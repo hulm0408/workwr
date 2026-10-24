@@ -235,12 +235,15 @@ function proxiesCard() {
       callback_data: `ap_px_${p.id}`,
     },
   ]);
-  rows.push([{ text: '➕ Add Proxy', callback_data: 'ap_px_add', style: 'success' }]);
+  rows.push([{ text: '🌐 Free Proxies Lao (auto)', callback_data: 'ap_px_free', style: 'success' }]);
+  rows.push([{ text: '➕ Add Proxy (khud ki)', callback_data: 'ap_px_add' }]);
+  rows.push([{ text: `🌐 Free Auto: ${ps.autoFree ? 'ON' : 'OFF'}`, callback_data: 'ap_px_autotoggle' }]);
   rows.push([{ text: ps.enabled ? '⏸ Pause Rotation' : '▶️ Enable Rotation', callback_data: 'ap_px_rot' }]);
   rows.push([{ text: '↩️ Settings', callback_data: 'ap_settings', style: 'primary' }]);
   return {
     text: section('🔀 Proxy Pool — IP Rotation', [
       `Status: <b>${ps.enabled ? `ON (${ps.enabledCount}/${ps.total})` : 'OFF'}</b> — ${esc(ps.rotation)}`,
+      `🌐 Free auto-fetch: <b>${ps.autoFree ? 'ON' : 'OFF'}</b>${ps.autoCount ? ` · ${ps.autoCount} auto proxies pool me` : ''}`,
       ``,
       list.length
         ? list.map((p) =>
@@ -248,7 +251,7 @@ function proxiesCard() {
           ).join('\n')
         : sub('Koi proxy nahi — abhi sab kuch EK IP se ja raha hai (rukne ka khatra).'),
       ``,
-      sub('Proxy add karte hi rotation ON. Ek IP blocked → bot turant doosri IP (ZERO wait).'),
+      sub('🌐 dabao — bot free proxy list se la kar sirf Swiggy par zinda wali rakhega. Batch start par bhi auto ho jata hai. Ek IP blocked → bot turant doosri IP (ZERO wait).'),
     ].join('\n')),
     rows,
   };
@@ -261,6 +264,7 @@ function proxyDetailCard(pxId) {
     text: section(`🔀 ${esc(p.label)}`, [
       `URL: <code>${esc(p.url.replace(/\/\/[^@]*@/, '//***:***@'))}</code>`,
       `Status: ${p.enabled ? '▫️ enabled' : '🚫 disabled'}${p.cooldownLeftMs > 0 ? ` · 🟡 WAF cooldown ${Math.ceil(p.cooldownLeftMs / 1000)}s` : ''}`,
+      p.auto ? `🌐 Free auto proxy${p.country ? ` · ${esc(p.country)}` : ''}${p.latencyMs ? ` · ⚡ ${p.latencyMs}ms (last check)` : ''} — marne par khud replace ho jayegi` : '',
       `WAF token: ${p.tokenReady ? '🔑 ready (per-proxy)' : '— (demand par banega)'}`,
       `Hits: ${p.hits || 0} · errors: ${p.consecutiveErrors || 0}`,
       ``,
@@ -720,7 +724,7 @@ bot.action('ap_proxies', async (ctx) => {
   await editOrSend(ctx, text, rows);
 });
 
-bot.action(/^ap_px_(?!add$|rot$)([a-f0-9-]{1,10})$/, async (ctx) => {
+bot.action(/^ap_px_(?!add$|rot$|free$|autotoggle$)([a-f0-9-]{1,10})$/, async (ctx) => {
   if (!(await gate(ctx))) return;
   await ctx.answerCbQuery().catch(() => {});
   const { text, rows } = proxyDetailCard(ctx.match[1]);
@@ -748,6 +752,45 @@ bot.action('ap_px_rot', async (ctx) => {
   const cur = proxyPool.proxySummary().enabled;
   const r = proxyPool.setPoolEnabled(!cur);
   await ctx.answerCbQuery(r.ok ? (r.enabled ? '▶️ Rotation ON' : '⏸ Rotation OFF') : `❌ ${r.error}`, !r.ok && { show_alert: true }).catch(() => {});
+  const { text, rows } = proxiesCard();
+  await editOrSend(ctx, text, rows);
+});
+
+// 🌐 Free Proxies Lao — public list se la kar Swiggy par test, sirf zinda pool me
+bot.action('ap_px_free', async (ctx) => {
+  if (!(await gate(ctx))) return;
+  await ctx.answerCbQuery('🌐 Free proxies dhoondh raha hoon…').catch(() => {});
+  await editOrSend(ctx, section('🌐 Free Proxies La Raha Hoon', [
+    '› Public free proxy list (ProxyScrape) se candidates la kar',
+    '› har ek ko <b>seedha Swiggy par test</b> kar raha hoon…',
+    '',
+    sub('30–60 second lag sakte hain — zinda + tez wali hi pool me jayengi.'),
+  ].join('\n')), [[{ text: '↩️ Proxies', callback_data: 'ap_proxies', style: 'primary' }]]);
+  try {
+    const r = await proxyPool.refreshFreeProxies({ want: 8 });
+    const ps = proxyPool.proxySummary();
+    await editOrSend(ctx, section('🌐 Free Proxies — Result', [
+      r?.added
+        ? `✅ <b>${r.added} zinda proxies</b> pool me daal di (${r.checked} parkhin).`
+        : `⚠️ Is baar ${r?.checked || 0} parkhin lekin koi Swiggy par zinda nahi mili. Thodi der baad phir dabana — free proxies aati-jaati rehti hain.`,
+      `🔀 Pool ab: <b>${ps.enabledCount}/${ps.total} ON</b> (${ps.autoCount} auto) — ${esc(ps.rotation)}`,
+      '',
+      sub('Batch me ek IP garam hote hi bot turant doosri IP le lega (zero wait). Mari hui auto proxies agle refresh par khud nikal jayengi.'),
+    ].join('\n')), [[{ text: '↩️ Proxies', callback_data: 'ap_proxies', style: 'primary' }]]);
+  } catch (e) {
+    await editOrSend(ctx, section('🌐 Free Proxies — Fail', [
+      `❌ <code>${esc(String(e?.message || e).slice(0, 200))}</code>`,
+      sub('List source down ho sakta hai — thodi der baad phir try karo, ya apni proxy ➕ se add kar do.'),
+    ].join('\n')), [[{ text: '↩️ Proxies', callback_data: 'ap_proxies', style: 'primary' }]]);
+  }
+});
+
+// 🌐 Auto-fetch on/off (batch-start par khud laana)
+bot.action('ap_px_autotoggle', async (ctx) => {
+  if (!(await gate(ctx))) return;
+  const cur = proxyPool.proxySummary().autoFree;
+  const r = proxyPool.setAutoFree(!cur);
+  await ctx.answerCbQuery(r.autoFree ? '🌐 Free auto-fetch ON' : '🌐 Free auto-fetch OFF').catch(() => {});
   const { text, rows } = proxiesCard();
   await editOrSend(ctx, text, rows);
 });

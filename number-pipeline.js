@@ -9,6 +9,7 @@
 //   ⚠️ infrastructure outcomes (engine alag tarah handle karta hai):
 //        • Swiggy rate limit        → rate_limited      (backoff)
 //        • Swiggy security check    → security_challenge (engine auto-recover: defer + IP cool-down)
+//        • Swiggy/proxy 5xx/network → deferred_swiggy_transient (number safe, proxy rotate + retry)
 //        • OTP send/miss/verify fail→ failed_*           (agla number)
 //        • STOP dabane par           → aborted            (number untouched/retryable)
 //
@@ -150,6 +151,46 @@ async function grabAndVerifyRound({
   return { status: 'failed', reason: v?.message || '', swiggyText: v?.swiggyStatus || '' };
 }
 
+// OTP-send failures ko engine ke samajhne wali shakl do. Khaas taur par
+// Swiggy/proxy ke temporary 5xx ya network errors number ki galti NAHI hain:
+// pehle ye sab `failed_otp_send` ban kar processed+failed count ho jate the
+// aur number retry queue me bhi nahi jata tha. Ab ye alag transient outcome
+// hai — engine number ko safe rakh kar proxy rotate + isi run me retry karega.
+export function _classifyOtpSendFailure(otpReq, phone, {
+  failKind = 'failed_otp_send',
+  stage = 'otp_send',
+} = {}) {
+  if (!otpReq || otpReq.success) return null;
+  const code = String(otpReq.code || '');
+  const httpStatus = Number(otpReq.httpStatus ?? otpReq.status) || 0;
+  const reason = otpReq.message || 'Swiggy OTP send fail';
+  const base = {
+    ok: false,
+    phone,
+    code: code || undefined,
+    httpStatus: httpStatus || undefined,
+    stage,
+    reason,
+  };
+
+  if (code === 'SWIGGY_WAF_COOLDOWN') {
+    return { ...base, kind: 'waf_cooldown', cooldownMs: Number(otpReq.cooldownMs) || 60_000 };
+  }
+  if (code === 'SWIGGY_RATE_LIMIT') return { ...base, kind: 'rate_limited' };
+  if (code === 'SWIGGY_SECURITY_CHALLENGE') return { ...base, kind: 'security_challenge' };
+
+  const isTransient =
+    code === 'SWIGGY_SERVER_ERROR' ||
+    code === 'SYSTEM_ERROR' ||
+    code === 'NO_RESPONSE' ||
+    (otpReq.retryable === true && httpStatus >= 500);
+  if (isTransient) {
+    return { ...base, kind: 'deferred_swiggy_transient', retryable: true };
+  }
+
+  return { ...base, kind: failKind };
+}
+
 // ---------------------------------------------------------------------------
 // Main: ek number ko shuru se end tak
 // ---------------------------------------------------------------------------
@@ -229,16 +270,10 @@ export async function processSingleNumber({
 
     const otpReq = await requestSwiggyOtpViaBridge(userId, phone, existingKey, existingName);
     if (!otpReq?.success) {
-      if (otpReq?.code === 'SWIGGY_WAF_COOLDOWN') {
-        return { ok: false, kind: 'waf_cooldown', phone, cooldownMs: Number(otpReq?.cooldownMs) || 60_000, reason: otpReq?.message || '' };
-      }
-      if (otpReq?.code === 'SWIGGY_RATE_LIMIT') {
-        return { ok: false, kind: 'rate_limited', phone, reason: otpReq?.message || '' };
-      }
-      if (otpReq?.code === 'SWIGGY_SECURITY_CHALLENGE') {
-        return { ok: false, kind: 'security_challenge', phone, reason: otpReq?.message || '' };
-      }
-      return { ok: false, kind: 'failed_otp_send', phone, reason: otpReq?.message || 'Swiggy OTP send fail' };
+      return _classifyOtpSendFailure(otpReq, phone, {
+        failKind: 'failed_otp_send',
+        stage: 'otp_send',
+      });
     }
 
     const isNew = Boolean(otpReq.isNewUser);
@@ -349,9 +384,10 @@ export async function processSingleNumber({
     const seen3 = await snapshotSeenOtpState(phone, { deviceIds });
     const otpReq2 = await requestSwiggyOtpViaBridge(userId, phone, '', null);
     if (!otpReq2?.success) {
-      if (otpReq2?.code === 'SWIGGY_RATE_LIMIT') return { ok: false, kind: 'rate_limited', phone, reason: otpReq2?.message || '' };
-      if (otpReq2?.code === 'SWIGGY_SECURITY_CHALLENGE') return { ok: false, kind: 'security_challenge', phone, reason: otpReq2?.message || '' };
-      return { ok: false, kind: 'failed_fresh_otp_send', phone, reason: otpReq2?.message || 'Fresh OTP send fail' };
+      return _classifyOtpSendFailure(otpReq2, phone, {
+        failKind: 'failed_fresh_otp_send',
+        stage: 'fresh_otp_send',
+      });
     }
 
     const round3 = await grabAndVerifyRound({

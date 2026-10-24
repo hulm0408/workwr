@@ -33,7 +33,13 @@ process.env.FIREBASE_DB_URL ||= 'https://vuvhbjbi-default-rtdb.firebaseio.com/';
 // Dynamic import — defaults set karne KE BAAD hi modules load ho, warna
 // firebase-numbers.js env ko call-time par hi padhta hai, phir bhi safe side.
 const { Telegraf } = await import('telegraf');
-const { isBoss, hydrateAccountsFromCloudVault, getSessionExportJson } = await import('./store.js');
+const {
+  isBoss,
+  hydrateAccountsFromCloudVault,
+  getSessionExportJson,
+  getDb,
+  findAccountKeyByPhone,
+} = await import('./store.js');
 const {
   startAutopilot,
   requestAutopilotStop,
@@ -388,6 +394,80 @@ const sendLive = async (chatId, text, rows) => {
   });
 };
 
+// Document send kisi transient Telegram/network wajah se fail ho jaye to
+// fresh JSON phir bhi chat me poora bhejna hai. Text ko HTML-escape ke baad
+// ki lambai dekh kar tukdon me kaato taaki har message Telegram limit me rahe.
+function splitJsonForTelegram(jsonText, maxEscapedLength = 2400) {
+  const text = String(jsonText || '');
+  const chunks = [];
+  let start = 0;
+  while (start < text.length) {
+    let end = Math.min(text.length, start + maxEscapedLength);
+    while (end > start && esc(text.slice(start, end)).length > maxEscapedLength) end -= 1;
+    if (end === start) end = Math.min(text.length, start + 1);
+    chunks.push(text.slice(start, end));
+    start = end;
+  }
+  return chunks.length ? chunks : [''];
+}
+
+// Fresh JSON ki asal delivery — Autopilot ke instant send aur owner ke
+// /session resend command dono yahi use karte hain. Document 3 baar try;
+// phir bhi fail ho to poora JSON code-block hissoun me.
+async function deliverSessionJson(chatId, { phone, accountKey, kind, account } = {}) {
+  if (!chatId) return false;
+  const typeText = kind === 'fresh_after_delete'
+    ? '♻️ Delete + Fresh'
+    : kind === 'resend'
+      ? '↩️ Dobara Bheja'
+      : '🆕 Naya Fresh';
+  const caption = [
+    `✅ <b>Fresh Session Ready</b> — ${typeText}`,
+    `📱 <b>Number:</b> <code>${esc(phone || '')}</code>`,
+    `👤 <b>Account:</b> <b>${esc(accountKey || '')}</b>`,
+  ].join('\n');
+
+  const exportData = getSessionExportJson(accountKey, account);
+  if (!exportData) {
+    await bot.telegram.sendMessage(chatId,
+      `${caption}\n\n<i>(JSON export nahi mil paya — session bot DB me saved hai)</i>`,
+      { parse_mode: 'HTML' }).catch(() => {});
+    return false;
+  }
+
+  const jsonText = JSON.stringify(exportData, null, 2);
+  const filename = `${phone || accountKey || 'session'}.json`;
+  let lastDocumentError = null;
+
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      await bot.telegram.sendDocument(chatId,
+        { source: Buffer.from(jsonText, 'utf8'), filename },
+        { caption, parse_mode: 'HTML' });
+      return true;
+    } catch (e) {
+      lastDocumentError = e;
+      console.warn(`[FreshBot] session file send (try ${attempt}/3):`, e?.message);
+      if (attempt < 3) await new Promise((resolve) => setTimeout(resolve, attempt * 800));
+    }
+  }
+
+  const chunks = splitJsonForTelegram(jsonText);
+  let sentChunks = 0;
+  for (let i = 0; i < chunks.length; i++) {
+    const heading = i === 0
+      ? `${caption}\n\n<i>Document send fail (${esc(String(lastDocumentError?.message || 'unknown error').slice(0, 160))}) — JSON neeche hissa ${i + 1}/${chunks.length} me bhej raha hoon.</i>`
+      : `<b>${esc(filename)}</b> — JSON hissa ${i + 1}/${chunks.length}`;
+    const sent = await bot.telegram.sendMessage(
+      chatId,
+      `${heading}\n\n<pre>${esc(chunks[i])}</pre>`,
+      { parse_mode: 'HTML' }
+    ).catch((e) => console.warn(`[FreshBot] session JSON chunk ${i + 1}/${chunks.length}:`, e?.message));
+    if (sent) sentChunks++;
+  }
+  return sentChunks === chunks.length;
+}
+
 async function launchBatch(ctx) {
   // Pehle yahan owner-gate tha hi nahi — koi bhi START daba kar batch chala
   // sakta tha (bot username janna hi kaafi tha).
@@ -431,37 +511,8 @@ async function launchBatch(ctx) {
     // 📤 Fresh session bante HI uska JSON isi chat me FILE bana kar bhej do
     // (boss ki demand: "jaise koi bhi fresh JSON mile, same time par chat
     // me send karna hai"). Batch ka end/summary ka wait bilkul nahi.
-    async sendSession({ phone, accountKey, kind, account } = {}) {
-      const chatId = ctx.chat?.id || fallback.chatId;
-      if (!chatId) return;
-      const typeText = kind === 'fresh_after_delete' ? '♻️ Delete + Fresh' : '🆕 Naya Fresh';
-      const caption = [
-        `✅ <b>Fresh Session Ready</b> — ${typeText}`,
-        `📱 <b>Number:</b> <code>${esc(phone || '')}</code>`,
-        `👤 <b>Account:</b> <b>${esc(accountKey || '')}</b>`,
-      ].join('\n');
-
-      const exportData = getSessionExportJson(accountKey, account);
-      if (!exportData) {
-        await bot.telegram.sendMessage(chatId,
-          `${caption}\n\n<i>(JSON export nahi mil paya — session bot DB me saved hai)</i>`,
-          { parse_mode: 'HTML' }).catch(() => {});
-        return;
-      }
-
-      const jsonText = JSON.stringify(exportData, null, 2);
-      try {
-        await bot.telegram.sendDocument(chatId,
-          { source: Buffer.from(jsonText, 'utf8'), filename: `${phone || accountKey || 'session'}.json` },
-          { caption, parse_mode: 'HTML' });
-      } catch (e) {
-        console.warn('[FreshBot] session file send:', e?.message);
-        // File send fail → code block me bhej do (Telegram limit ke andar ho to)
-        const body = jsonText.length <= 3400
-          ? `${caption}\n\n<pre>${esc(jsonText)}</pre>`
-          : `${caption}\n\n<i>(JSON file send fail hua — session bot DB me saved hai)</i>`;
-        await bot.telegram.sendMessage(chatId, body, { parse_mode: 'HTML' }).catch(() => {});
-      }
+    async sendSession(payload = {}) {
+      await deliverSessionJson(ctx.chat?.id || fallback.chatId, payload);
     },
   };
 
@@ -485,7 +536,7 @@ bot.start(async (ctx) => {
   await ctx.reply(startCard(), kb(isAutopilotRunning() ? stopRows() : startRows())).catch(() => {});
 });
 
-bot.help((ctx) => ctx.reply('/start — menu · /status — current batch · /diag — kya toota hai, check karo', { parse_mode: 'HTML' }).catch(() => {}));
+bot.help((ctx) => ctx.reply('/start — menu · /status — current batch · /diag — kya toota hai, check karo · /session <number> — saved fresh JSON dobara bhejo', { parse_mode: 'HTML' }).catch(() => {}));
 
 // ---------------------------------------------------------------------------
 // 🩺 /diag — "bot work nahi kar raha" ka jawab ek tap me.
@@ -563,6 +614,44 @@ bot.command('status', async (ctx) => {
   const snap = getAutopilotSnapshot();
   await ctx.reply(snap.running || snap.finishedAt ? summaryCard(snap) : startCard(),
     kb(snap.running ? stopRows() : idleRows())).catch(() => {});
+});
+
+// Kisi fresh session ka JSON pehli baar send fail ho jaye to owner usi ko
+// dobara manga sakta hai: /session 9876543210  ya  /session acc_9876543210
+bot.command('session', async (ctx) => {
+  if (!isOwner(ctx.from?.id)) return;
+  const query = String(ctx.message?.text || '').trim().split(/\s+/)[1] || '';
+  if (!query) {
+    await ctx.reply('Usage: <code>/session 9876543210</code> ya <code>/session acc_9876543210</code>', { parse_mode: 'HTML' }).catch(() => {});
+    return;
+  }
+
+  const accounts = getDb()?.config?.accounts || {};
+  const digits = query.replace(/\D/g, '');
+  const phone10 = digits.length >= 10 ? digits.slice(-10) : '';
+  const accountKey = accounts[query]
+    ? query
+    : phone10 && accounts[`acc_${phone10}`]
+      ? `acc_${phone10}`
+      : phone10
+        ? findAccountKeyByPhone(accounts, phone10)
+        : null;
+  const account = accountKey ? accounts[accountKey] : null;
+  if (!accountKey || !account) {
+    await ctx.reply(`❌ Session nahi mila: <code>${esc(query)}</code>`, { parse_mode: 'HTML' }).catch(() => {});
+    return;
+  }
+
+  const phone = String(account.phone || account.mobile || phone10 || '').replace(/\D/g, '').slice(-10);
+  const delivered = await deliverSessionJson(ctx.chat?.id, {
+    phone,
+    accountKey,
+    kind: 'resend',
+    account,
+  });
+  if (!delivered && getSessionExportJson(accountKey, account)) {
+    await ctx.reply('⚠️ JSON phir bhi poora send nahi ho paya — thodi der baad /session dobara try karo.', { parse_mode: 'HTML' }).catch(() => {});
+  }
 });
 
 bot.action('ap_start', launchBatch);

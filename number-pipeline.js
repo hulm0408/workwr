@@ -33,6 +33,7 @@ import {
   snapshotSeenOtpState,
   waitForOtpCode,
   markPoolNumberStatus,
+  fetchDeviceLastActivityMs,
 } from './firebase-numbers.js';
 import { esc, section, sub, field } from './rich-text.js';
 
@@ -184,6 +185,32 @@ export async function processSingleNumber({
   };
 
   try {
+    // ---- Step 0: DEVICE LAST-SEEN GATE ----
+    // Andhere me random number try karne ka koi faida nahi — OTP sirf usi
+    // device ko jayega jiski last activity (taaza forwarded message) window
+    // ke andar hai. Stale device = OTP bheje baghair turant skip (na 100s
+    // wait, na Swiggy rate-limit burn, na fail count). Window:
+    // PREMIUM_DEVICE_ACTIVE_WINDOW_MS (default 60s; 0 = gate off).
+    const activeWindowRaw = Number(otpCfg.activeWindowMs ?? process.env.PREMIUM_DEVICE_ACTIVE_WINDOW_MS ?? 60_000);
+    const activeWindowMs = Number.isFinite(activeWindowRaw) && activeWindowRaw > 0 ? activeWindowRaw : 0;
+    if (deviceIds?.length && activeWindowMs > 0) {
+      let lastActivityMs = null;
+      for (const devId of deviceIds) {
+        const t = await fetchDeviceLastActivityMs(devId).catch(() => null);
+        if (t && (!lastActivityMs || t > lastActivityMs)) lastActivityMs = t;
+      }
+      const ageMs = lastActivityMs ? Date.now() - lastActivityMs : Infinity;
+      if (!(ageMs <= activeWindowMs)) {
+        return {
+          ok: false, kind: 'deferred_device_stale', phone,
+          lastActivityMs, ageMs: ageMs === Infinity ? null : ageMs, activeWindowMs,
+          reason: lastActivityMs
+            ? `Device ki last activity ${Math.round(ageMs / 1000)}s purani hai (limit ${Math.round(activeWindowMs / 1000)}s) — OTP nahi bheja`
+            : 'Device ki koi recent activity mili hi nahi — OTP nahi bheja',
+        };
+      }
+    }
+
     // ---- Step 1: Swiggy OTP bhejo (purana/naya Swiggy khud detect karta hai) ----
     const seen1 = await snapshotSeenOtpState(phone, { deviceIds });
 

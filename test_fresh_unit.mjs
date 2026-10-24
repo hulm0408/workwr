@@ -54,7 +54,14 @@ globalThis.fetch = async (url) => {
   if (path === 'numbers') return respond(mock.numbers);
   if (path.startsWith('messages/')) {
     const devId = decodeURIComponent(path.slice('messages/'.length));
-    return respond(mock.messages[devId] ?? null);
+    let data = mock.messages[devId] ?? null;
+    const limit = Number(new URL(u).searchParams.get('limitToLast') || 0);
+    if (data && typeof data === 'object' && !Array.isArray(data) && limit > 0) {
+      const entries = Object.entries(data)
+        .sort(([a], [b]) => String(a).localeCompare(String(b), undefined, { numeric: true }));
+      data = Object.fromEntries(entries.slice(-limit));
+    }
+    return respond(data);
   }
   if (path.startsWith('otp/')) {
     const phone = decodeURIComponent(path.slice('otp/'.length));
@@ -637,9 +644,27 @@ console.log('device last-seen gate (mare hue device par OTP waste nahi):');
 
   const t1 = await fbn.fetchDeviceLastActivityMs('devFresh');
   ok(t1 === now - 5000, 'epoch-ms key se last activity mili (chhote inbox ids ignore)');
+  ok(mock.calls.at(-1).includes('messages/devFresh') && mock.calls.at(-1).includes('limitToLast=5'),
+    'last-seen probe halki hai: pehle sirf last 5 messages (50 full SMS nahi)');
   const t2 = await fbn.fetchDeviceLastActivityMs('devStale');
   ok(Boolean(t2) && (now - t2) > 60_000, 'purani dateTime wali activity stale pehchani');
   ok((await fbn.fetchDeviceLastActivityMs('devMissing')) === null, 'khali/missing device → null');
+
+  // Agar last 5 entries me koi parseable timestamp na ho to purani
+  // 50-entry query fallback ke tor par chalegi.
+  mock.messages['devOdd'] = {
+    a: { message: 'old but parseable', dateTime: '01-01-2025 | 10:00 AM' },
+    b: { message: 'no date 1' },
+    c: { message: 'no date 2' },
+    d: { message: 'no date 3' },
+    e: { message: 'no date 4' },
+    f: { message: 'no date 5' },
+  };
+  const oddCallsBefore = mock.calls.length;
+  const tOdd = await fbn.fetchDeviceLastActivityMs('devOdd');
+  const oddCalls = mock.calls.slice(oddCallsBefore).filter((u) => u.includes('messages/devOdd'));
+  ok(Boolean(tOdd) && oddCalls.length === 2 && oddCalls[1].includes('limitToLast=50'),
+    'last 5 me timestamp na mile to 50-entry fallback query');
 
   // Stale device: OTP request Swiggy tak jani hi nahi chahiye
   const callsBefore = mock.calls.length;
@@ -669,6 +694,20 @@ console.log('device last-seen gate (mare hue device par OTP waste nahi):');
     otpCfg: { activeWindowMs: 0, waitMs: 0, timeoutMs: 100 },
   });
   ok(r3.kind === 'failed_otp_send', 'activeWindowMs=0 → gate off, stale bhi aage gaya');
+
+  // Autopilot ladder mode: selected device ki activity fixed limit se
+  // bahar ho to pipeline use stale kehne ke bajaye window double karke
+  // aage badhegi. Invalid-format number par bridge wala failed_otp_send
+  // hi saboot hai ke gate pass hua.
+  const r4 = await pipe.processSingleNumber({
+    userId: 'test',
+    entry: { phone: '12345', deviceId: 'devStale', online: true },
+    otpCfg: {
+      activeWindowMs: 10_000, waitMs: 0, timeoutMs: 100,
+      widenLastSeenByDoubling: true,
+    },
+  });
+  ok(r4.kind === 'failed_otp_send', 'pipeline doubling: purani activity bhi ladder se gate pass (stale loop nahi)');
 }
 
 // ---------------------------------------------------------------------------
@@ -756,6 +795,35 @@ console.log('parallel device scan (hot-queue) + pipeline precheck:');
       'doubling ladder: 97s purani sabse taazi activity ≤160s window me mili');
     ok(r.widened === true && r.widestWindowMs === 160_000 && r.checked === 20 && calls.length === 20,
       'doubling ladder: ek hi pass ke cached probes reuse (koi rescan nahi)');
+  }
+
+  // Ranked backups + early ladder: full pool khatam hone ka intezaar nahi.
+  // Pehle chunk ke baad hi ≤20s/40s wala candidate mil jaye to backups ke
+  // saath return, aur pehla miss ho to agla cached device engine ke paas hai.
+  {
+    const calls = [];
+    const probe = async (id) => {
+      calls.push(id);
+      await new Promise((resolve) => setTimeout(resolve, 2));
+      return id === 'D2' ? now - 15_000 : id === 'D3' ? now - 18_000 : id === 'D90' ? now - 1000 : null;
+    };
+    const r = await fbn.scanFreshDevices(mkEntries(100), {
+      windowMs: 10_000,
+      maxWidenMs: Number.POSITIVE_INFINITY,
+      widenByDoubling: true,
+      earlyWidenStepMs: 1,
+      backupCount: 2,
+      want: 1,
+      chunkSize: 20,
+      maxProbe: 100,
+      probe,
+    });
+    ok(r.checked === 20 && calls.length === 20 && r.exhausted === false,
+      'early ladder: full pool scan kiye baghair pehle chunk ke baad return');
+    ok(r.fresh.length === 2 && r.fresh[0].entry.deviceId === 'D2' && r.fresh[1].entry.deviceId === 'D3',
+      'early ladder: ranked backup devices bhi mile (agla miss par rescan nahi)');
+    ok(r.earlyWidened === true && r.fresh[0].windowMs === 20_000,
+      'early ladder: 15s activity ≤20s window me select');
   }
 
   // scanFreshDevices — bilkul khali activity → fresh [] + exhausted

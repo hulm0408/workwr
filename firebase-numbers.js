@@ -471,6 +471,33 @@ function looksLikeMessageNode(node) {
     keys.some((k) => ['date', 'timestamp', 'time', 'createdAt', 'at', 'ts', 'sentAt', 'dateTime'].includes(k));
 }
 
+// ---------------------------------------------------------------------------
+// Device "last seen" — is DB me clients/ ke andar koi heartbeat/lastSeen
+// field NAHI hai (live verify kiya: fields sirf status/battery/joined/...).
+// Device zinda hai ya nahi, iska ekmatra saboot hai uske messages node ki
+// SABSE TAAZI entry: epoch-ms wali key (13-digit) ya message ki dateTime.
+// OTP bhejne se pehle isi se decide hoga ke device abhi active hai ya nahi —
+// mare hue device par OTP bhejkar 100s wait + rate-limit burn, dono bachega.
+// ---------------------------------------------------------------------------
+export async function fetchDeviceLastActivityMs(deviceId) {
+  if (!deviceId) return null;
+  const messagesPath = cleanPath(_source?.messagesPath || env('FIREBASE_MESSAGES_PATH', 'messages'));
+  let node = null;
+  try {
+    node = await fbGet(`${messagesPath}/${seg(deviceId)}`, { orderBy: '"$key"', limitToLast: 50 });
+  } catch { return null; }
+  if (!node || typeof node !== 'object') return null;
+  const entries = Array.isArray(node) ? node.map((m, i) => [i, m]) : Object.entries(node);
+  let best = null;
+  for (const [k, v] of entries) {
+    const keyTs = _parseTs(k); // sirf epoch-ms keys (>1e12) pass hongi, chhote inbox ids nahi
+    const msgTs = (v && typeof v === 'object') ? messageTsOf(v) : null;
+    const ts = Math.max(keyTs || 0, msgTs || 0) || null;
+    if (ts && (!best || ts > best)) best = ts;
+  }
+  return best;
+}
+
 // OTP dispatch se PEHLE inbox ka snapshot — purane messages kabhi accept na hon.
 // { ids: Set<idKey>, codes: Set<6-digit> }
 export async function snapshotSeenOtpState(phone, opts = {}) {

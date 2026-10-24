@@ -52,6 +52,7 @@ const state = {
   freshAfterDelete: 0,
   skipped: 0,
   deferred: 0,
+  staleSkips: 0,          // last-seen window se bahar wale devices (OTP bheje baghair skip)
   failed: 0,
   aborted: 0,
   rateStrikes: 0,
@@ -84,6 +85,7 @@ export function getAutopilotSnapshot() {
     skipped: state.skipped,
     deferred: state.deferred,
     failed: state.failed,
+    staleSkips: state.staleSkips || 0,
     aborted: state.aborted,
     rateStrikes: state.rateStrikes,
     wafStrikes: state.wafStrikes,
@@ -133,7 +135,7 @@ function statsLines() {
   return [
     field('Processed', String(state.processed)),
     field('✅ Fresh sessions', `${state.fresh}  (naye: ${state.freshNew} · delete+fresh: ${state.freshAfterDelete})`),
-    field('⚠️ Skipped', `${state.skipped} · deferred: ${state.deferred}`),
+    field('⚠️ Skipped', `${state.skipped} · deferred: ${state.deferred} · 📴 stale devices: ${state.staleSkips || 0}`),
     field('× Failed', `${state.failed} · aborted: ${state.aborted} · rate-limit: ${state.rateStrikes}`),
     (state.wafCooldowns || state.wafStrikes || state.proxyRotations)
       ? field('🛡 WAF', `${state.wafCooldowns} cooldown · challenges: ${state.wafStrikes} · rotations: ${state.proxyRotations}`)
@@ -271,6 +273,10 @@ export async function startAutopilot(opts = {}) {
     timeoutMs: s('otpTimeoutMs', envInt('PREMIUM_OTP_TIMEOUT_MS', 90_000)),
     pollMs: 2_500,
     acceptAnyAfterMs: 30_000,
+    // Device last-seen gate: sirf wahi devices jinki last activity itni
+    // taazi hai. Default 60s; sakht 10s ke liye Render env me
+    // PREMIUM_DEVICE_ACTIVE_WINDOW_MS=10000 (aur 0 = gate off).
+    activeWindowMs: envInt('PREMIUM_DEVICE_ACTIVE_WINDOW_MS', 60_000),
   };
 
   ui = opts.ui && typeof opts.ui.update === 'function' ? opts.ui : ui;
@@ -281,7 +287,7 @@ export async function startAutopilot(opts = {}) {
     startedAt: Date.now(), finishedAt: 0,
     target, maxMinutes, gapMs, backoffMs,
     processed: 0, fresh: 0, freshNew: 0, freshAfterDelete: 0,
-    skipped: 0, deferred: 0, failed: 0, aborted: 0,
+    skipped: 0, deferred: 0, staleSkips: 0, failed: 0, aborted: 0,
     rateStrikes: 0, wafStrikes: 0, wafCooldowns: 0, consecutiveFails: 0, proxyRotations: 0,
     current: null, history: [], freshAccounts: [], lastError: '',
     poolTotal: 0, poolFresh: 0,
@@ -294,6 +300,14 @@ export async function startAutopilot(opts = {}) {
     // WAF cooldown = number bilkul untouched (sirf wait hui) — count me mat lo,
     // warna summary jhootha dikhega.
     if (res.kind === 'waf_cooldown') return 'waf_cooldown';
+
+    // Device stale (last-seen window se bahar) — OTP gaya hi nahi, isliye
+    // na processed, na fail. Sirf counter (card par dikhe kitne mare hue
+    // devices chhaante gaye).
+    if (res.kind === 'deferred_device_stale') {
+      state.staleSkips = (state.staleSkips || 0) + 1;
+      return 'device_stale';
+    }
 
     state.processed++;
     state.history.push({ phone: res.phone, kind: res.kind, reason: res.reason || '', at: new Date().toISOString() });
@@ -425,8 +439,13 @@ export async function startAutopilot(opts = {}) {
     // unke liye defer/rotate wala alag flow hai.)
     const failedAttemptsThisRun = new Map(); // phone → count
     const underFailCap = (e) => (failedAttemptsThisRun.get(e.phone) || 0) < 2;
+    // Isi run me jo devices last-seen gate par stale nikle — dobara-dobara
+    // unhi ko probe na karo. "Fresh device ka wait" round me clear hota hai
+    // (device beech me zinda ho sakta hai).
+    const staleThisRun = new Set(); // phone
+    let freshWaitRounds = 0;
     const pickFreshList = () => {
-      let list = preferOnline(freshEntriesFrom(pool)).filter(underFailCap);
+      let list = preferOnline(freshEntriesFrom(pool)).filter(underFailCap).filter((e) => !staleThisRun.has(e.phone));
       if (!allowOffline) {
         const onlineOnly = list.filter((e) => e.online !== false);
         if (onlineOnly.length) list = onlineOnly;
@@ -445,6 +464,7 @@ export async function startAutopilot(opts = {}) {
 
       let fresh = pickFreshList();
       state.poolFresh = fresh.length;
+      if (fresh.length) freshWaitRounds = 0;
 
       if (!fresh.length) {
         // Pool khali? Pehle retry-later queue check (ISI run me dobara).
@@ -457,6 +477,24 @@ export async function startAutopilot(opts = {}) {
           fresh = pickFreshList();
           state.poolFresh = fresh.length;
           if (!fresh.length) {
+            // Numbers bache hain lekin sab ke devices abhi stale (last-seen
+            // window se bahar) — batch band karne ki jagah thodi der ruk kar
+            // dobara dekho, koi device zinda ho sakta hai. Max ~30 rounds
+            // (20s each ≈ 10 min), phir hi pool-exhausted.
+            const ledgerFreshLeft = freshEntriesFrom(pool).length;
+            if (ledgerFreshLeft > 0 && freshWaitRounds < 30) {
+              freshWaitRounds++;
+              await push(progressCard(section('🕐 Fresh Device Ka Wait', [
+                `› Abhi koi device last-seen window (≤${Math.round((otpCfg.activeWindowMs || 60000) / 1000)}s) me active nahi mila.`,
+                `› ${state.staleSkips || 0} stale devices chhaante gaye — 20s ruk kar pool dobara check karunga (round ${freshWaitRounds}/30).`,
+                sub('Andhere me mare hue devices par OTP waste nahi hoga.'),
+              ].join('\n'))), stopRows());
+              await sleep(20_000, () => state.stopRequested);
+              if (state.stopRequested) { endReason = state.stopReason || 'manual'; break; }
+              staleThisRun.clear();
+              try { await loadPool(); } catch (e) { state.lastError = e?.message || 'pool reload fail'; }
+              continue;
+            }
             // Pool khali + retry-later bhi khali → tabhi khatam
             endReason = 'pool-exhausted';
             break;
@@ -485,17 +523,28 @@ export async function startAutopilot(opts = {}) {
       if (!res.ok) {
         console.log(`[Autopilot] ${outcome} | ${res.kind} | ${res.phone} | ${String(res.reason || '').replace(/\s+/g, ' ').slice(0, 160)}`);
       }
-      await push(progressCard(
-        section(res.ok ? '✅ Number Done' : (res.kind === 'skipped_delete_blocked' ? '⚠️ Skipped' : (res.kind === 'aborted' ? '⏹ Aborted' : '× Result')), [
-          `📱 <b>Number:</b> <code>${esc(res.phone)}</code>`,
-          `› <b>Outcome:</b> <code>${esc(res.kind)}</code>`,
-          res.reason ? `<blockquote>${esc(String(res.reason).slice(0, 300))}</blockquote>` : '',
-        ].filter(Boolean).join('\n'))
-      ), stopRows());
+      // Stale devices rapid-fire skip hote hain — har ek par card edit karne
+      // se Telegram flood hoga. Unka count stats me dikhta hai, card nahi.
+      if (outcome !== 'device_stale') {
+        await push(progressCard(
+          section(res.ok ? '✅ Number Done' : (res.kind === 'skipped_delete_blocked' ? '⚠️ Skipped' : (res.kind === 'aborted' ? '⏹ Aborted' : '× Result')), [
+            `📱 <b>Number:</b> <code>${esc(res.phone)}</code>`,
+            `› <b>Outcome:</b> <code>${esc(res.kind)}</code>`,
+            res.reason ? `<blockquote>${esc(String(res.reason).slice(0, 300))}</blockquote>` : '',
+          ].filter(Boolean).join('\n'))
+        ), stopRows());
+      }
 
       // Engine-level reactions — "rukna hi na pare":
       //   rate-limit/WAF → TURANT proxy badal (nayi IP) + number defer kar
       //   (baad me isi run me dobara). Sirf tab ruk jab saare proxies side par.
+
+      // Device stale — OTP gaya hi nahi. Is run me is number ko dobara mat
+      // uthao, bina gap ke turant agla fresh device dhoondho.
+      if (outcome === 'device_stale') {
+        if (res.phone) staleThisRun.add(res.phone);
+        continue;
+      }
 
       if (outcome === 'rate_limited') {
         // NOTE: rateStrikes tally() me already badhta hai — yahan dobara ++

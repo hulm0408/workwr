@@ -506,4 +506,52 @@ console.log('isUnregisteredSwiggyAuthResponse (failed_otp_send wala bug):');
   ok(det(null) === false && det(undefined) === false, 'null/undefined safe');
 }
 
+// ---------------------------------------------------------------------------
+console.log('device last-seen gate (mare hue device par OTP waste nahi):');
+{
+  const fbn = await import('./firebase-numbers.js');
+  const pipe = await import('./number-pipeline.js');
+  const now = Date.now();
+  mock.messages['devFresh'] = {
+    [String(now - 5000)]: { message: 'hello', dateTime: '' },
+    '42': { message: 'old inbox', dateTime: '01-01-2025 | 10:00 AM' },
+  };
+  mock.messages['devStale'] = { '7': { message: 'purana', dateTime: '01-01-2025 | 10:00 AM' } };
+
+  const t1 = await fbn.fetchDeviceLastActivityMs('devFresh');
+  ok(t1 === now - 5000, 'epoch-ms key se last activity mili (chhote inbox ids ignore)');
+  const t2 = await fbn.fetchDeviceLastActivityMs('devStale');
+  ok(Boolean(t2) && (now - t2) > 60_000, 'purani dateTime wali activity stale pehchani');
+  ok((await fbn.fetchDeviceLastActivityMs('devMissing')) === null, 'khali/missing device → null');
+
+  // Stale device: OTP request Swiggy tak jani hi nahi chahiye
+  const callsBefore = mock.calls.length;
+  const r1 = await pipe.processSingleNumber({
+    userId: 'test',
+    entry: { phone: '9812345670', deviceId: 'devStale', online: true },
+    otpCfg: { activeWindowMs: 60_000, waitMs: 0, timeoutMs: 100 },
+  });
+  ok(r1.kind === 'deferred_device_stale', 'stale device → deferred_device_stale (OTP nahi bheja)');
+  ok(!mock.calls.slice(callsBefore).some((u) => u.includes('swiggy.com')), 'stale par Swiggy ko ek bhi request nahi gayi');
+  ok(r1.ok === false && Boolean(r1.reason), 'stale result me wajah hai');
+
+  // Fresh device: gate pass karke bridge tak jaye. Galat-format number rakha
+  // taaki bridge bina network ke turant INVALID_MOBILE de (test pure rahe) —
+  // pipeline use failed_otp_send me map karegi, matlab gate PASS hua tha.
+  const r2 = await pipe.processSingleNumber({
+    userId: 'test',
+    entry: { phone: '12345', deviceId: 'devFresh', online: true },
+    otpCfg: { activeWindowMs: 60_000, waitMs: 0, timeoutMs: 100 },
+  });
+  ok(r2.kind === 'failed_otp_send', 'fresh device gate pass (bridge tak gaya)');
+
+  // Gate off (0): stale device bhi aage badhe
+  const r3 = await pipe.processSingleNumber({
+    userId: 'test',
+    entry: { phone: '12345', deviceId: 'devStale', online: true },
+    otpCfg: { activeWindowMs: 0, waitMs: 0, timeoutMs: 100 },
+  });
+  ok(r3.kind === 'failed_otp_send', 'activeWindowMs=0 → gate off, stale bhi aage gaya');
+}
+
 console.log(`\n✅ ALL PASSED — ${passed} checks`);

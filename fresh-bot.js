@@ -143,7 +143,7 @@ function runningCard(snap, stageText = '') {
     ``,
     field('Processed', String(snap.processed)),
     field('✅ Fresh', `${snap.fresh}  (naye: ${snap.freshNew} · delete+fresh: ${snap.freshAfterDelete})`),
-    field('⚠️ Skipped', `${snap.skipped} · deferred: ${snap.deferred}`),
+    field('⚠️ Skipped', `${snap.skipped} · deferred: ${snap.deferred} · 📴 stale devices: ${snap.staleSkips || 0}`),
     field('× Failed', `${snap.failed} · rate-limit: ${snap.rateStrikes}`),
     field('Pool', `${snap.poolFresh} fresh / ${snap.poolTotal} numbers`),
     snap.current
@@ -163,7 +163,7 @@ function summaryCard(snap) {
     ``,
     field('Processed', String(snap.processed)),
     field('✅ Fresh', `${snap.fresh}  (naye: ${snap.freshNew} · delete+fresh: ${snap.freshAfterDelete})`),
-    field('⚠️ Skipped', `${snap.skipped} · deferred: ${snap.deferred}`),
+    field('⚠️ Skipped', `${snap.skipped} · deferred: ${snap.deferred} · 📴 stale devices: ${snap.staleSkips || 0}`),
     field('× Failed', `${snap.failed} · rate-limit: ${snap.rateStrikes}`),
     field('Pool', `${snap.poolFresh} fresh / ${snap.poolTotal} numbers`),
     snap.lastError ? field('Last error', snap.lastError) : '',
@@ -481,6 +481,12 @@ async function diagCard() {
     const online = pool.filter((p) => p.online !== false).length;
     lines.push(field('📱 Number pool', pool.length ? `✅ ${pool.length} numbers (${online} online)` : '❌ 0 numbers mile — Firebase clients/ node khali ya paths galat'));
   } catch (e) { lines.push(field('📱 Number pool', `❌ ${esc(String(e?.message || e).slice(0, 140))}`)); }
+  // Device last-seen gate
+  {
+    const w = Number(process.env.PREMIUM_DEVICE_ACTIVE_WINDOW_MS);
+    const wMs = Number.isFinite(w) && w > 0 ? w : 60_000;
+    lines.push(field('📟 Device gate', `sirf wahi devices jinki last activity ≤${Math.round(wMs / 1000)}s purani ho (env PREMIUM_DEVICE_ACTIVE_WINDOW_MS se badal sakta hai)`));
+  }
   // Proxies
   try {
     const ps = proxyPool.proxySummary();

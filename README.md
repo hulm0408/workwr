@@ -164,6 +164,7 @@ ho (403, rate-limit, network fail) — rotate/defer karke chalta rehta hai.
 | `PREMIUM_RATE_LIMIT_BACKOFF_MS` | 900000 | Rate-limit par rukna (15 min) |
 | `PREMIUM_OTP_WAIT_MS` | 10000 | OTP se pehle 10s wait (user requirement) |
 | `PREMIUM_OTP_TIMEOUT_MS` | 90000 | OTP inbox poll budget |
+| `PREMIUM_DEVICE_ACTIVE_WINDOW_MS` | 60000 | **Last-seen gate**: OTP sirf un devices par jin ki last activity (taaza forwarded message) is window ke andar ho — mare devices turant skip, OTP waste nahi. Sakht: `10000`, band: `0` |
 | `PREMIUM_ALLOW_OFFLINE_DEVICES` | — | `1` = offline devices bhi try |
 
 ## Timing expectation

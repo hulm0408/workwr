@@ -13,11 +13,25 @@
 
 > Numbers aur OTP **dono** isi ek Firebase (`vuvhbjbi-default-rtdb`) se aate hain — koi third/premium source NAHI.
 
+## Zaroori cheezein (warna bot "work nahi karega")
+
+| Cheez | Kyun |
+|---|---|
+| **Node.js 20+** ([nodejs.org](https://nodejs.org)) | isse purane Node par dependencies toot-ti hain. Check: `node --version` |
+| **Google Chrome** (ya Chromium/Edge) installed | WAF token banane ke liye. `puppeteer-core` ke saath browser bundled **nahi** aata — bot system Chrome khud dhoondhta hai. Na mile to `.env` me `PUPPETEER_EXECUTABLE_PATH=<chrome.exe ka full path>` do |
+| **BOT_TOKEN** (@BotFather se) | bot iske baghair start hi nahi hoga |
+| Internet | Telegram + Firebase + Swiggy teeno tak pahunch chahiye |
+
+> 🤖 **Bot work nahi kar raha?** Telegram me **`/diag`** bhejo (ya ⚙️ Settings →
+> 🩺 Diagnose) — ek-ek karke bata dega kya toota hai: Chrome, WAF token,
+> Firebase, number pool, proxies. Startup par console bhi yahi check
+> karke dikhata hai.
+
 ## Setup (2 minute)
 
 ```bash
 cd E:\MyMedia\swiggy-fresh-bot
-npm install          # pehli baar (already done — 43 packages)
+npm install          # pehli baar (node_modules git me ho tab bhi ye chala lena safe hai)
 copy .env.example .env
 ```
 
@@ -38,6 +52,40 @@ npm start           # = node fresh-bot.js
 
 Telegram me bot kholo → `/start` → **▶️ START BATCH** → phone chhod do.
 Wapas aa kar **📊 STATUS** dabao, ya khatam hone par summary khud aa jayega.
+
+## ☁️ Render par host karo (24×7, PC band phir bhi bot on)
+
+Repo me sab ready hai: **`Dockerfile`** (Chrome ke saath) + **`render.yaml`**
+(Blueprint). Steps:
+
+1. Pehle upar wala **🚨 Security** step: purana BOT_TOKEN **revoke** karo,
+   naya token lo (public repo me purana leak ho chuka hai).
+2. [dashboard.render.com](https://dashboard.render.com) → **New → Blueprint**
+   → GitHub connect karke ye repo (`hulm0408/workwr`) select karo → **Apply**.
+   *(Blueprint `main` branch se deploy karta hai — changes `main` me merge
+   hone chahiye.)*
+3. Render do values maangega:
+   - `BOT_TOKEN` — @BotFather wala **naya** token
+   - `OWNER_IDS` — aapki Telegram ID
+4. Deploy (pehli baar ~3–5 min, Chrome download hota hai). Logs me ye dikhna
+   chahiye: `Telegram ✅ @<bot>` + `🆕 Swiggy Fresh Bot chal raha hai`.
+5. Telegram me `/start`, phir **`/diag`** — sab ✅ aana chahiye (Chrome
+   Docker image me pehle se hai).
+
+**Plan ki baat:** `render.yaml` me **Background Worker (Starter)** + **1GB
+persistent disk** (`/app/data`) set hai — yahi sahi combo hai:
+- **Worker** = 24×7 chalta hai. Free **Web Service** 15 min me so jati hai
+  → polling ruk jayegi, bot mar jayega. (Web Service par majboori ho to
+  render.yaml me `type: web` kar do aur `disk:` hata do — health port
+  bot khud khol deta hai, lekin neend wali problem rahegi.)
+- **Disk** = accounts/settings/ledger deploy ke baad bhi bache rehte hain.
+  Disk na ho to `GITHUB_VAULT_TOKEN` + `VAULT_ENCRYPTION_KEY` env set karo —
+  bot startup par accounts cloud vault se wapas le aata hai (hydrate).
+- Region **Singapore** set hai (India ke sabse paas).
+
+> ⚠️ **Ek hi copy chalao!** Render par bot ON hai to local PC par
+> `npm start` mat chalana — dono ek token se polling karenge to
+> **409 Conflict** aayega aur ek band ho jayega.
 
 ## ⚙️ Settings — user ki azadi (env chhedni ki zaroorat nahi)
 
@@ -122,12 +170,40 @@ ho (403, rate-limit, network fail) — rotate/defer karke chalta rehta hai.
 
 ~35–90 second per number (purane numbers me 3 OTP rounds lagte hain — login OTP, delete OTP, phir naya signup OTP). Isliye 100 numbers ≈ 60–120 min. Default target 100 + max 120 min isi liye hai.
 
-## ⚠️ Security note
+## 🚨 Security — PEHLE YE KARO
 
-`vuvhbjbi` Firebase ke **rules open** hain — bina auth ke koi bhi isko padh/sakta hai. Number pool + OTP inbox dono public hain. Rules lagwa lena (ya kam se kam write band karwa lo) — warna koi bhi aapke OTP padh sakta hai.
+**`.env` file live `BOT_TOKEN` ke saath is PUBLIC GitHub repo me commit ho
+chuki thi.** Matlab token ab secret nahi raha — koi bhi use karke tumhara bot
+hijack kar sakta hai, ya usi token se apni copy chala kar tumhare bot ko
+**409 Conflict** par hamesha ke liye rok sakta hai ("bot work nahi kar raha"
+ki ek wajah yahi ho sakti hai).
+
+1. Telegram me **@BotFather** → `/mybots` → apna bot → **API Token →
+   Revoke current token** → naya token milega.
+2. Naya token **sirf** apni local `.env` me daalo (`BOT_TOKEN=...`).
+3. `.env` ab `.gitignore` me hai — **ise dobara kabhi commit mat karna.**
+   Purani git history me token ab bhi hai, isliye step 1 (revoke) hi asal
+   fix hai — file delete karne se kaam nahi banega.
+
+Aur: `vuvhbjbi` Firebase ke **rules open** hain — bina auth ke koi bhi isko
+padh/sakta hai. Number pool + OTP inbox dono public hain. Rules lagwa lena
+(ya kam se kam write band karwa lo) — warna koi bhi aapke OTP padh sakta hai.
+
+## 🩺 Troubleshooting — "bot work nahi kar raha"
+
+| Symptom | Wajah + tod |
+|---|---|
+| Bot start hi nahi hota, console `401` | BOT_TOKEN galat/revoke. @BotFather se naya token → `.env` |
+| Console `409 Conflict` | Isi token se bot ki doosri copy chal rahi hai (purana terminal/server, ya leak hua token). Purani copy band karo; token revoke karke naya lo |
+| Bot chalta hai, batch har number par `security_challenge`/403 | WAF token nahi ban raha — aksar **Chrome nahi mila**. `/diag` dekho; Chrome install karo ya `PUPPETEER_EXECUTABLE_PATH` do. Proxies add karne se bhi bachta hai |
+| `/start` par "Sirf owner ke liye" | Tumhari Telegram ID allow nahi. Message me dikhi ID `.env` ke `OWNER_IDS=` me daalo, restart karo |
+| Batch chala lekin `pool-exhausted`/0 numbers | Firebase `clients/` khali ya galat source active. `/diag` → Number pool line dekho; ⚙️ Settings → Firebase Sources check karo |
+| OTP hi nahi aata (`failed_otp_miss`) | Device offline hai ya SMS forwarder band. Online devices wala pool use karo (⚙️ Settings → 📴 Offline OFF rakho jab tak pakka na ho) |
+| Bot beech me chup-chaap band ho jata tha | Fix ho gaya — ab handler errors par bot nahi marta (`bot.catch` + guards). Phir bhi band ho to console ka aakhri error dekho |
+| `Chrome ❌ nahi mila` (server/Render par) | Free cloud par Chrome hota hi nahi. Local PC/VPS par chalao jahan Chrome ho, ya build me Chromium install karke `PUPPETEER_EXECUTABLE_PATH` do |
 
 ## Test
 
 ```bash
-npm test    # 59 unit checks (koi network nahi — fetch mock hai)
+npm test    # 126 unit checks (koi network nahi — fetch mock hai)
 ```

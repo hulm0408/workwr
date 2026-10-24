@@ -599,6 +599,7 @@ function ensureDb() {
 }
 
 let accountsSeeded = false;
+let _corruptBackupMade = false; // getDb() baar-baar bulaaya jata hai — corrupt backup sirf ek baar/process
 function seedAccountsFromJson(data) {
   if (accountsSeeded) return;
   try {
@@ -708,7 +709,20 @@ export function getDb() {
     return data;
   } catch (err) {
     console.error('Error reading db:', err);
-    return defaultData;
+    // Corrupt/adhuri db.json (bijli gayi, disk full, aadhi copy…) — pehle
+    // yahan shared `defaultData` return ho jata tha, phir koi saveDb() usi
+    // khali data se asli file overwrite kar deta = accounts/settings SAAF.
+    // Ab: kharab file ko backup karke rakho (recovery ke liye), aur
+    // default ki DEEP COPY do (shared object mutation na mare).
+    try {
+      if (!_corruptBackupMade && fs.existsSync(DB_FILE)) {
+        _corruptBackupMade = true;
+        const bak = `${DB_FILE}.corrupt-${Date.now()}`;
+        fs.copyFileSync(DB_FILE, bak);
+        console.error(`[store] db.json corrupt lagi — backup banaya: ${bak} (agar accounts wapas chahiye to is file ko check karo).`);
+      }
+    } catch {}
+    return JSON.parse(JSON.stringify(defaultData));
   }
 }
 

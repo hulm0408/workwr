@@ -245,17 +245,39 @@ export function markProxySuccess(id) {
 // Fetch wrapper — Swiggy ka traffic active proxy se guzarta hai.
 // Proxy OFF/na-setup ho to plain fetch (backward compatible).
 // ---------------------------------------------------------------------------
-let _dispatcherCache = new Map(); // proxyUrl → undici ProxyAgent
+let _dispatcherCache = new Map(); // proxyUrl → undici agent
+
+// Kaunsa undici agent lagega — protocol par nirbhar hai:
+//   http/https → ProxyAgent · socks5 → Socks5ProxyAgent · socks4 → unsupported
+// PEHLA BUG: socks5 proxy ko bhi HTTP ProxyAgent de diya jata tha, jo
+// request-time par fail hota — user ko lagta "proxy add kiya phir bhi bot
+// work nahi kar raha".
+export function dispatcherKind(rawUrl) {
+  let proto = '';
+  try { proto = new URL(String(rawUrl || '')).protocol; } catch { return 'unsupported'; }
+  if (proto === 'http:' || proto === 'https:') return 'http';
+  if (proto === 'socks5:' || proto === 'socks5h:') return 'socks5';
+  return 'unsupported';
+}
 
 async function getDispatcherFor(proxy) {
   if (!proxy?.url) return null;
   const existing = _dispatcherCache.get(proxy.url);
   if (existing) return existing;
-  const { ProxyAgent } = await import('undici');
-  const agent = new ProxyAgent({
-    uri: proxy.url,
-    ...(proxy.auth ? { token: `Basic ${Buffer.from(proxy.auth).toString('base64')}` } : {}),
-  });
+  const kind = dispatcherKind(proxy.url);
+  if (kind === 'unsupported') {
+    throw new Error(`Proxy protocol supported nahi (${proxy.url.split(':')[0]}:) — http:// ya socks5:// proxy use karo.`);
+  }
+  const undici = await import('undici');
+  let agent;
+  if (kind === 'socks5') {
+    agent = new undici.Socks5ProxyAgent(proxy.url);
+  } else {
+    agent = new undici.ProxyAgent({
+      uri: proxy.url,
+      ...(proxy.auth ? { token: `Basic ${Buffer.from(proxy.auth).toString('base64')}` } : {}),
+    });
+  }
   _dispatcherCache.set(proxy.url, agent);
   return agent;
 }

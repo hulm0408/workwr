@@ -4,6 +4,9 @@
   "description": "Ek START dabao — Firebase pool se number + OTP, Swiggy me fresh account banwao (autopilot batch)",
   "type": "module",
   "main": "fresh-bot.js",
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "start": "node fresh-bot.js",
     "test": "node test_fresh_unit.mjs",

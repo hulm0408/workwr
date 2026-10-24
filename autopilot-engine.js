@@ -19,7 +19,7 @@ import { isFirebaseConfigured, firebaseSetupHintLines, listPoolNumbers } from '.
 import { applyActiveSource } from './firebase-sources.js';
 import { getSetting } from './bot-settings.js';
 import { processSingleNumber, freshEntriesFrom, preferOnline, getPremiumLedger } from './number-pipeline.js';
-import { getLiveSwiggyWafToken, setBridgeProxy, getBridgeProxy } from './swiggy-bridge.js';
+import { getLiveSwiggyWafToken, setBridgeProxy, getBridgeProxy, getChromeStatus } from './swiggy-bridge.js';
 import * as wafPool from './waf-pool.js';
 import * as proxyPool from './proxy-pool.js';
 import { esc, section, sub, field } from './rich-text.js';
@@ -360,12 +360,31 @@ export async function startAutopilot(opts = {}) {
     };
     if (ps.enabled) rotateProxy();
 
+    let wafTok = '';
     try {
       wafPool.loadFromDb?.();
-      const tok = await getLiveSwiggyWafToken();
-      console.log(tok ? '[Autopilot] WAF token ready (warm start).' : '[Autopilot] WAF token nahi mila (Chromium?) — raw mode me chalega.');
+      wafTok = await getLiveSwiggyWafToken();
+      console.log(wafTok ? '[Autopilot] WAF token ready (warm start).' : '[Autopilot] WAF token nahi mila (Chromium?) — raw mode me chalega.');
     } catch (e) {
       console.warn('[Autopilot] WAF warm-up skipped:', e?.message);
+    }
+    // Chrome hi nahi mila aur saved token bhi nahi → har OTP par 403 pakki
+    // hai. Pehle ye sirf console me chup chaap reh jata tha aur user ko
+    // lagta tha "bot work nahi kar raha" — ab Telegram card par saaf btao.
+    if (!wafTok) {
+      let chrome = null;
+      try { chrome = getChromeStatus(); } catch {}
+      if (chrome && !chrome.found) {
+        await push(section('⚠️ Chrome Nahi Mila — WAF Token Nahi Banega', [
+          '› Is machine par <b>Chrome/Chromium nahi mila</b>, isliye Swiggy ka',
+          '› WAF token arrange nahi ho payega — OTP requests par <b>403</b> aayegi.',
+          '',
+          '› <b>Fix:</b> Google Chrome install karo, <i>ya</i> <code>.env</code> me daalo:',
+          '<code>PUPPETEER_EXECUTABLE_PATH=&lt;chrome.exe ka full path&gt;</code>',
+          '',
+          sub('Batch phir bhi try karega (raw mode) — lekin Chrome lagana hi sahi tod hai. /diag se status check karo.'),
+        ].join('\n')), stopRows());
+      }
     }
 
     // 🔁 Retry-later queue — rate-limit/WAF se atke numbers yahan jate hain
@@ -398,6 +417,23 @@ export async function startAutopilot(opts = {}) {
       }
     };
 
+    // Generic fail (OTP miss / verify fail / exception) par number ledger me
+    // mark NAHI hota — pehle wo isi run me baar-baar random pick hokar
+    // dobara OTP burn karta rehta tha (aur Swiggy per-number limit lag jati
+    // thi). Ab: ek run me ek number par max 2 generic-fail attempts.
+    // (Rate-limit/WAF/security wale infra outcomes is cap se bahar hain —
+    // unke liye defer/rotate wala alag flow hai.)
+    const failedAttemptsThisRun = new Map(); // phone → count
+    const underFailCap = (e) => (failedAttemptsThisRun.get(e.phone) || 0) < 2;
+    const pickFreshList = () => {
+      let list = preferOnline(freshEntriesFrom(pool)).filter(underFailCap);
+      if (!allowOffline) {
+        const onlineOnly = list.filter((e) => e.online !== false);
+        if (onlineOnly.length) list = onlineOnly;
+      }
+      return list;
+    };
+
     for (;;) {
       if (state.stopRequested) { endReason = state.stopReason || 'manual'; break; }
       if (Date.now() - state.startedAt > maxMinutes * 60_000) { endReason = 'time'; break; }
@@ -407,11 +443,7 @@ export async function startAutopilot(opts = {}) {
       const failLimit = ps.enabled ? 10 : 6;
       if (state.consecutiveFails >= failLimit) { endReason = 'circuit_breaker'; break; }
 
-      let fresh = preferOnline(freshEntriesFrom(pool));
-      if (!allowOffline) {
-        const onlineOnly = fresh.filter((e) => e.online !== false);
-        if (onlineOnly.length) fresh = onlineOnly;
-      }
+      let fresh = pickFreshList();
       state.poolFresh = fresh.length;
 
       if (!fresh.length) {
@@ -422,11 +454,7 @@ export async function startAutopilot(opts = {}) {
           state.poolFresh = 0;
         } else {
           await refreshIfStale();
-          fresh = preferOnline(freshEntriesFrom(pool));
-          if (!allowOffline) {
-            const onlineOnly = fresh.filter((e) => e.online !== false);
-            if (onlineOnly.length) fresh = onlineOnly;
-          }
+          fresh = pickFreshList();
           state.poolFresh = fresh.length;
           if (!fresh.length) {
             // Pool khali + retry-later bhi khali → tabhi khatam
@@ -449,6 +477,9 @@ export async function startAutopilot(opts = {}) {
 
       state.current = null;
       const outcome = tally(res);
+      if (outcome === 'failed' && res.phone) {
+        failedAttemptsThisRun.set(res.phone, (failedAttemptsThisRun.get(res.phone) || 0) + 1);
+      }
       // Console visibility — exact failure reason (Telegram card ke alawa),
       // taaki WAF/rate-limit/verify/OTP-miss ka farq turant dikhe logs me.
       if (!res.ok) {
@@ -467,7 +498,8 @@ export async function startAutopilot(opts = {}) {
       //   (baad me isi run me dobara). Sirf tab ruk jab saare proxies side par.
 
       if (outcome === 'rate_limited') {
-        state.rateStrikes++;
+        // NOTE: rateStrikes tally() me already badhta hai — yahan dobara ++
+        // karne se 3-strike wali limit 2 hits par hi band ho jati thi.
         // Number defer — isi run me aakhir me dobara try hoga
         if (res.phone) deferNumber(entry, 'rate_limited');
 

@@ -996,6 +996,39 @@ export function getAccounts() {
   return db.config.accounts || defaultData.config.accounts;
 }
 
+// Fresh session ka "JSON" — wahi shape jo bridge verify/signup par
+// exportJson ki surat me deta hai (account/name/token/tid/sid/cookies...).
+// Pehle bridge ke diye hue exportJson ko tarjeeh do; na ho to DB me saved
+// account se wahi shape bana do — taaki chat me bhejne ke liye JSON hamesha
+// mil jaye. Account hi na mile to null.
+export function getSessionExportJson(accountKey, bridgeAccount = null) {
+  if (bridgeAccount?.exportJson && typeof bridgeAccount.exportJson === 'object') {
+    return bridgeAccount.exportJson;
+  }
+  try {
+    const acc = getDb()?.config?.accounts?.[accountKey];
+    if (!acc) return null;
+    const phone = acc.phone || acc.mobile || '';
+    return {
+      account: accountKey,
+      name: acc.name || '',
+      swiggyName: acc.swiggyName || '',
+      botTag: acc.botTag || '',
+      mobile: phone,
+      phone,
+      customerId: acc.customerId || '',
+      token: acc.token || acc.tid || '',
+      tid: acc.tid || '',
+      sid: acc.sid || '',
+      deviceId: acc.deviceId || '',
+      cookies: acc.cookies || '',
+      savedAt: acc.savedAt || '',
+    };
+  } catch {
+    return null;
+  }
+}
+
 export function updateAccount(key, updates) {
   const db = getDb();
   if (!db.config.accounts) db.config.accounts = {};

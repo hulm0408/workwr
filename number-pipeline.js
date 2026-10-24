@@ -238,10 +238,19 @@ export async function processSingleNumber({
       let lastActivityMs = null;
       // Engine ka parallel scan pehle hi ye device probe kar chuka hai to
       // wahin ka fresh result use karo (dobara Firebase GET = fuzool time).
-      // Sirf tab jab precheck 45s se purana na ho.
+      // Lekin 10s jaise sakht window me queue me baithe-baithe activity
+      // purani ho sakti hai — aur beech me device par NAYI activity bhi aa
+      // sakti hai. Isliye prechecked activity ab window se bahar ho to
+      // number ko seedha stale kehne se pehle EK live refetch lazmi hai.
       const preTs = Number(otpCfg.precheckedLastActivityMs || 0) || null;
       const preAt = Number(otpCfg.precheckedAt || 0);
-      if (preTs && preAt && (Date.now() - preAt) < 45_000) {
+      const precheckNow = Date.now();
+      const precheckStillFresh = Boolean(
+        preTs && preAt &&
+        (precheckNow - preAt) < 45_000 &&
+        (precheckNow - preTs) <= activeWindowMs
+      );
+      if (precheckStillFresh) {
         lastActivityMs = preTs;
       } else {
         for (const devId of deviceIds) {

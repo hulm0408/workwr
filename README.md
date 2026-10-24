@@ -101,6 +101,19 @@ persistent disk** (`/app/data`) set hai — yahi sahi combo hai:
 
 Sab `data/db.json` me save hota hai — restart ke baad bhi yaad rehta hai.
 
+## 📟 Fresh device + JSON delivery
+
+- OTP sirf us device ko jata hai jiski latest Firebase activity configured
+  last-seen window ke andar ho. Agar `PREMIUM_DEVICE_ACTIVE_WINDOW_MS=10000`
+  rakha hai to rule bilkul sakht hai: 10s se purani activity par OTP nahi.
+  Scan pool ko 800-device segments me bina beech-wait ke poora cover karta
+  hai, aur chhote window me pehla zinda device milte hi process shuru ho jata hai.
+- Har fresh session ka JSON usi waqt chat me `.json` file ki surat me jata hai.
+  Telegram/document send fail ho to bot 3 baar retry karta hai; phir bhi na jaye
+  to poora JSON code-block hissoun me bhej deta hai.
+- Purane saved session ko dobara lena ho to owner command:
+  `/session 9876543210` ya `/session acc_9876543210`.
+
 ## 🛡 WAF / Security challenge — "aaye hi na" ka tod
 
 Jo 403 challenge pehle poora batch maar deta tha, ab uska tod:

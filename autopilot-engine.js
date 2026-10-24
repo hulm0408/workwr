@@ -658,10 +658,15 @@ export async function startAutopilot(opts = {}) {
       try {
         const r = await scanFreshDevices(candidates, {
           windowMs: otpCfg.activeWindowMs,
-          // Pehle 8 fresh milne tak 120-device chunks chalte the — sparse
-          // pool me pehla number hi minutes baad nikalta tha. Ab 3 fresh
-          // milte hi 40-device chunk par kaam shuru ho jata hai.
-          want: 3, chunkSize: 40, maxProbe: 800, concurrency: 24,
+          // User ka sakht rule: sirf configured last-seen window ke andar
+          // wala device. Scanner ki 15-min "best available" widening engine
+          // me band hai — 10s setting par 11s+ purani activity OTP nahi legi.
+          maxWidenMs: otpCfg.activeWindowMs,
+          // 10s jaise chhote window me 3 fresh jama karne ka wait pehle
+          // wale ko hi stale bana deta tha. Isliye pehla zinda device milte
+          // hi turant process karo; bade window par 3 ka chhota buffer rakho.
+          want: Number(otpCfg.activeWindowMs) <= 15_000 ? 1 : 3,
+          chunkSize: 40, maxProbe: 800, concurrency: 24,
           onProgress: ({ checked, freshCount }) => {
             state.scanChecked = baseChecked + checked;
             state.scanFresh = hotQueue.length + freshCount;
@@ -711,8 +716,17 @@ export async function startAutopilot(opts = {}) {
       let picked = takeFromHotQueue();
 
       if (!picked && gateOn) {
-        await refillHotQueue();
-        picked = takeFromHotQueue();
+        // Ek refill zyada se zyada 800 naye devices parkhta hai. Pehle woh
+        // segment khali nikle to bot 15s wait karke probed list clear kar
+        // deta tha — baqi ~2100 devices usi pass me scan hi nahi hote the.
+        // Ab bina wait ke agla segment, jab tak fresh na mile ya is pass ke
+        // saare candidates cover na ho jayein.
+        while (!picked) {
+          const scan = await refillHotQueue();
+          picked = takeFromHotQueue();
+          if (picked || state.stopRequested || scan?.exhausted || !(Number(scan?.checked) > 0)) break;
+        }
+        if (!picked && state.stopRequested) { endReason = state.stopReason || 'manual'; break; }
         if (!picked) {
           if (retryLater.length) {
             picked = { entry: retryLater.shift().entry };
@@ -766,14 +780,15 @@ export async function startAutopilot(opts = {}) {
       await ensureWarm();
 
       // Scan se aaye number ka prechecked last-seen pipeline ko dedo — wahi
-      // device dobara fetch nahi hoga. Widened scan par gate window bhi usi
-      // hisaab se (warna pipeline usi number ko phir stale keh dega).
+      // device dobara fetch nahi hoga. Gate window kabhi scan result se
+      // widen NAHI hogi; configured sakht window hi final hai. Precheck
+      // purana ho jaye to pipeline live activity dobara fetch karegi.
       const numCfg = picked.lastActivityMs
         ? {
             ...otpCfg,
             precheckedLastActivityMs: picked.lastActivityMs,
             precheckedAt: picked.checkedAt || Date.now(),
-            activeWindowMs: Math.max(Number(otpCfg.activeWindowMs) || 0, Number(picked.windowMs) || 0),
+            activeWindowMs: Number(otpCfg.activeWindowMs) || 0,
           }
         : otpCfg;
 

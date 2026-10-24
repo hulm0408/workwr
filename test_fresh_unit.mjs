@@ -716,6 +716,17 @@ console.log('parallel device scan (hot-queue) + pipeline precheck:');
     ok(r.widestWindowMs > 60_000 && r.checked === 120, 'widestWindowMs asal age tak badha + maxProbe respect');
   }
 
+  // Engine strict mode — maxWidenMs = windowMs ho to 30s purani activity
+  // ko 10s rule ke khilaf "best available" bana kar OTP nahi diya jayega.
+  {
+    const probe = async (id) => (id === 'D2' ? now - 30_000 : null);
+    const r = await fbn.scanFreshDevices(mkEntries(20), {
+      windowMs: 10_000, maxWidenMs: 10_000, want: 1, chunkSize: 20, probe,
+    });
+    ok(r.fresh.length === 0 && r.widened === false && r.widestWindowMs === 10_000,
+      'strict last-seen: maxWiden=window par 10s se purani activity fresh nahi banti');
+  }
+
   // scanFreshDevices — bilkul khali activity → fresh [] + exhausted
   {
     const r = await fbn.scanFreshDevices(mkEntries(10), { windowMs: 60_000, probe: async () => null });
@@ -742,6 +753,20 @@ console.log('parallel device scan (hot-queue) + pipeline precheck:');
       otpCfg: { activeWindowMs: 60_000, waitMs: 0, timeoutMs: 100, precheckedLastActivityMs: now - 3000, precheckedAt: now - 120_000 },
     });
     ok(r2.kind === 'deferred_device_stale', 'expired precheck → live refetch → stale defer');
+
+    // Scan ke baad queue me activity 10s window se baahar ho gayi, lekin
+    // mock devFresh par live taazi activity maujud hai. Purana code 45s ke
+    // andar wala precheck hi use karke number ko galat stale keh deta tha;
+    // ab window se bahar precheck par live refetch lazmi hai.
+    const r3 = await pipe.processSingleNumber({
+      userId: 'test',
+      entry: { phone: '12345', deviceId: 'devFresh', online: true },
+      otpCfg: {
+        activeWindowMs: 10_000, waitMs: 0, timeoutMs: 100,
+        precheckedLastActivityMs: now - 30_000, precheckedAt: now,
+      },
+    });
+    ok(r3.kind === 'failed_otp_send', 'window se bahar precheck → live refetch → taazi activity par gate pass');
   }
 }
 

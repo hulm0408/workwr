@@ -26,7 +26,7 @@
 
 import { getDb, saveDb } from './store.js';
 
-const TOKEN_TTL_MS = 2 * 60 * 60 * 1000;        // a WAF token lives ~hours; 2h refresh budget
+const TOKEN_TTL_MS = 30 * 60 * 1000;            // pehle 2h tha — token asal me beech me hi mar jata hai aur bot wahi jala token har request me bhejta rehta tha (challenge par challenge). 30m par fresh solve sasta padta hai.
 const ESCALATION_WINDOW_MS = 30 * 60 * 1000;    // hits within 30 min escalate
 const STREAK_RESET_MS = 60 * 60 * 1000;         // 60 min clean → streak back to 0
 const HIT_DEBOUNCE_MS = 120 * 1000;             // a scan's burst of 403s = ONE incident
@@ -79,6 +79,17 @@ export function tokenAgeMs() {
   return state.token ? Math.max(0, Date.now() - state.acquiredAt) : 0;
 }
 
+// Jala hua token phenk do — challenge mila matlab ye token ya to expire hai
+// ya WAF ko bharosa nahi raha. Pehle invalidate hi nahi hota tha, isliye har
+// naya number wahi jala token lekar jata aur phir challenge khata (engine
+// strikes isi ghoom-ghoom kar badhte the). Cooldown/streak ko haath nahi lagate.
+export function invalidateToken() {
+  if (!state.token) return;
+  state.token = '';
+  state.acquiredAt = 0;
+  persist();
+}
+
 export function isStale() {
   return Boolean(state.token && !getTokenSync());
 }
@@ -103,7 +114,11 @@ export function loadFromDb() {
 
 // Record a WAF block. Escalating cooldown with debounce:
 //   one scan producing 29 × 403 in 30s counts as a single hit.
+// Challenge = maujooda token bharose ke layak nahi raha → turant invalidate,
+// taaki agli request fresh token solve kare (purana jala token dobara na jaye).
 export function markWafHit() {
+  state.token = '';
+  state.acquiredAt = 0;
   const now = Date.now();
   if (lastHitAt && now - lastHitAt < HIT_DEBOUNCE_MS) {
     // Same incident (burst of 403s from one scan) — keep/extend current cooldown.

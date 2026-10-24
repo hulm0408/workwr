@@ -1025,6 +1025,16 @@ function createSwiggyHttpAuthSession(phone, targetAcc = '', targetAccName = null
 // 🔀 PROXY MODE: aws-waf-token IP-bound hota hai — jo token ek IP (proxy) ke
 // liye valid hai, doosri IP par kaam NAHI karta. Isliye jab proxy active ho,
 // sirf USI proxy ka token bhejo (warna WAF ko mismatch dikhega).
+// Jala hua token har cache se saaf karo (bridge-local + shared pool) —
+// challenge ke baad agli request fresh solve par majboor ho jaye.
+// Proxy mode me pool shared nahi hota (per-proxy tokens proxy-pool rakhta
+// hai, WAF hit par wo proxy waisay hi side par chali jati hai).
+function burnSharedWafToken() {
+  latestSharedWafToken = '';
+  latestSharedWafAt = 0;
+  try { wafPool.invalidateToken?.(); } catch {}
+}
+
 function freshWafTokenForRequests() {
   // Proxy active = per-proxy token
   if (currentProxy?.id) {
@@ -1228,8 +1238,12 @@ async function postSwiggyAuthJson(session, endpointUrl, payload = {}, { timeoutM
   }
 
   // Auto-recover 2: If mWeb transport hit an AWS WAF challenge, retry once over `Swiggy-Android` transport!
+  // Challenge matlab maujooda token jala hua hai — use retry me dobara mat
+  // chipkao (session + shared caches dono se saaf).
   if (isAwsWafChallengeResponse(out.status, out.rawText, out.headers) && session.transportMode !== 'android') {
     session.transportMode = 'android';
+    session.wafToken = '';
+    burnSharedWafToken();
     await bootstrapSwiggyAuthJar(session, { forceFresh: true });
     out = await sendOnce(true);
   }
@@ -1262,6 +1276,7 @@ async function postSwiggyAuthJson(session, endpointUrl, payload = {}, { timeoutM
         }
       }
     } else {
+      burnSharedWafToken(); // bridge cache bhi saaf (pool markWafHit me saaf hoga)
       try { wafPool.markWafHit(); } catch {}
       const refreshed = await getLiveSwiggyWafToken(true).catch(() => '');
       if (refreshed && refreshed !== session.wafToken) {
@@ -1280,7 +1295,13 @@ async function postSwiggyAuthJson(session, endpointUrl, payload = {}, { timeoutM
         session.page = launched.page;
         session.mode = 'browser';
         await session.page.goto('https://www.swiggy.com/auth', { waitUntil: 'domcontentloaded', timeout: 10000 }).catch(() => {});
-        await waitForSwiggyWafCookie(session.page, 2500);
+        // Challenge aksar thodi insaan-jaisi harkat ke baad khud solve ho jata
+        // hai — sirf khade khade cookie ka intezaar kamzor padta tha.
+        try {
+          await session.page.mouse.move(320 + Math.random() * 240, 240 + Math.random() * 160, { steps: 14 });
+          await session.page.mouse.wheel({ deltaY: 600 });
+        } catch {}
+        await waitForSwiggyWafCookie(session.page, 8000);
       }
       const pageCookies = await session.page.cookies().catch(() => []);
       const wafToken = pageCookies.find(c => c.name === 'aws-waf-token')?.value || '';
@@ -1455,7 +1476,23 @@ async function solveWafTokenOnce(forceRefresh = false) {
         timeout: 30000
       }).catch(() => {});
 
-      const token = await waitForSwiggyWafCookie(page, SWIGGY_WAF_COOKIE_WAIT_MS);
+      let token = await waitForSwiggyWafCookie(page, SWIGGY_WAF_COOKIE_WAIT_MS);
+      if (!token) {
+        // Pehle pass me cookie nahi aayi — challenge page aksar harkat
+        // (mouse/scroll) ke baad khud token de deta hai. Ek aur mauqa do,
+        // phir doosra page try karo. (Pehle yahan seedha haar maan lete the,
+        // phir requests bina token ke ja kar challenge khaati thein.)
+        try {
+          await page.mouse.move(320 + Math.random() * 240, 240 + Math.random() * 160, { steps: 14 });
+          await page.mouse.wheel({ deltaY: 700 });
+          await new Promise((r) => setTimeout(r, 1200));
+        } catch {}
+        token = await waitForSwiggyWafCookie(page, 8000);
+      }
+      if (!token) {
+        await page.goto('https://www.swiggy.com/restaurants', { waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
+        token = await waitForSwiggyWafCookie(page, 10000);
+      }
       if (token) {
         // Non-proxy mode = shared pool; proxy mode = caller per-proxy me store karega
         if (!currentProxy?.id) {

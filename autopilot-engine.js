@@ -122,6 +122,17 @@ export function requestAutopilotStop(reason = 'manual') {
   return true;
 }
 
+// Security challenge ke baad IP ko kitna thanda hone dein — ladder 30s →
+// 60s → 120s → 240s (lagatar strikes par). waf-pool ka circuit-breaker
+// cooldown usse lamba ho to wahi jeet (warna agla number seedha pool
+// cooldown khayega), lekin 5 min se zyada ek saath nahi (batch zinda rahe).
+export function wafChallengeWaitMs(consecutiveStrikes, poolCooldownMs = 0) {
+  const ladder = [30_000, 60_000, 120_000, 240_000];
+  const idx = Math.min(Math.max(1, Number(consecutiveStrikes) || 1), ladder.length) - 1;
+  const poolPart = Math.min(Math.max(0, Number(poolCooldownMs) || 0), 5 * 60_000);
+  return Math.min(Math.max(ladder[idx], poolPart), 5 * 60_000);
+}
+
 // Fresh session bante HI uska JSON chat me bhejo (batch ke end ka wait nahi).
 // ui.sendSession fresh-bot deta hai (document file ke tor par bhejta hai).
 // Fire-and-forget: send fail ho bhi jaye to batch kabhi na ruke.
@@ -224,8 +235,8 @@ function summaryCard() {
     manual: '⏹ Aapne STOP dabaya.',
     stopped: '⏹ Stop kiya gaya.',
     rate_limited: '🚦 Swiggy ne rate limit laga di — thodi der baad dobara start karein.',
-    security_challenge: '🛡 Swiggy ne 4 lagatar security challenges diye (saare proxies flagged) — proxies badal kar dobara start karein.',
-    waf_stuck: '🛡 20 baar saare proxies WAF cooldown me rahe — zyada proxies add karke dobara start karein.',
+    security_challenge: '🛡 12 lagatar security challenges — ye IP abhi Swiggy ke liye pakki flagged hai. Kuch der baad, ya proxies ke saath, dobara start karein.',
+    waf_stuck: '🛡 Bahut der tak WAF cooldown raha — proxies add karke dobara start karein (nayi IP par wait khatam ho jati hai).',
     circuit_breaker: '🔌 Bahut lagatar failures (proxy rotation ke baavjood) — reason dekh kar dobara start karein.',
     'no-online-devices': '📵 Pool me koi online device nahi mila — thodi der baad try karein.',
     firebase: '🔥 Firebase error — config/rules check karein.',
@@ -338,7 +349,16 @@ export async function startAutopilot(opts = {}) {
       return 'device_stale';
     }
 
+    // Security challenge — request WAF par hi ruk gayi, number bilkul
+    // untouched hai (na OTP gaya, na kuch burn hua). Processed/fail me
+    // gina jata tha to stats jhoothe padte the; engine isko alag handle
+    // karta hai (number defer + IP cooldown + naya token).
+    if (res.kind === 'security_challenge') return 'security_challenge';
+
     state.processed++;
+    // Yahan pahuncha matlab request WAF ko paar karke Swiggy tak gayi
+    // (OTP miss/fail bhi) — challenge "storm" khatam, strikes reset.
+    state.wafStrikes = 0;
     state.history.push({ phone: res.phone, kind: res.kind, reason: res.reason || '', at: new Date().toISOString() });
     if (state.history.length > 200) state.history.splice(0, state.history.length - 200);
 
@@ -353,7 +373,6 @@ export async function startAutopilot(opts = {}) {
         phone: res.phone, accountKey: res.accountKey, kind: res.kind, account: res.account,
       });
       state.consecutiveFails = 0;
-      state.wafStrikes = 0;   // ek success = WAF "storm" khatam
       return 'ok';
     }
     switch (res.kind) {
@@ -361,7 +380,6 @@ export async function startAutopilot(opts = {}) {
       case 'deferred_delete_otp_miss': state.deferred++; state.consecutiveFails = 0; return 'deferred';
       case 'aborted': state.aborted++; return 'aborted';
       case 'rate_limited': state.rateStrikes++; return 'rate_limited';
-      case 'security_challenge': return 'security_challenge';
       default:
         state.failed++;
         state.consecutiveFails++;
@@ -726,60 +744,72 @@ export async function startAutopilot(opts = {}) {
         continue;
       }
 
-      // WAF cooldown — bridge ne request bhejne se mana kiya (sare proxies
-      // side par). Number untouched; proxy free hote hi dobara.
+      // WAF cooldown — bridge ne request bhejne se mana kiya (IP/proxies
+      // abhi garam). Number untouched; IP thandi hote hi khud aage badhega.
+      // Cap bohot oonchi rakhi hai — batch is par kabhi "marna" nahi chahiye,
+      // sirf waqti slow hona chahiye.
       if (outcome === 'waf_cooldown') {
         state.wafCooldowns++;
-        if (state.wafCooldowns > 20) { endReason = 'waf_stuck'; break; }
+        if (state.wafCooldowns > 60) { endReason = 'waf_stuck'; break; }
         if (res.phone) deferNumber(entry, 'waf_cooldown');
 
-        // Pehle try: koi proxy free hua? (thoda wait, phir rotate)
-        const cdMs = Math.min(Number(res.cooldownMs) || 120_000, 3 * 60_000);
-        await push(progressCard(section('🛡 All Proxies Cooling — Short Wait', [
-          `› Saare proxies WAF cooldown me. ${Math.round(cdMs / 60000)} min ruk kar nayi IP se aage.`,
-          `› Hit #${state.wafCooldowns}/20 — number defer ho chuka hai (baad me dobara).`,
-          sub('Zyada proxies add karoge to ye wait kabhi na aayegi.'),
+        // Pool ke cooldown ka ahtaram karo lekin ek saath max 5 min — uske
+        // baad token naya solve karke phir dekho (IP beech me thandi hogi).
+        const cdMs = Math.min(Number(res.cooldownMs) || 120_000, 5 * 60_000);
+        await push(progressCard(section('🛡 WAF Cooling — Short Wait', [
+          `› Swiggy ki WAF abhi IP ko thanda hone de rahi hai — ~${Math.max(1, Math.round(cdMs / 60000))} min ruk kar aage badhunga.`,
+          `› Number defer ho chuka hai (isi run me dobara ayega). Batch zinda hai.`,
+          sub('Proxies add karoge to ye wait ghat kar seconds me aa jayegi (nayi IP = turant aage).'),
         ].join('\n'))), stopRows());
         await sleep(cdMs, () => state.stopRequested);
         if (state.stopRequested) { endReason = state.stopReason || 'manual'; break; }
-        rotateProxy(); // jo bhi free hua, use le lo
+        rotateProxy(); // proxy mode me jo bhi free hua, use le lo
         state.consecutiveFails = 0;
         continue;
       }
 
-      // Security challenge (403) — batch NAHI rukta. Proxy turant badal +
-      // usi number par retry. Sirf 3 lagatar = IP flagged (proxy hi nahi badle).
+      // Security challenge (403) — batch NAHI marta. Number defer, IP ko
+      // thanda hone do, naya token lo aur aage badho. Ek success par strikes
+      // reset (tally me) — isliye milawat wali run kabhi is par nahi rukti.
+      // Sirf 12 LAGATAR (bina ek bhi success ke) = IP asal me flagged hai;
+      // us se zyada zor lagana block ko aur gehra karega, tab hi roko.
+      // (Pehle: 4 par seedha batch band — boss ki sab se bari dikkat yahi thi.)
       if (outcome === 'security_challenge') {
         state.wafStrikes++;
         state.lastError = `security challenge ×${state.wafStrikes}`;
-        if (state.wafStrikes >= 4) { endReason = 'security_challenge'; break; }
+        if (res.phone) deferNumber(entry, 'security_challenge');
+        if (state.wafStrikes >= 12) { endReason = 'security_challenge'; break; }
 
         if (ps.enabled) {
           const before = getBridgeProxyId();
           const next = rotateProxy(before);
           if (next) {
-            await push(progressCard(section('🔀 Security Challenge — Proxy Rotate + Retry', [
-              `› Challenge mila (strike ${state.wafStrikes}/4) — nayi IP: <code>${esc(next.label)}</code>`,
-              `› WAF token naya arrange kar raha hoon…`,
-              sub('Batch nahi rukega — nayi IP par isi number ko dobara try karunga.'),
+            await push(progressCard(section('🔀 Security Challenge — Proxy Rotate', [
+              `› Challenge mila (lagatar ${state.wafStrikes}) — nayi IP: <code>${esc(next.label)}</code>`,
+              `› Number defer kiya — nayi IP + naye token ke saath aage badh raha hoon.`,
+              sub('Batch nahi rukega.'),
             ].join('\n'))), stopRows());
             try { await getLiveSwiggyWafToken(); } catch {}
             state.consecutiveFails = 0;
-            continue; // wahi number dobara (nayi IP + naya token)
+            continue; // agla number nayi IP par (ye wala baad me dobara)
           }
         }
 
-        // Direct mode — token refresh + chhota wait + retry
-        const waitMs = Math.min(state.wafStrikes * 60_000, 3 * 60_000); // 1-3 min
-        await push(progressCard(section('🛡 Swiggy Security Check — Auto-Recover', [
-          `› Challenge mila (strike ${state.wafStrikes}/4). Naya WAF token le raha hoon…`,
-          `› ${Math.round(waitMs / 60000)} min ruk kar isi number par dobara try karunga.`,
-          sub('Batch nahi rukega — 4 lagatar challenges par hi rukega.'),
+        // Direct mode — pehle IP ko THANDA hone do (ladder + pool cooldown),
+        // phir naya token banao. Garam IP par token banana bekar hota hai:
+        // solver visit bhi challenge kha sakti hai.
+        const poolCd = (() => { try { return wafPool.cooldownRemainingMs?.() || 0; } catch { return 0; } })();
+        const waitMs = wafChallengeWaitMs(state.wafStrikes, poolCd);
+        await push(progressCard(section('🛡 Swiggy Security Check — IP Cool-Down', [
+          `› Challenge mila (lagatar ${state.wafStrikes}) — IP abhi garam hai.`,
+          `› ~${Math.max(1, Math.round(waitMs / 60000))} min ruk kar naya WAF token banao-ga, phir aage. Number defer ho gaya (baad me dobara).`,
+          sub('Batch nahi rukega. Ek success milte hi ye ginti reset ho jati hai. Proxies hoge to nayi IP lete hi wait khatam.'),
         ].join('\n'))), stopRows());
-        try { await getLiveSwiggyWafToken(true); } catch {}
         await sleep(waitMs, () => state.stopRequested);
         if (state.stopRequested) { endReason = state.stopReason || 'manual'; break; }
-        continue; // wahi number dobara (fresh token ke saath)
+        try { await getLiveSwiggyWafToken(true); } catch {}
+        state.consecutiveFails = 0;
+        continue; // thandi IP + fresh token → agla number
       }
 
       // Generic failure streak — pehle proxy badal kar dekho (IP issue ho

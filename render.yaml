@@ -1,0 +1,43 @@
+# ===== Render Blueprint — Swiggy Fresh Bot =====
+# Deploy ka sabse asaan tareeka:
+#   Render Dashboard → New → Blueprint → is repo ko select karo → Apply.
+#   Phir BOT_TOKEN aur OWNER_IDS ki value bharna — bas, bot live.
+#
+# KYUN "worker" (web service nahi)?
+#   Ye bot Telegram long-polling karta hai — use 24x7 chalna hai, HTTP port
+#   ki zaroorat nahi. Free Web Service 15 min me so jati hai (bot ruk
+#   jayega), isliye Background Worker sahi hai (Starter plan).
+#
+# DISK kyun?
+#   Bina persistent disk ke har deploy/restart par data/db.json (accounts,
+#   settings, number ledger) udd jayega. 1GB disk /app/data par mount hai.
+#   (Disk na lagana ho to `disk:` wala block hata do — settings phir bhi
+#   Render env se chalengi, accounts cloud-vault se wapas aayenge agar
+#   GITHUB_VAULT_TOKEN + VAULT_ENCRYPTION_KEY set ho.)
+services:
+  - type: worker
+    name: swiggy-fresh-bot
+    runtime: docker
+    region: singapore # India ke sabse paas wala Render region (Swiggy ke liye kam latency)
+    plan: starter
+    dockerfilePath: ./Dockerfile
+    disk:
+      name: bot-data
+      mountPath: /app/data
+      sizeGB: 1
+    envVars:
+      # --- Zaroori (deploy ke waqt khud bharna padega) ---
+      - key: BOT_TOKEN
+        sync: false # @BotFather wala NAYA token (purana revoke kar diya hoga — README dekho)
+      - key: OWNER_IDS
+        sync: false # Aapki Telegram user ID (bot ko /start karne par dikh jati hai)
+      # --- Defaults (aise hi rehne do) ---
+      - key: FIREBASE_DB_URL
+        value: https://vuvhbjbi-default-rtdb.firebaseio.com/
+      - key: HEADLESS
+        value: "1"
+      # --- Optional: cloud vault (accounts GitHub par encrypted backup) ---
+      - key: GITHUB_VAULT_TOKEN
+        sync: false
+      - key: VAULT_ENCRYPTION_KEY
+        sync: false

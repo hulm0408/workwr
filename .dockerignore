@@ -1,0 +1,15 @@
+# Image me ye sab NAHI jaana chahiye
+node_modules
+.git
+.github
+
+# ⚠️ SECRET: .env image me gaya to BOT_TOKEN image layers me hamesha ke
+# liye reh jayega. Render par env vars dashboard se aate hain, file se nahi.
+.env
+.env.*
+
+# Local runtime data — server par fresh bankega (+ vault hydrate)
+data
+test-data
+scratch
+*.log

@@ -33,18 +33,32 @@ process.env.FIREBASE_DB_URL ||= 'https://vuvhbjbi-default-rtdb.firebaseio.com/';
 // Dynamic import — defaults set karne KE BAAD hi modules load ho, warna
 // firebase-numbers.js env ko call-time par hi padhta hai, phir bhi safe side.
 const { Telegraf } = await import('telegraf');
-const { isBoss } = await import('./store.js');
+const { isBoss, hydrateAccountsFromCloudVault } = await import('./store.js');
 const {
   startAutopilot,
   requestAutopilotStop,
   getAutopilotSnapshot,
   isAutopilotRunning,
 } = await import('./autopilot-engine.js');
-const { isFirebaseConfigured, firebaseSetupHintLines } = await import('./firebase-numbers.js');
+const { isFirebaseConfigured, firebaseSetupHintLines, listPoolNumbers } = await import('./firebase-numbers.js');
 const sources = await import('./firebase-sources.js');
 const bs = await import('./bot-settings.js');
 const proxyPool = await import('./proxy-pool.js');
+const { getChromeStatus } = await import('./swiggy-bridge.js');
+const wafPool = await import('./waf-pool.js');
 const { esc, section, sub, field } = await import('./rich-text.js');
+
+// ---------------------------------------------------------------------------
+// Process guards — ek stray async error poore bot ko NA maare.
+// (Pehle: koi bhi unhandled rejection/handler error = process band, aur
+// user ko sirf "bot work nahi kar raha" dikhta tha, wajah kabhi nahi.)
+// ---------------------------------------------------------------------------
+process.on('unhandledRejection', (err) => {
+  console.error('[FreshBot] unhandledRejection (bot chalta rahega):', err?.stack || err?.message || err);
+});
+process.on('uncaughtException', (err) => {
+  console.error('[FreshBot] uncaughtException (bot chalta rahega):', err?.stack || err?.message || err);
+});
 
 // ---------------------------------------------------------------------------
 // Config + owner gate
@@ -200,6 +214,7 @@ const settingsRows = () => [
   [{ text: `⏱ Max: ${bs.getSetting('maxMinutes')}m`, callback_data: 'ap_pick_time' }],
   [{ text: `🚦 Gap: ${bs.fmtSetting('gapMs')}`, callback_data: 'ap_pick_gap' }],
   [{ text: `📴 Offline: ${bs.getSetting('allowOffline') ? 'ON' : 'OFF'}`, callback_data: 'ap_toggle_offline' }],
+  [{ text: '🩺 Diagnose (kya toota hai?)', callback_data: 'ap_diag' }],
   [{ text: '↩️ Back', callback_data: 'ap_home', style: 'primary' }],
 ];
 
@@ -330,6 +345,20 @@ if (!TOKEN) {
 // hai isliye handlers fast hi rehte hain.
 const bot = new Telegraf(TOKEN);
 
+// ⚠️ SABSE BADA FIX: pehle bot.catch hi nahi tha. Telegraf ka default error
+// handler error ko WAPAS throw karta hai → polling loop reject →
+// bot.launch() reject → process.exit(1). Matlab EK bhi handler me kahin
+// chhota sa error (message edit fail, Firebase slow, kuch bhi) = POORA BOT
+// BAND. Ab error log hoga, bot chalta rahega.
+bot.catch((err, ctx) => {
+  console.error(`[FreshBot] handler error (update ${ctx?.update?.update_id ?? '?'}):`, err?.stack || err?.message || err);
+  // User ko bhi bata do ke kuch gadbad hui (chup rehne se "bot dead hai" lagta hai).
+  // try/catch zaroori hai: message-update par answerCbQuery sync throw karta
+  // hai — error-handler khud throw kare to bot wapas marr jayega.
+  try { ctx?.reply?.('⚠️ Ek error aayi hai — console me details hain. /start dubara dabao, bot chal raha hai.')?.catch?.(() => {}); } catch {}
+  try { ctx?.answerCbQuery?.('⚠️ Error — /start dubara dabao')?.catch?.(() => {}); } catch {}
+});
+
 const gate = async (ctx) => {
   const uid = ctx.from?.id;
   if (!isOwner(uid)) {
@@ -352,6 +381,9 @@ const sendLive = async (chatId, text, rows) => {
 };
 
 async function launchBatch(ctx) {
+  // Pehle yahan owner-gate tha hi nahi — koi bhi START daba kar batch chala
+  // sakta tha (bot username janna hi kaafi tha).
+  if (!(await gate(ctx))) return;
   if (isAutopilotRunning()) {
     await ctx.answerCbQuery('Pehle se chal raha hai!').catch(() => {});
     return;
@@ -409,7 +441,72 @@ bot.start(async (ctx) => {
   await ctx.reply(startCard(), kb(isAutopilotRunning() ? stopRows() : startRows())).catch(() => {});
 });
 
-bot.help((ctx) => ctx.reply('/start — menu · /status — current batch', { parse_mode: 'HTML' }).catch(() => {}));
+bot.help((ctx) => ctx.reply('/start — menu · /status — current batch · /diag — kya toota hai, check karo', { parse_mode: 'HTML' }).catch(() => {}));
+
+// ---------------------------------------------------------------------------
+// 🩺 /diag — "bot work nahi kar raha" ka jawab ek tap me.
+// Firebase reachable? Pool me numbers? Chrome mila? WAF token? Sab check.
+// ---------------------------------------------------------------------------
+async function diagCard() {
+  const lines = [];
+  lines.push(field('Node', process.version));
+  // Chrome (WAF solver ke liye zaroori)
+  try {
+    const c = getChromeStatus();
+    lines.push(field('🌐 Chrome', c.found ? `✅ mila — <code>${esc(c.path)}</code>${c.headless ? ' (headless)' : ''}` : '❌ NAHI mila — Chrome install karo ya .env me PUPPETEER_EXECUTABLE_PATH do'));
+  } catch { lines.push(field('🌐 Chrome', '—')); }
+  // WAF token
+  try {
+    wafPool.loadFromDb?.(); // db.json me saved token bhi dikhe (warna hamesha "nahi hai" lagega)
+    const w = wafPool.getSummary();
+    lines.push(field('🛡 WAF token', w.hasToken ? `✅ hai (age ${w.tokenAgeMin}m, ${esc(w.source)})` : (w.stale ? '⚠️ purana/expired — batch start par naya banega (Chrome chahiye)' : '— abhi nahi (batch start par banega)')));
+  } catch { lines.push(field('🛡 WAF token', '—')); }
+  // Firebase (active source verify = shallow root read, halka test)
+  try {
+    const src = sources.getActiveSource();
+    if (src) {
+      const t0 = Date.now();
+      const v = await sources.verifySource(src.id);
+      lines.push(field('🔥 Firebase', v.ok
+        ? `✅ reachable ${Date.now() - t0}ms — ${esc(src.name)}`
+        : `❌ ${esc(v.error || 'unreachable')} — URL/auth/rules check karo`));
+    } else {
+      lines.push(field('🔥 Firebase', '❌ koi active source nahi (⚙️ Settings → Firebase Sources)'));
+    }
+  } catch (e) { lines.push(field('🔥 Firebase', `❌ ${esc(String(e?.message || e).slice(0, 120))}`)); }
+  // Pool count (asli test — thoda slow ho sakta hai, isliye alag try)
+  try {
+    sources.applyActiveSource();
+    const pool = await listPoolNumbers();
+    const online = pool.filter((p) => p.online !== false).length;
+    lines.push(field('📱 Number pool', pool.length ? `✅ ${pool.length} numbers (${online} online)` : '❌ 0 numbers mile — Firebase clients/ node khali ya paths galat'));
+  } catch (e) { lines.push(field('📱 Number pool', `❌ ${esc(String(e?.message || e).slice(0, 140))}`)); }
+  // Proxies
+  try {
+    const ps = proxyPool.proxySummary();
+    lines.push(field('🔀 Proxies', ps.enabled ? `✅ ${ps.enabledCount}/${ps.total} ON` : '⚠️ OFF (ek hi IP — rukna pad sakta hai)'));
+  } catch { lines.push(field('🔀 Proxies', '—')); }
+  const snap = getAutopilotSnapshot();
+  lines.push(field('▶️ Batch', snap.running ? `● RUNNING — ${snap.fresh}/${snap.target} fresh` : (snap.finishedAt ? `⏹ last: ${snap.fresh} fresh · ${esc(snap.stopReason || 'done')}${snap.lastError ? ` · last error: ${esc(String(snap.lastError).slice(0, 100))}` : ''}` : 'ready')));
+  return section('🩺 Diagnose — kya toota hai?', [
+    ...lines,
+    '',
+    sub('Jahan ❌ hai wahi problem hai. Sab ✅ ho aur phir bhi batch fail ho to console logs dekho — har number ka exact reason wahan likhta hai.'),
+  ].join('\n'));
+}
+
+bot.command('diag', async (ctx) => {
+  if (!isOwner(ctx.from?.id)) return;
+  const wait = await ctx.reply('🩺 Check kar raha hoon… (pool test me ~15s lag sakta hai)').catch(() => null);
+  const text = await diagCard();
+  if (wait) {
+    await ctx.telegram.editMessageText(ctx.chat.id, wait.message_id, undefined, text, kb(idleRows())).catch(async () => {
+      await ctx.reply(text, kb(idleRows())).catch(() => {});
+    });
+  } else {
+    await ctx.reply(text, kb(idleRows())).catch(() => {});
+  }
+});
 
 bot.command('status', async (ctx) => {
   if (!isOwner(ctx.from?.id)) return;
@@ -480,6 +577,14 @@ bot.action('ap_settings', async (ctx) => {
   if (!(await gate(ctx))) return;
   await ctx.answerCbQuery().catch(() => {});
   await editOrSend(ctx, settingsCard(), settingsRows());
+});
+
+bot.action('ap_diag', async (ctx) => {
+  if (!(await gate(ctx))) return;
+  await ctx.answerCbQuery('🩺 Checking…').catch(() => {});
+  await editOrSend(ctx, '🩺 Check kar raha hoon… (pool test me ~15s lag sakta hai)', [[{ text: '↩️ Settings', callback_data: 'ap_settings', style: 'primary' }]]);
+  const text = await diagCard();
+  await editOrSend(ctx, text, [[{ text: '↩️ Settings', callback_data: 'ap_settings', style: 'primary' }]]);
 });
 
 bot.action('ap_sources', async (ctx) => {
@@ -757,14 +862,145 @@ bot.on('callback_query', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
 });
 
-try {
-  await bot.launch({ dropPendingUpdates: true }, () => {
-    console.log('🆕 Swiggy Fresh Bot chal raha hai — START dabao, phone chhod ke aa jao.');
-  });
-} catch (e) {
-  console.error('[FreshBot] launch failed:', e?.message || e);
-  process.exit(1);
+// ---------------------------------------------------------------------------
+// 🚀 Launch — preflight + retry ke saath.
+// PEHLE KE BUGS:
+//  1) Ek hi network jhatka (TLS disconnect waghera) = "launch failed" bolkar
+//     bot seedha band. Ab getMe preflight 6 baar retry karega.
+//  2) 401/409 par wajah samajh hi nahi aati thi. Ab saaf bataega:
+//       401 = BOT_TOKEN galat/revoke ho chuka
+//       409 = isi token se DOOSRI copy pehle se chal rahi hai
+//  3) SIGINT/SIGTERM handlers `await bot.launch()` ke BAAD lage the — launch
+//     wala promise bot band hone par hi resolve hota hai, matlab handlers
+//     kabhi register hi nahi hote the. Ab pehle lagte hain.
+// ---------------------------------------------------------------------------
+let shuttingDown = false;
+const shutdown = (signal) => {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`[FreshBot] ${signal} mila — batch rok kar band kar raha hoon…`);
+  try { requestAutopilotStop(signal); } catch {}
+  try { bot.stop(signal); } catch {}
+  setTimeout(() => process.exit(0), 1500).unref?.();
+};
+process.once('SIGINT', () => shutdown('SIGINT'));
+process.once('SIGTERM', () => shutdown('SIGTERM'));
+
+// Startup self-check — console me pehli nazar me sab dikh jaye
+{
+  const nodeMajor = Number(String(process.versions.node).split('.')[0]) || 0;
+  console.log(`[FreshBot] Node ${process.version}${nodeMajor < 20 ? '  ⚠️ Node 20+ chahiye — nodejs.org se update karo, warna kuch bhi kabhi bhi toot sakta hai!' : ''}`);
+  try {
+    const c = getChromeStatus();
+    console.log(c.found
+      ? `[FreshBot] Chrome ✅ ${c.path}${c.headless ? ' (headless)' : ''}`
+      : '[FreshBot] Chrome ❌ nahi mila — WAF solver nahi chalega. Chrome install karo ya .env me PUPPETEER_EXECUTABLE_PATH do. (Bot phir bhi chalega, /diag dekho.)');
+  } catch {}
+  console.log(`[FreshBot] Firebase ${isFirebaseConfigured() ? '✅ configured' : '❌ config nahi — FIREBASE_DB_URL / Settings → Firebase Sources'}`);
+  console.log(`[FreshBot] Owner gate: ${ownerIds() ? 'OWNER_IDS (.env)' : 'store bossIds + default (OWNER_IDS khali hai)'}`);
 }
 
-process.once('SIGINT', () => bot.stop('SIGINT'));
-process.once('SIGTERM', () => bot.stop('SIGTERM'));
+const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
+const tgCode = (e) => Number(e?.code ?? e?.response?.error_code ?? 0) || 0;
+const isNetErr = (e) => /fetch|network|socket|TLS|ECONN|ETIMEDOUT|EAI_AGAIN|timed? ?out|disconnected/i.test(`${e?.name || ''} ${e?.message || ''}`);
+
+// Token + internet pehle test karo (getMe) — network par retry, token galat
+// ho to turant saaf wajah. Bina is test ke bot chup-chaap "launch failed"
+// bolkar mar jata tha.
+async function preflight() {
+  for (let attempt = 1; attempt <= 6; attempt++) {
+    try {
+      const me = await bot.telegram.getMe();
+      console.log(`[FreshBot] Telegram ✅ @${me.username} (id ${me.id})`);
+      // Agar is token par kahin webhook laga ho (purana server, ya token
+      // leak hone par kisi aur ne lagaya ho) to polling 409 marega aur bot
+      // kabhi chalega hi nahi — isliye shuru me webhook saaf kar do.
+      await bot.telegram.deleteWebhook({ drop_pending_updates: true }).catch(() => {});
+      return me;
+    } catch (e) {
+      const code = tgCode(e);
+      if (code === 401) {
+        console.error('❌ BOT_TOKEN galat hai ya revoke ho chuka hai (Telegram 401).');
+        console.error('   Fix: Telegram me @BotFather → /mybots → apna bot → API Token → naya token lo,');
+        console.error('   .env ki BOT_TOKEN= wali line me naya token daalo, phir npm start.');
+        process.exit(1);
+      }
+      const waitSec = Math.min(3 * 2 ** (attempt - 1), 30);
+      const retryable = isNetErr(e) || code === 429 || code >= 500 || code === 0;
+      console.error(`[FreshBot] Telegram se connect nahi hua (try ${attempt}/6): ${e?.message || e}`);
+      if (!retryable || attempt === 6) {
+        console.error('❌ Internet/Telegram tak pahunch hi nahi paya. Net check karo (VPN/firewall?), phir npm start.');
+        process.exit(1);
+      }
+      console.log(`[FreshBot] ${waitSec}s ruk kar dobara try…`);
+      await sleepMs(waitSec * 1000);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// ☁️ Cloud-vault hydrate (Render ke liye khaas zaroori) — bina persistent
+// disk ke har deploy/restart par data/db.json fresh banta hai aur saare
+// saved accounts chale jate. Vault configured ho (GITHUB_VAULT_TOKEN +
+// VAULT_ENCRYPTION_KEY) to accounts GitHub vault se wapas aa jate hain.
+// Pehle ye function store me tha lekin bot ise KABHI bulata hi nahi tha.
+// 12s timeout: vault slow/fail ho to bot startup atke nahi.
+// ---------------------------------------------------------------------------
+try {
+  const hydrated = await Promise.race([
+    hydrateAccountsFromCloudVault(),
+    sleepMs(12_000).then(() => null),
+  ]);
+  if (hydrated) console.log(`[FreshBot] Cloud vault hydrate: ${hydrated.restored}/${hydrated.total} accounts wapas aaye.`);
+} catch (e) {
+  console.warn('[FreshBot] Cloud vault hydrate skipped:', e?.message || e);
+}
+
+// ---------------------------------------------------------------------------
+// ❤️ Health server (sirf tab jab PORT env ho — Render Web Service par
+// Render khud PORT deta hai aur port khula na mile to deploy fail kar deta
+// hai). Worker/local par PORT nahi hota → ye bilkul band rehta hai.
+// GET / ya /health → { ok, bot running?, uptime } JSON.
+// ---------------------------------------------------------------------------
+if (process.env.PORT) {
+  try {
+    const { createServer } = await import('node:http');
+    const bootAt = Date.now();
+    createServer((req, res) => {
+      let snap = {};
+      try { snap = getAutopilotSnapshot(); } catch {}
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        ok: true,
+        service: 'swiggy-fresh-bot',
+        uptimeSec: Math.floor((Date.now() - bootAt) / 1000),
+        batchRunning: Boolean(snap.running),
+        freshThisRun: snap.fresh ?? 0,
+      }));
+    }).listen(Number(process.env.PORT), '0.0.0.0', () => {
+      console.log(`[FreshBot] Health server port ${process.env.PORT} par sun raha hai (Render Web Service ke liye).`);
+    });
+  } catch (e) {
+    console.warn('[FreshBot] Health server start nahi hua:', e?.message || e);
+  }
+}
+
+await preflight();
+
+try {
+  await bot.launch({ dropPendingUpdates: true }, () => {
+    console.log('🆕 Swiggy Fresh Bot chal raha hai — START dabao, phone chhod ke aa jao. (/diag = health check)');
+  });
+} catch (e) {
+  const code = tgCode(e);
+  if (code === 409) {
+    console.error('❌ Telegram 409 Conflict — isi BOT_TOKEN se bot ki DOOSRI copy pehle se chal rahi hai.');
+    console.error('   Fix: purani copy band karo (doosra terminal/server/PC jahan bot chal raha ho),');
+    console.error('   phir yahan npm start. Ek token = ek hi copy ek waqt par.');
+  } else if (code === 401) {
+    console.error('❌ Telegram 401 — BOT_TOKEN revoke/galat. @BotFather se naya token lekar .env me daalo.');
+  } else {
+    console.error('[FreshBot] launch failed:', e?.stack || e?.message || e);
+  }
+  process.exit(1);
+}

@@ -456,4 +456,29 @@ ok(requestAutopilotStop('manual') === false, 'na chalne wale batch ko stop = fal
   ok(snap.running === false && snap.processed === 0, 'default snapshot clean');
 }
 
+// ---------------------------------------------------------------------------
+console.log('chrome discovery + proxy dispatcher (2026 fixes):');
+{
+  const bridge = await import('./swiggy-bridge.js');
+  // Env me maujud file do to wahi mile (process.execPath hamesha exist karta hai)
+  const prevEnv = process.env.PUPPETEER_EXECUTABLE_PATH;
+  process.env.PUPPETEER_EXECUTABLE_PATH = process.execPath;
+  ok(bridge.findChromePath() === process.execPath, 'PUPPETEER_EXECUTABLE_PATH (valid file) respect');
+  // Env me GALAT path ho to usi jhoothe path par latke na rahe — auto-detect
+  process.env.PUPPETEER_EXECUTABLE_PATH = '/definitely/not/chrome-xyz.exe';
+  ok(bridge.findChromePath() !== '/definitely/not/chrome-xyz.exe', 'galat env Chrome path par fallback (latakta nahi)');
+  if (prevEnv === undefined) delete process.env.PUPPETEER_EXECUTABLE_PATH;
+  else process.env.PUPPETEER_EXECUTABLE_PATH = prevEnv;
+
+  const cs = bridge.getChromeStatus();
+  ok(typeof cs.found === 'boolean' && 'path' in cs && 'headless' in cs, 'getChromeStatus shape (found/path/headless)');
+
+  // Kaunsa undici agent kis protocol par — socks5 ko HTTP agent na mile
+  ok(px.dispatcherKind('http://1.2.3.4:8080') === 'http', 'http proxy → http dispatcher');
+  ok(px.dispatcherKind('https://1.2.3.4:8443') === 'http', 'https proxy → http dispatcher');
+  ok(px.dispatcherKind('socks5://1.2.3.4:1080') === 'socks5', 'socks5 proxy → socks5 dispatcher');
+  ok(px.dispatcherKind('socks4://1.2.3.4:1080') === 'unsupported', 'socks4 → unsupported (saaf error milega)');
+  ok(px.dispatcherKind('not-a-url') === 'unsupported', 'ganda URL → unsupported');
+}
+
 console.log(`\n✅ ALL PASSED — ${passed} checks`);

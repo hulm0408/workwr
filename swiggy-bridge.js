@@ -2,6 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import crypto from 'crypto';
+import { fileURLToPath } from 'url';
 import puppeteer from 'puppeteer-core';
 import { updateAccount, getNextAutoUserName, cleanEssentialSwiggyCookies } from './store.js';
 import { normalizeIndianMobileNumber } from './phone-utils.js';
@@ -31,39 +32,157 @@ async function fetchSwiggy(url, opts = {}) {
   return proxyPool.fetchSwiggy(url, opts, currentProxy);
 }
 
+// ---------------------------------------------------------------------------
+// Chrome/Chromium discovery — puppeteer-core ke paas APNA browser nahi hota,
+// isliye system par installed Chrome/Chromium/Edge dhoondhna zaroori hai.
+//
+// PEHLA BUG (bot "work nahi kar raha" ki sabse badi wajah): pehle Windows par
+// sirf `C:\Program Files\...\chrome.exe` hard-coded tha (exist check bhi
+// nahi!). Jiski Chrome per-user install (LocalAppData), Program Files (x86)
+// ya sirf Edge ho — uske yahan WAF solver har baar chup-chaap fail hota,
+// token kabhi banta hi nahi, har OTP request 403 aur batch band.
+//
+// Ab: env override → saare common install paths (Win/mac/Linux) →
+// puppeteer/playwright cache folders. Na mile to '' (jhootha path nahi) —
+// taaki canUseStealthBrowser() sahi `false` de aur user ko saaf warning mile.
+// Custom path: .env me  PUPPETEER_EXECUTABLE_PATH=C:\path\to\chrome.exe
+// ---------------------------------------------------------------------------
+const _exists = (p) => { try { return Boolean(p && fs.existsSync(p)); } catch { return false; } };
+let _badEnvChromeWarned = false;
+
 export function findChromePath() {
-  if (process.env.PUPPETEER_EXECUTABLE_PATH) return process.env.PUPPETEER_EXECUTABLE_PATH;
-  if (process.env.CHROME_BIN) return process.env.CHROME_BIN;
+  // 1) Explicit override (sabse pehle) — lekin galat path ho to warn karke
+  //    auto-detect par gir jao, warna bot bina wajah atka rahega.
+  for (const key of ['PUPPETEER_EXECUTABLE_PATH', 'CHROME_BIN', 'CHROME_PATH']) {
+    const v = String(process.env[key] || '').trim();
+    if (!v) continue;
+    if (_exists(v)) return v;
+    if (!_badEnvChromeWarned) {
+      _badEnvChromeWarned = true;
+      console.warn(`[SwiggyBridge] ${key} set hai lekin file nahi mili: ${v} — auto-detect try kar raha hoon.`);
+    }
+  }
+
+  const candidates = [];
   if (process.platform === 'win32') {
-    return 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe';
+    const pf = process.env.ProgramFiles || 'C:\\Program Files';
+    const pf86 = process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)';
+    const local = process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local');
+    for (const root of [pf, pf86, local]) {
+      candidates.push(path.join(root, 'Google', 'Chrome', 'Application', 'chrome.exe'));
+      candidates.push(path.join(root, 'Chromium', 'Application', 'chrome.exe'));
+    }
+    // Edge (Chromium-based) puppeteer-core ke saath chal jata hai — Chrome na
+    // ho to ye aakhri bharosa hai, har Windows par pehle se hota hai.
+    for (const root of [pf, pf86, local]) {
+      candidates.push(path.join(root, 'Microsoft', 'Edge', 'Application', 'msedge.exe'));
+    }
+    candidates.push(path.join(local, 'BraveSoftware', 'Brave-Browser', 'Application', 'brave.exe'));
+  } else if (process.platform === 'darwin') {
+    candidates.push(
+      '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+      '/Applications/Chromium.app/Contents/MacOS/Chromium',
+      '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
+      '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser',
+    );
+  } else {
+    candidates.push(
+      '/usr/bin/google-chrome',
+      '/usr/bin/google-chrome-stable',
+      '/usr/bin/chromium',
+      '/usr/bin/chromium-browser',
+      '/usr/bin/microsoft-edge',
+      '/usr/bin/brave-browser',
+      '/snap/bin/chromium',
+      '/usr/local/bin/chromium',
+      '/usr/local/bin/google-chrome',
+    );
   }
-  const linuxPaths = [
-    '/usr/bin/chromium',
-    '/usr/bin/chromium-browser',
-    '/usr/bin/google-chrome',
-    '/usr/bin/google-chrome-stable',
-    '/opt/playwright/browsers/chromium-1247/chrome-linux64/chrome'
-  ];
-  for (const p of linuxPaths) {
-    try { if (fs.existsSync(p)) return p; } catch (e) {}
+  for (const p of candidates) if (_exists(p)) return p;
+
+  // 2) Puppeteer / Playwright download caches (Linux servers par aksar yahi
+  //    ekmatra browser hota hai) — 2 level deep scan.
+  const cacheRoots = [
+    process.env.PUPPETEER_CACHE_DIR,
+    path.join(os.homedir(), '.cache', 'puppeteer'),
+    '/root/.cache/puppeteer',
+    '/opt/playwright/browsers',
+    path.join(os.homedir(), '.cache', 'ms-playwright'),
+    '/ms-playwright',
+  ].filter(Boolean);
+  const binNames = process.platform === 'win32'
+    ? ['chrome.exe']
+    : ['chrome', 'chrome-headless-shell', 'headless_shell', 'chromium'];
+  const scan = (dir, depth) => {
+    if (depth < 0 || !_exists(dir)) return '';
+    let entries = [];
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return ''; }
+    for (const e of entries) {
+      const full = path.join(dir, e.name);
+      if (!e.isDirectory() && binNames.includes(e.name)) return full;
+    }
+    for (const e of entries) {
+      if (!e.isDirectory()) continue;
+      const hit = scan(path.join(dir, e.name), depth - 1);
+      if (hit) return hit;
+    }
+    return '';
+  };
+  for (const root of cacheRoots) {
+    const hit = scan(root, 3);
+    if (hit) return hit;
   }
-  for (const rootDir of ['/opt/playwright/browsers', path.join(os.homedir(), '.cache', 'puppeteer'), '/root/.cache/puppeteer']) {
-    try {
-      if (!fs.existsSync(rootDir)) continue;
-      for (const entry of fs.readdirSync(rootDir)) {
-        for (const sub of ['chrome-linux64/chrome', 'chrome-linux/chrome']) {
-          const full = path.join(rootDir, entry, sub);
-          if (fs.existsSync(full)) return full;
-        }
-      }
-    } catch (e) {}
-  }
-  return '/usr/bin/chromium';
+
+  return ''; // nahi mila — jhootha default path mat do
 }
 
 const CHROME_PATH = findChromePath();
 const IS_LINUX = process.platform === 'linux';
-const HEADLESS_MODE = (IS_LINUX || process.env.RAILWAY_ENVIRONMENT || process.env.HEADLESS === 'true') ? 'new' : false;
+
+// puppeteer-core v25 me headless sirf `boolean | 'shell'` hai — purana 'new'
+// invalid hai (galti se chal jata tha). HEADLESS=1/true → har jagah headless,
+// HEADLESS=0/false → window ke saath (debug ke liye).
+function resolveHeadless() {
+  const v = String(process.env.HEADLESS || '').trim().toLowerCase();
+  if (['1', 'true', 'yes'].includes(v)) return true;
+  if (['0', 'false', 'no'].includes(v)) return false;
+  return Boolean(IS_LINUX || process.env.RAILWAY_ENVIRONMENT || process.env.RENDER || process.env.CI);
+}
+const HEADLESS_MODE = resolveHeadless();
+
+// Bot startup + /diag ke liye — Chrome mila ya nahi, saaf-saaf.
+export function getChromeStatus() {
+  return {
+    found: Boolean(CHROME_PATH && _exists(CHROME_PATH)),
+    path: CHROME_PATH || '',
+    headless: HEADLESS_MODE,
+    platform: process.platform,
+  };
+}
+
+// swiggy-cart.js is standalone repo me NAHI hai (purane bade bot ka module
+// tha) — pehle iska dynamic import har call par fail hota aur catch{} me
+// chup jata tha. Ab: file ho tabhi import, warna ek baar warn karke skip.
+let _cartBootstrap = undefined; // undefined = try nahi kiya, null = unavailable
+async function loadAndroidBootstrap() {
+  if (_cartBootstrap !== undefined) return _cartBootstrap;
+  try {
+    const cartFile = fileURLToPath(new URL('./swiggy-cart.js', import.meta.url));
+    if (!_exists(cartFile)) {
+      console.warn('[SwiggyBridge] swiggy-cart.js repo me nahi hai — Android-token → web-session bootstrap skip (sirf imported Android accounts par asar).');
+      _cartBootstrap = null;
+      return null;
+    }
+    const mod = await import('./swiggy-cart.js');
+    _cartBootstrap = typeof mod.bootstrapSwiggyWebSessionFromAndroidTokens === 'function'
+      ? mod.bootstrapSwiggyWebSessionFromAndroidTokens
+      : null;
+  } catch (e) {
+    console.warn('[SwiggyBridge] swiggy-cart.js load fail:', e?.message);
+    _cartBootstrap = null;
+  }
+  return _cartBootstrap;
+}
 
 // Active login sessions keyed by userId:
 // { [userId]: { browser, page, phone, otp, targetAcc, targetAccName, signupEmail, isNewUser, safetyTimer } }
@@ -688,6 +807,13 @@ export async function claimSwiggyBreakfastAndLateNightOffers(account, { force = 
 }
 
 async function launchStealthSwiggyBrowser() {
+  if (!CHROME_PATH || !_exists(CHROME_PATH)) {
+    throw new Error(
+      'Chrome/Chromium nahi mila is machine par. Google Chrome install karo, ' +
+      'ya .env me PUPPETEER_EXECUTABLE_PATH=<chrome.exe ka full path> set karo. ' +
+      '(puppeteer-core ke saath browser bundled NAHI aata.)'
+    );
+  }
   const browser = await puppeteer.launch({
     executablePath: CHROME_PATH,
     headless: HEADLESS_MODE,
@@ -1762,8 +1888,8 @@ async function resolveDeleteCookieJarAndCsrf(acc, cleanPhone = '', targetAcc = '
   // Auto-mint `_session_tid` if account was imported with Android tokens (`tid` + `token`) without web `_session_tid`!
   if (!cookieString.includes('_session_tid=') && effectiveAcc && (effectiveAcc.tid || effectiveAcc.token)) {
     try {
-      const { bootstrapSwiggyWebSessionFromAndroidTokens } = await import('./swiggy-cart.js');
-      const minted = await bootstrapSwiggyWebSessionFromAndroidTokens(effectiveAcc, 3500);
+      const bootstrap = await loadAndroidBootstrap();
+      const minted = bootstrap ? await bootstrap(effectiveAcc, 3500) : null;
       if (minted) {
         cookieString = stripStaleWafCookie(minted);
       }
@@ -2683,8 +2809,8 @@ export async function logoutSwiggySessionRemote(accountOrKey) {
   let webSessionEstablished = Boolean(cookieMap.get('_session_tid'));
   if (!webSessionEstablished && (tid || token)) {
     try {
-      const { bootstrapSwiggyWebSessionFromAndroidTokens } = await import('./swiggy-cart.js');
-      const minted = await bootstrapSwiggyWebSessionFromAndroidTokens(source);
+      const bootstrap = await loadAndroidBootstrap();
+      const minted = bootstrap ? await bootstrap(source) : null;
       if (minted && /(?:^|;\s*)_session_tid=/.test(minted)) {
         for (const part of String(minted).split(';')) {
           const t = part.trim();

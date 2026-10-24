@@ -1,0 +1,15 @@
+# ⚠️ SECRETS — ye kabhi git/GitHub par nahi jaane chahiye!
+# (Pehle .env live BOT_TOKEN ke saath is PUBLIC repo me committed thi —
+# woh token ab REVOKE karna padega, dekho README ka Security section.)
+.env
+.env.*
+!.env.example
+
+# Dependencies (npm install / npm ci se wapas aa jate hain)
+node_modules/
+
+# Runtime data / scratch
+data/*.tmp
+data/db.json.corrupt-*
+*.log
+accounts.json

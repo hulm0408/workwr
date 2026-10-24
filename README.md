@@ -112,8 +112,7 @@ Jo 403 challenge pehle poora batch maar deta tha, ab uska tod:
 2. **Phir bhi challenge aaye** → bot **turant naya token** lekar **ek baar
    retry** karta hai (na ki hammering).
 3. **Engine-level** — challenge aane par batch **nahi rukta**: token refresh +
-   chhota wait + usi number par dobara. **4 lagatar challenges** par hi
-   rukta hai (IP flagged ho to).
+   IP cool-down (ladder 30s→4m) + naya token + number defer karke aage. Sirf **12 lagatar challenges** (bina ek bhi request guzare) par batch rukta hai — ek request bhi paar ho gayi to ginti reset.
 4. **WAF cooldown** (circuit-breaker) active ho to request bheji hi nahi
    jaati — cooldown khatam hote hi khud aage badhta hai.
 

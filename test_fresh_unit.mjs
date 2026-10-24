@@ -673,4 +673,38 @@ console.log('fresh JSON chat me turant bhejna (export + engine notify):');
   await new Promise((r) => setTimeout(r, 10)); // unhandledRejection hota to yahin crash hota
 }
 
+// ---------------------------------------------------------------------------
+console.log('WAF challenge survival (jala token invalidate + batch-marta-nahi ladder):');
+{
+  const wafPool = await import('./waf-pool.js');
+  const engine = await import('./autopilot-engine.js');
+  const fakeToken = 't'.repeat(80);
+
+  // Seed → mile; invalidate → gayab (challenge ke baad jala token reuse na ho)
+  ok(wafPool.seedToken(fakeToken, { source: 'manual' }) === true && wafPool.getTokenSync() === fakeToken,
+    'seedToken ke baad token milta hai');
+  wafPool.invalidateToken();
+  ok(wafPool.getTokenSync() === '', 'invalidateToken ke baad token nahi milta');
+
+  // TTL 30 min — 31 min purana token dead (pehle 2h tak jala token chalta rehta tha)
+  wafPool.seedToken(fakeToken, { source: 'manual', acquiredAt: Date.now() - 31 * 60_000 });
+  ok(wafPool.getTokenSync() === '', '31 min purana token TTL se bahar (fresh solve hoga)');
+
+  // Challenge (markWafHit) → token turant invalidate + cooldown lag jaye
+  wafPool.seedToken(fakeToken, { source: 'manual' });
+  wafPool.markWafHit();
+  ok(wafPool.getTokenSync() === '', 'markWafHit par jala token invalidate ho gaya');
+  ok(wafPool.cooldownRemainingMs() > 0, 'markWafHit par circuit-breaker cooldown laga');
+  wafPool.clearCooldown();
+  ok(wafPool.cooldownRemainingMs() === 0, 'clearCooldown reset karta hai');
+
+  // Engine wait ladder: 30s → 60s → 120s → 240s; pool cooldown lamba ho to wahi (5 min cap)
+  ok(engine.wafChallengeWaitMs(1, 0) === 30_000, 'ladder strike1 = 30s (pehle seedha 1-3 min tha)');
+  ok(engine.wafChallengeWaitMs(2, 0) === 60_000 && engine.wafChallengeWaitMs(3, 0) === 120_000, 'ladder strike2/3 = 60s/120s');
+  ok(engine.wafChallengeWaitMs(9, 0) === 240_000, 'ladder cap 240s (strike chahe kitne bhi)');
+  ok(engine.wafChallengeWaitMs(1, 4 * 60_000) === 4 * 60_000, 'pool cooldown lamba ho to wahi jeet');
+  ok(engine.wafChallengeWaitMs(1, 30 * 60_000) === 5 * 60_000, 'ek saath max 5 min (batch zinda rahe)');
+  ok(engine.wafChallengeWaitMs(0, 0) === 30_000, 'strikes 0/invalid → pehla step (30s)');
+}
+
 console.log(`\n✅ ALL PASSED — ${passed} checks`);

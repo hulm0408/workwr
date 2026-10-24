@@ -8,7 +8,7 @@
 //        • delete SUCCESS → purge → usi number se fresh registration → fresh_after_delete
 //   ⚠️ infrastructure outcomes (engine alag tarah handle karta hai):
 //        • Swiggy rate limit        → rate_limited      (backoff)
-//        • Swiggy security check    → security_challenge (band karo)
+//        • Swiggy security check    → security_challenge (engine auto-recover: defer + IP cool-down)
 //        • OTP send/miss/verify fail→ failed_*           (agla number)
 //        • STOP dabane par           → aborted            (number untouched/retryable)
 //

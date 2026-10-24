@@ -416,10 +416,26 @@ console.log('proxy-pool (IP rotation — "rukna hi na pare"):');
   px.invalidateProxyToken(a.id);
   ok(px.getProxyToken(a.id) === '', 'token invalidate');
 
+  // Route priority — jis IP par fresh WAF token pehle se hai, rotation
+  // usi ko pehle le (warna har rotate par naya Chromium solve lagta tha).
+  px.setProxyToken(b.id, 'TOKEN_FOR_IP_B'.padEnd(60, 'y'));
+  ok(px.pickProxy()?.id === b.id, 'picker: fresh-token wali proxy pehle');
+  ok(px.pickProxy({ requireToken: true })?.id === b.id, 'picker: requireToken sirf token-ready route');
+  ok(px.proxySummary().tokenReadyCount === 1, 'summary: token-ready count');
+
+  // Solver jis proxy par fail hua, use turant dobara mat uthao — full
+  // Chromium solve dobara chalana hi 4-minute loop ki asal wajah thi.
+  px.markProxyWafSolveFailure(b.id, 60_000);
+  const bDetail = px.listProxies().find((x) => x.id === b.id);
+  ok(bDetail.wafSolveCooldownLeftMs > 50_000 && bDetail.wafSolveFailures === 1 && !bDetail.tokenReady,
+    'solve failure: route quarantine + token clear');
+  ok(px.pickProxy()?.id === a.id, 'picker: solve-failed proxy side par');
+
   // Cooldown — hit hone par proxy thodi der side par
   px.markProxyWafHit(a.id, 60_000);
   const detail = px.listProxies().find((x) => x.id === a.id);
   ok(detail.cooldownLeftMs > 50_000, 'cooldown set (proxy side par)');
+  ok(detail.wafHits === 1 && !detail.tokenReady, 'WAF hit: count + jala token clear');
   const d = px.pickProxy({ excludeIds: [] });
   ok(d && d.id !== a.id, 'cooldown wala proxy pick nahi hua');
 
@@ -479,6 +495,38 @@ console.log('chrome discovery + proxy dispatcher (2026 fixes):');
   ok(px.dispatcherKind('socks5://1.2.3.4:1080') === 'socks5', 'socks5 proxy → socks5 dispatcher');
   ok(px.dispatcherKind('socks4://1.2.3.4:1080') === 'unsupported', 'socks4 → unsupported (saaf error milega)');
   ok(px.dispatcherKind('not-a-url') === 'unsupported', 'ganda URL → unsupported');
+
+  // WAF solver coalescing route-keyed hai — ek proxy ka token doosri
+  // proxy ke solver promise se leak nahi hona chahiye.
+  ok(bridge._wafSolveRouteKey(null) === 'direct', 'WAF solver route-key: direct');
+  ok(bridge._wafSolveRouteKey({ id: 'proxy-a' }) !== bridge._wafSolveRouteKey({ id: 'proxy-b' }),
+    'WAF solver route-key: har proxy alag (IP-bound token safety)');
+
+  // Challenge ke baad current proxy ka token asal me burn hona chahiye.
+  // Pehle sirf direct/shared cache saaf hota tha — retry wahi jala token
+  // dobara chipka deti thi.
+  const burnProxy = px.addProxy('8.8.8.8:8080').proxy;
+  px.setProxyToken(burnProxy.id, 'BURN_ME'.padEnd(60, 'z'));
+  bridge.setBridgeProxy(burnProxy);
+  bridge.burnCurrentWafToken();
+  ok(px.getProxyToken(burnProxy.id) === '', 'burnCurrentWafToken: per-proxy jala token clear');
+  bridge.setBridgeProxy(null);
+  px.removeProxy(burnProxy.id);
+  px.setPoolEnabled(false);
+
+  // Security route policy — 3 proxy challenges ke baad kharab pool me
+  // ghoomne ke bajaye direct, 2 direct challenges ke baad best proxy wapas.
+  const engine = await import('./autopilot-engine.js');
+  ok(engine.securityRouteAction({ proxyEnabled: true, proxyChallenges: 2 }) === 'rotate_proxy',
+    'security route: 2 proxy challenges tak rotate');
+  ok(engine.securityRouteAction({ proxyEnabled: true, proxyChallenges: 3 }) === 'direct_fallback',
+    'security route: 3 proxy challenges ke baad direct fallback');
+  ok(engine.securityRouteAction({ proxyEnabled: true, usingDirectFallback: true, directChallenges: 1 }) === 'direct_cooldown',
+    'security route: pehla direct challenge cooldown');
+  ok(engine.securityRouteAction({ proxyEnabled: true, usingDirectFallback: true, directChallenges: 2 }) === 'restore_proxy',
+    'security route: 2 direct challenges ke baad proxy restore');
+  ok(engine.securityRouteAction({ proxyEnabled: false, proxyChallenges: 0 }) === 'direct_cooldown',
+    'security route: proxy OFF par direct cooldown');
 }
 
 // ---------------------------------------------------------------------------
@@ -898,6 +946,23 @@ console.log('🌐 free proxies auto-fetch (ProxyScrape parse/rank/probe/refresh)
       });
       ok(r.ok === true && r.quality === 'clean' && r.genericStatus === 204 && r.status === 200,
         'undici regression: local HTTP proxy se asal request origin tak gayi');
+
+      // Sticky-route regression: session-bound request fail ho to
+      // fetchSwiggy khud doosri IP se chup-chaap retry NAHI karega.
+      // Cookies/WAF token pehli IP ke hote hain; rotation bridge/engine
+      // ki explicit recovery hi karegi.
+      const goodProxy = pp.addProxy(`http://127.0.0.1:${proxy.address().port}`).proxy;
+      const badProxy = pp.addProxy('127.0.0.1:9').proxy;
+      let stickyThrew = false;
+      try {
+        await pp.fetchSwiggy(`${originBase}/swiggy`, { signal: AbortSignal.timeout(2000) }, badProxy);
+      } catch {
+        stickyThrew = true;
+      }
+      ok(stickyThrew === true, 'fetchSwiggy sticky: bad route par silent alternate-IP retry nahi');
+      pp.removeProxy(goodProxy.id);
+      pp.removeProxy(badProxy.id);
+      if (!before.enabled) pp.setPoolEnabled(false);
     } finally {
       await Promise.allSettled([
         new Promise((resolve) => proxy.close(resolve)),

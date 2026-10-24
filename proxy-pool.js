@@ -24,7 +24,20 @@ import crypto from 'crypto';
 import { getDb, saveDb } from './store.js';
 
 // In-memory runtime state (persist NAHI hota — sirf session ke liye)
-const runtime = new Map(); // id → { token, tokenAt, cooldownUntil, consecutiveErrors }
+// id → { token, tokenAt, cooldownUntil, consecutiveErrors, wafHits,
+//        lastWafHitAt, wafSolveFailedUntil, wafSolveFailures }
+const runtime = new Map();
+const PROXY_TOKEN_TTL_MS = 7 * 60_000;
+
+function runtimeFor(id) {
+  const rt = runtime.get(id) || {};
+  runtime.set(id, rt);
+  return rt;
+}
+
+function hasFreshProxyToken(rt) {
+  return Boolean(rt?.token && (Date.now() - (Number(rt.tokenAt) || 0) <= PROXY_TOKEN_TTL_MS));
+}
 
 function loadState() {
   const db = getDb();
@@ -105,11 +118,16 @@ export function listProxies() {
   return state.list.map((p) => {
     const rt = runtime.get(p.id) || {};
     const cdUntil = Number(rt.cooldownUntil) || 0;
+    const solveFailedUntil = Number(rt.wafSolveFailedUntil) || 0;
     return {
       ...p,
       active: p.enabled,
-      tokenReady: Boolean(rt.token),
+      tokenReady: hasFreshProxyToken(rt),
       cooldownLeftMs: Math.max(0, cdUntil - now),
+      wafSolveCooldownLeftMs: Math.max(0, solveFailedUntil - now),
+      wafHits: Number(rt.wafHits) || 0,
+      lastWafHitAt: rt.lastWafHitAt || '',
+      wafSolveFailures: Number(rt.wafSolveFailures) || 0,
       consecutiveErrors: Number(rt.consecutiveErrors) || 0,
     };
   });
@@ -165,24 +183,44 @@ export function setPoolEnabled(on) {
 // ---------------------------------------------------------------------------
 let lastAssignedId = '';
 
-export function pickProxy({ excludeIds = [] } = {}) {
+export function pickProxy({ excludeIds = [], requireToken = false } = {}) {
   const state = ensureSeeded();
   if (!state.enabled) return null;
   const now = Date.now();
-  const candidates = state.list.filter(
+  const baseCandidates = state.list.filter(
     (p) => p.enabled && !excludeIds.includes(p.id) &&
       !((Number(runtime.get(p.id)?.cooldownUntil) || 0) > now) &&
-      (Number(runtime.get(p.id)?.consecutiveErrors) || 0) < 3
+      (Number(runtime.get(p.id)?.consecutiveErrors) || 0) < 3 &&
+      (!requireToken || hasFreshProxyToken(runtime.get(p.id) || {}))
   );
-  if (!candidates.length) return null;
-  // Clean/manual proxies pehle; WAF-challenged (lekin Swiggy-reachable) free
-  // proxies fallback tier me. Phir least-recently-used + least-hits.
+  if (!baseCandidates.length) return null;
+
+  // Jis proxy par WAF token solve abhi-abhi fail hua hai, use turant dobara
+  // route bana kar full Chromium solver phir se chalana minutes zaya karta
+  // hai. Doosre candidates hon to use side par rakho; koi aur na ho tabhi lo.
+  const solveReady = baseCandidates.filter(
+    (p) => !((Number(runtime.get(p.id)?.wafSolveFailedUntil) || 0) > now)
+  );
+  const candidates = solveReady.length ? solveReady : baseCandidates;
+
+  // Route quality — sirf round-robin kafi nahi. Pehle wo route jo asal me
+  // OTP bhej sakne ke sab se qareeb hai:
+  //   clean/manual → fresh per-proxy WAF token → Indian IP → kam WAF hits
+  //   → kam latency → phir purani tokenAt/least-hits rotation.
   const qualityRank = (p) => (p?.quality === 'challenged' ? 1 : 0);
+  const tokenRank = (p) => (hasFreshProxyToken(runtime.get(p.id) || {}) ? 0 : 1);
+  const countryRank = (p) => (String(p?.country || '').toUpperCase() === 'IN' ? 0 : 1);
   candidates.sort((a, b) => {
     const ra = runtime.get(a.id) || {};
     const rb = runtime.get(b.id) || {};
     return qualityRank(a) - qualityRank(b) ||
-      (Number(ra.tokenAt) || 0) - (Number(rb.tokenAt) || 0) || (a.hits || 0) - (b.hits || 0);
+      tokenRank(a) - tokenRank(b) ||
+      countryRank(a) - countryRank(b) ||
+      (Number(ra.wafHits) || 0) - (Number(rb.wafHits) || 0) ||
+      (Number(ra.wafSolveFailures) || 0) - (Number(rb.wafSolveFailures) || 0) ||
+      (Number(a.latencyMs) || 99999) - (Number(b.latencyMs) || 99999) ||
+      (Number(ra.tokenAt) || 0) - (Number(rb.tokenAt) || 0) ||
+      (a.hits || 0) - (b.hits || 0);
   });
   const pick = candidates[0];
   lastAssignedId = pick.id;
@@ -205,30 +243,67 @@ export function getProxy(id) {
 // ---------------------------------------------------------------------------
 export function getProxyToken(id) {
   const rt = runtime.get(id);
-  if (!rt?.token) return '';
-  // 7 min TTL — token fresh rakho (WAF token ~2h valid, hum 7 min me refresh)
-  if (Date.now() - (Number(rt.tokenAt) || 0) > 7 * 60_000) return '';
+  if (!hasFreshProxyToken(rt)) return '';
   return rt.token;
 }
 
 export function setProxyToken(id, token) {
   if (!token) return;
-  const rt = runtime.get(id) || {};
+  const rt = runtimeFor(id);
   rt.token = String(token);
   rt.tokenAt = Date.now();
-  runtime.set(id, rt);
+  rt.wafSolveFailedUntil = 0;
+  rt.wafSolveFailures = 0;
+  rt.lastWafSolveAt = new Date().toISOString();
 }
 
 export function invalidateProxyToken(id) {
   const rt = runtime.get(id);
-  if (rt) delete rt.token;
+  if (rt) {
+    delete rt.token;
+    rt.tokenAt = 0;
+  }
 }
 
 export function markProxyWafHit(id, cooldownMs = 60_000) {
-  const rt = runtime.get(id) || {};
-  rt.cooldownUntil = Date.now() + Number(cooldownMs) || 0;
+  if (!id) return;
+  const rt = runtimeFor(id);
+  rt.cooldownUntil = Date.now() + (Number(cooldownMs) || 0);
+  rt.wafHits = (Number(rt.wafHits) || 0) + 1;
+  rt.lastWafHitAt = new Date().toISOString();
   delete rt.token; // purana token IP ke saath reject hua
-  runtime.set(id, rt);
+  rt.tokenAt = 0;
+}
+
+// Chromium is proxy par aws-waf-token nahi bana paya — kuch der is route ko
+// solver ke liye side par rakho. Warna har rotate/OTP par wahi 30-90s ka
+// full solver chal kar batch ko sust kar deta hai.
+export function markProxyWafSolveFailure(id, cooldownMs = 10 * 60_000) {
+  if (!id) return;
+  const rt = runtimeFor(id);
+  rt.wafSolveFailedUntil = Date.now() + (Number(cooldownMs) || 0);
+  rt.wafSolveFailures = (Number(rt.wafSolveFailures) || 0) + 1;
+  rt.lastWafSolveAt = new Date().toISOString();
+  delete rt.token;
+  rt.tokenAt = 0;
+}
+
+export function proxyWafSolveCooldownLeftMs(id) {
+  const until = Number(runtime.get(id)?.wafSolveFailedUntil) || 0;
+  return Math.max(0, until - Date.now());
+}
+
+export function getProxyRouteState(id) {
+  const rt = runtime.get(id) || {};
+  const now = Date.now();
+  return {
+    tokenReady: hasFreshProxyToken(rt),
+    cooldownLeftMs: Math.max(0, (Number(rt.cooldownUntil) || 0) - now),
+    wafSolveCooldownLeftMs: Math.max(0, (Number(rt.wafSolveFailedUntil) || 0) - now),
+    wafHits: Number(rt.wafHits) || 0,
+    wafSolveFailures: Number(rt.wafSolveFailures) || 0,
+    consecutiveErrors: Number(rt.consecutiveErrors) || 0,
+  };
 }
 
 export function markProxyError(id) {
@@ -309,7 +384,13 @@ async function getDispatcherFor(proxy) {
  * fetchSwiggy(url, opts, proxy)
  *   proxy = pickProxy() ka return (ya null)
  *   → undici ProxyAgent se swiggy.com request
- *   → error par markProxyError + doosri proxy se EK retry
+ *
+ * ⚠️ STICKY ROUTE: network error par yahan chup-chaap doosri proxy se retry
+ * NAHI hota. Pehle hota tha — lekin session cookies/CSRF/WAF token pehli IP
+ * ke liye bante the aur asal request doosri IP se ja kar mismatch/challenge
+ * khaati thi; POST ka outcome bhi ambiguous ho jata tha. Rotation ab sirf
+ * bridge/engine ki explicit recovery karegi, jahan naya token/session route
+ * ke hisaab se banta hai.
  */
 export async function fetchSwiggy(url, opts = {}, proxy = null) {
   if (!proxy?.url) return fetch(url, opts);
@@ -320,17 +401,6 @@ export async function fetchSwiggy(url, opts = {}, proxy = null) {
     return res;
   } catch (e) {
     markProxyError(proxy.id);
-    // network/proxy error → doosri proxy se ek retry (ZERO wait)
-    const alt = pickProxy({ excludeIds: [proxy.id] });
-    if (alt) {
-      try {
-        const dispatcher = await getDispatcherFor(alt);
-        return await fetchWithDispatcher(url, opts, dispatcher);
-      } catch (e2) {
-        markProxyError(alt.id);
-        throw e2;
-      }
-    }
     throw e;
   }
 }
@@ -905,6 +975,12 @@ export function proxySummary() {
   const enabled = state.list.filter((p) => p.enabled).length;
   const autoCount = state.list.filter((p) => p.auto && p.enabled).length;
   const autoChallenged = state.list.filter((p) => p.auto && p.enabled && p.quality === 'challenged').length;
+  const now = Date.now();
+  const tokenReadyCount = state.list.filter((p) => p.enabled && hasFreshProxyToken(runtime.get(p.id) || {})).length;
+  const wafCoolingCount = state.list.filter((p) => {
+    const rt = runtime.get(p.id) || {};
+    return p.enabled && ((Number(rt.cooldownUntil) || 0) > now || (Number(rt.wafSolveFailedUntil) || 0) > now);
+  }).length;
   return {
     enabled: Boolean(state.enabled),
     total: state.list.length,
@@ -912,6 +988,8 @@ export function proxySummary() {
     autoCount,
     autoClean: autoCount - autoChallenged,
     autoChallenged,
+    tokenReadyCount,
+    wafCoolingCount,
     autoFree: freeProxiesEnabled(),
     rotation: state.enabled && enabled > 1 ? 'ON (IP rotation — zero-wait recovery)' : 'OFF (ek hi IP)',
   };

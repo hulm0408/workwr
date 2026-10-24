@@ -80,7 +80,14 @@ const {
   listPoolNumbers, fetchOtpCandidates, snapshotSeenOtpState, waitForOtpCode,
   setFirebaseSource, getFirebaseSource,
 } = await import('./firebase-numbers.js');
-const { freshEntriesFrom, preferOnline, getPremiumLedger } = await import('./number-pipeline.js');
+const {
+  freshEntriesFrom,
+  preferOnline,
+  getPremiumLedger,
+  getExtractedNumberCooldown,
+  isPhoneBlockedByPremiumLedger,
+  EXTRACTED_NUMBER_COOLDOWN_MS,
+} = await import('./number-pipeline.js');
 const { getAutopilotSnapshot, isAutopilotRunning, requestAutopilotStop } = await import('./autopilot-engine.js');
 const srcMod = await import('./firebase-sources.js');
 const bs = await import('./bot-settings.js');
@@ -296,6 +303,67 @@ console.log('freshEntriesFrom + preferOnline (pipeline helpers):');
 
   const ordered = preferOnline(fresh);
   ok(ordered[0].online === true && ordered[ordered.length - 1].online === false, 'online pehle, offline baad me');
+
+  // 7-day extracted-number cooldown: 6 din pehle bheja number block,
+  // exact 7 din guzarne ke baad hi dobara eligible.
+  const now = Date.now();
+  const cooldownLedger = {
+    '9876500011': { status: 'success', at: new Date(now - 6 * 24 * 60 * 60 * 1000).toISOString() },
+    '9876500012': { status: 'success', at: new Date(now - EXTRACTED_NUMBER_COOLDOWN_MS - 1).toISOString() },
+    '9876500013': { status: 'skipped', at: new Date(now - EXTRACTED_NUMBER_COOLDOWN_MS - 1).toISOString() },
+  };
+  const cooldownPool = ['9876500011', '9876500012', '9876500013', '9876500014']
+    .map((phone) => ({ phone, status: '', online: true }));
+  const afterCooldownFilter = freshEntriesFrom(cooldownPool, {
+    now,
+    ledger: cooldownLedger,
+    savedSessions: new Map(),
+  }).map((n) => n.phone);
+  ok(!afterCooldownFilter.includes('9876500011'), '7-day cooldown: 6 din pehle extracted number block');
+  ok(afterCooldownFilter.includes('9876500012'), '7-day cooldown: 7 din guzarne ke baad number eligible');
+  ok(!afterCooldownFilter.includes('9876500013'), 'skipped ledger entry 7 din baad bhi block (purani safety barqarar)');
+  ok(getExtractedNumberCooldown('9876500011', {
+    now,
+    ledger: cooldownLedger,
+    savedSessions: new Map(),
+  }).blocked === true, 'cooldown helper: recent extracted number blocked');
+  ok(isPhoneBlockedByPremiumLedger('9876500012', {
+    now,
+    ledger: cooldownLedger,
+    savedSessions: new Map(),
+  }) === false, 'cooldown helper: expired success dobara allowed');
+
+  // Agar local ledger restart/deploy me kho jaye lekin saved session
+  // cloud se wapas aa jaye, to uska savedAt bhi wahi 7 din rokega.
+  const savedFallback = freshEntriesFrom([{ phone: '9876500015', status: '', online: true }], {
+    now,
+    ledger: {},
+    savedSessions: new Map([['9876500015', now - 60_000]]),
+  });
+  ok(savedFallback.length === 0, 'ledger missing ho to saved-session savedAt se 7-day cooldown');
+
+  // Cloud snapshot/merge: premium ledger ab accounts ke saath durable hai.
+  const store = await import('./store.js');
+  const snapshot = store.buildCloudVaultSnapshot({
+    config: { accounts: {}, deletedAccounts: {} },
+    sessionVault: {},
+    orders: {},
+    premiumFlow: { used: cooldownLedger },
+  });
+  ok(snapshot.premiumFlow.used['9876500011'].status === 'success', 'cloud snapshot me extracted-number ledger shamil');
+  const mergedLedger = store._mergePremiumLedgerEntries(
+    { '9876500016': { status: 'success', at: new Date(now - 10_000).toISOString() } },
+    { '9876500016': { status: 'success', at: new Date(now - 1_000).toISOString() } },
+  );
+  ok(mergedLedger.changed === 1 && Date.parse(mergedLedger.used['9876500016'].at) === now - 1_000,
+    'cloud ledger merge: nayi extracted timestamp jeet-ti hai');
+  const vaultSync = await import('./vault-sync.js');
+  const safePushPayload = vaultSync._mergeVaultPremiumLedger(
+    { premiumFlow: { used: {} } },
+    { premiumFlow: { used: cooldownLedger } },
+  );
+  ok(safePushPayload.premiumFlow.used['9876500011'].status === 'success',
+    'cloud push safeguard: khali local snapshot remote 7-day ledger erase nahi karta');
 }
 
 // ---------------------------------------------------------------------------
@@ -445,6 +513,8 @@ console.log('proxy-pool (IP rotation — "rukna hi na pare"):');
   ok(detail.wafHits === 1 && !detail.tokenReady, 'WAF hit: count + jala token clear');
   const d = px.pickProxy({ excludeIds: [] });
   ok(d && d.id !== a.id, 'cooldown wala proxy pick nahi hua');
+  ok(px.proxySummary().usableCount === 1 && px.proxySummary().wafCoolingCount >= 1,
+    'summary: ON ke bajaye asal usable/cooling proxy count');
 
   // Error / success streak
   px.markProxyError(b.id);
@@ -534,6 +604,18 @@ console.log('chrome discovery + proxy dispatcher (2026 fixes):');
     'security route: 2 direct challenges ke baad proxy restore');
   ok(engine.securityRouteAction({ proxyEnabled: false, proxyChallenges: 0 }) === 'direct_cooldown',
     'security route: proxy OFF par direct cooldown');
+  ok(engine.securityChallengeRouteKind({
+    proxyEnabled: true,
+    routeModeAtStart: 'proxy',
+    proxyIdAtStart: 'proxy-a',
+    finalProxyId: '',
+  }) === 'proxy', 'security route kind: proxy episode ko final empty ID par direct mat gino');
+  ok(engine.securityChallengeRouteKind({
+    proxyEnabled: true,
+    routeModeAtStart: 'direct-fallback',
+    proxyIdAtStart: '',
+    finalProxyId: '',
+  }) === 'direct', 'security route kind: direct-fallback episode direct hi hai');
 }
 
 // ---------------------------------------------------------------------------
@@ -670,12 +752,22 @@ console.log('device last-seen gate (mare hue device par OTP waste nahi):');
   const callsBefore = mock.calls.length;
   const r1 = await pipe.processSingleNumber({
     userId: 'test',
-    entry: { phone: '9812345670', deviceId: 'devStale', online: true },
+    entry: { phone: '9812345672', deviceId: 'devStale', online: true },
     otpCfg: { activeWindowMs: 60_000, waitMs: 0, timeoutMs: 100 },
   });
   ok(r1.kind === 'deferred_device_stale', 'stale device → deferred_device_stale (OTP nahi bheja)');
   ok(!mock.calls.slice(callsBefore).some((u) => u.includes('swiggy.com')), 'stale par Swiggy ko ek bhi request nahi gayi');
   ok(r1.ok === false && Boolean(r1.reason), 'stale result me wajah hai');
+
+  // Pipeline-level hard gate: retry/hot queue me purani entry reh bhi jaye
+  // to recently extracted number OTP se pehle hi ruk jaye.
+  pipe.markLedger('9812345671', 'success');
+  const rCooldown = await pipe.processSingleNumber({
+    userId: 'test',
+    entry: { phone: '9812345671', deviceId: 'devFresh', online: true },
+    otpCfg: { activeWindowMs: 60_000, waitMs: 0, timeoutMs: 100 },
+  });
+  ok(rCooldown.kind === 'deferred_number_cooldown', '7-day cooldown: pipeline extracted number ko OTP se pehle rokta hai');
 
   // Fresh device: gate pass karke bridge tak jaye. Galat-format number rakha
   // taaki bridge bina network ke turant INVALID_MOBILE de (test pure rahe) —

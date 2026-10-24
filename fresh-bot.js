@@ -149,11 +149,11 @@ function runningCard(snap, stageText = '') {
     ``,
     field('Processed', String(snap.processed)),
     field('✅ Fresh', `${snap.fresh}  (naye: ${snap.freshNew} · delete+fresh: ${snap.freshAfterDelete})`),
-    field('⚠️ Skipped', `${snap.skipped} · deferred: ${snap.deferred} · 📴 stale devices: ${snap.staleSkips || 0}`),
+    field('⚠️ Skipped', `${snap.skipped} · deferred: ${snap.deferred} · 7-day cooldown: ${snap.cooldownSkips || 0} · 📴 stale devices: ${snap.staleSkips || 0}`),
     field('× Failed', `${snap.failed} · rate-limit: ${snap.rateStrikes}`),
     field('Pool', snap.poolTotal ? `${snap.poolFresh} fresh / ${snap.poolTotal} numbers` : 'load ho raha hai…'),
     (snap.scanning || snap.scanChecked)
-      ? field('🔎 Device scan', `pass ${snap.scanPass || 1}: ${snap.scanUniqueChecked || 0}/${snap.scanTotalDevices || 0} unique · probes ${snap.scanTotalProbes || snap.scanChecked || 0} · window ≤${fmtDuration(snap.scanWindowMs || 0)} · ${snap.scanBestActivityMs ? `best SMS ~${fmtDuration(Date.now() - snap.scanBestActivityMs)} purani · ` : ''}${snap.scanFresh || 0} fresh ready${snap.scanning ? ' · scanning…' : ''}`)
+      ? field('🔎 Device scan', `pass ${snap.scanPass || 1}: ${snap.scanUniqueChecked || 0}/${snap.scanTotalDevices || 0} unique · probes ${snap.scanTotalProbes || snap.scanChecked || 0} · window ≤${fmtDuration(snap.scanWindowMs || 0)} · ${snap.scanBestActivityMs ? `scan ke waqt best SMS ~${fmtDuration(snap.scanBestActivityAgeMs || Math.max(0, Date.now() - snap.scanBestActivityMs))} purani · ` : ''}${snap.scanFresh || 0} fresh ready${snap.scanning ? ' · scanning…' : ''}`)
       : '',
     snap.current
       ? `📍 <b>Abhi:</b> <code>${esc(snap.current.phone)}</code> (${fmtDuration(Date.now() - snap.current.startedAt)})`
@@ -172,7 +172,7 @@ function summaryCard(snap) {
     ``,
     field('Processed', String(snap.processed)),
     field('✅ Fresh', `${snap.fresh}  (naye: ${snap.freshNew} · delete+fresh: ${snap.freshAfterDelete})`),
-    field('⚠️ Skipped', `${snap.skipped} · deferred: ${snap.deferred} · 📴 stale devices: ${snap.staleSkips || 0}`),
+    field('⚠️ Skipped', `${snap.skipped} · deferred: ${snap.deferred} · 7-day cooldown: ${snap.cooldownSkips || 0} · 📴 stale devices: ${snap.staleSkips || 0}`),
     field('× Failed', `${snap.failed} · rate-limit: ${snap.rateStrikes}`),
     field('Pool', `${snap.poolFresh} fresh / ${snap.poolTotal} numbers`),
     snap.scanChecked ? field('🔎 Device scan', `pass ${snap.scanPass || 1}: ${snap.scanUniqueChecked || 0}/${snap.scanTotalDevices || 0} unique · total probes ${snap.scanTotalProbes || snap.scanChecked}`) : '',

@@ -120,6 +120,14 @@ Sab `data/db.json` me save hota hai — restart ke baad bhi yaad rehta hai.
 - Har fresh session ka JSON usi waqt chat me `.json` file ki surat me jata hai.
   Telegram/document send fail ho to bot 3 baar retry karta hai; phir bhi na jaye
   to poora JSON code-block hissoun me bhej deta hai.
+- **⏳ 7-day extracted-number cooldown:** jis number ka fresh session ek
+  baar extract/send ho jaye, woh number **7 din se pehle dobara process
+  nahi hota** — na hot-queue se, na purani retry-later entry se, na next
+  run me. Success timestamp `premiumFlow.used` ledger me rehta hai aur
+  cloud vault ke saath sync/hydrate hota hai, isliye Render restart/deploy
+  ke baad bhi ye rok barqarar rehti hai. Ledger kisi wajah se missing ho
+  to saved account/session ke `savedAt` se bhi wahi 7 din ginay jate hain.
+  7 din guzarne ke baad hi number dobara eligible hota hai.
 - Purane saved session ko dobara lena ho to owner command:
   `/session 9876543210` ya `/session acc_9876543210`.
 
@@ -136,9 +144,14 @@ Jo 403 challenge pehle poora batch maar deta tha, ab uska tod:
 3. **Engine-level** — challenge aane par batch **nahi rukta**: final proxy ko
    quarantine karke best next route, **3 proxy challenges ke baad Render ki
    direct IP**, aur 2 direct challenges ke baad best proxy dobara try hoti
-   hai. Card par rotations/route/token-ready count asal state dikhate hain.
-   Sirf **12 lagatar challenges** (bina ek bhi request guzare) par batch
-   rukta hai — ek request bhi paar ho gayi to ginti reset.
+   hai. Route ki ginti process shuru honay wali asal route episode se hoti
+   hai (bridge ke andar IP badalne par direct-fallback wali ginti gum nahi
+   hoti). Ek hi number par ek run me combined WAF/security/rate/transient
+   attempts max **2** hain, taaki storm me wohi number baar-baar time na
+   jalaye. Card par rotations/route/token-ready aur asal usable/cooling
+   proxy count dikhte hain. Sirf **12 lagatar challenges** (bina ek bhi
+   request guzare) par batch rukta hai — ek request bhi paar ho gayi to
+   ginti reset.
 4. **Solver route-locked + time-boxed** — har proxy ka solve alag route key
    par hota hai (ek IP ka token doosri IP par leak nahi), ek solve zyada se
    zyada ~25–35s leta hai, aur jis proxy par solve fail ho wo 10 min side
@@ -175,8 +188,8 @@ jitne chahein add karo (ek saath comma me bhi):
   aati hai; challenged/solve-failed routes peeche rehti hain.
 - **WAF/rate-limit/temporary 5xx hit = TURANT doosri proxy** — number
   failed count kiye baghair defer karke aage badhta hai, baad me **isi run
-  me** dobara try karta hai (per number max 2 temporary attempts). Lagatar
-  3 temporary errors par 60s ka short cool-off lagta hai.
+  me** ek aur mauqa milta hai (per number combined infra attempts max 2).
+  Lagatar 3 temporary errors par 60s ka short cool-off lagta hai.
 - **`aws-waf-token` IP-bound** hota hai → har proxy ka **apna token** +
   apna WAF/solve-failure state (proxy-pool.js me per-proxy). Challenge par
   usi route ka token burn ho jata hai; ek session ke beech silent IP-switch

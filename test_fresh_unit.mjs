@@ -726,9 +726,20 @@ console.log('🌐 free proxies auto-fetch (ProxyScrape parse/rank/probe/refresh)
   ok(parsed.length === 2, 'JSON: socks4 + dead exclude, 2 kaam ke bache');
   ok(parsed[0].country === 'IN' && parsed[0].hosting === false && parsed[0].avgTimeoutMs === 800, 'JSON: country/hosting/timeout fields mapped');
 
+  // GitHub shard / Proxifly array shapes bhi parse hon (multi-source v2)
+  const generic = pp._parseFreeProxyListJson([
+    { protocol: 'http', ip: '4.4.4.4', port: 8080, country_code: 'IN', uptime_percent: 88, latency_ms: 250, anonymity: 'elite', ssl: true },
+    { proxy: 'socks5://5.5.5.5:1080', geolocation: { country: 'IN' }, score: 2, https: true },
+  ]);
+  ok(generic.length === 2 && generic[0].country === 'IN' && generic[0].uptime === 88 && generic[0].avgTimeoutMs === 250 && generic[0].ssl === true,
+    'JSON arrays: GitHub/Proxifly metadata mapped');
+
   // Text parse
   const txt = pp._parseFreeProxyListText('socks5://1.1.1.1:1080\nGARBAGE LINE\nhttp://2.2.2.2:8080\nsocks4://3.3.3.3:1080\n');
   ok(txt.length === 2, 'text: garbage + socks4 exclude');
+  const bareSocks = pp._parseFreeProxyListText('7.7.7.7:1080\n', { defaultProtocol: 'socks5', country: 'IN' });
+  ok(bareSocks.length === 1 && bareSocks[0].url.startsWith('socks5://') && bareSocks[0].country === 'IN',
+    'text: bare ip:port par source protocol/country apply');
 
   // Ranking — IN pehle, phir non-hosting, phir uptime/timeout
   const ranked = pp._rankFreeCandidates([
@@ -741,6 +752,15 @@ console.log('🌐 free proxies auto-fetch (ProxyScrape parse/rank/probe/refresh)
   ok(ranked.length === 4 && ranked[0].url.includes('in-resi') && ranked[1].url.includes('in-host') && ranked[2].url.includes('de-resi'),
     'ranking: IN residential sab se pehle + dedupe');
 
+  // Ek hi IP ke kai ports probe queue ke top par ghus kar diversity na marein
+  const diversified = pp._rankFreeCandidates([
+    { url: 'http://same-host:1001', country: 'IN', uptime: 100, avgTimeoutMs: 100, ssl: true },
+    { url: 'http://same-host:1002', country: 'IN', uptime: 99, avgTimeoutMs: 100, ssl: true },
+    { url: 'http://other-host:1003', country: 'IN', uptime: 98, avgTimeoutMs: 100, ssl: true },
+  ]);
+  ok(diversified[1].url.includes('other-host'), 'ranking: per-IP diversity (same host ke ports peeche)');
+  ok(ranked[0].sourceCount === 2, 'ranking: duplicate sources corroboration count me merge');
+
   // Probe — early stop + tez pehle sorted
   {
     const cands = Array.from({ length: 30 }, (_, i) => ({ url: `http://bad${i}:80`, country: '', hosting: false, uptime: 0, avgTimeoutMs: 1 }));
@@ -751,6 +771,70 @@ console.log('🌐 free proxies auto-fetch (ProxyScrape parse/rank/probe/refresh)
     const r = await pp.probeFreeCandidates(cands, { want: 2, concurrency: 4, check });
     ok(r.good.length === 2 && r.good[0].url.includes('good-fast'), 'probe: 2 zinda mile, tez wala pehle');
     ok(r.checked < 30, 'probe: want milte hi ruk gaya (poori list nahi parkhi)');
+  }
+
+  // Challenged-but-reachable fallback — clean pehle, WAF-ready baad me.
+  // (Yahi purani "0 proxies" ki ek wajah thi: challenged = dead phenk dete the.)
+  {
+    const cands = [
+      { url: 'http://challenged-fast:80', country: 'IN', hosting: false, uptime: 90, avgTimeoutMs: 100 },
+      { url: 'http://clean-slow:80', country: 'IN', hosting: false, uptime: 80, avgTimeoutMs: 100 },
+      { url: 'http://dead-one:80', country: 'IN', hosting: false, uptime: 10, avgTimeoutMs: 100 },
+    ];
+    const tierCheck = async (c) => c.url.includes('clean')
+      ? { ok: true, quality: 'clean', latencyMs: 500, status: 200 }
+      : c.url.includes('challenged')
+        ? { ok: true, quality: 'challenged', challenged: true, latencyMs: 50, status: 403 }
+        : { ok: false, quality: 'dead', latencyMs: 10, reason: 'ECONNREFUSED' };
+    const r = await pp.probeFreeCandidates(cands, { want: 2, concurrency: 2, check: tierCheck });
+    ok(r.good.length === 2 && r.good[0].quality === 'clean' && r.good[1].quality === 'challenged',
+      'probe tiers: clean pehle, WAF-challenged fallback baad me');
+    ok(r.cleanCount === 1 && r.challengedCount === 1 && r.stats.dead === 1 && r.stats.reasons[0]?.reason === 'ECONNREFUSED',
+      'probe diagnostics: clean/challenged/dead + top reason');
+  }
+
+  // REGRESSION: npm undici agent global fetch ke saath incompatible tha
+  // ("invalid onRequestStart method") — har check network se pehle fail.
+  // Band local port par ab asli ECONNREFUSED aana chahiye, compat error nahi.
+  {
+    const r = await pp.checkProxyOnce('http://127.0.0.1:9', { timeoutMs: 1500 });
+    ok(r.ok === false && r.quality === 'dead' && !/onRequestStart|UND_ERR_INVALID_ARG/i.test(r.reason || ''),
+      'undici regression: dispatcher apne hi fetch se chalta hai (no onRequestStart)');
+  }
+
+  // Local loopback par asal HTTP proxy se end-to-end — sirf compat error
+  // gayab hona kaafi nahi, request proxy hokar origin tak jaani chahiye.
+  {
+    const http = await import('node:http');
+    const origin = http.createServer((req, res) => {
+      if (req.url === '/generic') { res.writeHead(204); res.end(); return; }
+      res.writeHead(200, { 'content-type': 'text/plain' }); res.end('ok');
+    });
+    const proxy = http.createServer((req, res) => {
+      const upstream = http.request(req.url, { method: req.method, headers: req.headers }, (up) => {
+        res.writeHead(up.statusCode || 502, up.headers);
+        up.pipe(res);
+      });
+      upstream.on('error', () => { if (!res.headersSent) res.writeHead(502); res.end(); });
+      req.pipe(upstream);
+    });
+    await new Promise((resolve) => origin.listen(0, '127.0.0.1', resolve));
+    await new Promise((resolve) => proxy.listen(0, '127.0.0.1', resolve));
+    try {
+      const originBase = `http://127.0.0.1:${origin.address().port}`;
+      const r = await pp.checkProxyOnce(`http://127.0.0.1:${proxy.address().port}`, {
+        timeoutMs: 2500,
+        genericTarget: `${originBase}/generic`,
+        target: `${originBase}/swiggy`,
+      });
+      ok(r.ok === true && r.quality === 'clean' && r.genericStatus === 204 && r.status === 200,
+        'undici regression: local HTTP proxy se asal request origin tak gayi');
+    } finally {
+      await Promise.allSettled([
+        new Promise((resolve) => proxy.close(resolve)),
+        new Promise((resolve) => origin.close(resolve)),
+      ]);
+    }
   }
 
   // Refresh glue — injected list + check; pool me auto entries; dobara me zinda ki id barkarar
@@ -767,6 +851,22 @@ console.log('🌐 free proxies auto-fetch (ProxyScrape parse/rank/probe/refresh)
   const autos2 = pp.listProxies().filter((p) => p.auto);
   ok(r2.added === 1 && autos2.length === 1 && autos2[0].id === keepId,
     'dusra refresh: mari hui auto nikal gayi, zinda ki ID wahi rahi (token continuity)');
+
+  // Multi-source v2: baki sources fail hon tab bhi ek zinda source kaafi;
+  // sirf WAF-challenged reachable mile to bhi pool 0 nahi rehta.
+  const oneSourceFetch = async (url) => {
+    if (!String(url).includes('api.proxyscrape.com')) throw new Error('source down');
+    return { ok: true, text: async () => JSON.stringify(sample) };
+  };
+  const challengedCheck = async (c) => c.url.includes('1.2.3.4')
+    ? { ok: true, quality: 'challenged', challenged: true, latencyMs: 140, status: 403 }
+    : { ok: false, quality: 'dead', latencyMs: 10, reason: 'timeout' };
+  const r3 = await pp.refreshFreeProxies({ want: 2, fetchImpl: oneSourceFetch, check: challengedCheck });
+  const autos3 = pp.listProxies().filter((p) => p.auto);
+  ok(r3.added === 1 && autos3.length === 1 && autos3[0].id === keepId && autos3[0].quality === 'challenged',
+    'refresh v2: ek source + sirf WAF-ready proxy par bhi pool me entry');
+  ok(r3.sourcesOk >= 1 && r3.sourcesTotal >= 10 && r3.candidates >= 2 && r3.stats?.challenged === 1,
+    'refresh v2: source/candidate/tier diagnostics wapas');
 
   // Kill switch — env 0 par auto band
   process.env.PREMIUM_AUTO_FREE_PROXIES = '0';

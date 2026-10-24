@@ -243,11 +243,11 @@ function proxiesCard() {
   return {
     text: section('🔀 Proxy Pool — IP Rotation', [
       `Status: <b>${ps.enabled ? `ON (${ps.enabledCount}/${ps.total})` : 'OFF'}</b> — ${esc(ps.rotation)}`,
-      `🌐 Free auto-fetch: <b>${ps.autoFree ? 'ON' : 'OFF'}</b>${ps.autoCount ? ` · ${ps.autoCount} auto proxies pool me` : ''}`,
+      `🌐 Free auto-fetch: <b>${ps.autoFree ? 'ON' : 'OFF'}</b>${ps.autoCount ? ` · ${ps.autoCount} auto (${ps.autoClean || 0} clean${ps.autoChallenged ? ` · ${ps.autoChallenged} 🛡 WAF-ready` : ''})` : ''}`,
       ``,
       list.length
         ? list.map((p) =>
-            `${p.enabled ? (p.cooldownLeftMs > 0 ? `🟡 (${Math.ceil(p.cooldownLeftMs / 1000)}s)` : '▫️') : '🚫'} <b>${esc(p.label)}</b>${p.tokenReady ? ' 🔑' : ''} · hits: ${p.hits || 0}`
+            `${p.enabled ? (p.cooldownLeftMs > 0 ? `🟡 (${Math.ceil(p.cooldownLeftMs / 1000)}s)` : '▫️') : '🚫'} <b>${esc(p.label)}</b>${p.quality === 'challenged' ? ' 🛡' : ''}${p.tokenReady ? ' 🔑' : ''} · hits: ${p.hits || 0}`
           ).join('\n')
         : sub('Koi proxy nahi — abhi sab kuch EK IP se ja raha hai (rukne ka khatra).'),
       ``,
@@ -264,7 +264,7 @@ function proxyDetailCard(pxId) {
     text: section(`🔀 ${esc(p.label)}`, [
       `URL: <code>${esc(p.url.replace(/\/\/[^@]*@/, '//***:***@'))}</code>`,
       `Status: ${p.enabled ? '▫️ enabled' : '🚫 disabled'}${p.cooldownLeftMs > 0 ? ` · 🟡 WAF cooldown ${Math.ceil(p.cooldownLeftMs / 1000)}s` : ''}`,
-      p.auto ? `🌐 Free auto proxy${p.country ? ` · ${esc(p.country)}` : ''}${p.latencyMs ? ` · ⚡ ${p.latencyMs}ms (last check)` : ''} — marne par khud replace ho jayegi` : '',
+      p.auto ? `🌐 Free auto proxy${p.country ? ` · ${esc(p.country)}` : ''}${p.latencyMs ? ` · ⚡ ${p.latencyMs}ms (last check)` : ''}${p.quality === 'challenged' ? ' · 🛡 Swiggy WAF challenge deta hai — browser token solve karke chalegi' : ' · ✅ clean'} — marne par khud replace ho jayegi` : '',
       `WAF token: ${p.tokenReady ? '🔑 ready (per-proxy)' : '— (demand par banega)'}`,
       `Hits: ${p.hits || 0} · errors: ${p.consecutiveErrors || 0}`,
       ``,
@@ -756,32 +756,60 @@ bot.action('ap_px_rot', async (ctx) => {
   await editOrSend(ctx, text, rows);
 });
 
-// 🌐 Free Proxies Lao — public list se la kar Swiggy par test, sirf zinda pool me
+// 🌐 Free Proxies Lao — kai public lists se la kar pehle generic HTTPS,
+// phir seedha Swiggy par test. Clean pehle; WAF-challenged lekin reachable
+// proxies bhi fallback tier me pool me rehti hain (token solve se chalti hain).
 bot.action('ap_px_free', async (ctx) => {
   if (!(await gate(ctx))) return;
   await ctx.answerCbQuery('🌐 Free proxies dhoondh raha hoon…').catch(() => {});
+  const backRows = [[{ text: '↩️ Proxies', callback_data: 'ap_proxies', style: 'primary' }]];
   await editOrSend(ctx, section('🌐 Free Proxies La Raha Hoon', [
-    '› Public free proxy list (ProxyScrape) se candidates la kar',
-    '› har ek ko <b>seedha Swiggy par test</b> kar raha hoon…',
+    '› Kai public free lists se candidates la raha hoon…',
+    '› Har ek ko pehle HTTPS, phir <b>seedha Swiggy par test</b> kar raha hoon…',
     '',
-    sub('30–60 second lag sakte hain — zinda + tez wali hi pool me jayengi.'),
-  ].join('\n')), [[{ text: '↩️ Proxies', callback_data: 'ap_proxies', style: 'primary' }]]);
+    sub('Zinda proxies kam milen to 1–2 minute lag sakte hain. Progress yahi card par dikhega.'),
+  ].join('\n')), backRows);
+  let finished = false;
+  let lastProgressAt = 0;
+  let progressPromise = Promise.resolve();
   try {
-    const r = await proxyPool.refreshFreeProxies({ want: 8 });
+    const r = await proxyPool.refreshFreeProxies({
+      want: 10,
+      onProgress: ({ checked = 0, clean = 0, challenged = 0, total = 0 } = {}) => {
+        const now = Date.now();
+        if (finished || now - lastProgressAt < 10_000) return;
+        lastProgressAt = now;
+        progressPromise = editOrSend(ctx, section('🌐 Free Proxies Test Ho Rahi Hain', [
+          `🧪 Parkhin: <b>${checked}${total ? `/${total}` : ''}</b>`,
+          `✅ Clean mili: <b>${clean}</b>`,
+          `🛡 Swiggy-reachable (WAF challenge): <b>${challenged}</b>`,
+          '',
+          sub('Clean 10 milte hi ruk jaunga; warna deadline tak best fallback bhi jama karunga.'),
+        ].join('\n')), backRows).catch(() => {});
+      },
+    });
+    finished = true;
+    await progressPromise.catch(() => {});
     const ps = proxyPool.proxySummary();
+    const reasons = (r?.stats?.reasons || []).slice(0, 3)
+      .map((x) => `${x.reason}×${x.count}`).join(', ');
     await editOrSend(ctx, section('🌐 Free Proxies — Result', [
       r?.added
-        ? `✅ <b>${r.added} zinda proxies</b> pool me daal di (${r.checked} parkhin).`
-        : `⚠️ Is baar ${r?.checked || 0} parkhin lekin koi Swiggy par zinda nahi mili. Thodi der baad phir dabana — free proxies aati-jaati rehti hain.`,
+        ? `✅ <b>${r.added} proxies</b> pool me daal di — ${r.keptClean || 0} clean + ${r.keptChallenged || 0} 🛡 WAF-ready.`
+        : `⚠️ Is baar koi bhi proxy Swiggy tak nahi pohanchi. Thodi der baad phir dabana — free proxies aati-jaati rehti hain.`,
+      `📥 Sources: <b>${r?.sourcesOk || 0}/${r?.sourcesTotal || 0}</b> · candidates: <b>${r?.candidates || 0}</b> · parkhin: <b>${r?.checked || 0}</b>`,
       `🔀 Pool ab: <b>${ps.enabledCount}/${ps.total} ON</b> (${ps.autoCount} auto) — ${esc(ps.rotation)}`,
+      reasons ? sub(`Dead ki top wajuhat: ${esc(reasons)}`) : '',
       '',
-      sub('Batch me ek IP garam hote hi bot turant doosri IP le lega (zero wait). Mari hui auto proxies agle refresh par khud nikal jayengi.'),
-    ].join('\n')), [[{ text: '↩️ Proxies', callback_data: 'ap_proxies', style: 'primary' }]]);
+      sub('Clean proxies pehle use hongi; 🛡 wali par browser WAF token solve hoga. Mari hui auto proxies agle refresh par khud nikal jayengi.'),
+    ].filter(Boolean).join('\n')), backRows);
   } catch (e) {
+    finished = true;
+    await progressPromise.catch(() => {});
     await editOrSend(ctx, section('🌐 Free Proxies — Fail', [
       `❌ <code>${esc(String(e?.message || e).slice(0, 200))}</code>`,
-      sub('List source down ho sakta hai — thodi der baad phir try karo, ya apni proxy ➕ se add kar do.'),
-    ].join('\n')), [[{ text: '↩️ Proxies', callback_data: 'ap_proxies', style: 'primary' }]]);
+      sub('Kuch list sources down ho sakte hain — thodi der baad phir try karo, ya apni proxy ➕ se add kar do.'),
+    ].join('\n')), backRows);
   }
 });
 

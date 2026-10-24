@@ -433,11 +433,11 @@ export async function startAutopilot(opts = {}) {
     // behavior, koi rukawat nahi.
     const freePromise = (async () => {
       try {
-        const r = await proxyPool.ensureFreeProxies({ min: 1, want: 8 });
+        const r = await proxyPool.ensureFreeProxies({ min: 3, want: 10 });
         if (r && !r.skipped) {
           console.log(r.added
-            ? `[Autopilot] 🌐 Free proxies: ${r.checked} parkhin, ${r.added} zinda mili — IP rotation ON.`
-            : `[Autopilot] 🌐 Free proxies: ${r.checked} parkhin, koi zinda nahi mili — direct mode chalega.`);
+            ? `[Autopilot] 🌐 Free proxies: ${r.candidates || 0} candidates me se ${r.checked} parkhin, ${r.added} rakhin (clean ${r.clean || 0}, WAF-ready ${r.challenged || 0}) — IP rotation ON.`
+            : `[Autopilot] 🌐 Free proxies: ${r.candidates || 0} candidates me se ${r.checked} parkhin, koi Swiggy-reachable nahi mili — direct mode chalega.`);
         }
         return r;
       } catch { return null; }
@@ -788,8 +788,8 @@ export async function startAutopilot(opts = {}) {
         if (!rotated) {
           // Koi proxy free nahi bachi (free wali jaldi marti hain) — background
           // me nayi free proxies le aao, batch ko roke baghair.
-          void proxyPool.refreshFreeProxies({ want: 8 }).then((r) => {
-            if (r?.added) { ps = proxyPool.proxySummary(); console.log(`[Autopilot] 🌐 ${r.added} nayi free proxies aa gayin.`); }
+          void proxyPool.refreshFreeProxies({ want: 10 }).then((r) => {
+            if (r?.added) { ps = proxyPool.proxySummary(); console.log(`[Autopilot] 🌐 ${r.added} free proxies aa gayin (clean ${r.keptClean || 0}, WAF-ready ${r.keptChallenged || 0}).`); }
           }).catch(() => {});
         }
         state.consecutiveFails = 0;

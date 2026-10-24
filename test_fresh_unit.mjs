@@ -716,15 +716,46 @@ console.log('parallel device scan (hot-queue) + pipeline precheck:');
     ok(r.widestWindowMs > 60_000 && r.checked === 120, 'widestWindowMs asal age tak badha + maxProbe respect');
   }
 
-  // Engine strict mode — maxWidenMs = windowMs ho to 30s purani activity
-  // ko 10s rule ke khilaf "best available" bana kar OTP nahi diya jayega.
+  // Generic cap mode — maxWidenMs = windowMs ho to purani activity fresh
+  // nahi banti. (Engine ab is mode ki jagah neeche wala doubling ladder
+  // use karta hai.)
   {
     const probe = async (id) => (id === 'D2' ? now - 30_000 : null);
     const r = await fbn.scanFreshDevices(mkEntries(20), {
       windowMs: 10_000, maxWidenMs: 10_000, want: 1, chunkSize: 20, probe,
     });
     ok(r.fresh.length === 0 && r.widened === false && r.widestWindowMs === 10_000,
-      'strict last-seen: maxWiden=window par 10s se purani activity fresh nahi banti');
+      'cap mode: maxWiden=window par 10s se purani activity fresh nahi banti');
+  }
+
+  // Doubling ladder — base 10s me koi na mile to ISI pass ke cached
+  // timestamps par 20s → 40s → 80s → 160s ... Firebase ko har ladder step
+  // par dobara scan nahi karna chahiye.
+  {
+    ok(fbn.doubledWidenWindowMs(10_000, 10_000) === 10_000 &&
+      fbn.doubledWidenWindowMs(10_000, 10_001) === 20_000 &&
+      fbn.doubledWidenWindowMs(10_000, 40_001) === 80_000 &&
+      fbn.doubledWidenWindowMs(10_000, 120_000) === 160_000,
+    'doubling helper: 10s → 20s → 40s → 80s → 160s');
+
+    const calls = [];
+    const probe = async (id) => {
+      calls.push(id);
+      return id === 'D2' ? now - 97_000 : id === 'D5' ? now - 300_000 : null;
+    };
+    const r = await fbn.scanFreshDevices(mkEntries(20), {
+      windowMs: 10_000,
+      maxWidenMs: Number.POSITIVE_INFINITY,
+      widenByDoubling: true,
+      want: 1,
+      chunkSize: 20,
+      maxProbe: 20,
+      probe,
+    });
+    ok(r.fresh.length === 1 && r.fresh[0].entry.deviceId === 'D2' && r.fresh[0].windowMs === 160_000,
+      'doubling ladder: 97s purani sabse taazi activity ≤160s window me mili');
+    ok(r.widened === true && r.widestWindowMs === 160_000 && r.checked === 20 && calls.length === 20,
+      'doubling ladder: ek hi pass ke cached probes reuse (koi rescan nahi)');
   }
 
   // scanFreshDevices — bilkul khali activity → fresh [] + exhausted

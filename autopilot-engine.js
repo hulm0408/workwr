@@ -74,7 +74,12 @@ const state = {
   poolTotal: 0,
   poolFresh: 0,
   scanning: false,        // abhi devices ki parallel last-seen scan chal rahi hai
-  scanChecked: 0,         // is run me kitne devices probe hue
+  scanChecked: 0,         // backward-compat: is run ke TOTAL probes (unique devices nahi)
+  scanTotalProbes: 0,     // repeated passes sameet saare Firebase probes
+  scanUniqueChecked: 0,   // current pass me check hue unique devices
+  scanTotalDevices: 0,    // current pass ke total unique candidate devices
+  scanPass: 1,            // full-pool scan ka pass number
+  scanWindowMs: 0,        // current/selected last-seen ladder window
   scanFresh: 0,           // hot-queue me ready (fresh) devices
 };
 
@@ -112,6 +117,11 @@ export function getAutopilotSnapshot() {
     poolFresh: state.poolFresh,
     scanning: Boolean(state.scanning),
     scanChecked: state.scanChecked || 0,
+    scanTotalProbes: state.scanTotalProbes || state.scanChecked || 0,
+    scanUniqueChecked: state.scanUniqueChecked || 0,
+    scanTotalDevices: state.scanTotalDevices || 0,
+    scanPass: state.scanPass || 1,
+    scanWindowMs: state.scanWindowMs || 0,
     scanFresh: state.scanFresh || 0,
     lastError: state.lastError,
     history: state.history.slice(-40),
@@ -222,7 +232,7 @@ function statsLines() {
       ? `${state.poolFresh} fresh / ${state.poolTotal} numbers`
       : 'load ho raha hai…'),
     (state.scanning || state.scanChecked)
-      ? field('🔎 Device scan', `${state.scanChecked || 0} check · ${state.scanFresh || 0} fresh ready${state.scanning ? ' · scanning…' : ''}`)
+      ? field('🔎 Device scan', `pass ${state.scanPass || 1}: ${state.scanUniqueChecked || 0}/${state.scanTotalDevices || 0} unique check · total probes ${state.scanTotalProbes || state.scanChecked || 0} · window ≤${fmtDuration(state.scanWindowMs || 0)} · ${state.scanFresh || 0} fresh ready${state.scanning ? ' · scanning…' : ''}`)
       : '',
     state.current
       ? `📍 <b>Abhi:</b> <code>${esc(state.current.phone)}</code> (${fmtDuration(Date.now() - state.current.startedAt)})`
@@ -373,7 +383,9 @@ export async function startAutopilot(opts = {}) {
     routeMode: 'direct', proxyChallenges: 0, directChallenges: 0,
     current: null, history: [], freshAccounts: [], lastError: '',
     poolTotal: 0, poolFresh: 0,
-    scanning: false, scanChecked: 0, scanFresh: 0,
+    scanning: false, scanChecked: 0, scanTotalProbes: 0,
+    scanUniqueChecked: 0, scanTotalDevices: 0, scanPass: 1,
+    scanWindowMs: Number(otpCfg.activeWindowMs) || 0, scanFresh: 0,
   });
 
   const userId = opts.userId || 'autopilot';
@@ -651,31 +663,49 @@ export async function startAutopilot(opts = {}) {
     };
     const refillHotQueue = async () => {
       if (!gateOn) return { fresh: [] };
-      const candidates = pickFreshList().filter((e) => e.deviceId && !probedDevices.has(e.deviceId));
+      const allCandidates = pickFreshList().filter((e) => e.deviceId);
+      const passDeviceIds = new Set(allCandidates.map((e) => e.deviceId));
+      const candidates = allCandidates.filter((e) => !probedDevices.has(e.deviceId));
+      const baseUniqueChecked = [...probedDevices].filter((id) => passDeviceIds.has(id)).length;
+      const baseTotalProbes = state.scanTotalProbes || state.scanChecked || 0;
       state.scanning = true;
-      const baseChecked = state.scanChecked || 0;
+      state.scanTotalDevices = passDeviceIds.size;
+      state.scanUniqueChecked = baseUniqueChecked;
+      state.scanWindowMs = Number(otpCfg.activeWindowMs) || 0;
       let lastPushAt = 0;
       try {
         const r = await scanFreshDevices(candidates, {
           windowMs: otpCfg.activeWindowMs,
-          // User ka sakht rule: sirf configured last-seen window ke andar
-          // wala device. Scanner ki 15-min "best available" widening engine
-          // me band hai — 10s setting par 11s+ purani activity OTP nahi legi.
-          maxWidenMs: otpCfg.activeWindowMs,
+          // User ki nayi ladder policy: base window (mis. 10s) me pool ke
+          // is pass me koi na mile to Firebase ko dobara scan NAHI karna.
+          // Scanner isi pass ke cached activity timestamps se window ko
+          // 20s → 40s → 80s → 160s... double karke sabse taaza device dega,
+          // jab tak woh kisi ladder window ke andar na aa jaye.
+          maxWidenMs: Number.POSITIVE_INFINITY,
+          widenByDoubling: true,
           // 10s jaise chhote window me 3 fresh jama karne ka wait pehle
           // wale ko hi stale bana deta tha. Isliye pehla zinda device milte
           // hi turant process karo; bade window par 3 ka chhota buffer rakho.
           want: Number(otpCfg.activeWindowMs) <= 15_000 ? 1 : 3,
-          chunkSize: 40, maxProbe: 800, concurrency: 24,
+          // Is pass ke saare unprobed candidates cover karo — warna pehle
+          // 800 ke cached results par hi ladder lagana adhura hoga.
+          chunkSize: 40, maxProbe: Math.max(800, candidates.length), concurrency: 24,
+          shouldAbort: () => state.stopRequested,
           onProgress: ({ checked, freshCount }) => {
-            state.scanChecked = baseChecked + checked;
+            state.scanUniqueChecked = Math.min(
+              passDeviceIds.size,
+              baseUniqueChecked + checked
+            );
+            state.scanTotalProbes = baseTotalProbes + checked;
+            state.scanChecked = state.scanTotalProbes;
             state.scanFresh = hotQueue.length + freshCount;
             const now = Date.now();
             if (now - lastPushAt >= 4000) {
               lastPushAt = now;
               void push(progressCard(section('🔎 Zinda Devices Dhoondh Raha Hoon', [
-                `› ${state.scanChecked} devices check hue — <b>${freshCount}</b> fresh mile (last-seen ≤${Math.round(otpCfg.activeWindowMs / 1000)}s).`,
-                sub('Mare hue devices par OTP nahi jata — pehle scan, phir sirf zinda device par OTP.'),
+                `› Pass ${state.scanPass || 1}: <b>${state.scanUniqueChecked}/${state.scanTotalDevices}</b> unique devices check hue — <b>${freshCount}</b> fresh mile (base window ≤${fmtDuration(otpCfg.activeWindowMs)}).`,
+                `› Total probes: ${state.scanTotalProbes} (repeated passes sameet — ye unique devices ki ginti nahi hai).`,
+                sub(`Base window me na mile to isi pass par window double hogi: ${fmtDuration(otpCfg.activeWindowMs)} → ${fmtDuration(Number(otpCfg.activeWindowMs) * 2)} → ${fmtDuration(Number(otpCfg.activeWindowMs) * 4)} → …, Firebase dobara scan kiye baghair.`),
               ].join('\n'))), stopRows());
             }
           },
@@ -683,12 +713,21 @@ export async function startAutopilot(opts = {}) {
         for (const id of r.probedDeviceIds || []) probedDevices.add(id);
         const at = Date.now();
         for (const f of r.fresh) {
-          hotQueue.push({ entry: f.entry, lastActivityMs: f.lastActivityMs, windowMs: r.widestWindowMs, checkedAt: at });
+          hotQueue.push({
+            entry: f.entry,
+            lastActivityMs: f.lastActivityMs,
+            windowMs: Number(f.windowMs) || Number(r.widestWindowMs) || Number(otpCfg.activeWindowMs),
+            checkedAt: at,
+          });
         }
-        state.scanChecked = baseChecked + (r.checked || 0);
+        state.scanTotalProbes = baseTotalProbes + (r.checked || 0);
+        state.scanChecked = state.scanTotalProbes;
+        state.scanUniqueChecked = [...probedDevices].filter((id) => passDeviceIds.has(id)).length;
+        state.scanWindowMs = Number(r.fresh?.[0]?.windowMs) || Number(r.widestWindowMs) || Number(otpCfg.activeWindowMs) || 0;
         state.scanFresh = hotQueue.length;
         if (r.widened && r.fresh.length) {
-          console.log(`[Autopilot] Scan: window me fresh nahi mila — sabse taaze devices liye (~${Math.round(r.widestWindowMs / 1000)}s purani activity).`);
+          const ageMs = Math.max(0, at - (Number(r.fresh[0].lastActivityMs) || at));
+          console.log(`[Autopilot] Scan: base window ≤${fmtDuration(otpCfg.activeWindowMs)} me koi nahi — isi cached pass se sabse taaza device liya (activity ~${fmtDuration(ageMs)} purani, ladder ≤${fmtDuration(state.scanWindowMs)}).`);
         }
         return r;
       } finally {
@@ -716,17 +755,16 @@ export async function startAutopilot(opts = {}) {
       let picked = takeFromHotQueue();
 
       if (!picked && gateOn) {
-        // Ek refill zyada se zyada 800 naye devices parkhta hai. Pehle woh
-        // segment khali nikle to bot 15s wait karke probed list clear kar
-        // deta tha — baqi ~2100 devices usi pass me scan hi nahi hote the.
-        // Ab bina wait ke agla segment, jab tak fresh na mile ya is pass ke
-        // saare candidates cover na ho jayein.
+        // Refill is pass ke saare unprobed candidates cover kar sakta hai.
+        // Agar mile hue entries ledger/caps ki wajah se skip ho jayein to
+        // bina wait kiye baqi unprobed candidates bhi cover karo — probed
+        // list sirf poora pass khatam hone ke baad hi clear hoti hai.
         while (!picked) {
           const scan = await refillHotQueue();
           picked = takeFromHotQueue();
           if (picked || state.stopRequested || scan?.exhausted || !(Number(scan?.checked) > 0)) break;
         }
-        if (!picked && state.stopRequested) { endReason = state.stopReason || 'manual'; break; }
+        if (state.stopRequested) { endReason = state.stopReason || 'manual'; break; }
         if (!picked) {
           if (retryLater.length) {
             picked = { entry: retryLater.shift().entry };
@@ -739,14 +777,17 @@ export async function startAutopilot(opts = {}) {
             if (state.poolFresh > 0 && freshWaitRounds < 40) {
               freshWaitRounds++;
               await push(progressCard(section('🕐 Fresh Device Ka Wait', [
-                `› Is waqt koi device taazi activity (last-seen) nahi dikha raha — ${state.scanChecked || 0} devices check kiye.`,
-                `› 15s ruk kar dobara scan karunga (round ${freshWaitRounds}/40).`,
-                sub('Andhere me mare hue devices par OTP waste nahi hoga.'),
+                `› Pass ${state.scanPass || 1} ke <b>${state.scanUniqueChecked || 0}/${state.scanTotalDevices || 0}</b> unique devices me koi usable last-activity timestamp hi nahi mila.`,
+                `› Total probes: ${state.scanTotalProbes || state.scanChecked || 0} (repeated passes sameet). 15s ruk kar naya pass karunga (round ${freshWaitRounds}/40).`,
+                sub('Timestamp wala device hota to isi pass par window double karke use le liya jata — dobara scan sirf nayi activity ke intezaar ke liye hai.'),
               ].join('\n'))), stopRows());
               await sleep(15_000, () => state.stopRequested);
               if (state.stopRequested) { endReason = state.stopReason || 'manual'; break; }
               probedDevices.clear();
               staleThisRun.clear();
+              state.scanPass = (state.scanPass || 1) + 1;
+              state.scanUniqueChecked = 0;
+              state.scanWindowMs = Number(otpCfg.activeWindowMs) || 0;
               continue;
             }
             endReason = 'pool-exhausted';
@@ -780,15 +821,17 @@ export async function startAutopilot(opts = {}) {
       await ensureWarm();
 
       // Scan se aaye number ka prechecked last-seen pipeline ko dedo — wahi
-      // device dobara fetch nahi hoga. Gate window kabhi scan result se
-      // widen NAHI hogi; configured sakht window hi final hai. Precheck
-      // purana ho jaye to pipeline live activity dobara fetch karegi.
+      // device dobara fetch nahi hoga. Agar ye device base window miss ke
+      // baad doubling ladder se mila hai to pipeline ko USI ladder window
+      // ke hisaab se judge karo, warna scanner ka chuna hua device gate par
+      // foran stale ho jayega. Precheck us window se bhi purana ho jaye to
+      // pipeline live activity dobara fetch karegi.
       const numCfg = picked.lastActivityMs
         ? {
             ...otpCfg,
             precheckedLastActivityMs: picked.lastActivityMs,
             precheckedAt: picked.checkedAt || Date.now(),
-            activeWindowMs: Number(otpCfg.activeWindowMs) || 0,
+            activeWindowMs: Math.max(Number(otpCfg.activeWindowMs) || 0, Number(picked.windowMs) || 0),
           }
         : otpCfg;
 

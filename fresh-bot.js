@@ -153,7 +153,7 @@ function runningCard(snap, stageText = '') {
     field('× Failed', `${snap.failed} · rate-limit: ${snap.rateStrikes}`),
     field('Pool', snap.poolTotal ? `${snap.poolFresh} fresh / ${snap.poolTotal} numbers` : 'load ho raha hai…'),
     (snap.scanning || snap.scanChecked)
-      ? field('🔎 Device scan', `${snap.scanChecked || 0} check · ${snap.scanFresh || 0} fresh ready${snap.scanning ? ' · scanning…' : ''}`)
+      ? field('🔎 Device scan', `pass ${snap.scanPass || 1}: ${snap.scanUniqueChecked || 0}/${snap.scanTotalDevices || 0} unique · probes ${snap.scanTotalProbes || snap.scanChecked || 0} · window ≤${fmtDuration(snap.scanWindowMs || 0)} · ${snap.scanFresh || 0} fresh ready${snap.scanning ? ' · scanning…' : ''}`)
       : '',
     snap.current
       ? `📍 <b>Abhi:</b> <code>${esc(snap.current.phone)}</code> (${fmtDuration(Date.now() - snap.current.startedAt)})`
@@ -175,7 +175,7 @@ function summaryCard(snap) {
     field('⚠️ Skipped', `${snap.skipped} · deferred: ${snap.deferred} · 📴 stale devices: ${snap.staleSkips || 0}`),
     field('× Failed', `${snap.failed} · rate-limit: ${snap.rateStrikes}`),
     field('Pool', `${snap.poolFresh} fresh / ${snap.poolTotal} numbers`),
-    snap.scanChecked ? field('🔎 Devices check kiye', String(snap.scanChecked)) : '',
+    snap.scanChecked ? field('🔎 Device scan', `pass ${snap.scanPass || 1}: ${snap.scanUniqueChecked || 0}/${snap.scanTotalDevices || 0} unique · total probes ${snap.scanTotalProbes || snap.scanChecked}`) : '',
     snap.lastError ? field('Last error', snap.lastError) : '',
     freshList ? `` : '',
     freshList ? `▤ <b>Latest fresh sessions:</b>` : '',

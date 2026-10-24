@@ -103,11 +103,13 @@ Sab `data/db.json` me save hota hai — restart ke baad bhi yaad rehta hai.
 
 ## 📟 Fresh device + JSON delivery
 
-- OTP sirf us device ko jata hai jiski latest Firebase activity configured
-  last-seen window ke andar ho. Agar `PREMIUM_DEVICE_ACTIVE_WINDOW_MS=10000`
-  rakha hai to rule bilkul sakht hai: 10s se purani activity par OTP nahi.
-  Scan pool ko 800-device segments me bina beech-wait ke poora cover karta
-  hai, aur chhote window me pehla zinda device milte hi process shuru ho jata hai.
+- Scanner pehle configured base last-seen window (mis. 10s) me device
+  dhoondhta hai. Ek full pass me woh na mile to Firebase ko dobara scan kiye
+  baghair, **usi pass ke cached timestamps** par window double hoti rehti hai:
+  10s → 20s → 40s → 80s → 160s → …, jab tak sabse taaza device andar na aa
+  jaye. Card par current pass ke **unique devices** aur repeated passes sameet
+  **total probes** alag-alag dikhte hain. Sirf tab naya pass hota hai jab kisi
+  device ka usable activity timestamp hi na mile.
 - Har fresh session ka JSON usi waqt chat me `.json` file ki surat me jata hai.
   Telegram/document send fail ho to bot 3 baar retry karta hai; phir bhi na jaye
   to poora JSON code-block hissoun me bhej deta hai.

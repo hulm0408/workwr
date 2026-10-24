@@ -523,12 +523,23 @@ export async function fetchDevicesLastActivityMs(deviceIds = [], { concurrency =
   return out;
 }
 
+// Last-seen fallback ladder: base window ko tab tak double karo jab tak
+// device ki asal activity age uske andar na aa jaye. 10s base par sequence
+// 10s → 20s → 40s → 80s → 160s → ... (koi arbitrary rukawat nahi).
+export function doubledWidenWindowMs(baseWindowMs, activityAgeMs) {
+  let windowMs = Math.max(1, Number(baseWindowMs) || 1);
+  const ageMs = Math.max(0, Number(activityAgeMs) || 0);
+  while (windowMs < ageMs) windowMs *= 2;
+  return windowMs;
+}
+
 // Hot-queue scanner: pool entries me se wo numbers dhoondho jinke device ki
 // last activity `windowMs` ke andar hai — chunks me parallel probe, `want`
 // milte hi ruk jata hai (poora pool scan zaruri nahi). Window me kuch na mile
-// to probed devices me se SABSE TAAZE (maxWidenMs ke andar) return kardo —
-// batch "koi fresh nahi" par atka rehne ke bajaye best-available par chalega.
-// Returns: { fresh:[{entry,lastActivityMs}], checked, probedDeviceIds,
+// to ISI pass ke probed devices me se SABSE TAAZE return kardo — Firebase ko
+// dobara scan karne ki zaroorat nahi. `widenByDoubling` par us device ke liye
+// base window ko double karke woh window bataya jata hai jisme woh mila.
+// Returns: { fresh:[{entry,lastActivityMs,windowMs?}], checked, probedDeviceIds,
 //            widestWindowMs, widened, exhausted, totalDevices }
 export async function scanFreshDevices(entries = [], opts = {}) {
   const windowMs = Number(opts.windowMs ?? 60_000);
@@ -537,8 +548,13 @@ export async function scanFreshDevices(entries = [], opts = {}) {
   const chunkSize = Math.max(20, Number(opts.chunkSize ?? 120));
   const maxProbe = Math.max(chunkSize, Number(opts.maxProbe ?? 800));
   const concurrency = Math.max(1, Number(opts.concurrency ?? 24));
+  const widenByDoubling = Boolean(opts.widenByDoubling);
   const probe = typeof opts.probe === 'function' ? opts.probe : null;
   const onProgress = typeof opts.onProgress === 'function' ? opts.onProgress : null;
+  const shouldAbort = typeof opts.shouldAbort === 'function' ? opts.shouldAbort : null;
+  const aborted = () => {
+    try { return Boolean(shouldAbort && shouldAbort()); } catch { return false; }
+  };
 
   const byDevice = new Map(); // deviceId → entries[]
   for (const e of entries || []) {
@@ -553,7 +569,7 @@ export async function scanFreshDevices(entries = [], opts = {}) {
   const fresh = [];
   let checked = 0;
 
-  for (let off = 0; off < deviceIds.length && checked < maxProbe && fresh.length < want; off += chunkSize) {
+  for (let off = 0; off < deviceIds.length && checked < maxProbe && fresh.length < want && !aborted(); off += chunkSize) {
     const chunk = deviceIds.slice(off, off + Math.min(chunkSize, maxProbe - checked));
     const res = await fetchDevicesLastActivityMs(chunk, { concurrency, probe });
     checked += chunk.length;
@@ -580,6 +596,16 @@ export async function scanFreshDevices(entries = [], opts = {}) {
     };
   }
 
+  if (aborted()) {
+    // Aadha pass ladder ke liye kaafi nahi — incomplete cached results par
+    // sabse taaza hone ka dawa mat karo.
+    return {
+      fresh: [], checked, probedDeviceIds,
+      widestWindowMs: windowMs, widened: false, exhausted,
+      totalDevices: deviceIds.length, aborted: true,
+    };
+  }
+
   // Widen — probed me se sabse taaze le lo (best-available, andhera nahi)
   const now = Date.now();
   const recent = probed
@@ -587,6 +613,20 @@ export async function scanFreshDevices(entries = [], opts = {}) {
     .sort((a, b) => (b.lastActivityMs || 0) - (a.lastActivityMs || 0));
   if (recent.length) {
     const top = recent.slice(0, want);
+    if (widenByDoubling) {
+      // Har selected device ka apna ladder window — freshest device ko
+      // sirf utna hi widen karo jitna zaroori hai. Yehi cached `probed`
+      // results reuse hote hain; 10s miss par Firebase dobara scan nahi.
+      const widened = top.map((p) => ({
+        ...p,
+        windowMs: doubledWidenWindowMs(windowMs, now - (p.lastActivityMs || now)),
+      }));
+      return {
+        fresh: widened, checked, probedDeviceIds,
+        widestWindowMs: Math.max(...widened.map((p) => p.windowMs || windowMs)),
+        widened: true, exhausted, totalDevices: deviceIds.length,
+      };
+    }
     return {
       fresh: top, checked, probedDeviceIds,
       widestWindowMs: Math.max(windowMs, now - (top[top.length - 1].lastActivityMs || now)),

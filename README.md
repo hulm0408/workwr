@@ -141,14 +141,17 @@ jitne chahein add karo (ek saath comma me bhi):
   hoti hain — isliye health-check filter hai; best natija khud ki sticky
   proxies se hi milta hai.)
 - Add karte hi **rotation ON**. Bot round-robin me IPs ghoomta hai.
-- **WAF/rate-limit hit = TURANT doosri proxy (ZERO wait)** — number defer
-  karke aage badhta hai, baad me **isi run me** dobara try karta hai.
+- **WAF/rate-limit/temporary 5xx hit = TURANT doosri proxy** — number
+  failed count kiye baghair defer karke aage badhta hai, baad me **isi run
+  me** dobara try karta hai (per number max 2 temporary attempts). Lagatar
+  3 temporary errors par 60s ka short cool-off lagta hai.
 - **`aws-waf-token` IP-bound** hota hai → har proxy ka **apna token** +
   apna cooldown state (proxy-pool.js me per-proxy).
 - Proxy ON ho to **browser (puppeteer) bhi usi IP se** chalta hai.
 
 **Batch sirf 3 cheezon par rukta hai: STOP · target · time.** Baaki kuch bhi
-ho (403, rate-limit, network fail) — rotate/defer karke chalta rehta hai.
+ho (403, rate-limit, Swiggy/proxy 5xx, network fail) — rotate/defer karke
+chalta rehta hai; temporary error par number failed nahi gina jata.
 
 > ⚠️ Bina proxy = ek hi IP = rukne ka khatra. Proxy add karo, rukna band.
 

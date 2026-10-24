@@ -507,6 +507,75 @@ console.log('isUnregisteredSwiggyAuthResponse (failed_otp_send wala bug):');
 }
 
 // ---------------------------------------------------------------------------
+console.log('Swiggy temporary 5xx/network — number FAILED nahi, retry queue:');
+{
+  const bridge = await import('./swiggy-bridge.js');
+  const pipe = await import('./number-pipeline.js');
+  const engine = await import('./autopilot-engine.js');
+
+  const serverErr = bridge.parseSwiggyOtpError({
+    status: 500,
+    rawText: '{"statusCode":1,"statusMessage":"Internal server error"}',
+    data: { statusCode: 1, statusMessage: 'Internal server error' },
+  });
+  ok(serverErr.code === 'SWIGGY_SERVER_ERROR' && serverErr.retryable === true,
+    'asal HTTP 500 response → SWIGGY_SERVER_ERROR (retryable)');
+
+  const systemErr = bridge.parseSwiggyOtpError({
+    status: 500,
+    error: 'ECONNRESET socket hang up',
+    rawText: '',
+    data: { statusMessage: 'ECONNRESET socket hang up' },
+  });
+  ok(systemErr.code === 'SYSTEM_ERROR' && /ECONNRESET/.test(systemErr.message),
+    'proxy/network exception wala synthetic 500 → SYSTEM_ERROR (asli wajah barkarar)');
+
+  const c1 = pipe._classifyOtpSendFailure({
+    success: false,
+    code: 'SWIGGY_SERVER_ERROR',
+    httpStatus: 500,
+    retryable: true,
+    message: serverErr.message,
+  }, '6306779573');
+  ok(c1.kind === 'deferred_swiggy_transient' && c1.retryable === true && c1.httpStatus === 500 && c1.stage === 'otp_send',
+    'pipeline: HTTP 500 → deferred_swiggy_transient (failed_otp_send nahi)');
+
+  const c2 = pipe._classifyOtpSendFailure({
+    success: false,
+    code: 'SYSTEM_ERROR',
+    httpStatus: 0,
+    retryable: true,
+    message: systemErr.message,
+  }, '6306779573', { failKind: 'failed_fresh_otp_send', stage: 'fresh_otp_send' });
+  ok(c2.kind === 'deferred_swiggy_transient' && c2.stage === 'fresh_otp_send',
+    'pipeline: network/system error bhi transient retry outcome');
+
+  const c3 = pipe._classifyOtpSendFailure({
+    success: false,
+    code: 'INVALID_MOBILE',
+    httpStatus: 400,
+    retryable: false,
+    message: 'invalid',
+  }, '12345');
+  ok(c3.kind === 'failed_otp_send', 'pipeline: invalid mobile transient nahi — asli failed_otp_send');
+
+  ok(pipe._classifyOtpSendFailure({ success: false, code: 'SWIGGY_RATE_LIMIT', message: 'limit' }, '9812345670').kind === 'rate_limited'
+    && pipe._classifyOtpSendFailure({ success: false, code: 'SWIGGY_SECURITY_CHALLENGE', message: 'waf' }, '9812345670').kind === 'security_challenge',
+  'pipeline: rate-limit/security apne purane infra outcomes par hi');
+  ok(pipe._classifyOtpSendFailure({ success: true }, '9812345670') === null,
+    'pipeline: successful OTP send par failure classification null');
+
+  ok(engine.transientSwiggyRetryWaitMs(1) === 20_000
+    && engine.transientSwiggyRetryWaitMs(2) === 45_000
+    && engine.transientSwiggyRetryWaitMs(3) === 60_000
+    && engine.transientSwiggyRetryWaitMs(99) === 60_000,
+  'engine: transient cool-off ladder 20s→45s→60s cap');
+  const snap = engine.getAutopilotSnapshot();
+  ok(Number.isFinite(snap.serverErrors) && Number.isFinite(snap.transientStrikes),
+    'engine snapshot: serverErrors/transientStrikes counters maujood');
+}
+
+// ---------------------------------------------------------------------------
 console.log('device last-seen gate (mare hue device par OTP waste nahi):');
 {
   const fbn = await import('./firebase-numbers.js');

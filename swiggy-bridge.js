@@ -1596,16 +1596,10 @@ export function parseSwiggyOtpError(otpResult) {
     };
   }
 
-  if ([500, 502, 503, 504].includes(status)) {
-    return {
-      code: 'SWIGGY_SERVER_ERROR',
-      retryable: true,
-      message: `Swiggy returned a temporary server error (HTTP ${status}). Wait a minute or two before retrying.`,
-      swiggyStatus: swiggyMsg || `Swiggy Server Error (${status})`,
-      details: `HTTP ${status}`
-    };
-  }
-
+  // Error field wala 5xx aksar asal Swiggy response nahi hota — browser /
+  // proxy / network exception ko synthetic status 500 de kar yahan bheja
+  // jata hai. Use "Swiggy server error" kehna gumrah-kun tha (asli wajah
+  // chhup jati thi), isliye pehle SYSTEM_ERROR classify karo.
   if (otpResult.error) {
     return {
       code: 'SYSTEM_ERROR',
@@ -1613,6 +1607,16 @@ export function parseSwiggyOtpError(otpResult) {
       message: `Could not complete the OTP request: ${otpResult.error}`,
       swiggyStatus: otpResult.error,
       details: 'Network or session context error'
+    };
+  }
+
+  if ([500, 502, 503, 504].includes(status)) {
+    return {
+      code: 'SWIGGY_SERVER_ERROR',
+      retryable: true,
+      message: `Swiggy returned a temporary server error (HTTP ${status}). Wait a minute or two before retrying.`,
+      swiggyStatus: swiggyMsg || `Swiggy Server Error (${status})`,
+      details: `HTTP ${status}`
     };
   }
 
@@ -1844,10 +1848,12 @@ export async function requestSwiggyOtpViaBridge(userId, phone, targetAcc = '', t
 
         closeBridgeSessionCleanly(session);
         const parsedErr = parseSwiggyOtpError(signupInitResult);
+        console.warn(`[SwiggyBridge] Signup OTP send failed | phone=******${cleanPhone.slice(-4)} | code=${parsedErr.code} | http=${signupInitResult.status || 0} | proxy=${currentProxy?.label || 'direct'} | ${parsedErr.message}`);
         return {
           success: false,
           code: parsedErr.code,
           retryable: parsedErr.retryable,
+          httpStatus: Number(signupInitResult.status) || 0,
           message: parsedErr.message,
           swiggyStatus: parsedErr.swiggyStatus,
           details: parsedErr.details
@@ -1883,10 +1889,12 @@ export async function requestSwiggyOtpViaBridge(userId, phone, targetAcc = '', t
 
       closeBridgeSessionCleanly(session);
       const parsedErr = parseSwiggyOtpError(otpResult);
+      console.warn(`[SwiggyBridge] OTP send failed | phone=******${cleanPhone.slice(-4)} | code=${parsedErr.code} | http=${otpResult.status || 0} | proxy=${currentProxy?.label || 'direct'} | ${parsedErr.message}`);
       return {
         success: false,
         code: parsedErr.code,
         retryable: parsedErr.retryable,
+        httpStatus: Number(otpResult.status) || 0,
         message: parsedErr.message,
         swiggyStatus: parsedErr.swiggyStatus,
         details: parsedErr.details
@@ -1895,18 +1903,23 @@ export async function requestSwiggyOtpViaBridge(userId, phone, targetAcc = '', t
       closeBridgeSessionCleanly(session);
       delete activeSessions[userId];
       const lower = String(err.message || '').toLowerCase();
+      // Generic exception ko synthetic HTTP 500 mat banao — wo aksar proxy /
+      // network fail hota hai, Swiggy server ka jawab nahi. Sirf rate-limit
+      // aur WAF wording se status infer karo; baki SYSTEM_ERROR rahega.
       const inferredStatus = /429|rate limit|too many requests/.test(lower)
         ? 429
-        : (/waf|captcha|challenge|verify you are human|bot verification|automated traffic/.test(lower) ? 403 : 500);
+        : (/waf|captcha|challenge|verify you are human|bot verification|automated traffic/.test(lower) ? 403 : 0);
       const diagnostic = parseSwiggyOtpError({
         status: inferredStatus,
         error: err.message,
         data: { statusMessage: err.message }
       });
+      console.warn(`[SwiggyBridge] OTP send exception | phone=******${cleanPhone.slice(-4)} | code=${diagnostic.code} | proxy=${currentProxy?.label || 'direct'} | ${err.message}`);
       return {
         success: false,
         code: diagnostic.code,
         retryable: diagnostic.retryable,
+        httpStatus: inferredStatus,
         message: diagnostic.message,
         swiggyStatus: diagnostic.swiggyStatus,
         details: err.stack ? err.stack.split('\n')[0] : diagnostic.details

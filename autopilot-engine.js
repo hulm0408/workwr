@@ -59,6 +59,8 @@ const state = {
   rateStrikes: 0,
   wafStrikes: 0,
   wafCooldowns: 0,
+  serverErrors: 0,        // Swiggy/proxy temporary 5xx/network — number failed nahi gina jata
+  transientStrikes: 0,    // lagatar temporary errors (cool-off ladder ke liye)
   proxyRotations: 0,
   deferredQueue: 0,
   consecutiveFails: 0,
@@ -94,6 +96,8 @@ export function getAutopilotSnapshot() {
     rateStrikes: state.rateStrikes,
     wafStrikes: state.wafStrikes,
     wafCooldowns: state.wafCooldowns,
+    serverErrors: state.serverErrors || 0,
+    transientStrikes: state.transientStrikes || 0,
     proxyRotations: state.proxyRotations,
     deferredQueue: state.deferredQueue,
     currentProxy: getBridgeProxy()?.label || '',
@@ -131,6 +135,16 @@ export function wafChallengeWaitMs(consecutiveStrikes, poolCooldownMs = 0) {
   const idx = Math.min(Math.max(1, Number(consecutiveStrikes) || 1), ladder.length) - 1;
   const poolPart = Math.min(Math.max(0, Number(poolCooldownMs) || 0), 5 * 60_000);
   return Math.min(Math.max(ladder[idx], poolPart), 5 * 60_000);
+}
+
+// Swiggy/proxy temporary 5xx ya network error par cool-off ladder. Proxy
+// rotate ho jaye to pehle 2 strikes par wait nahi (nayi IP turant try hogi);
+// ye wait sirf direct/no-next-proxy ya 3+ lagatar transient errors par
+// istemal hota hai taaki asal Swiggy outage me poora pool churn na ho.
+export function transientSwiggyRetryWaitMs(consecutiveStrikes) {
+  const ladder = [20_000, 45_000, 60_000, 60_000];
+  const idx = Math.min(Math.max(1, Number(consecutiveStrikes) || 1), ladder.length) - 1;
+  return ladder[idx];
 }
 
 // Fresh session bante HI uska JSON chat me bhejo (batch ke end ka wait nahi).
@@ -173,6 +187,9 @@ function statsLines() {
     field('× Failed', `${state.failed} · aborted: ${state.aborted} · rate-limit: ${state.rateStrikes}`),
     (state.wafCooldowns || state.wafStrikes || state.proxyRotations)
       ? field('🛡 WAF', `${state.wafCooldowns} cooldown · challenges: ${state.wafStrikes} · rotations: ${state.proxyRotations}`)
+      : '',
+    state.serverErrors
+      ? field('↻ Swiggy 5xx', `${state.serverErrors} temporary · numbers failed nahi, retry queue me`)
       : '',
     pSummary?.enabled
       ? field('🔀 Proxy', `${getBridgeProxy()?.label || '—'}  ·  ${pSummary.enabledCount} ON  ·  rotates: ${state.proxyRotations}`)
@@ -327,7 +344,8 @@ export async function startAutopilot(opts = {}) {
     target, maxMinutes, gapMs, backoffMs,
     processed: 0, fresh: 0, freshNew: 0, freshAfterDelete: 0,
     skipped: 0, deferred: 0, staleSkips: 0, failed: 0, aborted: 0,
-    rateStrikes: 0, wafStrikes: 0, wafCooldowns: 0, consecutiveFails: 0, proxyRotations: 0,
+    rateStrikes: 0, wafStrikes: 0, wafCooldowns: 0, serverErrors: 0, transientStrikes: 0,
+    consecutiveFails: 0, proxyRotations: 0,
     current: null, history: [], freshAccounts: [], lastError: '',
     poolTotal: 0, poolFresh: 0,
     scanning: false, scanChecked: 0, scanFresh: 0,
@@ -355,7 +373,21 @@ export async function startAutopilot(opts = {}) {
     // karta hai (number defer + IP cooldown + naya token).
     if (res.kind === 'security_challenge') return 'security_challenge';
 
+    // Swiggy/proxy temporary 5xx ya network error — OTP confirm hi nahi
+    // hua, isliye number processed/failed NAHI gina jayega. Engine use
+    // retry queue me rakh kar proxy rotate karega. (Pehle ye
+    // `failed_otp_send` ban kar number ko kha jata tha.)
+    if (res.kind === 'deferred_swiggy_transient') {
+      state.serverErrors = (state.serverErrors || 0) + 1;
+      state.transientStrikes = (state.transientStrikes || 0) + 1;
+      state.lastError = `${res.code || 'SWIGGY_TRANSIENT'}: ${res.reason || ''}`.slice(0, 160);
+      return 'swiggy_transient';
+    }
+
     state.processed++;
+    // Koi bhi asal processed outcome matlab Swiggy side se jawab aaya —
+    // temporary-error streak khatam.
+    state.transientStrikes = 0;
     // Yahan pahuncha matlab request WAF ko paar karke Swiggy tak gayi
     // (OTP miss/fail bhi) — challenge "storm" khatam, strikes reset.
     state.wafStrikes = 0;
@@ -533,13 +565,20 @@ export async function startAutopilot(opts = {}) {
     // unke liye defer/rotate wala alag flow hai.)
     const failedAttemptsThisRun = new Map(); // phone → count
     const underFailCap = (e) => (failedAttemptsThisRun.get(e.phone) || 0) < 2;
+    // Temporary 5xx/network par bhi per-number cap — ek hi number par
+    // OTP request baar-baar thok kar per-number limit nahi jalani.
+    const transientAttemptsThisRun = new Map(); // phone → count
+    const underTransientCap = (e) => (transientAttemptsThisRun.get(e.phone) || 0) < 2;
     // Isi run me jo devices last-seen gate par stale nikle — dobara-dobara
     // unhi ko probe na karo. "Fresh device ka wait" round me clear hota hai
     // (device beech me zinda ho sakta hai).
     const staleThisRun = new Set(); // phone
     let freshWaitRounds = 0;
     const pickFreshList = () => {
-      let list = preferOnline(freshEntriesFrom(pool)).filter(underFailCap).filter((e) => !staleThisRun.has(e.phone));
+      let list = preferOnline(freshEntriesFrom(pool))
+        .filter(underFailCap)
+        .filter(underTransientCap)
+        .filter((e) => !staleThisRun.has(e.phone));
       if (!allowOffline) {
         const onlineOnly = list.filter((e) => e.online !== false);
         if (onlineOnly.length) list = onlineOnly;
@@ -560,7 +599,7 @@ export async function startAutopilot(opts = {}) {
       while (hotQueue.length) {
         const h = hotQueue.shift();
         state.scanFresh = hotQueue.length;
-        if (staleThisRun.has(h.entry.phone) || !underFailCap(h.entry)) continue;
+        if (staleThisRun.has(h.entry.phone) || !underFailCap(h.entry) || !underTransientCap(h.entry)) continue;
         if (getPremiumLedger()[h.entry.phone]) continue;
         return h;
       }
@@ -713,7 +752,17 @@ export async function startAutopilot(opts = {}) {
       // se Telegram flood hoga. Unka count stats me dikhta hai, card nahi.
       if (outcome !== 'device_stale') {
         await push(progressCard(
-          section(res.ok ? '✅ Number Done' : (res.kind === 'skipped_delete_blocked' ? '⚠️ Skipped' : (res.kind === 'aborted' ? '⏹ Aborted' : '× Result')), [
+          section(
+            res.ok
+              ? '✅ Number Done'
+              : res.kind === 'skipped_delete_blocked'
+                ? '⚠️ Skipped'
+                : res.kind === 'aborted'
+                  ? '⏹ Aborted'
+                  : res.kind === 'deferred_swiggy_transient'
+                    ? '↻ Temporary Swiggy Error — Retry Later'
+                    : '× Result',
+            [
             `📱 <b>Number:</b> <code>${esc(res.phone)}</code>`,
             `› <b>Outcome:</b> <code>${esc(res.kind)}</code>`,
             res.reason ? `<blockquote>${esc(String(res.reason).slice(0, 300))}</blockquote>` : '',
@@ -729,6 +778,49 @@ export async function startAutopilot(opts = {}) {
       // uthao, bina gap ke turant agla fresh device dhoondho.
       if (outcome === 'device_stale') {
         if (res.phone) staleThisRun.add(res.phone);
+        continue;
+      }
+
+      // Swiggy/proxy temporary 5xx ya network error — number ki galti
+      // nahi. Number isi run ki retry queue me (max 2 attempts), proxy
+      // turant rotate, aur agar lagatar 3 hon to asal outage samajh kar
+      // short cool-off. Pehle ye seedha Failed count hota tha aur proxy
+      // 4 generic fails se pehle badalti hi nahi thi.
+      if (outcome === 'swiggy_transient') {
+        const attempt = (transientAttemptsThisRun.get(res.phone) || 0) + 1;
+        if (res.phone) transientAttemptsThisRun.set(res.phone, attempt);
+        const willRetry = Boolean(res.phone && attempt < 2);
+        if (willRetry) deferNumber(entry, 'swiggy_transient');
+
+        let next = null;
+        if (ps.enabled) {
+          next = rotateProxy(getBridgeProxyId());
+          if (next) state.proxyRotations = (state.proxyRotations || 0) + 1;
+        }
+
+        const needsCoolOff = !next || (state.transientStrikes || 0) >= 3;
+        const waitMs = needsCoolOff ? transientSwiggyRetryWaitMs(state.transientStrikes) : 0;
+        await push(progressCard(section('↻ Temporary Error — Number Safe Hai', [
+          `› ${res.httpStatus ? `HTTP ${res.httpStatus}` : 'Network/5xx'} temporary error — ye number <b>FAILED count nahi</b> hua.`,
+          willRetry
+            ? `› Number retry queue me daal diya (attempt ${attempt}/2) — isi run me dobara ayega.`
+            : `› Is number ke is run ke 2 temporary attempts ho gaye — ledger/pool me failed mark nahi kiya, agli run me mil sakta hai.`,
+          next
+            ? `› Proxy rotate kar diya: <code>${esc(next.label)}</code> (rotation #${state.proxyRotations})`
+            : `› Doosri proxy available nahi — isi IP par cool-off ke baad aage badhunga.`,
+          waitMs
+            ? `› Lagatar ${state.transientStrikes} temporary errors — ${Math.round(waitMs / 1000)}s cool-off, phir batch khud aage badhega.`
+            : `› Nayi IP par turant agla number — batch nahi rukega.`,
+        ].join('\n'))), stopRows());
+
+        if (waitMs) {
+          await sleep(waitMs, () => state.stopRequested);
+          if (state.stopRequested) { endReason = state.stopReason || 'manual'; break; }
+        }
+        if (next) {
+          try { await getLiveSwiggyWafToken(); } catch {}
+        }
+        state.consecutiveFails = 0;
         continue;
       }
 

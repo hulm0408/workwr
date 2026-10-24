@@ -122,6 +122,22 @@ export function requestAutopilotStop(reason = 'manual') {
   return true;
 }
 
+// Fresh session bante HI uska JSON chat me bhejo (batch ke end ka wait nahi).
+// ui.sendSession fresh-bot deta hai (document file ke tor par bhejta hai).
+// Fire-and-forget: send fail ho bhi jaye to batch kabhi na ruke.
+export function notifyFreshSession(currentUi, payload) {
+  try {
+    if (currentUi && typeof currentUi.sendSession === 'function') {
+      Promise.resolve(currentUi.sendSession(payload))
+        .catch((e) => console.warn('[Autopilot] session send:', e?.message));
+      return true;
+    }
+  } catch (e) {
+    console.warn('[Autopilot] session send:', e?.message);
+  }
+  return false;
+}
+
 // ---------------------------------------------------------------------------
 // Cards
 // ---------------------------------------------------------------------------
@@ -226,7 +242,7 @@ function summaryCard() {
     freshList ? `▤ <b>Latest fresh sessions:</b>` : '',
     freshList || sub('Is run me koi fresh session nahi bana.'),
     ``,
-    sub('Saare sessions bot DB + cloud vault me saved hain (Connected Accounts / Export JSON).'),
+    sub('Har fresh session ka JSON chat me file ki surat me bhej diya gaya hai (bot DB + cloud vault me bhi saved hai).'),
   ].filter((x) => x !== '' && x !== false).join('\n'));
 }
 
@@ -331,6 +347,11 @@ export async function startAutopilot(opts = {}) {
       if (res.kind === 'fresh_new') state.freshNew++;
       if (res.kind === 'fresh_after_delete') state.freshAfterDelete++;
       state.freshAccounts.push({ phone: res.phone, accountKey: res.accountKey });
+      // 📤 Fresh JSON isi waqt chat me bhej do — boss ko batch khatam
+      // hone tak ruk kar list se nahi dhoondhna padega.
+      notifyFreshSession(ui, {
+        phone: res.phone, accountKey: res.accountKey, kind: res.kind, account: res.account,
+      });
       state.consecutiveFails = 0;
       state.wafStrikes = 0;   // ek success = WAF "storm" khatam
       return 'ok';

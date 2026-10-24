@@ -628,4 +628,49 @@ console.log('parallel device scan (hot-queue) + pipeline precheck:');
   }
 }
 
+// ---------------------------------------------------------------------------
+console.log('fresh JSON chat me turant bhejna (export + engine notify):');
+{
+  const store = await import('./store.js');
+  const engine = await import('./autopilot-engine.js');
+
+  // Bridge ke diye exportJson ko waisi ka waisa tarjeeh
+  const bridgeJson = { account: 'AK1', name: 'Naya', phone: '9812345670', token: 'TOK', cookies: 'x=y' };
+  ok(store.getSessionExportJson('AK1', { exportJson: bridgeJson }) === bridgeJson,
+    'bridge exportJson passthrough (wahi fresh JSON chat me jayega)');
+
+  // Bridge ka na mile to DB ke saved account se wahi shape banao
+  store.updateAccount('TESTEXPORT1', {
+    name: 'Test User', swiggyName: 'Swg', botTag: 'tag1', phone: '9812345670',
+    customerId: 'CUST9', token: 'TOKEN9', tid: 'TID9', sid: 'SID9', deviceId: 'DEV9',
+    isLoggedIn: true, savedAt: '2026-10-24T00:00:00.000Z',
+  });
+  const rebuilt = store.getSessionExportJson('TESTEXPORT1', null);
+  ok(Boolean(rebuilt) && rebuilt.account === 'TESTEXPORT1' && rebuilt.token === 'TOKEN9'
+    && rebuilt.tid === 'TID9' && rebuilt.sid === 'SID9' && rebuilt.deviceId === 'DEV9'
+    && rebuilt.phone === '9812345670' && rebuilt.mobile === '9812345670'
+    && rebuilt.customerId === 'CUST9',
+    'DB account se export shape rebuild (token/tid/sid/phone sahi)');
+
+  ok(store.getSessionExportJson('NO_SUCH_ACCOUNT_XYZ', null) === null, 'account na mile → null (crash nahi)');
+
+  // Engine notify — fresh bante hi ui.sendSession ko payload jaye
+  const sent = [];
+  const uiOk = { sendSession: async (p) => { sent.push(p); } };
+  ok(engine.notifyFreshSession(uiOk, { phone: '9812345670', accountKey: 'AK1', kind: 'fresh_new', account: { exportJson: bridgeJson } }) === true,
+    'notifyFreshSession → sendSession bulaaya');
+  ok(sent.length === 1 && sent[0].phone === '9812345670' && sent[0].accountKey === 'AK1' && sent[0].kind === 'fresh_new',
+    'payload me phone/accountKey/kind sahi gaya');
+
+  ok(engine.notifyFreshSession({}, {}) === false && engine.notifyFreshSession(null, {}) === false,
+    'sendSession na ho → false (batch normal chalta rahe)');
+
+  ok(engine.notifyFreshSession({ sendSession: () => { throw new Error('tg down'); } }, {}) === false,
+    'sendSession throw kare → bhi crash nahi');
+
+  const rej = engine.notifyFreshSession({ sendSession: async () => { throw new Error('tg 500'); } }, {});
+  ok(rej === true, 'async reject fire-and-forget (batch nahi rukta)');
+  await new Promise((r) => setTimeout(r, 10)); // unhandledRejection hota to yahin crash hota
+}
+
 console.log(`\n✅ ALL PASSED — ${passed} checks`);

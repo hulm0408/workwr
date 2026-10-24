@@ -33,7 +33,7 @@ process.env.FIREBASE_DB_URL ||= 'https://vuvhbjbi-default-rtdb.firebaseio.com/';
 // Dynamic import — defaults set karne KE BAAD hi modules load ho, warna
 // firebase-numbers.js env ko call-time par hi padhta hai, phir bhi safe side.
 const { Telegraf } = await import('telegraf');
-const { isBoss, hydrateAccountsFromCloudVault } = await import('./store.js');
+const { isBoss, hydrateAccountsFromCloudVault, getSessionExportJson } = await import('./store.js');
 const {
   startAutopilot,
   requestAutopilotStop,
@@ -175,7 +175,7 @@ function summaryCard(snap) {
     freshList ? `▤ <b>Latest fresh sessions:</b>` : '',
     freshList || sub('Abhi tak koi fresh session nahi bana.'),
     ``,
-    sub('Saare sessions data/db.json + cloud vault me saved hain (agar vault configured).'),
+    sub('Har fresh session ka JSON chat me file bana kar bhej diya gaya hai (data/db.json + cloud vault me bhi saved).'),
   ].filter((x) => x !== '' && x !== false).join('\n'));
 }
 
@@ -421,6 +421,42 @@ async function launchBatch(ctx) {
           fallback.seq += 1;
           await sendLive(fallback.chatId, text, rows);
         }
+      }
+    },
+
+    // 📤 Fresh session bante HI uska JSON isi chat me FILE bana kar bhej do
+    // (boss ki demand: "jaise koi bhi fresh JSON mile, same time par chat
+    // me send karna hai"). Batch ka end/summary ka wait bilkul nahi.
+    async sendSession({ phone, accountKey, kind, account } = {}) {
+      const chatId = ctx.chat?.id || fallback.chatId;
+      if (!chatId) return;
+      const typeText = kind === 'fresh_after_delete' ? '♻️ Delete + Fresh' : '🆕 Naya Fresh';
+      const caption = [
+        `✅ <b>Fresh Session Ready</b> — ${typeText}`,
+        `📱 <b>Number:</b> <code>${esc(phone || '')}</code>`,
+        `👤 <b>Account:</b> <b>${esc(accountKey || '')}</b>`,
+      ].join('\n');
+
+      const exportData = getSessionExportJson(accountKey, account);
+      if (!exportData) {
+        await bot.telegram.sendMessage(chatId,
+          `${caption}\n\n<i>(JSON export nahi mil paya — session bot DB me saved hai)</i>`,
+          { parse_mode: 'HTML' }).catch(() => {});
+        return;
+      }
+
+      const jsonText = JSON.stringify(exportData, null, 2);
+      try {
+        await bot.telegram.sendDocument(chatId,
+          { source: Buffer.from(jsonText, 'utf8'), filename: `${phone || accountKey || 'session'}.json` },
+          { caption, parse_mode: 'HTML' });
+      } catch (e) {
+        console.warn('[FreshBot] session file send:', e?.message);
+        // File send fail → code block me bhej do (Telegram limit ke andar ho to)
+        const body = jsonText.length <= 3400
+          ? `${caption}\n\n<pre>${esc(jsonText)}</pre>`
+          : `${caption}\n\n<i>(JSON file send fail hua — session bot DB me saved hai)</i>`;
+        await bot.telegram.sendMessage(chatId, body, { parse_mode: 'HTML' }).catch(() => {});
       }
     },
   };

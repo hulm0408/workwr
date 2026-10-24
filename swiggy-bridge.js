@@ -1317,19 +1317,29 @@ async function postSwiggyAuthJson(session, endpointUrl, payload = {}, { timeoutM
   return out;
 }
 
-function isUnregisteredSwiggyAuthResponse(result) {
+export function isUnregisteredSwiggyAuthResponse(result) {
   if (!result || (result.status !== 200 && result.status !== 202)) return false;
-  const msgLower = `${result.data?.statusMessage || ''} ${result.data?.message || ''} ${result.rawText || ''}`.toLowerCase();
-  if (/rate limit|too many|limit reached|maximum|valid 10 digit|invalid otp|incorrect otp|wrong otp|expired otp|something went wrong|internal server|csrf|blocked|suspended/.test(msgLower)) {
+  // ⚠️ BUG FIX (Render par har naya number `failed_otp_send` ho raha tha):
+  // Negative checks AB SIRF human message (statusMessage/message) par lagenge,
+  // poore raw JSON par NAHI. Pehle regex me akela `csrf` tha aur Swiggy ke
+  // har normal response me `csrfToken` FIELD hota hai — to detector
+  // "user not registered" wale response ko bhi pehle hi reject kar deta tha,
+  // bot fresh-registration branch me kabhi jata hi nahi tha.
+  const statusMsg = `${result.data?.statusMessage || ''} ${result.data?.message || ''}`.toLowerCase();
+  if (/rate limit|too many|limit reached|maximum attempts|valid 10 digit|invalid mobile|invalid otp|incorrect otp|wrong otp|expired otp|something went wrong|internal server|invalid csrf|csrf.*(invalid|expire|mismatch)|blocked|suspended/.test(statusMsg)) {
     return false;
   }
   if (isAwsWafChallengeResponse(result.status, result.rawText, result.headers)) {
     return false;
   }
-  if (/not\s*registered|user\s*not\s*found|does\s*not\s*exist|no\s*account|new\s*user|sign\s*up|signup|register\s*first|unregistered/.test(msgLower)) {
+  // Positive check poori body par chal sakta hai (message kabhi nested bhi
+  // aata hai) — field-naam isse galat trigger nahi karenge.
+  const allText = `${statusMsg} ${String(result.rawText || '').toLowerCase()}`;
+  if (/not\s*registered|user\s*not\s*found|does\s*not\s*exist|no\s*account|new\s*user|sign\s*up|signup|register\s*first|unregistered/.test(allText)) {
     return true;
   }
-  return result.data?.statusCode === 999;
+  if (result.data?.data?.registered === false) return true;
+  return Number(result.data?.statusCode) === 999;
 }
 
 // Pre-warm browser in background (safe no-op on cloud runtimes without local Chromium)
@@ -1752,8 +1762,13 @@ export async function requestSwiggyOtpViaBridge(userId, phone, targetAcc = '', t
         if (!signupSecurityBlocked && signupInitResult.status === 200 && (signupInitResult.data?.statusCode === 0 || signupInitResult.data?.statusCode === undefined)) {
           signupPreRegistered = true;
           signupOtpDispatched = true;
-        } else if (!signupSecurityBlocked && /otp.*required|enter.*otp|invalid.*otp/i.test(finalInitLower)) {
+        } else if (!signupSecurityBlocked && signupInitResult.status === 200) {
           // Cluster requires `sms-otp` (with `type: 'register'`) first and `signup` WITH `otp` on verification!
+          // (Pehle ye fallback sirf "otp required/invalid otp" wording par
+          // chalta tha — Swiggy wording badle to number seedha fail ho jata
+          // tha. Ab signup-init ka koi bhi non-success 200 aaye to register
+          // OTP ek baar try hoga; wo bhi fail ho tab hi asli error.)
+          console.log(`[SwiggyBridge] signup-init non-success (HTTP ${signupInitResult.status}, code=${signupInitResult.data?.statusCode}, msg="${signupInitResult.data?.statusMessage || signupInitResult.data?.message || ''}") — sms-otp type=register fallback try kar raha hoon.`);
           const regSms = await postSwiggyAuthJson(session, 'https://www.swiggy.com/dapi/auth/sms-otp', {
             mobile: cleanPhone,
             type: 'register'

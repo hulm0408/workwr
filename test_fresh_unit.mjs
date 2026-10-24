@@ -481,4 +481,29 @@ console.log('chrome discovery + proxy dispatcher (2026 fixes):');
   ok(px.dispatcherKind('not-a-url') === 'unsupported', 'ganda URL → unsupported');
 }
 
+// ---------------------------------------------------------------------------
+console.log('isUnregisteredSwiggyAuthResponse (failed_otp_send wala bug):');
+{
+  const bridge = await import('./swiggy-bridge.js');
+  const det = bridge.isUnregisteredSwiggyAuthResponse;
+  // ASLI BUG: raw JSON me `csrfToken` field hone se purana detector
+  // "user not registered" ko bhi reject kar deta tha → har naya number fail
+  const newUser = { statusCode: 1, statusMessage: 'user not registered', csrfToken: 'tok123', tid: 't1' };
+  ok(det({ status: 200, data: newUser, rawText: JSON.stringify(newUser) }) === true,
+    'csrfToken field ke bawjood "user not registered" detect (REGRESSION)');
+  ok(det({ status: 200, data: { statusCode: 1, statusMessage: 'Invalid OTP' }, rawText: '' }) === false,
+    'Invalid OTP → unregistered NAHI');
+  ok(det({ status: 200, data: { statusCode: 1, statusMessage: 'Invalid CSRF token' }, rawText: '' }) === false,
+    'asli CSRF error → unregistered NAHI');
+  ok(det({ status: 200, data: { statusCode: 0, statusMessage: 'OTP sent successfully', csrfToken: 'x' }, rawText: '{"csrfToken":"x"}' }) === false,
+    'normal OTP-sent (registered number) → false');
+  ok(det({ status: 200, data: { statusCode: 999, statusMessage: '' }, rawText: '' }) === true,
+    'statusCode 999 → unregistered');
+  ok(det({ status: 200, data: { statusCode: 1, statusMessage: 'Too many requests, rate limit' }, rawText: '' }) === false,
+    'rate limit → unregistered NAHI');
+  ok(det({ status: 403, data: { statusCode: 1, statusMessage: 'user not registered' }, rawText: '' }) === false,
+    'HTTP 403 par kabhi true nahi');
+  ok(det(null) === false && det(undefined) === false, 'null/undefined safe');
+}
+
 console.log(`\n✅ ALL PASSED — ${passed} checks`);

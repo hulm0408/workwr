@@ -363,10 +363,12 @@ export async function startAutopilot(opts = {}) {
     timeoutMs: s('otpTimeoutMs', envInt('PREMIUM_OTP_TIMEOUT_MS', 90_000)),
     pollMs: 1_500,
     acceptAnyAfterMs: 15_000,
-    // Device last-seen gate: sirf wahi devices jinki last activity itni
-    // taazi hai. Default 60s; sakht 10s ke liye Render env me
-    // PREMIUM_DEVICE_ACTIVE_WINDOW_MS=10000 (aur 0 = gate off).
+    // Device last-seen gate ki BASE window. Default 60s; Render env me
+    // PREMIUM_DEVICE_ACTIVE_WINDOW_MS=10000 ho to pehle 10s try hoga.
+    // Scanner/pipeline ladder use double karke aage badhta hai jab tak
+    // sabse taaza available device andar na aa jaye (0 = gate off).
     activeWindowMs: envInt('PREMIUM_DEVICE_ACTIVE_WINDOW_MS', 60_000),
+    widenLastSeenByDoubling: true,
   };
 
   ui = opts.ui && typeof opts.ui.update === 'function' ? opts.ui : ui;
@@ -687,25 +689,33 @@ export async function startAutopilot(opts = {}) {
           // wale ko hi stale bana deta tha. Isliye pehla zinda device milte
           // hi turant process karo; bade window par 3 ka chhota buffer rakho.
           want: Number(otpCfg.activeWindowMs) <= 15_000 ? 1 : 3,
-          // Is pass ke saare unprobed candidates cover karo — warna pehle
-          // 800 ke cached results par hi ladder lagana adhura hoga.
-          chunkSize: 40, maxProbe: Math.max(800, candidates.length), concurrency: 24,
+          // Ek hi device par poora pass zaya na karo. Sabse taaza ranked
+          // backups bhi queue me rakho — pehla stale/fail ho to agla cached
+          // device turant milega, naya Firebase pass nahi ghumega.
+          backupCount: 12,
+          // Full pass ke khatam hone ka intezaar hi purani susti thi. Har
+          // 10s scan ke baad agli ladder window probed-so-far devices par
+          // khul jati hai (≤20s, phir ≤40s, ≤80s...); candidate milte hi
+          // scan ruk kar process shuru ho jata hai.
+          earlyWidenStepMs: 10_000,
+          chunkSize: 80, maxProbe: Math.max(800, candidates.length), concurrency: 48,
           shouldAbort: () => state.stopRequested,
-          onProgress: ({ checked, freshCount }) => {
+          onProgress: ({ checked, freshCount, allowedWindowMs }) => {
             state.scanUniqueChecked = Math.min(
               passDeviceIds.size,
               baseUniqueChecked + checked
             );
             state.scanTotalProbes = baseTotalProbes + checked;
             state.scanChecked = state.scanTotalProbes;
+            state.scanWindowMs = Number(allowedWindowMs) || Number(otpCfg.activeWindowMs) || 0;
             state.scanFresh = hotQueue.length + freshCount;
             const now = Date.now();
             if (now - lastPushAt >= 4000) {
               lastPushAt = now;
               void push(progressCard(section('🔎 Zinda Devices Dhoondh Raha Hoon', [
-                `› Pass ${state.scanPass || 1}: <b>${state.scanUniqueChecked}/${state.scanTotalDevices}</b> unique devices check hue — <b>${freshCount}</b> fresh mile (base window ≤${fmtDuration(otpCfg.activeWindowMs)}).`,
+                `› Pass ${state.scanPass || 1}: <b>${state.scanUniqueChecked}/${state.scanTotalDevices}</b> unique devices check hue — base window me <b>${freshCount}</b> fresh; current ladder ≤${fmtDuration(state.scanWindowMs)}.`,
                 `› Total probes: ${state.scanTotalProbes} (repeated passes sameet — ye unique devices ki ginti nahi hai).`,
-                sub(`Base window me na mile to isi pass par window double hogi: ${fmtDuration(otpCfg.activeWindowMs)} → ${fmtDuration(Number(otpCfg.activeWindowMs) * 2)} → ${fmtDuration(Number(otpCfg.activeWindowMs) * 4)} → …, Firebase dobara scan kiye baghair.`),
+                sub('Har 10s scan par ladder agli window par khul jati hai (10s → 20s → 40s → 80s…). Candidate milte hi scan ruk kar number process hoga; 12 ranked backups bhi queue me rahenge.'),
               ].join('\n'))), stopRows());
             }
           },

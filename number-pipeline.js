@@ -35,6 +35,7 @@ import {
   waitForOtpCode,
   markPoolNumberStatus,
   fetchDeviceLastActivityMs,
+  doubledWidenWindowMs,
 } from './firebase-numbers.js';
 import { esc, section, sub, field } from './rich-text.js';
 
@@ -259,12 +260,22 @@ export async function processSingleNumber({
         }
       }
       const ageMs = lastActivityMs ? Date.now() - lastActivityMs : Infinity;
-      if (!(ageMs <= activeWindowMs)) {
+      // Autopilot ladder mode me scanner ne is device ko sabse taaza
+      // available samajh kar chuna hota hai. Scan/queue/WAF warm-up ke
+      // beech woh chuni hui limit se chand second bahar ho jaye to use
+      // stale keh kar poora scan dobara ghumana pagalpan hai — wahin
+      // window ko double karke aage badho (10s→20s→40s→…), jab tak asal
+      // activity age andar na aa jaye. Sirf bilkul timestamp na hona stale hai.
+      const allowDoubling = Boolean(otpCfg.widenLastSeenByDoubling);
+      const effectiveWindowMs = allowDoubling && Number.isFinite(ageMs)
+        ? doubledWidenWindowMs(activeWindowMs, ageMs)
+        : activeWindowMs;
+      if (!(ageMs <= effectiveWindowMs)) {
         return {
           ok: false, kind: 'deferred_device_stale', phone,
-          lastActivityMs, ageMs: ageMs === Infinity ? null : ageMs, activeWindowMs,
+          lastActivityMs, ageMs: ageMs === Infinity ? null : ageMs, activeWindowMs: effectiveWindowMs,
           reason: lastActivityMs
-            ? `Device ki last activity ${Math.round(ageMs / 1000)}s purani hai (limit ${Math.round(activeWindowMs / 1000)}s) — OTP nahi bheja`
+            ? `Device ki last activity ${Math.round(ageMs / 1000)}s purani hai (limit ${Math.round(effectiveWindowMs / 1000)}s) — OTP nahi bheja`
             : 'Device ki koi recent activity mili hi nahi — OTP nahi bheja',
         };
       }

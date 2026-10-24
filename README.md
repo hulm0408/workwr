@@ -104,12 +104,16 @@ Sab `data/db.json` me save hota hai — restart ke baad bhi yaad rehta hai.
 ## 📟 Fresh device + JSON delivery
 
 - Scanner pehle configured base last-seen window (mis. 10s) me device
-  dhoondhta hai. Ek full pass me woh na mile to Firebase ko dobara scan kiye
-  baghair, **usi pass ke cached timestamps** par window double hoti rehti hai:
-  10s → 20s → 40s → 80s → 160s → …, jab tak sabse taaza device andar na aa
-  jaye. Card par current pass ke **unique devices** aur repeated passes sameet
-  **total probes** alag-alag dikhte hain. Sirf tab naya pass hota hai jab kisi
-  device ka usable activity timestamp hi na mile.
+  dhoondhta hai. Har device ki halki probe pehle sirf uske **last 5 messages**
+  dekhti hai (50 full SMS nahi). Scan ke har 10 second par probed-so-far
+  devices par agli ladder window khul jati hai — 10s → 20s → 40s → 80s →
+  160s → … — taaki full pool khatam hone ka intezaar na karna pade. Candidate
+  milte hi scan ruk jata hai aur sabse taaze **12 ranked backups** bhi queue me
+  rehte hain; ek miss ho to agla cached device process hota hai, Firebase pass
+  dobara nahi ghumta. Dispatch se pehle selected device limit cross kar jaye
+  to pipeline bhi window ko wahin double karke aage badhti hai. Card par
+  current pass ke **unique devices**, **total probes** aur current ladder
+  window alag-alag dikhte hain.
 - Har fresh session ka JSON usi waqt chat me `.json` file ki surat me jata hai.
   Telegram/document send fail ho to bot 3 baar retry karta hai; phir bhi na jaye
   to poora JSON code-block hissoun me bhej deta hai.

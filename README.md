@@ -125,6 +125,15 @@ ko nahi. Ek IP par lagatar request = flagged IP = 403 = wait.
 jitne chahein add karo (ek saath comma me bhi):
 
 - `host:port` · `http://user:pass@host:port` · `socks5://host:port`
+- **🌐 Free Proxies Lao (auto)** — proxy card se ek tap: bot public free
+  list (ProxyScrape) se la kar har proxy ko **seedha Swiggy par test**
+  karta hai aur sirf zinda+tez wali pool me rakhta hai. Batch start par
+  enabled proxy ek bhi na ho to ye **khud ho jata hai** (OFF karna ho:
+  proxy card par 🌐 Free Auto toggle, ya env `PREMIUM_AUTO_FREE_PROXIES=0`).
+  Apni list URLs: `PREMIUM_PROXY_SOURCES=url1,url2`. Free proxies marne par
+  refresh me khud replace ho jati hain; manual proxies ko haath nahi lagta.
+  (Sach: free wali aksar slow/dead hoti hain — isliye health-check filter
+  hai; best natija khud ki sticky proxies se hi milta hai.)
 - Add karte hi **rotation ON**. Bot round-robin me IPs ghoomta hai.
 - **WAF/rate-limit hit = TURANT doosri proxy (ZERO wait)** — number defer
   karke aage badhta hai, baad me **isi run me** dobara try karta hai.

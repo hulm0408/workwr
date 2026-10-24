@@ -707,4 +707,77 @@ console.log('WAF challenge survival (jala token invalidate + batch-marta-nahi la
   ok(engine.wafChallengeWaitMs(0, 0) === 30_000, 'strikes 0/invalid → pehla step (30s)');
 }
 
+// ---------------------------------------------------------------------------
+console.log('🌐 free proxies auto-fetch (ProxyScrape parse/rank/probe/refresh):');
+{
+  const pp = await import('./proxy-pool.js');
+  const before = pp.proxySummary();
+
+  // JSON parse — socks4 + dead bahar, fields mapped
+  const sample = {
+    proxies: [
+      { proxy: 'socks5://1.2.3.4:1080', protocol: 'socks5', alive: true, ssl: true, uptime: 90, average_timeout: 800, ip_data: { countryCode: 'IN', hosting: false } },
+      { proxy: 'socks4://5.6.7.8:4145', protocol: 'socks4', alive: true, ssl: true, uptime: 99, average_timeout: 100, ip_data: { countryCode: 'IN', hosting: false } },
+      { proxy: 'http://9.9.9.9:8080', protocol: 'http', alive: false, ssl: true, uptime: 99, average_timeout: 100, ip_data: { countryCode: 'US', hosting: true } },
+      { proxy: 'http://8.8.8.8:3128', protocol: 'http', alive: true, ssl: true, uptime: 70, average_timeout: 1500, ip_data: { countryCode: 'US', hosting: true } },
+    ],
+  };
+  const parsed = pp._parseFreeProxyListJson(sample);
+  ok(parsed.length === 2, 'JSON: socks4 + dead exclude, 2 kaam ke bache');
+  ok(parsed[0].country === 'IN' && parsed[0].hosting === false && parsed[0].avgTimeoutMs === 800, 'JSON: country/hosting/timeout fields mapped');
+
+  // Text parse
+  const txt = pp._parseFreeProxyListText('socks5://1.1.1.1:1080\nGARBAGE LINE\nhttp://2.2.2.2:8080\nsocks4://3.3.3.3:1080\n');
+  ok(txt.length === 2, 'text: garbage + socks4 exclude');
+
+  // Ranking — IN pehle, phir non-hosting, phir uptime/timeout
+  const ranked = pp._rankFreeCandidates([
+    { url: 'http://us-host:1', country: 'US', hosting: true, uptime: 99, avgTimeoutMs: 100 },
+    { url: 'http://in-host:1', country: 'IN', hosting: true, uptime: 50, avgTimeoutMs: 900 },
+    { url: 'http://in-resi:1', country: 'IN', hosting: false, uptime: 40, avgTimeoutMs: 500 },
+    { url: 'http://de-resi:1', country: 'DE', hosting: false, uptime: 95, avgTimeoutMs: 200 },
+    { url: 'http://in-resi:1', country: 'IN', hosting: false, uptime: 40, avgTimeoutMs: 500 }, // duplicate
+  ]);
+  ok(ranked.length === 4 && ranked[0].url.includes('in-resi') && ranked[1].url.includes('in-host') && ranked[2].url.includes('de-resi'),
+    'ranking: IN residential sab se pehle + dedupe');
+
+  // Probe — early stop + tez pehle sorted
+  {
+    const cands = Array.from({ length: 30 }, (_, i) => ({ url: `http://bad${i}:80`, country: '', hosting: false, uptime: 0, avgTimeoutMs: 1 }));
+    cands[10] = { url: 'http://good-slow:80', country: '', hosting: false, uptime: 0, avgTimeoutMs: 1 };
+    cands[11] = { url: 'http://good-fast:80', country: '', hosting: false, uptime: 0, avgTimeoutMs: 1 };
+    const check = async (c) => c.url.includes('good-fast') ? { ok: true, latencyMs: 90 }
+      : c.url.includes('good-slow') ? { ok: true, latencyMs: 400 } : { ok: false, latencyMs: 10 };
+    const r = await pp.probeFreeCandidates(cands, { want: 2, concurrency: 4, check });
+    ok(r.good.length === 2 && r.good[0].url.includes('good-fast'), 'probe: 2 zinda mile, tez wala pehle');
+    ok(r.checked < 30, 'probe: want milte hi ruk gaya (poori list nahi parkhi)');
+  }
+
+  // Refresh glue — injected list + check; pool me auto entries; dobara me zinda ki id barkarar
+  const fetchImpl = async () => ({ ok: true, text: async () => JSON.stringify(sample) });
+  const okCheck = async (c) => ({ ok: true, latencyMs: 120, status: 200 });
+  const r1 = await pp.refreshFreeProxies({ want: 2, fetchImpl, check: okCheck });
+  ok(r1.ok && r1.added === 2, 'refresh: 2 auto proxies pool me gayin');
+  const autos1 = pp.listProxies().filter((p) => p.auto);
+  ok(autos1.length === 2 && autos1.every((p) => p.enabled), 'auto entries enabled + tagged hain');
+  const keepId = autos1.find((p) => p.url.includes('1.2.3.4'))?.id;
+
+  const pickyCheck = async (c) => ({ ok: c.url.includes('1.2.3.4'), latencyMs: 100, status: 200 });
+  const r2 = await pp.refreshFreeProxies({ want: 2, fetchImpl, check: pickyCheck });
+  const autos2 = pp.listProxies().filter((p) => p.auto);
+  ok(r2.added === 1 && autos2.length === 1 && autos2[0].id === keepId,
+    'dusra refresh: mari hui auto nikal gayi, zinda ki ID wahi rahi (token continuity)');
+
+  // Kill switch — env 0 par auto band
+  process.env.PREMIUM_AUTO_FREE_PROXIES = '0';
+  ok(pp.freeProxiesEnabled() === false, 'PREMIUM_AUTO_FREE_PROXIES=0 → auto-fetch OFF');
+  const skipped = await pp.ensureFreeProxies({ min: 99 });
+  ok(skipped.skipped === true && skipped.reason === 'disabled', 'ensureFreeProxies disabled par seedha skip');
+  delete process.env.PREMIUM_AUTO_FREE_PROXIES;
+
+  // Cleanup — test DB ko wapas waisa chhodo jaisa mila tha
+  for (const p of pp.listProxies().filter((x) => x.auto)) pp.removeProxy(p.id);
+  if (!before.enabled) pp.setPoolEnabled(false);
+}
+
 console.log(`\n✅ ALL PASSED — ${passed} checks`);

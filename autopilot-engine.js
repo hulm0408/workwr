@@ -403,14 +403,16 @@ export async function startAutopilot(opts = {}) {
     // WAF warm-up — pehle number se PEHLE ek valid aws-waf-token arrange karo
     // (Chromium solver, ~5-15s ek baar). Uske baad 2h tak saari OTP requests
     // token ke saath jaati hain → "aaye hi na" wali 403 challenges kam.
-    const ps = proxyPool.proxySummary();
+    // `let` isliye: free-proxy auto-fetch ke baad summary badal jati hai
+    // (pool OFF → ON) aur poora loop isi snapshot par faisle karta hai.
+    let ps = proxyPool.proxySummary();
     await push(section('🔥 Warm-up', [
-      ps.enabled
+      ps.enabledCount
         ? `🔀 Proxy pool: ${ps.enabledCount}/${ps.total} proxies ON — ${ps.rotation}`
-        : `🔀 Proxy pool: OFF (ek hi IP) — ⚙️ Settings me proxy add karne par rukna bilkul band.`,
+        : `🔀 Koi proxy nahi — 🌐 <b>free proxies auto-fetch</b> try kar raha hoon (Swiggy par test karke sirf zinda wali rakhunga)…`,
       'Swiggy WAF token arrange kar raha hoon (ek baar, ~15s)…',
       '📋 Saath hi pool load + zinda devices ki parallel scan chal rahi hai…',
-      sub('Token ready hote hi pehla OTP fresh device par jayega.'),
+      sub('Sab ready hote hi pehla OTP fresh device par jayega.'),
     ].join('\n')), stopRows());
 
     // Proxy assign — pehli enabled proxy (round-robin se). WAF token bhi
@@ -425,7 +427,21 @@ export async function startAutopilot(opts = {}) {
       }
       return null;
     };
-    if (ps.enabled) rotateProxy();
+    // 🌐 Free proxies — enabled proxy ek bhi nahi to list se khud le aao
+    // (parallel me; WAF warm-up iske baad hi proxy choose karega kyunki
+    // aws-waf-token IP-bound hota hai). Fail ho to direct mode — purana
+    // behavior, koi rukawat nahi.
+    const freePromise = (async () => {
+      try {
+        const r = await proxyPool.ensureFreeProxies({ min: 1, want: 8 });
+        if (r && !r.skipped) {
+          console.log(r.added
+            ? `[Autopilot] 🌐 Free proxies: ${r.checked} parkhin, ${r.added} zinda mili — IP rotation ON.`
+            : `[Autopilot] 🌐 Free proxies: ${r.checked} parkhin, koi zinda nahi mili — direct mode chalega.`);
+        }
+        return r;
+      } catch { return null; }
+    })();
 
     // Pool load (bada node — ek baar, zarurat par refresh). YE WAF warm-up ke
     // SAATH parallel chalega — pehle dono ek-ke-peeche-ek the isliye pehla
@@ -449,6 +465,11 @@ export async function startAutopilot(opts = {}) {
     let wafTok = '';
     const warmPromise = (async () => {
       try {
+        // PEHLE proxy final karo (free auto-fetch khatam hone do), PHIR token
+        // solve karo — aws-waf-token IP-bound hai, galat IP ka token bekar hai.
+        await freePromise;
+        ps = proxyPool.proxySummary();
+        if (ps.enabled) rotateProxy();
         wafPool.loadFromDb?.();
         wafTok = await getLiveSwiggyWafToken();
         console.log(wafTok ? '[Autopilot] WAF token ready (warm start).' : '[Autopilot] WAF token nahi mila (Chromium?) — raw mode me chalega.');
@@ -763,7 +784,14 @@ export async function startAutopilot(opts = {}) {
         ].join('\n'))), stopRows());
         await sleep(cdMs, () => state.stopRequested);
         if (state.stopRequested) { endReason = state.stopReason || 'manual'; break; }
-        rotateProxy(); // proxy mode me jo bhi free hua, use le lo
+        const rotated = rotateProxy(); // proxy mode me jo bhi free hua, use le lo
+        if (!rotated) {
+          // Koi proxy free nahi bachi (free wali jaldi marti hain) — background
+          // me nayi free proxies le aao, batch ko roke baghair.
+          void proxyPool.refreshFreeProxies({ want: 8 }).then((r) => {
+            if (r?.added) { ps = proxyPool.proxySummary(); console.log(`[Autopilot] 🌐 ${r.added} nayi free proxies aa gayin.`); }
+          }).catch(() => {});
+        }
         state.consecutiveFails = 0;
         continue;
       }

@@ -326,15 +326,274 @@ export function puppeteerProxyAuth(page, proxy) {
 }
 
 // ---------------------------------------------------------------------------
+// 🌐 FREE PROXIES AUTO-FETCH — "proxy kahan se laoon?" ka tod
+//
+// Boss ke paas paid proxies/card nahi hai. Isliye bot khud public free
+// proxy lists (ProxyScrape — bina signup/key ke milti hai) se candidates
+// laata hai, har ek ko seedha swiggy.com par TEST karta hai (zinda + tez +
+// abhi WAF-challenge NA de raha ho), aur sirf top wale pool me rakhta hai.
+//
+// Sach ye hai ke free proxies zyadatar dead/slow hoti hain — isliye
+// health-check hi is feature ki jaaaan hai. Jo pass ho jaye wo WAF/rate-limit
+// par rotation de deti hai (ek garam IP = turant doosri IP, zero wait).
+// Manual (boss ki add ki hui) proxies ko kabhi haath nahi lagta — auto
+// entries `auto:true` tag se alag rehti hain, refresh par wahin replace
+// hoti hain jo ab zinda nahi.
+//
+// Knobs:
+//   PREMIUM_AUTO_FREE_PROXIES=0  → auto-fetch OFF (default ON)
+//   PREMIUM_PROXY_SOURCES=<url>[,<url>] → apni list URLs pehle try hongi
+//     (JSON {proxies:[{proxy,...}]} ya text lines "proto://ip:port")
+// ---------------------------------------------------------------------------
+
+const PROXYSCRAPE_JSON = 'https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=json&ssl=yes';
+const PROXYSCRAPE_TEXT = 'https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=text&ssl=yes';
+
+export function freeProxiesEnabled() {
+  if (String(process.env.PREMIUM_AUTO_FREE_PROXIES || '') === '0') return false;
+  try { return loadState().autoFree !== false; } catch { return true; }
+}
+
+export function setAutoFree(on) {
+  const state = ensureSeeded();
+  state.autoFree = Boolean(on);
+  persist(state);
+  return { ok: true, autoFree: state.autoFree };
+}
+
+export function freeProxySourceUrls() {
+  const extra = String(process.env.PREMIUM_PROXY_SOURCES || '')
+    .split(/[,\n]/).map((s) => s.trim()).filter(Boolean);
+  return [...extra, PROXYSCRAPE_JSON, PROXYSCRAPE_TEXT];
+}
+
+// ProxyScrape v4 JSON → saleeqe ke candidates. Sirf wahi protocol jo hamare
+// dispatcher chala sakte hain (http/socks5 — socks4 unsupported hai).
+export function _parseFreeProxyListJson(json) {
+  const arr = Array.isArray(json?.proxies) ? json.proxies : (Array.isArray(json) ? json : []);
+  const out = [];
+  for (const p of arr) {
+    const url = String(p?.proxy || (p?.ip && p?.port ? `${p.protocol || 'http'}://${p.ip}:${p.port}` : '')).trim();
+    const parsed = parseProxyUrl(url);
+    if (!parsed) continue;
+    if (dispatcherKind(parsed.url) === 'unsupported') continue; // socks4 waghera bahar
+    if (p?.alive === false) continue;
+    out.push({
+      url: parsed.url,
+      country: String(p?.ip_data?.countryCode || '').toUpperCase(),
+      hosting: p?.ip_data?.hosting === true,
+      uptime: Number(p?.uptime) || 0,
+      avgTimeoutMs: Number(p?.average_timeout ?? p?.timeout) || 99999,
+    });
+  }
+  return out;
+}
+
+// Text list fallback — har line "proto://ip:port" (ya bare ip:port)
+export function _parseFreeProxyListText(text) {
+  const out = [];
+  for (const line of String(text || '').split(/\r?\n/)) {
+    const parsed = parseProxyUrl(line.trim());
+    if (!parsed) continue;
+    if (dispatcherKind(parsed.url) === 'unsupported') continue;
+    out.push({ url: parsed.url, country: '', hosting: false, uptime: 0, avgTimeoutMs: 99999 });
+  }
+  return out;
+}
+
+// Ranking — pehle wo jo Swiggy par sab se zyada kaam ke hone ki umeed hai:
+//   1) Indian IP (Swiggy India-only service hai)
+//   2) non-hosting (residential-ish IPs WAF par kam flag hoti hain)
+//   3) zyada uptime, kam average timeout
+export function _rankFreeCandidates(cands = []) {
+  const seen = new Set();
+  const uniq = [];
+  for (const c of cands) {
+    if (!c?.url || seen.has(c.url)) continue;
+    seen.add(c.url);
+    uniq.push(c);
+  }
+  return uniq.sort((a, b) =>
+    ((a.country === 'IN' ? 0 : 1) - (b.country === 'IN' ? 0 : 1)) ||
+    ((a.hosting ? 1 : 0) - (b.hosting ? 1 : 0)) ||
+    ((b.uptime || 0) - (a.uptime || 0)) ||
+    ((a.avgTimeoutMs || 99999) - (b.avgTimeoutMs || 99999))
+  );
+}
+
+// Ek proxy ko seedha Swiggy par parkho. Temp dispatcher (cache wala nahi —
+// saikron dead proxies ke agents cache me phans jate), kaam ke baad band.
+// ok = response mila, 5xx/407 nahi, aur WAF challenge NAHI hai (challenge
+// wali IP abhi garam hai — hamare kisi kaam ki nahi).
+export async function checkProxyOnce(url, { timeoutMs = 7000, target = 'https://www.swiggy.com/' } = {}) {
+  const started = Date.now();
+  let agent = null;
+  try {
+    const kind = dispatcherKind(url);
+    if (kind === 'unsupported') return { ok: false, latencyMs: 0, reason: 'unsupported' };
+    const undici = await import('undici');
+    agent = kind === 'socks5' ? new undici.Socks5ProxyAgent(url) : new undici.ProxyAgent({ uri: url });
+    const res = await fetch(target, {
+      dispatcher: agent,
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36' },
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    const latencyMs = Date.now() - started;
+    const wafHeader = typeof res.headers?.get === 'function' ? (res.headers.get('x-amzn-waf-action') || '') : '';
+    let challenged = Boolean(wafHeader);
+    if (!challenged && res.status === 403) {
+      const sample = (await res.text().catch(() => '')).slice(0, 4000).toLowerCase();
+      challenged = /awswaf|captcha|challenge|verify you are human|automated traffic/.test(sample);
+    } else {
+      // body drain kardo taaki socket saaf band ho
+      try { await res.text(); } catch {}
+    }
+    const ok = !challenged && res.status !== 407 && res.status < 500;
+    return { ok, latencyMs, status: res.status, challenged };
+  } catch (e) {
+    return { ok: false, latencyMs: Date.now() - started, reason: String(e?.cause?.code || e?.message || e).slice(0, 80) };
+  } finally {
+    try { await agent?.close?.(); } catch {}
+    try { agent?.destroy?.(); } catch {}
+  }
+}
+
+// Candidates ko parallel parkho — `want` achhe milte hi naye probe shuru
+// karna band. Returns { good: [{...cand, latencyMs}] (tez pehle), checked }
+export async function probeFreeCandidates(cands = [], {
+  want = 8, concurrency = 16, timeoutMs = 7000, maxProbe = 140, check = null, onProgress = null,
+} = {}) {
+  const list = (cands || []).slice(0, Math.max(1, maxProbe));
+  const good = [];
+  let checked = 0;
+  let i = 0;
+  const fn = typeof check === 'function' ? check : (c) => checkProxyOnce(c.url, { timeoutMs });
+  const workerCount = Math.max(1, Math.min(Number(concurrency) || 1, list.length || 1));
+  const workers = Array.from({ length: workerCount }, async () => {
+    while (i < list.length && good.length < want) {
+      const cand = list[i++];
+      const r = await fn(cand).catch(() => null);
+      checked++;
+      if (r?.ok) good.push({ ...cand, latencyMs: Number(r.latencyMs) || 0, status: r.status });
+      if (onProgress) { try { onProgress({ checked, good: good.length, total: list.length }); } catch {} }
+    }
+  });
+  await Promise.all(workers);
+  good.sort((a, b) => (a.latencyMs || 99999) - (b.latencyMs || 99999));
+  return { good: good.slice(0, want), checked };
+}
+
+async function fetchFreeProxyCandidates({ fetchImpl = null } = {}) {
+  const doFetch = typeof fetchImpl === 'function' ? fetchImpl : fetch;
+  for (const src of freeProxySourceUrls()) {
+    try {
+      const res = await doFetch(src, { signal: AbortSignal.timeout(20_000) });
+      if (!res?.ok) continue;
+      const body = await res.text();
+      let cands = [];
+      if (body.trimStart().startsWith('{') || body.trimStart().startsWith('[')) {
+        try { cands = _parseFreeProxyListJson(JSON.parse(body)); } catch { cands = []; }
+      }
+      if (!cands.length) cands = _parseFreeProxyListText(body);
+      if (cands.length) return { cands, source: src };
+    } catch { /* agla source try */ }
+  }
+  return { cands: [], source: '' };
+}
+
+let _freeRefreshPromise = null;
+
+// Pool ki auto entries ko taazi verified free proxies se badal do.
+// Purani auto entries pehle re-verify hongi (zinda hain to wahi id/token
+// continuity ke saath reh jayengi). Manual proxies untouched.
+export async function refreshFreeProxies({
+  want = 8, concurrency = 16, timeoutMs = 7000, maxProbe = 140,
+  fetchImpl = null, check = null, onProgress = null,
+} = {}) {
+  if (_freeRefreshPromise) return _freeRefreshPromise;
+  _freeRefreshPromise = (async () => {
+    try {
+      const state = ensureSeeded();
+      const existingAuto = state.list.filter((p) => p.auto);
+      const existingByUrl = new Map(existingAuto.map((p) => [p.url, p]));
+
+      const { cands, source } = await fetchFreeProxyCandidates({ fetchImpl });
+      // Purani zinda autos sab se pehle parkho (unke paas WAF token bhi ho sakta hai)
+      const oldFirst = existingAuto.map((p) => ({
+        url: p.url, country: p.country || '', hosting: false, uptime: 100, avgTimeoutMs: 1,
+      }));
+      const ranked = _rankFreeCandidates([...oldFirst, ...cands]);
+      const { good, checked } = await probeFreeCandidates(ranked, {
+        want, concurrency, timeoutMs, maxProbe, check, onProgress,
+      });
+
+      const keptEntries = good.map((g) => {
+        const prev = existingByUrl.get(g.url);
+        if (prev) {
+          return { ...prev, latencyMs: g.latencyMs, lastOkAt: new Date().toISOString() };
+        }
+        const parsed = parseProxyUrl(g.url);
+        return {
+          id: crypto.randomUUID().slice(0, 8),
+          label: `🌐 ${parsed?.label || g.url}${g.country ? ` (${g.country})` : ''}`,
+          url: g.url,
+          enabled: true,
+          auto: true,
+          country: g.country || '',
+          latencyMs: g.latencyMs,
+          hits: 0,
+          addedAt: new Date().toISOString(),
+          lastOkAt: new Date().toISOString(),
+        };
+      });
+
+      const keptIds = new Set(keptEntries.map((e) => e.id));
+      for (const old of existingAuto) {
+        if (!keptIds.has(old.id)) runtime.delete(old.id); // mari hui auto ka runtime saaf
+      }
+      state.list = [...state.list.filter((p) => !p.auto), ...keptEntries];
+      if (keptEntries.length) state.enabled = true;
+      state.autoFreeAt = new Date().toISOString();
+      persist(state);
+      console.log(`[ProxyPool] 🌐 Free proxies: ${checked} parkhin, ${keptEntries.length} zinda mili (source: ${source ? 'list' : 'sirf purani'}).`);
+      return { ok: keptEntries.length > 0, added: keptEntries.length, checked, source };
+    } finally {
+      _freeRefreshPromise = null;
+    }
+  })();
+  return _freeRefreshPromise;
+}
+
+// Batch shuru hone se pehle: enabled proxies kam hon to free wali khud le aao.
+// Kabhi throw nahi karta — fail ho to purana direct-mode hi chalega.
+export async function ensureFreeProxies({ min = 1, want = 8 } = {}) {
+  try {
+    const state = ensureSeeded();
+    const enabledCount = state.list.filter((p) => p.enabled).length;
+    if (!freeProxiesEnabled()) return { skipped: true, reason: 'disabled', count: enabledCount };
+    if (enabledCount >= min && state.enabled) return { skipped: true, reason: 'enough', count: enabledCount };
+    const r = await refreshFreeProxies({ want });
+    const now = ensureSeeded().list.filter((p) => p.enabled).length;
+    return { skipped: false, added: r.added || 0, checked: r.checked || 0, count: now };
+  } catch (e) {
+    console.warn('[ProxyPool] ensureFreeProxies:', e?.message);
+    return { skipped: true, reason: 'error', count: 0 };
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Summary (bot UI + engine ke liye)
 // ---------------------------------------------------------------------------
 export function proxySummary() {
   const state = ensureSeeded();
   const enabled = state.list.filter((p) => p.enabled).length;
+  const autoCount = state.list.filter((p) => p.auto && p.enabled).length;
   return {
     enabled: Boolean(state.enabled),
     total: state.list.length,
     enabledCount: enabled,
+    autoCount,
+    autoFree: freeProxiesEnabled(),
     rotation: state.enabled && enabled > 1 ? 'ON (IP rotation — zero-wait recovery)' : 'OFF (ek hi IP)',
   };
 }

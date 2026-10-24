@@ -62,6 +62,9 @@ const state = {
   serverErrors: 0,        // Swiggy/proxy temporary 5xx/network — number failed nahi gina jata
   transientStrikes: 0,    // lagatar temporary errors (cool-off ladder ke liye)
   proxyRotations: 0,
+  routeMode: 'direct',    // 'proxy' | 'direct-fallback' | 'direct'
+  proxyChallenges: 0,     // current proxy route system par lagatar WAF challenges
+  directChallenges: 0,    // direct fallback par lagatar WAF challenges
   deferredQueue: 0,
   consecutiveFails: 0,
   current: null,          // { phone, startedAt }
@@ -99,6 +102,9 @@ export function getAutopilotSnapshot() {
     serverErrors: state.serverErrors || 0,
     transientStrikes: state.transientStrikes || 0,
     proxyRotations: state.proxyRotations,
+    routeMode: state.routeMode || 'direct',
+    proxyChallenges: state.proxyChallenges || 0,
+    directChallenges: state.directChallenges || 0,
     deferredQueue: state.deferredQueue,
     currentProxy: getBridgeProxy()?.label || '',
     current: state.current ? { ...state.current } : null,
@@ -147,6 +153,22 @@ export function transientSwiggyRetryWaitMs(consecutiveStrikes) {
   return ladder[idx];
 }
 
+// Security challenge ke baad route ka faisla. Free proxies teeno garam hon
+// to unhi ke beech ghumna dead-end hai — Render ki direct IP ko asal chance
+// do. Direct bhi 2 baar challenge de to best proxy route par wapas jao.
+export function securityRouteAction({
+  proxyEnabled = false,
+  usingDirectFallback = false,
+  proxyChallenges = 0,
+  directChallenges = 0,
+} = {}) {
+  if (usingDirectFallback) {
+    return Number(directChallenges) >= 2 ? 'restore_proxy' : 'direct_cooldown';
+  }
+  if (!proxyEnabled) return 'direct_cooldown';
+  return Number(proxyChallenges) >= 3 ? 'direct_fallback' : 'rotate_proxy';
+}
+
 // Fresh session bante HI uska JSON chat me bhejo (batch ke end ka wait nahi).
 // ui.sendSession fresh-bot deta hai (document file ke tor par bhejta hai).
 // Fire-and-forget: send fail ho bhi jaye to batch kabhi na ruke.
@@ -186,13 +208,15 @@ function statsLines() {
     field('⚠️ Skipped', `${state.skipped} · deferred: ${state.deferred} · 📴 stale devices: ${state.staleSkips || 0}`),
     field('× Failed', `${state.failed} · aborted: ${state.aborted} · rate-limit: ${state.rateStrikes}`),
     (state.wafCooldowns || state.wafStrikes || state.proxyRotations)
-      ? field('🛡 WAF', `${state.wafCooldowns} cooldown · challenges: ${state.wafStrikes} · rotations: ${state.proxyRotations}`)
+      ? field('🛡 WAF', `${state.wafCooldowns} cooldown · challenges: ${state.wafStrikes} · rotations: ${state.proxyRotations} · token-ready: ${pSummary?.tokenReadyCount || 0}`)
       : '',
     state.serverErrors
       ? field('↻ Swiggy 5xx', `${state.serverErrors} temporary · numbers failed nahi, retry queue me`)
       : '',
     pSummary?.enabled
-      ? field('🔀 Proxy', `${getBridgeProxy()?.label || '—'}  ·  ${pSummary.enabledCount} ON  ·  rotates: ${state.proxyRotations}`)
+      ? field('🔀 Proxy', state.routeMode === 'direct-fallback'
+          ? `DIRECT fallback (Render IP)  ·  pool ${pSummary.enabledCount} ON  ·  rotates: ${state.proxyRotations}`
+          : `${getBridgeProxy()?.label || '—'}  ·  ${pSummary.enabledCount} ON  ·  rotates: ${state.proxyRotations}`)
       : field('🔀 Proxy', 'OFF (ek hi IP — ⚙️ Settings me add karo)'),
     field('Pool', state.poolTotal
       ? `${state.poolFresh} fresh / ${state.poolTotal} numbers`
@@ -346,6 +370,7 @@ export async function startAutopilot(opts = {}) {
     skipped: 0, deferred: 0, staleSkips: 0, failed: 0, aborted: 0,
     rateStrikes: 0, wafStrikes: 0, wafCooldowns: 0, serverErrors: 0, transientStrikes: 0,
     consecutiveFails: 0, proxyRotations: 0,
+    routeMode: 'direct', proxyChallenges: 0, directChallenges: 0,
     current: null, history: [], freshAccounts: [], lastError: '',
     poolTotal: 0, poolFresh: 0,
     scanning: false, scanChecked: 0, scanFresh: 0,
@@ -391,6 +416,8 @@ export async function startAutopilot(opts = {}) {
     // Yahan pahuncha matlab request WAF ko paar karke Swiggy tak gayi
     // (OTP miss/fail bhi) — challenge "storm" khatam, strikes reset.
     state.wafStrikes = 0;
+    state.proxyChallenges = 0;
+    state.directChallenges = 0;
     state.history.push({ phone: res.phone, kind: res.kind, reason: res.reason || '', at: new Date().toISOString() });
     if (state.history.length > 200) state.history.splice(0, state.history.length - 200);
 
@@ -449,11 +476,18 @@ export async function startAutopilot(opts = {}) {
 
     // Proxy assign — pehli enabled proxy (round-robin se). WAF token bhi
     // usi IP ke liye arrange hoga.
-    const rotateProxy = (excludeId = '') => {
+    const rotateProxy = (excludeId = '', { countRotation = false } = {}) => {
       if (!proxyPool.isEnabled()) return null;
+      const beforeId = getBridgeProxy()?.id || '';
       const next = proxyPool.pickProxy(excludeId ? { excludeIds: [excludeId] } : {});
       if (next) {
         setBridgeProxy(next);
+        state.routeMode = 'proxy';
+        // Counter yahin central hai — pehle security/rate branches asal
+        // rotation ke bawjood card par 0 dikhaate the.
+        if (countRotation && beforeId && next.id !== beforeId) {
+          state.proxyRotations = (state.proxyRotations || 0) + 1;
+        }
         console.log(`[Autopilot] Proxy → ${next.label}`);
         return next;
       }
@@ -501,9 +535,19 @@ export async function startAutopilot(opts = {}) {
         // solve karo — aws-waf-token IP-bound hai, galat IP ka token bekar hai.
         await freePromise;
         ps = proxyPool.proxySummary();
-        if (ps.enabled) rotateProxy();
+        if (ps.enabled) {
+          const chosen = rotateProxy();
+          if (!chosen) {
+            // Saari proxies cooling/unsolvable hain — purani run ki stale
+            // proxy chipki na reh jaye, seedha Render IP se shuru karo.
+            setBridgeProxy(null);
+            state.routeMode = 'direct-fallback';
+          }
+        } else {
+          state.routeMode = 'direct';
+        }
         wafPool.loadFromDb?.();
-        wafTok = await getLiveSwiggyWafToken();
+        wafTok = await getLiveSwiggyWafToken(false, { solveBudgetMs: 25_000 });
         console.log(wafTok ? '[Autopilot] WAF token ready (warm start).' : '[Autopilot] WAF token nahi mila (Chromium?) — raw mode me chalega.');
       } catch (e) {
         console.warn('[Autopilot] WAF warm-up skipped:', e?.message);
@@ -614,7 +658,10 @@ export async function startAutopilot(opts = {}) {
       try {
         const r = await scanFreshDevices(candidates, {
           windowMs: otpCfg.activeWindowMs,
-          want: 8, chunkSize: 120, maxProbe: 800, concurrency: 24,
+          // Pehle 8 fresh milne tak 120-device chunks chalte the — sparse
+          // pool me pehla number hi minutes baad nikalta tha. Ab 3 fresh
+          // milte hi 40-device chunk par kaam shuru ho jata hai.
+          want: 3, chunkSize: 40, maxProbe: 800, concurrency: 24,
           onProgress: ({ checked, freshCount }) => {
             state.scanChecked = baseChecked + checked;
             state.scanFresh = hotQueue.length + freshCount;
@@ -794,8 +841,7 @@ export async function startAutopilot(opts = {}) {
 
         let next = null;
         if (ps.enabled) {
-          next = rotateProxy(getBridgeProxyId());
-          if (next) state.proxyRotations = (state.proxyRotations || 0) + 1;
+          next = rotateProxy(getBridgeProxyId(), { countRotation: true });
         }
 
         const needsCoolOff = !next || (state.transientStrikes || 0) >= 3;
@@ -818,7 +864,7 @@ export async function startAutopilot(opts = {}) {
           if (state.stopRequested) { endReason = state.stopReason || 'manual'; break; }
         }
         if (next) {
-          try { await getLiveSwiggyWafToken(); } catch {}
+          try { await getLiveSwiggyWafToken(false, { solveBudgetMs: 25_000 }); } catch {}
         }
         state.consecutiveFails = 0;
         continue;
@@ -832,7 +878,7 @@ export async function startAutopilot(opts = {}) {
 
         if (ps.enabled) {
           const before = getBridgeProxyId();
-          const next = rotateProxy(before);
+          const next = rotateProxy(before, { countRotation: true });
           if (next) {
             await push(progressCard(section('🔀 Rate Limit — Proxy Rotate (zero wait)', [
               `› IP ko limit lagi — nayi IP (proxy) le liya: <code>${esc(next.label)}</code>`,
@@ -876,7 +922,7 @@ export async function startAutopilot(opts = {}) {
         ].join('\n'))), stopRows());
         await sleep(cdMs, () => state.stopRequested);
         if (state.stopRequested) { endReason = state.stopReason || 'manual'; break; }
-        const rotated = rotateProxy(); // proxy mode me jo bhi free hua, use le lo
+        const rotated = rotateProxy('', { countRotation: true }); // proxy mode me jo bhi free hua, use le lo
         if (!rotated) {
           // Koi proxy free nahi bachi (free wali jaldi marti hain) — background
           // me nayi free proxies le aao, batch ko roke baghair.
@@ -900,34 +946,107 @@ export async function startAutopilot(opts = {}) {
         if (res.phone) deferNumber(entry, 'security_challenge');
         if (state.wafStrikes >= 12) { endReason = 'security_challenge'; break; }
 
-        if (ps.enabled) {
-          const before = getBridgeProxyId();
-          const next = rotateProxy(before);
+        const currentId = getBridgeProxyId();
+        // Bridge khud bhi andar recovery me IP badal sakta hai — routeMode
+        // ko asal current bridge route se sync rakho, andaza mat lagao.
+        state.routeMode = currentId ? 'proxy' : (ps.enabled ? 'direct-fallback' : 'direct');
+        if (currentId) {
+          state.proxyChallenges = (state.proxyChallenges || 0) + 1;
+          // Final challenged route ki quarantine guarantee (bridge ke kuch
+          // paths pehle ye miss kar dete the). Bridge ne already cooldown
+          // laga diya ho to double-count na karo.
+          try {
+            const info = proxyPool.listProxies().find((p) => p.id === currentId);
+            if (!info || !info.cooldownLeftMs) proxyPool.markProxyWafHit(currentId, 10 * 60_000);
+          } catch {}
+        } else {
+          state.directChallenges = (state.directChallenges || 0) + 1;
+        }
+
+        const action = securityRouteAction({
+          proxyEnabled: Boolean(ps.enabled),
+          usingDirectFallback: state.routeMode === 'direct-fallback',
+          proxyChallenges: state.proxyChallenges || 0,
+          directChallenges: state.directChallenges || 0,
+        });
+
+        const enterDirectFallback = async (reasonLine) => {
+          setBridgeProxy(null);
+          state.routeMode = 'direct-fallback';
+          state.directChallenges = 0;
+          state.proxyRotations = (state.proxyRotations || 0) + 1; // asal IP switch hua hai
+          // Direct try hota rahe, peeche nayi free proxies bhi parkh lo.
+          void proxyPool.refreshFreeProxies({ want: 10 }).then((r) => {
+            if (r?.added) {
+              ps = proxyPool.proxySummary();
+              console.log(`[Autopilot] 🌐 Direct fallback ke peeche ${r.added} free proxies refresh.`);
+            }
+          }).catch(() => {});
+          await push(progressCard(section('🌐 Proxies Garam — Direct IP Try', [
+            `› Challenge mila (lagatar ${state.wafStrikes}). ${reasonLine}`,
+            `› Ab Render ki <b>direct IP</b> + usi IP ka fresh WAF token try hoga (route switch #${state.proxyRotations}).`,
+            `› Number defer hai — failed mark nahi hua. Direct par response milte hi challenge storm reset ho jayegi.`,
+            sub('Peeche nayi free proxies bhi parkh raha hoon.'),
+          ].join('\n'))), stopRows());
+          try { await getLiveSwiggyWafToken(false, { solveBudgetMs: 25_000 }); } catch {}
+        };
+
+        if (action === 'direct_fallback') {
+          await enterDirectFallback(`${state.proxyChallenges} proxy routes challenge de chuke hain — kharab free pool me aur nahi ghumunga.`);
+          state.consecutiveFails = 0;
+          continue;
+        }
+
+        if (action === 'restore_proxy') {
+          const next = rotateProxy('', { countRotation: true });
+          if (next) {
+            state.proxyRotations = (state.proxyRotations || 0) + 1; // direct → proxy switch
+            state.proxyChallenges = 0;
+            await push(progressCard(section('🔀 Direct Bhi Garam — Best Proxy Wapas', [
+              `› Direct IP par 2 challenges aaye — best available proxy le liya: <code>${esc(next.label)}</code>`,
+              `› Picker ab fresh-token/Indian/clean route ko pehle rakhta hai (rotation #${state.proxyRotations}).`,
+              `› Number defer hai, failed nahi.`,
+            ].join('\n'))), stopRows());
+            try { await getLiveSwiggyWafToken(false, { solveBudgetMs: 25_000 }); } catch {}
+            state.consecutiveFails = 0;
+            continue;
+          }
+          // Proxy bhi free nahi mili — neeche direct cooldown ladder chalega.
+        } else if (action === 'rotate_proxy') {
+          const next = rotateProxy(currentId, { countRotation: true });
           if (next) {
             await push(progressCard(section('🔀 Security Challenge — Proxy Rotate', [
-              `› Challenge mila (lagatar ${state.wafStrikes}) — nayi IP: <code>${esc(next.label)}</code>`,
+              `› Challenge mila (lagatar ${state.wafStrikes}) — nayi IP: <code>${esc(next.label)}</code> (rotation #${state.proxyRotations})`,
               `› Number defer kiya — nayi IP + naye token ke saath aage badh raha hoon.`,
-              sub('Batch nahi rukega.'),
+              sub('Batch nahi rukega. 3 proxy challenges ke baad direct fallback bhi try hoga.'),
             ].join('\n'))), stopRows());
-            try { await getLiveSwiggyWafToken(); } catch {}
+            try { await getLiveSwiggyWafToken(false, { solveBudgetMs: 25_000 }); } catch {}
             state.consecutiveFails = 0;
             continue; // agla number nayi IP par (ye wala baad me dobara)
           }
+
+          // Pehle yahan purani garam proxy hi chipki rehti thi aur code
+          // "direct mode" samajh kar usi par token solve karta rehta tha.
+          await enterDirectFallback('Doosri usable proxy abhi free nahi hai.');
+          state.consecutiveFails = 0;
+          continue;
         }
 
-        // Direct mode — pehle IP ko THANDA hone do (ladder + pool cooldown),
-        // phir naya token banao. Garam IP par token banana bekar hota hai:
-        // solver visit bhi challenge kha sakti hai.
+        // Direct mode / direct fallback — pehle IP ko THANDA hone do
+        // (ladder + pool cooldown), phir naya token banao. Garam IP par
+        // token banana bekar hota hai: solver visit bhi challenge kha sakti hai.
         const poolCd = (() => { try { return wafPool.cooldownRemainingMs?.() || 0; } catch { return 0; } })();
         const waitMs = wafChallengeWaitMs(state.wafStrikes, poolCd);
         await push(progressCard(section('🛡 Swiggy Security Check — IP Cool-Down', [
-          `› Challenge mila (lagatar ${state.wafStrikes}) — IP abhi garam hai.`,
+          `› Challenge mila (lagatar ${state.wafStrikes}) — direct IP abhi garam hai.`,
           `› ~${Math.max(1, Math.round(waitMs / 60000))} min ruk kar naya WAF token banao-ga, phir aage. Number defer ho gaya (baad me dobara).`,
-          sub('Batch nahi rukega. Ek success milte hi ye ginti reset ho jati hai. Proxies hoge to nayi IP lete hi wait khatam.'),
+          sub(ps.enabled
+            ? 'Ek aur direct challenge par best proxy route dobara try hogi.'
+            : 'Batch nahi rukega. Ek success milte hi ye ginti reset ho jati hai.'),
         ].join('\n'))), stopRows());
         await sleep(waitMs, () => state.stopRequested);
         if (state.stopRequested) { endReason = state.stopReason || 'manual'; break; }
-        try { await getLiveSwiggyWafToken(true); } catch {}
+        try { await getLiveSwiggyWafToken(true, { solveBudgetMs: 25_000 }); } catch {}
         state.consecutiveFails = 0;
         continue; // thandi IP + fresh token → agla number
       }
@@ -935,10 +1054,9 @@ export async function startAutopilot(opts = {}) {
       // Generic failure streak — pehle proxy badal kar dekho (IP issue ho
       // sakti hai), warna hi band. Pehle ye 6 par seedha band ho jata tha.
       if (outcome === 'failed' && state.consecutiveFails >= 4 && ps.enabled) {
-        const next = rotateProxy(getBridgeProxyId());
+        const next = rotateProxy(getBridgeProxyId(), { countRotation: true });
         if (next) {
           state.consecutiveFails = 0;
-          state.proxyRotations = (state.proxyRotations || 0) + 1;
           if (state.proxyRotations > 25) { endReason = 'circuit_breaker'; break; }
           await push(progressCard(section('🔀 Fail Streak — Proxy Rotate', [
             `› ${state.consecutiveFails} lagatar failures — IP issue lag raha hai.`,

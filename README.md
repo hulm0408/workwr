@@ -111,9 +111,17 @@ Jo 403 challenge pehle poora batch maar deta tha, ab uska tod:
    dikhta hai, challenge hi nahi.
 2. **Phir bhi challenge aaye** → bot **turant naya token** lekar **ek baar
    retry** karta hai (na ki hammering).
-3. **Engine-level** — challenge aane par batch **nahi rukta**: token refresh +
-   IP cool-down (ladder 30s→4m) + naya token + number defer karke aage. Sirf **12 lagatar challenges** (bina ek bhi request guzare) par batch rukta hai — ek request bhi paar ho gayi to ginti reset.
-4. **WAF cooldown** (circuit-breaker) active ho to request bheji hi nahi
+3. **Engine-level** — challenge aane par batch **nahi rukta**: final proxy ko
+   quarantine karke best next route, **3 proxy challenges ke baad Render ki
+   direct IP**, aur 2 direct challenges ke baad best proxy dobara try hoti
+   hai. Card par rotations/route/token-ready count asal state dikhate hain.
+   Sirf **12 lagatar challenges** (bina ek bhi request guzare) par batch
+   rukta hai — ek request bhi paar ho gayi to ginti reset.
+4. **Solver route-locked + time-boxed** — har proxy ka solve alag route key
+   par hota hai (ek IP ka token doosri IP par leak nahi), ek solve zyada se
+   zyada ~25–35s leta hai, aur jis proxy par solve fail ho wo 10 min side
+   par rehti hai taaki har number par wahi lamba solver na ghume.
+5. **WAF cooldown** (circuit-breaker) active ho to request bheji hi nahi
    jaati — cooldown khatam hote hi khud aage badhta hai.
 
 ## 🔀 Proxies — "rukna hi na pare" ka asli tod (IP rotation)
@@ -140,13 +148,17 @@ jitne chahein add karo (ek saath comma me bhi):
   hain; manual proxies ko haath nahi lagta. (Sach: free wali aksar slow/dead
   hoti hain — isliye health-check filter hai; best natija khud ki sticky
   proxies se hi milta hai.)
-- Add karte hi **rotation ON**. Bot round-robin me IPs ghoomta hai.
+- Add karte hi **rotation ON**. Picker sirf round-robin nahi — clean,
+  fresh per-proxy token wali, Indian, kam-hit aur kam-latency route pehle
+  aati hai; challenged/solve-failed routes peeche rehti hain.
 - **WAF/rate-limit/temporary 5xx hit = TURANT doosri proxy** — number
   failed count kiye baghair defer karke aage badhta hai, baad me **isi run
   me** dobara try karta hai (per number max 2 temporary attempts). Lagatar
   3 temporary errors par 60s ka short cool-off lagta hai.
 - **`aws-waf-token` IP-bound** hota hai → har proxy ka **apna token** +
-  apna cooldown state (proxy-pool.js me per-proxy).
+  apna WAF/solve-failure state (proxy-pool.js me per-proxy). Challenge par
+  usi route ka token burn ho jata hai; ek session ke beech silent IP-switch
+  nahi hota (**sticky route**, rotation sirf explicit recovery me).
 - Proxy ON ho to **browser (puppeteer) bhi usi IP se** chalta hai.
 
 **Batch sirf 3 cheezon par rukta hai: STOP · target · time.** Baaki kuch bhi

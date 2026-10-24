@@ -12,7 +12,8 @@
 //   PREMIUM_ALLOW_OFFLINE_DEVICES   — '1' = offline devices bhi try karo
 //   PREMIUM_OTP_WAIT_MS             — poll shuru karne se pehle wait (default 3000)
 //   PREMIUM_OTP_TIMEOUT_MS          — inbox poll budget (default 90000)
-//   PREMIUM_DEVICE_ACTIVE_WINDOW_MS — last-seen gate window (default 60000, 0=off)
+//   PREMIUM_DEVICE_ACTIVE_WINDOW_MS — last-seen base window (default 60000, 0=off)
+//   PREMIUM_DEVICE_SCAN_BUDGET_MS   — quick scan/refill ka hard budget (default 12000)
 //
 // Engine process-singleton hai: dono bots (main + autopilot) isi state ko dekhte hain.
 
@@ -80,6 +81,7 @@ const state = {
   scanTotalDevices: 0,    // current pass ke total unique candidate devices
   scanPass: 1,            // full-pool scan ka pass number
   scanWindowMs: 0,        // current/selected last-seen ladder window
+  scanBestActivityMs: 0,  // probed sample ki sabse taazi SMS activity (diagnostic)
   scanFresh: 0,           // hot-queue me ready (fresh) devices
 };
 
@@ -122,6 +124,7 @@ export function getAutopilotSnapshot() {
     scanTotalDevices: state.scanTotalDevices || 0,
     scanPass: state.scanPass || 1,
     scanWindowMs: state.scanWindowMs || 0,
+    scanBestActivityMs: state.scanBestActivityMs || 0,
     scanFresh: state.scanFresh || 0,
     lastError: state.lastError,
     history: state.history.slice(-40),
@@ -232,7 +235,7 @@ function statsLines() {
       ? `${state.poolFresh} fresh / ${state.poolTotal} numbers`
       : 'load ho raha hai…'),
     (state.scanning || state.scanChecked)
-      ? field('🔎 Device scan', `pass ${state.scanPass || 1}: ${state.scanUniqueChecked || 0}/${state.scanTotalDevices || 0} unique check · total probes ${state.scanTotalProbes || state.scanChecked || 0} · window ≤${fmtDuration(state.scanWindowMs || 0)} · ${state.scanFresh || 0} fresh ready${state.scanning ? ' · scanning…' : ''}`)
+      ? field('🔎 Device scan', `pass ${state.scanPass || 1}: ${state.scanUniqueChecked || 0}/${state.scanTotalDevices || 0} unique check · total probes ${state.scanTotalProbes || state.scanChecked || 0} · window ≤${fmtDuration(state.scanWindowMs || 0)} · ${state.scanBestActivityMs ? `best SMS ~${fmtDuration(Date.now() - state.scanBestActivityMs)} purani · ` : ''}${state.scanFresh || 0} fresh ready${state.scanning ? ' · scanning…' : ''}`)
       : '',
     state.current
       ? `📍 <b>Abhi:</b> <code>${esc(state.current.phone)}</code> (${fmtDuration(Date.now() - state.current.startedAt)})`
@@ -358,6 +361,10 @@ export async function startAutopilot(opts = {}) {
     : s('gapMs', envInt('PREMIUM_BATCH_GAP_MS', 6_000));
   const backoffMs = s('backoffMs', envInt('PREMIUM_RATE_LIMIT_BACKOFF_MS', 15 * 60_000));
   const allowOffline = s('allowOffline', String(process.env.PREMIUM_ALLOW_OFFLINE_DEVICES || '') === '1') === true;
+  // Ek refill me device scan ka hard time budget. Iske baad full pool ka
+  // intezaar nahi: probed sample ka sabse taaza SMS device, warna Firebase
+  // clients me ONLINE device process hoga. 0 = purana unbounded scan.
+  const deviceScanBudgetMs = envInt('PREMIUM_DEVICE_SCAN_BUDGET_MS', 12_000);
   const otpCfg = {
     waitMs: s('otpWaitMs', envInt('PREMIUM_OTP_WAIT_MS', 3_000)),
     timeoutMs: s('otpTimeoutMs', envInt('PREMIUM_OTP_TIMEOUT_MS', 90_000)),
@@ -387,7 +394,7 @@ export async function startAutopilot(opts = {}) {
     poolTotal: 0, poolFresh: 0,
     scanning: false, scanChecked: 0, scanTotalProbes: 0,
     scanUniqueChecked: 0, scanTotalDevices: 0, scanPass: 1,
-    scanWindowMs: Number(otpCfg.activeWindowMs) || 0, scanFresh: 0,
+    scanWindowMs: Number(otpCfg.activeWindowMs) || 0, scanBestActivityMs: 0, scanFresh: 0,
   });
 
   const userId = opts.userId || 'autopilot';
@@ -674,6 +681,7 @@ export async function startAutopilot(opts = {}) {
       state.scanTotalDevices = passDeviceIds.size;
       state.scanUniqueChecked = baseUniqueChecked;
       state.scanWindowMs = Number(otpCfg.activeWindowMs) || 0;
+      state.scanBestActivityMs = 0;
       let lastPushAt = 0;
       try {
         const r = await scanFreshDevices(candidates, {
@@ -694,13 +702,16 @@ export async function startAutopilot(opts = {}) {
           // device turant milega, naya Firebase pass nahi ghumega.
           backupCount: 12,
           // Full pass ke khatam hone ka intezaar hi purani susti thi. Har
-          // 10s scan ke baad agli ladder window probed-so-far devices par
-          // khul jati hai (≤20s, phir ≤40s, ≤80s...); candidate milte hi
-          // scan ruk kar process shuru ho jata hai.
-          earlyWidenStepMs: 10_000,
+          // 4s scan ke baad agli ladder window probed-so-far devices par
+          // khul jati hai (≤20s, phir ≤40s, ≤80s...). 12s ka hard budget
+          // khatam ho to probed sample ka sabse taaza device, aur SMS
+          // timestamp hi na ho to clients ONLINE device, process hoga.
+          earlyWidenStepMs: 4_000,
+          maxScanMs: deviceScanBudgetMs,
+          onlineFallback: true,
           chunkSize: 80, maxProbe: Math.max(800, candidates.length), concurrency: 48,
           shouldAbort: () => state.stopRequested,
-          onProgress: ({ checked, freshCount, allowedWindowMs }) => {
+          onProgress: ({ checked, freshCount, allowedWindowMs, bestLastActivityMs }) => {
             state.scanUniqueChecked = Math.min(
               passDeviceIds.size,
               baseUniqueChecked + checked
@@ -708,14 +719,22 @@ export async function startAutopilot(opts = {}) {
             state.scanTotalProbes = baseTotalProbes + checked;
             state.scanChecked = state.scanTotalProbes;
             state.scanWindowMs = Number(allowedWindowMs) || Number(otpCfg.activeWindowMs) || 0;
+            state.scanBestActivityMs = Number(bestLastActivityMs) || 0;
             state.scanFresh = hotQueue.length + freshCount;
             const now = Date.now();
             if (now - lastPushAt >= 4000) {
               lastPushAt = now;
+              const bestLine = state.scanBestActivityMs
+                ? `› Ab tak sabse taazi SMS activity: ~${fmtDuration(now - state.scanBestActivityMs)} purani.`
+                : '› Ab tak kisi probed device ki SMS activity timestamp nahi mili.';
+              const budgetLine = deviceScanBudgetMs > 0
+                ? `Quick scan max ${fmtDuration(deviceScanBudgetMs)} chalegi. Taaza SMS na mili to full ${state.scanTotalDevices} devices ka wait nahi hoga — probed sample ke sabse taaza / Firebase ONLINE device ko process karunga.`
+                : 'Candidate milte hi scan ruk kar number process hoga; 12 ranked backups bhi queue me rahenge.';
               void push(progressCard(section('🔎 Zinda Devices Dhoondh Raha Hoon', [
                 `› Pass ${state.scanPass || 1}: <b>${state.scanUniqueChecked}/${state.scanTotalDevices}</b> unique devices check hue — base window me <b>${freshCount}</b> fresh; current ladder ≤${fmtDuration(state.scanWindowMs)}.`,
+                bestLine,
                 `› Total probes: ${state.scanTotalProbes} (repeated passes sameet — ye unique devices ki ginti nahi hai).`,
-                sub('Har 10s scan par ladder agli window par khul jati hai (10s → 20s → 40s → 80s…). Candidate milte hi scan ruk kar number process hoga; 12 ranked backups bhi queue me rahenge.'),
+                sub(budgetLine),
               ].join('\n'))), stopRows());
             }
           },
@@ -727,6 +746,8 @@ export async function startAutopilot(opts = {}) {
             entry: f.entry,
             lastActivityMs: f.lastActivityMs,
             windowMs: Number(f.windowMs) || Number(r.widestWindowMs) || Number(otpCfg.activeWindowMs),
+            onlineFallback: Boolean(f.onlineFallback),
+            selectionSource: f.selectionSource || '',
             checkedAt: at,
           });
         }
@@ -734,10 +755,13 @@ export async function startAutopilot(opts = {}) {
         state.scanChecked = state.scanTotalProbes;
         state.scanUniqueChecked = [...probedDevices].filter((id) => passDeviceIds.has(id)).length;
         state.scanWindowMs = Number(r.fresh?.[0]?.windowMs) || Number(r.widestWindowMs) || Number(otpCfg.activeWindowMs) || 0;
+        state.scanBestActivityMs = Number(r.bestLastActivityMs) || Number(r.fresh?.[0]?.lastActivityMs) || 0;
         state.scanFresh = hotQueue.length;
-        if (r.widened && r.fresh.length) {
+        if (r.onlineFallback && r.fresh.length) {
+          console.log(`[Autopilot] Scan: quick-scan me usable taaza SMS timestamp nahi mila — Firebase clients ONLINE device process hoga (checked ${r.checked}/${passDeviceIds.size}, timedOut=${Boolean(r.scanTimedOut)}).`);
+        } else if (r.widened && r.fresh.length) {
           const ageMs = Math.max(0, at - (Number(r.fresh[0].lastActivityMs) || at));
-          console.log(`[Autopilot] Scan: base window ≤${fmtDuration(otpCfg.activeWindowMs)} me koi nahi — isi cached pass se sabse taaza device liya (activity ~${fmtDuration(ageMs)} purani, ladder ≤${fmtDuration(state.scanWindowMs)}).`);
+          console.log(`[Autopilot] Scan: base window ≤${fmtDuration(otpCfg.activeWindowMs)} me koi nahi — ${r.scanTimedOut ? 'quick-scan sample' : 'isi cached pass'} se sabse taaza device liya (activity ~${fmtDuration(ageMs)} purani, ladder ≤${fmtDuration(state.scanWindowMs)}, checked ${r.checked}/${passDeviceIds.size}).`);
         }
         return r;
       } finally {
@@ -798,6 +822,7 @@ export async function startAutopilot(opts = {}) {
               state.scanPass = (state.scanPass || 1) + 1;
               state.scanUniqueChecked = 0;
               state.scanWindowMs = Number(otpCfg.activeWindowMs) || 0;
+              state.scanBestActivityMs = 0;
               continue;
             }
             endReason = 'pool-exhausted';
@@ -822,10 +847,26 @@ export async function startAutopilot(opts = {}) {
       }
 
       if (!picked) { endReason = 'pool-exhausted'; break; }
-      if (picked.lastActivityMs) freshWaitRounds = 0;
+      if (picked.lastActivityMs || picked.onlineFallback) freshWaitRounds = 0;
 
       const entry = picked.entry;
       state.current = { phone: entry.phone, startedAt: Date.now() };
+
+      // Card par foran saaf dikhao ke scan ruk chuka hai aur asal number
+      // process ho raha hai. Warna WAF warm-up / OTP wait ke dauran purana
+      // scan card dekh kar bot atka hua lagta tha.
+      if (picked.lastActivityMs || picked.onlineFallback) {
+        const pickedAgeMs = picked.lastActivityMs
+          ? Math.max(0, Date.now() - Number(picked.lastActivityMs))
+          : null;
+        await push(progressCard(section('📟 Device Mil Gaya — Number Process Shuru', [
+          `📱 <b>Number:</b> <code>${esc(entry.phone)}</code>`,
+          picked.onlineFallback
+            ? '› Quick scan me taaza SMS activity nahi mili — Firebase <b>clients me ONLINE</b> dikh raha device liya hai. Full pool scan ka wait nahi kiya.'
+            : `› Device ki last SMS activity ~${fmtDuration(pickedAgeMs || 0)} purani · ladder ≤${fmtDuration(Math.max(Number(otpCfg.activeWindowMs) || 0, Number(picked.windowMs) || 0))} · queue me ${hotQueue.length} backup(s).`,
+          sub('Scan ruk chuka hai — ab WAF/OTP flow chalega. Processed count is number ka result aate hi badhega.'),
+        ].join('\n'))), stopRows());
+      }
 
       // WAF warm-up background me chal raha tha — pehla OTP iske baghair na jaye
       await ensureWarm();
@@ -834,16 +875,18 @@ export async function startAutopilot(opts = {}) {
       // device dobara fetch nahi hoga. Agar ye device base window miss ke
       // baad doubling ladder se mila hai to pipeline ko USI ladder window
       // ke hisaab se judge karo, warna scanner ka chuna hua device gate par
-      // foran stale ho jayega. Precheck us window se bhi purana ho jaye to
-      // pipeline live activity dobara fetch karegi.
-      const numCfg = picked.lastActivityMs
-        ? {
-            ...otpCfg,
-            precheckedLastActivityMs: picked.lastActivityMs,
-            precheckedAt: picked.checkedAt || Date.now(),
-            activeWindowMs: Math.max(Number(otpCfg.activeWindowMs) || 0, Number(picked.windowMs) || 0),
-          }
-        : otpCfg;
+      // foran stale ho jayega. ONLINE fallback par SMS-age gate skip hai —
+      // incoming SMS ka na aana device band honay ka saboot nahi.
+      const numCfg = picked.onlineFallback
+        ? { ...otpCfg, skipLastSeenGate: true }
+        : picked.lastActivityMs
+          ? {
+              ...otpCfg,
+              precheckedLastActivityMs: picked.lastActivityMs,
+              precheckedAt: picked.checkedAt || Date.now(),
+              activeWindowMs: Math.max(Number(otpCfg.activeWindowMs) || 0, Number(picked.windowMs) || 0),
+            }
+          : otpCfg;
 
       const res = await processSingleNumber({
         userId,

@@ -708,6 +708,19 @@ console.log('device last-seen gate (mare hue device par OTP waste nahi):');
     },
   });
   ok(r4.kind === 'failed_otp_send', 'pipeline doubling: purani activity bhi ladder se gate pass (stale loop nahi)');
+
+  // Scanner ka explicit clients-ONLINE fallback: device ke paas koi SMS
+  // timestamp hi na ho tab bhi pipeline use stale keh kar wapas scan par
+  // nahi bhejegi. SMS ka na aana device band honay ka saboot nahi hai.
+  const r5 = await pipe.processSingleNumber({
+    userId: 'test',
+    entry: { phone: '12345', deviceId: 'devMissing', online: true },
+    otpCfg: {
+      activeWindowMs: 10_000, waitMs: 0, timeoutMs: 100,
+      skipLastSeenGate: true,
+    },
+  });
+  ok(r5.kind === 'failed_otp_send', 'pipeline ONLINE fallback: SMS timestamp na ho tab bhi gate pass');
 }
 
 // ---------------------------------------------------------------------------
@@ -824,6 +837,61 @@ console.log('parallel device scan (hot-queue) + pipeline precheck:');
       'early ladder: ranked backup devices bhi mile (agla miss par rescan nahi)');
     ok(r.earlyWidened === true && r.fresh[0].windowMs === 20_000,
       'early ladder: 15s activity ≤20s window me select');
+  }
+
+  // Hard quick-scan budget: agar koi bhi device ki last SMS taazi nahi hai
+  // (zinda device ko bhi dinon SMS nahi aata), to full pool ghumane ke
+  // bajaye budget ke andar probed sample ka sabse taaza device mil jaye.
+  {
+    const calls = [];
+    const probe = async (id) => {
+      calls.push(id);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      return id === 'D2' ? now - 2 * 24 * 3600_000 : id === 'D90' ? now - 1000 : null;
+    };
+    const r = await fbn.scanFreshDevices(mkEntries(100), {
+      windowMs: 10_000,
+      maxWidenMs: Number.POSITIVE_INFINITY,
+      widenByDoubling: true,
+      maxScanMs: 1,
+      backupCount: 2,
+      want: 1,
+      chunkSize: 20,
+      maxProbe: 100,
+      probe,
+    });
+    ok(r.scanTimedOut === true && r.checked === 20 && calls.length === 20 && r.exhausted === false,
+      'quick-scan budget: deadline par full pool scan ruk gaya');
+    ok(r.fresh.length === 1 && r.fresh[0].entry.deviceId === 'D2' && r.bestLastActivityMs === now - 2 * 24 * 3600_000,
+      'quick-scan budget: probed sample ka sabse taaza SMS device process ke liye mila');
+  }
+
+  // ONLINE fallback: probed sample me SMS timestamp ek bhi na ho, lekin
+  // clients status ONLINE ho, to scanner khali haath lot kar dobara scan
+  // nahi ghumayega — online devices ko explicit flag ke saath dega.
+  {
+    const calls = [];
+    const probe = async (id) => {
+      calls.push(id);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      return null;
+    };
+    const r = await fbn.scanFreshDevices(mkEntries(100), {
+      windowMs: 10_000,
+      maxWidenMs: Number.POSITIVE_INFINITY,
+      widenByDoubling: true,
+      maxScanMs: 1,
+      onlineFallback: true,
+      backupCount: 2,
+      want: 1,
+      chunkSize: 20,
+      maxProbe: 100,
+      probe,
+    });
+    ok(r.scanTimedOut === true && r.checked === 20 && calls.length === 20,
+      'ONLINE fallback: deadline ke baad baqi pool scan nahi hua');
+    ok(r.onlineFallback === true && r.fresh.length === 2 && r.fresh.every((f) => f.onlineFallback && !f.lastActivityMs),
+      'ONLINE fallback: SMS timestamp na hone par clients-online backups mile');
   }
 
   // scanFreshDevices — bilkul khali activity → fresh [] + exhausted

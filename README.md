@@ -105,15 +105,18 @@ Sab `data/db.json` me save hota hai — restart ke baad bhi yaad rehta hai.
 
 - Scanner pehle configured base last-seen window (mis. 10s) me device
   dhoondhta hai. Har device ki halki probe pehle sirf uske **last 5 messages**
-  dekhti hai (50 full SMS nahi). Scan ke har 10 second par probed-so-far
-  devices par agli ladder window khul jati hai — 10s → 20s → 40s → 80s →
-  160s → … — taaki full pool khatam hone ka intezaar na karna pade. Candidate
-  milte hi scan ruk jata hai aur sabse taaze **12 ranked backups** bhi queue me
-  rehte hain; ek miss ho to agla cached device process hota hai, Firebase pass
-  dobara nahi ghumta. Dispatch se pehle selected device limit cross kar jaye
-  to pipeline bhi window ko wahin double karke aage badhti hai. Card par
-  current pass ke **unique devices**, **total probes** aur current ladder
-  window alag-alag dikhte hain.
+  dekhti hai (50 full SMS nahi). Ek refill ki quick scan ka hard budget
+  **12s** hai (`PREMIUM_DEVICE_SCAN_BUDGET_MS`); is dauran har 4s par ladder
+  agli window par khulti hai — 10s → 20s → 40s → 80s. Budget khatam ho to
+  full pool ka intezaar nahi hota: probed sample ka sabse taaza SMS device,
+  aur agar usable SMS timestamp hi na ho to Firebase `clients` me **ONLINE**
+  dikh raha device, process hota hai. Ye zaroori hai kyunki last incoming SMS
+  asal heartbeat nahi — zinda device ko bhi ghanton/dinon SMS nahi aata.
+  Candidate milte hi scan ruk jata hai aur sabse taaze **12 ranked backups**
+  bhi queue me rehte hain; ek miss ho to agla cached device process hota hai,
+  Firebase pass dobara nahi ghumta. Card par current pass ke **unique
+  devices**, **total probes**, current ladder window aur ab tak ki sabse
+  taazi SMS age alag-alag dikhte hain.
 - Har fresh session ka JSON usi waqt chat me `.json` file ki surat me jata hai.
   Telegram/document send fail ho to bot 3 baar retry karta hai; phir bhi na jaye
   to poora JSON code-block hissoun me bhej deta hai.
@@ -212,7 +215,8 @@ chalta rehta hai; temporary error par number failed nahi gina jata.
 | `PREMIUM_RATE_LIMIT_BACKOFF_MS` | 900000 | Rate-limit par rukna (15 min) |
 | `PREMIUM_OTP_WAIT_MS` | 3000 | OTP bhejne ke baad poll shuru karne se pehle chhota wait (snapshot purane codes se bachata hai, jaldi poll safe hai) |
 | `PREMIUM_OTP_TIMEOUT_MS` | 90000 | OTP inbox poll budget |
-| `PREMIUM_DEVICE_ACTIVE_WINDOW_MS` | 60000 | **Last-seen gate**: OTP sirf un devices par jin ki last activity (taaza forwarded message) is window ke andar ho — mare devices turant skip, OTP waste nahi. Sakht: `10000`, band: `0` |
+| `PREMIUM_DEVICE_ACTIVE_WINDOW_MS` | 60000 | **Last-seen base window**: pehle is window ki SMS activity wala device, phir doubling ladder. Sakht: `10000`, band: `0` |
+| `PREMIUM_DEVICE_SCAN_BUDGET_MS` | 12000 | Ek refill me quick scan ka hard time budget; iske baad probed sample ka best ya clients-ONLINE device process hota hai |
 | `PREMIUM_ALLOW_OFFLINE_DEVICES` | — | `1` = offline devices bhi try |
 
 ## Timing expectation

@@ -38,10 +38,130 @@ import {
   doubledWidenWindowMs,
 } from './firebase-numbers.js';
 import { esc, section, sub, field } from './rich-text.js';
+import { normalizeIndianMobileNumber } from './phone-utils.js';
 
 // ---------------------------------------------------------------------------
 // Ledger (db.json → premiumFlow.used) + fresh-selection helpers
 // ---------------------------------------------------------------------------
+// Boss ka hard rule: jis number ka fresh session ek baar extract/send ho
+// gaya, woh number 7 din se pehle dobara process NAHI hoga. Ledger local
+// db ke saath cloud vault me bhi sync hota hai (store.js snapshot), warna
+// Render restart/deploy par sirf accounts wapas aate aur used-list ud jati.
+export const EXTRACTED_NUMBER_COOLDOWN_MS = 7 * 24 * 60 * 60 * 1000;
+
+function timestampMs(value) {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    if (value > 1e12) return value;
+    if (value > 1e9) return value * 1000;
+    return 0;
+  }
+  const parsed = Date.parse(String(value || ''));
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+}
+
+function ledgerTimestampMs(entry) {
+  return timestampMs(
+    entry?.extractedAt || entry?.sentAt || entry?.at || entry?.updatedAt || entry?.createdAt || ''
+  );
+}
+
+function isExtractedLedgerStatus(status) {
+  return /^(success|extracted|sent)$/i.test(String(status || '').trim());
+}
+
+function savedSessionTimestampsByPhone(db) {
+  const out = new Map();
+  const add = (rawPhone, value) => {
+    const phone = normalizeIndianMobileNumber(rawPhone);
+    if (!phone || !value || typeof value !== 'object') return;
+    const ts = timestampMs(value.savedAt || value.updatedAt || value.createdAt || value.at || '');
+    if (ts && ts > (out.get(phone) || 0)) out.set(phone, ts);
+  };
+
+  for (const [key, acc] of Object.entries(db?.config?.accounts || {})) {
+    if (!acc || acc.isLoggedIn === false || acc.isLoggedOut || acc.sessionExpired) continue;
+    if (!(acc.cookies || acc.tid || acc.token || acc._session_tid || acc.isLoggedIn)) continue;
+    add(acc.phone || acc.mobile || String(key).replace(/^acc_/, ''), acc);
+  }
+  for (const [key, value] of Object.entries(db?.sessionVault || {})) {
+    add(value?.phone || value?.mobile || value?.account || String(key).replace(/^acc_/, ''), value);
+  }
+  return out;
+}
+
+function extractedCooldownFromMaps(phone, { now = Date.now(), used = {}, savedSessions = new Map() } = {}) {
+  const cleanPhone = normalizeIndianMobileNumber(phone) || String(phone || '');
+  const entry = used?.[cleanPhone] || used?.[phone] || null;
+  let extractedAtMs = 0;
+  let source = '';
+
+  if (entry && isExtractedLedgerStatus(entry.status)) {
+    extractedAtMs = ledgerTimestampMs(entry);
+    source = 'ledger';
+    if (!extractedAtMs) {
+      // Purani/malformed success entry ka time hi na mile to andazay se
+      // number ko release mat karo — boss ka 7-day rule fail-closed hai.
+      return {
+        blocked: true,
+        extractedAtMs: 0,
+        cooldownUntilMs: null,
+        remainingMs: null,
+        source,
+      };
+    }
+  } else if (!entry) {
+    // Ledger kisi restart/deploy me reh gaya ho to saved account/session
+    // ka savedAt hi pichhle extraction ka saboot hai. Ledger maujood ho
+    // to wahi authoritative hai; account baad me use honay se savedAt
+    // badal bhi sakta hai, isliye use ledger ke upar nahi lagate.
+    extractedAtMs = Number(savedSessions?.get(cleanPhone) || 0);
+    source = extractedAtMs ? 'saved-session' : '';
+  }
+
+  if (!extractedAtMs) {
+    return { blocked: false, extractedAtMs: 0, cooldownUntilMs: 0, remainingMs: 0, source: '' };
+  }
+  const cooldownUntilMs = extractedAtMs + EXTRACTED_NUMBER_COOLDOWN_MS;
+  return {
+    blocked: now < cooldownUntilMs,
+    extractedAtMs,
+    cooldownUntilMs,
+    remainingMs: Math.max(0, cooldownUntilMs - now),
+    source,
+  };
+}
+
+function premiumSelectionMaps(opts = {}) {
+  let used = opts.ledger || null;
+  let savedSessions = opts.savedSessions || null;
+  if (!used || !savedSessions) {
+    try {
+      const db = opts.db || getDb();
+      if (!used) used = db?.premiumFlow?.used || {};
+      if (!savedSessions) savedSessions = savedSessionTimestampsByPhone(db);
+    } catch {
+      if (!used) used = {};
+      if (!savedSessions) savedSessions = new Map();
+    }
+  }
+  return { used, savedSessions };
+}
+
+export function getExtractedNumberCooldown(phone, opts = {}) {
+  const now = Number(opts.now) || Date.now();
+  const { used, savedSessions } = premiumSelectionMaps(opts);
+  return extractedCooldownFromMaps(phone, { now, used, savedSessions });
+}
+
+export function isPhoneBlockedByPremiumLedger(phone, opts = {}) {
+  const now = Number(opts.now) || Date.now();
+  const { used, savedSessions } = premiumSelectionMaps(opts);
+  const cleanPhone = normalizeIndianMobileNumber(phone) || String(phone || '');
+  const entry = used?.[cleanPhone] || used?.[phone] || null;
+  if (entry && !isExtractedLedgerStatus(entry.status)) return true;
+  return extractedCooldownFromMaps(phone, { now, used, savedSessions }).blocked;
+}
+
 export function getPremiumLedger() {
   try {
     const db = getDb();
@@ -58,8 +178,15 @@ export function markLedger(phone, status, extra = {}) {
     const db = getDb();
     if (!db.premiumFlow) db.premiumFlow = {};
     if (!db.premiumFlow.used) db.premiumFlow.used = {};
-    db.premiumFlow.used[phone] = { status, at: new Date().toISOString(), ...extra };
+    const at = new Date().toISOString();
+    const record = { status, at, ...extra };
+    if (isExtractedLedgerStatus(status) && !record.extractedAt) record.extractedAt = at;
+    db.premiumFlow.used[phone] = record;
     saveDb(db);
+    // Ledger ko bhi cloud vault snapshot ke saath bhej do. Warna account
+    // to restart ke baad wapas aa jata tha, magar "ye number nikal chuka
+    // hai" wali list local disk ke saath ghayab ho jati thi.
+    void syncCloudVaultNow(getDb()).catch(() => {});
   } catch (e) {
     console.warn('[Pipeline] ledger save failed:', e?.message);
   }
@@ -73,11 +200,15 @@ export async function markPoolStatus(entry, status) {
   }
 }
 
-export function freshEntriesFrom(pool) {
-  const used = getPremiumLedger();
-  return (pool || []).filter(
-    (n) => !used[n.phone] && !/^(used|skipped|deferred)$/i.test(String(n.status || '').trim())
-  );
+export function freshEntriesFrom(pool, opts = {}) {
+  const now = Number(opts.now) || Date.now();
+  const { used, savedSessions } = premiumSelectionMaps(opts);
+  return (pool || []).filter((n) => {
+    if (/^(used|skipped|deferred)$/i.test(String(n.status || '').trim())) return false;
+    const entry = used?.[n.phone] || null;
+    if (entry && !isExtractedLedgerStatus(entry.status)) return false;
+    return !extractedCooldownFromMaps(n.phone, { now, used, savedSessions }).blocked;
+  });
 }
 
 // Online devices pehle (unme hi OTP aayega), phir offline fallback.
@@ -205,6 +336,28 @@ export async function processSingleNumber({
 }) {
   const phone = entry?.phone;
   if (!phone) return { ok: false, kind: 'failed_bad_entry', phone: '', reason: 'Entry me phone nahi hai' };
+
+  // 7-day extracted-number cooldown — selection ke ilawa yahan bhi hard
+  // gate hai. Pehle retry-later queue ki purani entry ledger check bypass
+  // karke wohi number dobara utha sakti thi jo thodi der pehle extract /
+  // send ho chuka tha. Ab kisi bhi rasty se aaye, OTP se pehle ruk jayega.
+  if (markUsed) {
+    const cooldown = getExtractedNumberCooldown(phone);
+    if (cooldown.blocked) {
+      const until = cooldown.cooldownUntilMs
+        ? new Date(cooldown.cooldownUntilMs).toISOString()
+        : 'unknown (purani success entry me timestamp nahi)';
+      return {
+        ok: false,
+        kind: 'deferred_number_cooldown',
+        phone,
+        extractedAtMs: cooldown.extractedAtMs || null,
+        cooldownUntilMs: cooldown.cooldownUntilMs,
+        remainingMs: cooldown.remainingMs,
+        reason: `Ye number pehle extract/send ho chuka hai — 7-day cooldown ${until} tak hai, OTP nahi bheja`,
+      };
+    }
+  }
 
   const deviceIds = entry?.deviceId ? [entry.deviceId] : null;
   const say = async (text) => { if (report) { try { await report(text); } catch {} } };

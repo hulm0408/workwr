@@ -28,6 +28,7 @@ const defaultData = {
     deletedAccounts: {}
   },
   sessionVault: {},
+  premiumFlow: { used: {} },
   orders: {},
   drafts: {},
   bossState: null,
@@ -407,6 +408,36 @@ function consolidateDuplicatePhoneSlots(db, winningKey, cleanPhone) {
   }
 }
 
+function premiumLedgerTimestampMs(entry) {
+  const raw = entry?.extractedAt || entry?.sentAt || entry?.at || entry?.updatedAt || entry?.createdAt || '';
+  if (typeof raw === 'number' && Number.isFinite(raw)) {
+    if (raw > 1e12) return raw;
+    if (raw > 1e9) return raw * 1000;
+    return 0;
+  }
+  const parsed = Date.parse(String(raw || ''));
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+}
+
+// Extracted/used-number ledger ko local + cloud copies ke beech merge karo.
+// Har phone par nayi timestamp wali entry jeet-ti hai; isse Render ki
+// ephemeral disk udnay ke baad bhi 7-day cooldown wapas aa jata hai.
+export function _mergePremiumLedgerEntries(localUsed = {}, remoteUsed = {}) {
+  const used = { ...(localUsed || {}) };
+  let changed = 0;
+  for (const [rawPhone, remoteEntry] of Object.entries(remoteUsed || {})) {
+    if (!remoteEntry || typeof remoteEntry !== 'object') continue;
+    const phone = normalizeTenDigitPhone(rawPhone || remoteEntry.phone || '');
+    if (!phone) continue;
+    const localEntry = used[phone];
+    if (!localEntry || premiumLedgerTimestampMs(remoteEntry) > premiumLedgerTimestampMs(localEntry)) {
+      used[phone] = { ...remoteEntry };
+      changed++;
+    }
+  }
+  return { used, changed };
+}
+
 export function buildCloudVaultSnapshot(data = null) {
   const src = data || getDb();
   const accountsOut = {};
@@ -422,12 +453,20 @@ export function buildCloudVaultSnapshot(data = null) {
     if (!o || !o.id) continue;
     ordersOut[k] = { ...o };
   }
+  const premiumUsedOut = {};
+  for (const [phone, entry] of Object.entries(src?.premiumFlow?.used || {})) {
+    if (entry && typeof entry === 'object') premiumUsedOut[phone] = { ...entry };
+  }
   return {
-    version: 16,
+    version: 17,
     updatedAt: new Date().toISOString(),
     accounts: accountsOut,
     deletedAccounts: { ...(src?.config?.deletedAccounts || {}) },
     sessionVault: { ...(src?.sessionVault || {}) },
+    // Extracted/used numbers ki ledger bhi durable rakho — warna har
+    // Render deploy/restart ke baad wohi numbers dobara process hote the
+    // jo thodi der pehle hi JSON bana kar bheje ja chuke thay.
+    premiumFlow: { used: premiumUsedOut },
     orders: ordersOut,
     // Shared WAF token (encrypted at rest by the vault transport) so a fresh
     // Render deploy starts WARM — no cold-start challenge storm on scans.
@@ -453,6 +492,15 @@ export async function hydrateAccountsFromCloudVault() {
     if (!db.config.accounts) db.config.accounts = {};
     if (!db.config.deletedAccounts) db.config.deletedAccounts = {};
     if (!db.sessionVault) db.sessionVault = {};
+    if (!db.premiumFlow || typeof db.premiumFlow !== 'object') db.premiumFlow = { used: {} };
+    if (!db.premiumFlow.used || typeof db.premiumFlow.used !== 'object') db.premiumFlow.used = {};
+
+    // 7-day extracted-number cooldown ko restart/deploy ke baad restore karo.
+    const mergedLedger = _mergePremiumLedgerEntries(db.premiumFlow.used, remote.premiumFlow?.used || {});
+    if (mergedLedger.changed) {
+      db.premiumFlow.used = mergedLedger.used;
+      mutated = true;
+    }
 
     for (const [delKey, delVal] of Object.entries(remote.deletedAccounts || {})) {
       if (!delVal) continue;
@@ -674,6 +722,12 @@ export function getDb() {
     }
     if (!data.sessionVault) {
       data.sessionVault = {};
+    }
+    if (!data.premiumFlow || typeof data.premiumFlow !== 'object') {
+      data.premiumFlow = { used: {} };
+    }
+    if (!data.premiumFlow.used || typeof data.premiumFlow.used !== 'object') {
+      data.premiumFlow.used = {};
     }
     seedAccountsFromJson(data);
     delete data.config.depositAmount;

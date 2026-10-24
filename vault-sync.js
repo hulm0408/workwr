@@ -246,6 +246,39 @@ export async function pullAccountsFromCloudVault() {
   }
 }
 
+function vaultPremiumLedgerTimestampMs(entry) {
+  const raw = entry?.extractedAt || entry?.sentAt || entry?.at || entry?.updatedAt || entry?.createdAt || '';
+  if (typeof raw === 'number' && Number.isFinite(raw)) {
+    if (raw > 1e12) return raw;
+    if (raw > 1e9) return raw * 1000;
+    return 0;
+  }
+  const parsed = Date.parse(String(raw || ''));
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+}
+
+// Premium ledger monotonic hai: kisi purane/local-khali snapshot ka push
+// cloud ki extracted-number history ko erase na kar sakay. Push se pehle
+// remote entries merge kar do; har phone par nayi timestamp jeet-ti hai.
+export function _mergeVaultPremiumLedger(payloadObj, remotePayload) {
+  const payload = payloadObj && typeof payloadObj === 'object' ? { ...payloadObj } : {};
+  const localUsed = payload?.premiumFlow?.used && typeof payload.premiumFlow.used === 'object'
+    ? { ...payload.premiumFlow.used }
+    : {};
+  for (const [phone, remoteEntry] of Object.entries(remotePayload?.premiumFlow?.used || {})) {
+    if (!remoteEntry || typeof remoteEntry !== 'object') continue;
+    const localEntry = localUsed[phone];
+    if (!localEntry || vaultPremiumLedgerTimestampMs(remoteEntry) > vaultPremiumLedgerTimestampMs(localEntry)) {
+      localUsed[phone] = { ...remoteEntry };
+    }
+  }
+  payload.premiumFlow = {
+    ...(payload.premiumFlow && typeof payload.premiumFlow === 'object' ? payload.premiumFlow : {}),
+    used: localUsed,
+  };
+  return payload;
+}
+
 export async function pushAccountsToCloudVaultNow(payloadObj) {
   const token = resolveVaultToken();
   if (!token || !payloadObj) return { ok: false, reason: 'NO_TOKEN' };
@@ -266,9 +299,17 @@ export async function pushAccountsToCloudVaultNow(payloadObj) {
         signal: AbortSignal.timeout(8000)
       });
       const existingJson = existingRes.ok ? await existingRes.json().catch(() => null) : null;
+      let payloadToPush = payloadObj;
+      if (existingJson?.content) {
+        try {
+          const remoteRaw = Buffer.from(existingJson.content.replace(/\s+/g, ''), 'base64').toString('utf8');
+          const remotePayload = decryptVaultPayloadText(remoteRaw);
+          if (remotePayload) payloadToPush = _mergeVaultPremiumLedger(payloadObj, remotePayload);
+        } catch {}
+      }
       const body = {
-        message: `chore(vault): sync ${Object.keys(payloadObj.accounts || {}).length} saved Swiggy accounts`,
-        content: Buffer.from(encryptVaultPayloadText(payloadObj), 'utf8').toString('base64'),
+        message: `chore(vault): sync ${Object.keys(payloadToPush.accounts || {}).length} saved Swiggy accounts`,
+        content: Buffer.from(encryptVaultPayloadText(payloadToPush), 'utf8').toString('base64'),
         branch: VAULT_BRANCH,
         ...(existingJson?.sha ? { sha: existingJson.sha } : {})
       };

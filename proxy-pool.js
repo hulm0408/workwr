@@ -981,15 +981,30 @@ export function proxySummary() {
     const rt = runtime.get(p.id) || {};
     return p.enabled && ((Number(rt.cooldownUntil) || 0) > now || (Number(rt.wafSolveFailedUntil) || 0) > now);
   }).length;
+  const solveCoolingCount = state.list.filter((p) => {
+    const rt = runtime.get(p.id) || {};
+    return p.enabled && (Number(rt.wafSolveFailedUntil) || 0) > now;
+  }).length;
+  // "ON" hona aur asal me pick honay ke qabil hona alag baatein hain.
+  // Card pehle 10 ON dikha deta tha jab unme se aksar WAF/solve cooldown
+  // me hotay thay — usableCount picker ke base filter se match karta hai.
+  const usableCount = state.list.filter((p) => {
+    const rt = runtime.get(p.id) || {};
+    return p.enabled &&
+      !((Number(rt.cooldownUntil) || 0) > now) &&
+      (Number(rt.consecutiveErrors) || 0) < 3;
+  }).length;
   return {
     enabled: Boolean(state.enabled),
     total: state.list.length,
     enabledCount: enabled,
+    usableCount,
     autoCount,
     autoClean: autoCount - autoChallenged,
     autoChallenged,
     tokenReadyCount,
     wafCoolingCount,
+    solveCoolingCount,
     autoFree: freeProxiesEnabled(),
     rotation: state.enabled && enabled > 1 ? 'ON (IP rotation — zero-wait recovery)' : 'OFF (ek hi IP)',
   };

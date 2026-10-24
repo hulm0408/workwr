@@ -29,6 +29,50 @@ import { getDb, saveDb } from './store.js';
 const runtime = new Map();
 const PROXY_TOKEN_TTL_MS = 7 * 60_000;
 
+// Parallel autopilot lanes ke liye route reservations: ek proxy ek waqt
+// me sirf EK lane ke paas hogi. Ye sirf in-memory coordination hai; proxy
+// ki health/token state upar wale runtime map me hi rehti hai.
+const proxyReservations = new Map(); // proxyId -> owner
+
+export function reserveProxy(id, owner) {
+  const proxyId = String(id || '');
+  const ownerId = String(owner || '');
+  if (!proxyId || !ownerId) return false;
+  const currentOwner = proxyReservations.get(proxyId);
+  if (currentOwner && currentOwner !== ownerId) return false;
+  proxyReservations.set(proxyId, ownerId);
+  return true;
+}
+
+export function releaseProxyReservation(id, owner = '') {
+  const proxyId = String(id || '');
+  if (!proxyId) return false;
+  const ownerId = String(owner || '');
+  if (ownerId && proxyReservations.get(proxyId) !== ownerId) return false;
+  return proxyReservations.delete(proxyId);
+}
+
+export function releaseProxyReservationsForOwner(owner) {
+  const ownerId = String(owner || '');
+  if (!ownerId) return 0;
+  let released = 0;
+  for (const [proxyId, currentOwner] of [...proxyReservations.entries()]) {
+    if (currentOwner === ownerId) {
+      proxyReservations.delete(proxyId);
+      released++;
+    }
+  }
+  return released;
+}
+
+export function getProxyReservationOwner(id) {
+  return proxyReservations.get(String(id || '')) || '';
+}
+
+export function _clearProxyReservations() {
+  proxyReservations.clear();
+}
+
 function runtimeFor(id) {
   const rt = runtime.get(id) || {};
   runtime.set(id, rt);
@@ -129,6 +173,7 @@ export function listProxies() {
       lastWafHitAt: rt.lastWafHitAt || '',
       wafSolveFailures: Number(rt.wafSolveFailures) || 0,
       consecutiveErrors: Number(rt.consecutiveErrors) || 0,
+      reservedBy: proxyReservations.get(p.id) || '',
     };
   });
 }
@@ -158,6 +203,7 @@ export function removeProxy(id) {
   if (idx === -1) return { ok: false, error: 'Proxy nahi mila.' };
   state.list.splice(idx, 1);
   runtime.delete(id);
+  proxyReservations.delete(id);
   persist(state);
   return { ok: true };
 }
@@ -183,12 +229,14 @@ export function setPoolEnabled(on) {
 // ---------------------------------------------------------------------------
 let lastAssignedId = '';
 
-export function pickProxy({ excludeIds = [], requireToken = false } = {}) {
+export function pickProxy({ excludeIds = [], requireToken = false, reserveFor = '' } = {}) {
   const state = ensureSeeded();
   if (!state.enabled) return null;
   const now = Date.now();
+  const reserveOwner = String(reserveFor || '');
   const baseCandidates = state.list.filter(
     (p) => p.enabled && !excludeIds.includes(p.id) &&
+      (!proxyReservations.has(p.id) || proxyReservations.get(p.id) === reserveOwner) &&
       !((Number(runtime.get(p.id)?.cooldownUntil) || 0) > now) &&
       (Number(runtime.get(p.id)?.consecutiveErrors) || 0) < 3 &&
       (!requireToken || hasFreshProxyToken(runtime.get(p.id) || {}))
@@ -223,12 +271,13 @@ export function pickProxy({ excludeIds = [], requireToken = false } = {}) {
       (a.hits || 0) - (b.hits || 0);
   });
   const pick = candidates[0];
+  if (reserveOwner && !reserveProxy(pick.id, reserveOwner)) return null;
   lastAssignedId = pick.id;
   pick.hits = (pick.hits || 0) + 1;
   pick.lastUsedAt = new Date().toISOString();
   persist(state);
   const parsed = parseProxyUrl(pick.url);
-  return { ...pick, ...parsed };
+  return { ...pick, ...parsed, reservedFor: reserveOwner };
 }
 
 export function getProxy(id) {
@@ -991,14 +1040,17 @@ export function proxySummary() {
   const usableCount = state.list.filter((p) => {
     const rt = runtime.get(p.id) || {};
     return p.enabled &&
+      !proxyReservations.has(p.id) &&
       !((Number(rt.cooldownUntil) || 0) > now) &&
       (Number(rt.consecutiveErrors) || 0) < 3;
   }).length;
+  const reservedCount = state.list.filter((p) => proxyReservations.has(p.id)).length;
   return {
     enabled: Boolean(state.enabled),
     total: state.list.length,
     enabledCount: enabled,
     usableCount,
+    reservedCount,
     autoCount,
     autoClean: autoCount - autoChallenged,
     autoChallenged,

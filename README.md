@@ -131,6 +131,35 @@ Sab `data/db.json` me save hota hai — restart ke baad bhi yaad rehta hai.
 - Purane saved session ko dobara lena ho to owner command:
   `/session 9876543210` ya `/session acc_9876543210`.
 
+## ⚡ Parallel lanes — 10 numbers, 10 alag IPs, ek saath
+
+Autopilot ab numbers ko ek-ek karke sequential process nahi karta. Batch
+**dynamic parallel lanes** chalata hai:
+
+- Har lane ka **alag number, alag device, alag bridge session aur reserved
+  proxy/IP route** hota hai. Ek proxy ek waqt me do lanes ko nahi milti.
+- Default **10 lanes** hain; ⚙️ **Settings → ⚡ Parallel** se 1/3/5/10
+  choose kar sakte hain (env fallback: `PREMIUM_BATCH_CONCURRENCY`).
+- Asal lane count distinct routes tak limited hai: **enabled proxies +
+  1 direct Render IP**. Misal: 9 proxies + direct = 10 lanes; 3 proxies +
+  direct = 4 lanes; proxy bilkul na ho to direct par sirf 1 lane (ek hi IP
+  ko jhooth-mooth 10 IP nahi dikhaya jata).
+- Jo lane pehle free hoti hai wahi agla number uthata hai — OTP wait,
+  WAF/rate cooldown ya slow proxy baaki lanes ko nahi rokti.
+- Ek hi phone ya ek hi `deviceId` ki doosri SIM do lanes ek saath nahi
+  uthati, warna ek hi inbox par OTP ambiguity ho sakti hai.
+- Har lane ki WAF/security/rate-limit reaction usi lane ki IP par hoti
+  hai; ek IP garam hone se baaki IPs par kaam jaari rehta hai.
+- Live card par saari active lanes ke number + route dikhte hain. Gap bhi
+  ab **per-lane/per-IP** hai, poore batch ko rokne wala global gap nahi.
+- Chromium WAF solver memory safety ke liye ek waqt me ek hi chalta hai,
+  lekin lanes pehla HTTP/OTP attempt solver queue ke baghair bhej sakti
+  hain; token sirf asal challenge par solve hota hai.
+
+> 10 lanes ka matlab 10 guna output ki guarantee nahi — output phir bhi
+> zinda devices, OTP forwarding aur proxy quality par depend karega.
+> Lekin ek slow number/IP ab poore batch ko block nahi karega.
+
 ## 🛡 WAF / Security challenge — "aaye hi na" ka tod
 
 Jo 403 challenge pehle poora batch maar deta tha, ab uska tod:
@@ -141,17 +170,19 @@ Jo 403 challenge pehle poora batch maar deta tha, ab uska tod:
    dikhta hai, challenge hi nahi.
 2. **Phir bhi challenge aaye** → bot **turant naya token** lekar **ek baar
    retry** karta hai (na ki hammering).
-3. **Engine-level** — challenge aane par batch **nahi rukta**: final proxy ko
-   quarantine karke best next route, **3 proxy challenges ke baad Render ki
-   direct IP**, aur 2 direct challenges ke baad best proxy dobara try hoti
-   hai. Route ki ginti process shuru honay wali asal route episode se hoti
-   hai (bridge ke andar IP badalne par direct-fallback wali ginti gum nahi
-   hoti). Ek hi number par ek run me combined WAF/security/rate/transient
-   attempts max **2** hain, taaki storm me wohi number baar-baar time na
-   jalaye. Card par rotations/route/token-ready aur asal usable/cooling
-   proxy count dikhte hain. Sirf **12 lagatar challenges** (bina ek bhi
-   request guzare) par batch rukta hai — ek request bhi paar ho gayi to
-   ginti reset.
+3. **Engine-level** — challenge aane par batch **nahi rukta**: sirf us
+   lane ki final proxy quarantine karke best next route milti hai, usi
+   lane par **3 proxy challenges ke baad Render ki direct IP**, aur 2
+   direct challenges ke baad best proxy dobara try hoti hai. Route ki
+   ginti lane ke process-start route episode se hoti hai (bridge ke andar
+   IP badalne par ginti gum nahi hoti). Ek hi number par ek run me
+   combined WAF/security/rate/transient attempts max **2** hain, taaki
+   storm me wohi number baar-baar time na jalaye. Card par active lanes,
+   rotations, token-ready aur free-usable/lane-reserved/cooling proxy
+   counts dikhte hain. Batch sirf bahut lagatar challenges par rukta hai
+   — limit lanes ke hisaab se scale hoti hai taaki pehli parallel wave hi
+   batch ko premature band na kar de; ek processed response bhi aa jaye
+   to storm ginti reset ho jati hai.
 4. **Solver route-locked + time-boxed** — har proxy ka solve alag route key
    par hota hai (ek IP ka token doosri IP par leak nahi), ek solve zyada se
    zyada ~25–35s leta hai, aur jis proxy par solve fail ho wo 10 min side
@@ -176,7 +207,8 @@ jitne chahein add karo (ek saath comma me bhi):
   challenge deti hai use 🛡 fallback tier me rakha jata hai kyunki browser
   usi IP ka `aws-waf-token` solve kar sakta hai. Card par sources/candidates/
   checked/clean/challenged diagnostics bhi dikhte hain. Batch start par
-  3 se kam enabled proxies hon to ye **khud bhi ho sakta hai** (OFF karna ho:
+  requested parallel lanes se kam enabled proxies hon to ye **khud bhi
+  ho sakta hai** (OFF karna ho:
   proxy card par 🌐 Free Auto toggle, ya env `PREMIUM_AUTO_FREE_PROXIES=0`).
   Apni list URLs: `PREMIUM_PROXY_SOURCES=url1,url2` — ye baki sources ke
   saath merge hongi. Free proxies marne par refresh me khud replace ho jati
@@ -207,13 +239,13 @@ chalta rehta hai; temporary error par number failed nahi gina jata.
 | File | Kaam |
 |---|---|
 | `fresh-bot.js` | Bot UI — START/STOP/STATUS/**SETTINGS** (entry point) |
-| `autopilot-engine.js` | Batch loop — target/time/**proxy-rotate**/defer/live-card |
+| `autopilot-engine.js` | **Parallel batch lanes** — distinct IPs/devices, target/time, lane-local rotate/defer, live-card |
 | `number-pipeline.js` | EK number ka poora lifecycle (saare scenarios) |
 | `firebase-numbers.js` | Firebase reader — pool + OTP inbox + **dynamic source override** |
 | `firebase-sources.js` | **Multiple Firebase sources** — add/switch/verify (db-backed) |
-| `bot-settings.js` | **Batch knobs** — target/time/gap (UI se, validated + clamped) |
-| `proxy-pool.js` | **Proxy pool** — IP rotation, per-proxy WAF token + cooldown |
-| `swiggy-bridge.js` | Swiggy automation + **WAF token injection** + **proxy routing** |
+| `bot-settings.js` | **Batch knobs** — target/parallel lanes/time/gap (UI se, validated + clamped) |
+| `proxy-pool.js` | **Proxy pool** — lane reservations, IP rotation, per-proxy WAF token + cooldown |
+| `swiggy-bridge.js` | Swiggy automation + WAF token injection + **lane-local proxy routing** |
 | `store.js` + `vault-sync.js` | Session DB (`data/db.json`) + cloud vault |
 | `test_fresh_unit.mjs` | Unit tests (mocked fetch) — `npm test` |
 | `scratch/firebase-inspect.mjs` | Firebase ka live structure dump — `npm run inspect` |
@@ -223,8 +255,9 @@ chalta rehta hai; temporary error par number failed nahi gina jata.
 | Var | Default | Matlab |
 |---|---|---|
 | `PREMIUM_BATCH_TARGET` | 100 | Kitne fresh sessions tak chale |
+| `PREMIUM_BATCH_CONCURRENCY` | 10 | Ek saath kitni parallel lanes (1–10); asal lanes distinct proxy/direct routes tak limited |
 | `PREMIUM_BATCH_MAX_MINUTES` | 120 | Max run time |
-| `PREMIUM_BATCH_GAP_MS` | 6000 | Do numbers ke beech gap |
+| `PREMIUM_BATCH_GAP_MS` | 6000 | Ek hi lane/IP par do numbers ke beech gap |
 | `PREMIUM_RATE_LIMIT_BACKOFF_MS` | 900000 | Rate-limit par rukna (15 min) |
 | `PREMIUM_OTP_WAIT_MS` | 3000 | OTP bhejne ke baad poll shuru karne se pehle chhota wait (snapshot purane codes se bachata hai, jaldi poll safe hai) |
 | `PREMIUM_OTP_TIMEOUT_MS` | 90000 | OTP inbox poll budget |
@@ -234,7 +267,7 @@ chalta rehta hai; temporary error par number failed nahi gina jata.
 
 ## Timing expectation
 
-~35–90 second per number (purane numbers me 3 OTP rounds lagte hain — login OTP, delete OTP, phir naya signup OTP). Isliye 100 numbers ≈ 60–120 min. Default target 100 + max 120 min isi liye hai.
+~35–90 second per number **per lane** lag sakte hain (purane numbers me 3 OTP rounds lagte hain — login OTP, delete OTP, phir naya signup OTP). 10 healthy lanes hon to ye waits overlap ho jate hain aur aggregate throughput sequential run se kai guna ho sakta hai; lekin dead devices, OTP na aana, kharab free proxies ya WAF solver queue asal speed ko limit kar sakte hain. Default target 100 + max 120 min isi liye hai.
 
 ## 🚨 Security — PEHLE YE KARO
 

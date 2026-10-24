@@ -88,7 +88,10 @@ const {
   isPhoneBlockedByPremiumLedger,
   EXTRACTED_NUMBER_COOLDOWN_MS,
 } = await import('./number-pipeline.js');
-const { getAutopilotSnapshot, isAutopilotRunning, requestAutopilotStop } = await import('./autopilot-engine.js');
+const {
+  getAutopilotSnapshot, isAutopilotRunning, requestAutopilotStop,
+  normalizeBatchConcurrency, availableParallelLanes, parallelWorkerUserId,
+} = await import('./autopilot-engine.js');
 const srcMod = await import('./firebase-sources.js');
 const bs = await import('./bot-settings.js');
 const px = await import('./proxy-pool.js');
@@ -443,9 +446,15 @@ console.log('bot-settings (UI se knobs — validation + clamp):');
   ok(r6.ok && bs.fmtSetting('backoffMs') === '15 min', 'backoff fmt minutes');
   const r7 = bs.setSetting('allowOffline', true);
   ok(r7.ok && bs.getSetting('allowOffline') === true, 'bool toggle');
+  ok(bs.getSetting('concurrency') === 10, 'parallel lanes default = 10');
+  const r8 = bs.setSetting('concurrency', 5);
+  ok(r8.ok && bs.getSetting('concurrency') === 5, 'parallel lanes set + readback');
+  ok(bs.setSetting('concurrency', 11).ok === false, 'parallel lanes 10 se zyada reject');
+  ok(bs.setSetting('concurrency', 0).ok === false, 'parallel lanes 0 reject');
   const all = bs.getAllSettings();
-  ok(all.target === 150 && all.allowOffline === true, 'getAllSettings consistent');
+  ok(all.target === 150 && all.allowOffline === true && all.concurrency === 5, 'getAllSettings consistent');
   bs.setSetting('target', 100); // restore default
+  bs.setSetting('concurrency', 10);
 }
 
 // ---------------------------------------------------------------------------
@@ -483,6 +492,18 @@ console.log('proxy-pool (IP rotation — "rukna hi na pare"):');
   // Exclude — jab doosra proxy exclude ho, pehla hi milega
   const c = px.pickProxy({ excludeIds: [a.id] });
   ok(c && c.id !== a.id, 'exclude kaam karta hai');
+
+  // Parallel lane reservations — ek proxy do lanes ko ek saath kabhi
+  // nahi milni chahiye, warna "10 alag IP" wala dawa jhootha hoga.
+  ok(px.reserveProxy(a.id, 'lane-a') === true, 'lane reservation: pehli lane ko route mila');
+  ok(px.reserveProxy(a.id, 'lane-b') === false, 'lane reservation: same IP doosri lane ko reject');
+  const reservedPick = px.pickProxy({ reserveFor: 'lane-b' });
+  ok(reservedPick?.id === b.id && px.getProxyReservationOwner(b.id) === 'lane-b',
+    'lane reservation: picker doosri free IP reserve karke deta hai');
+  ok(px.pickProxy({ reserveFor: 'lane-c' }) === null, 'lane reservation: free IP na ho to koi route nahi');
+  ok(px.releaseProxyReservation(a.id, 'lane-b') === false, 'lane reservation: ghalat owner release nahi kar sakta');
+  ok(px.releaseProxyReservationsForOwner('lane-a') === 1, 'lane reservation: owner ki route release');
+  ok(px.releaseProxyReservationsForOwner('lane-b') === 1, 'lane reservation: doosri route bhi release');
 
   // Per-proxy WAF token (IP-bound hota hai)
   px.setProxyToken(a.id, 'TOKEN_FOR_IP_A'.padEnd(60, 'x'));
@@ -547,6 +568,20 @@ ok(requestAutopilotStop('manual') === false, 'na chalne wale batch ko stop = fal
 {
   const snap = getAutopilotSnapshot();
   ok(snap.running === false && snap.processed === 0, 'default snapshot clean');
+  ok(snap.concurrency >= 1 && Array.isArray(snap.activeNumbers) && snap.activeWorkers === 0,
+    'snapshot: parallel lane fields maujood');
+  ok(normalizeBatchConcurrency(99) === 10, 'parallel lanes max 10 par cap');
+  ok(normalizeBatchConcurrency(0) === 1, 'parallel lanes min 1');
+  ok(normalizeBatchConcurrency('x') === 10, 'parallel lanes invalid value par default 10');
+  ok(availableParallelLanes({ requested: 10, proxyEnabled: false, enabledProxyCount: 0 }) === 1,
+    'direct-only mode: ek hi IP isliye 1 lane');
+  ok(availableParallelLanes({ requested: 10, proxyEnabled: true, enabledProxyCount: 9 }) === 10,
+    '9 proxies + 1 direct = 10 distinct lanes');
+  ok(availableParallelLanes({ requested: 10, proxyEnabled: true, enabledProxyCount: 3 }) === 4,
+    'routes kam hon to lanes bhi distinct routes tak limited');
+  ok(availableParallelLanes({ requested: 3, proxyEnabled: true, enabledProxyCount: 9 }) === 3,
+    'user ki requested lane limit respect hoti hai');
+  ok(parallelWorkerUserId('owner-1', 7) === 'owner-1:lane7', 'har lane ki bridge session ID alag');
 }
 
 // ---------------------------------------------------------------------------
@@ -590,6 +625,36 @@ console.log('chrome discovery + proxy dispatcher (2026 fixes):');
   bridge.setBridgeProxy(null);
   px.removeProxy(burnProxy.id);
   px.setPoolEnabled(false);
+
+  // Lane-local bridge routes — do parallel contexts ek dusre ki IP
+  // kabhi overwrite na karein. Ye naive Promise.all wale sabse bare
+  // corruption bug ki regression guard hai.
+  const laneRouteA = { id: 'lane-route-a', label: 'lane A' };
+  const laneRouteA2 = { id: 'lane-route-a2', label: 'lane A rotated' };
+  const laneRouteB = { id: 'lane-route-b', label: 'lane B' };
+  const laneRoutesSeen = await Promise.all([
+    bridge.runWithBridgeProxy(laneRouteA, async () => {
+      await new Promise((resolve) => setTimeout(resolve, 15));
+      bridge.setBridgeProxy(laneRouteA2);
+      return bridge.getBridgeProxy()?.id;
+    }, { owner: 'test-lane-a' }),
+    bridge.runWithBridgeProxy(laneRouteB, async () => {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+      return bridge.getBridgeProxy()?.id;
+    }, { owner: 'test-lane-b' }),
+  ]);
+  ok(laneRoutesSeen[0] === 'lane-route-a2' && laneRoutesSeen[1] === 'lane-route-b',
+    'bridge ALS: parallel lanes ki IPs alag rehti hain');
+  ok(bridge.getBridgeProxy() === null, 'bridge ALS: lane rotate global route ko touch nahi karta');
+  ok(px.getProxyReservationOwner('lane-route-a2') === '' && px.getProxyReservationOwner('lane-route-b') === '',
+    'bridge ALS: context khatam hone par reservations release');
+  let laneRouteConflict = false;
+  await bridge.runWithBridgeProxy(laneRouteA, async () => {
+    try {
+      await bridge.runWithBridgeProxy(laneRouteA, async () => {}, { owner: 'test-lane-other' });
+    } catch { laneRouteConflict = true; }
+  }, { owner: 'test-lane-a' });
+  ok(laneRouteConflict === true, 'bridge ALS: reserved IP doosri lane ko reject');
 
   // Security route policy — 3 proxy challenges ke baad kharab pool me
   // ghoomne ke bajaye direct, 2 direct challenges ke baad best proxy wapas.

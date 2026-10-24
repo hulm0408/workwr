@@ -153,7 +153,7 @@ function runningCard(snap, stageText = '') {
     field('× Failed', `${snap.failed} · rate-limit: ${snap.rateStrikes}`),
     field('Pool', snap.poolTotal ? `${snap.poolFresh} fresh / ${snap.poolTotal} numbers` : 'load ho raha hai…'),
     (snap.scanning || snap.scanChecked)
-      ? field('🔎 Device scan', `pass ${snap.scanPass || 1}: ${snap.scanUniqueChecked || 0}/${snap.scanTotalDevices || 0} unique · probes ${snap.scanTotalProbes || snap.scanChecked || 0} · window ≤${fmtDuration(snap.scanWindowMs || 0)} · ${snap.scanFresh || 0} fresh ready${snap.scanning ? ' · scanning…' : ''}`)
+      ? field('🔎 Device scan', `pass ${snap.scanPass || 1}: ${snap.scanUniqueChecked || 0}/${snap.scanTotalDevices || 0} unique · probes ${snap.scanTotalProbes || snap.scanChecked || 0} · window ≤${fmtDuration(snap.scanWindowMs || 0)} · ${snap.scanBestActivityMs ? `best SMS ~${fmtDuration(Date.now() - snap.scanBestActivityMs)} purani · ` : ''}${snap.scanFresh || 0} fresh ready${snap.scanning ? ' · scanning…' : ''}`)
       : '',
     snap.current
       ? `📍 <b>Abhi:</b> <code>${esc(snap.current.phone)}</code> (${fmtDuration(Date.now() - snap.current.startedAt)})`

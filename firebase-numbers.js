@@ -586,6 +586,8 @@ export async function scanFreshDevices(entries = [], opts = {}) {
   const widenByDoubling = Boolean(opts.widenByDoubling);
   const backupCount = Math.max(want, Number(opts.backupCount) || want);
   const earlyWidenStepMs = Math.max(0, Number(opts.earlyWidenStepMs) || 0);
+  const maxScanMs = Math.max(0, Number(opts.maxScanMs) || 0);
+  const onlineFallback = Boolean(opts.onlineFallback);
   const probe = typeof opts.probe === 'function' ? opts.probe : null;
   const onProgress = typeof opts.onProgress === 'function' ? opts.onProgress : null;
   const shouldAbort = typeof opts.shouldAbort === 'function' ? opts.shouldAbort : null;
@@ -606,7 +608,9 @@ export async function scanFreshDevices(entries = [], opts = {}) {
   const fresh = [];
   const scanStartedAt = Date.now();
   let bestLastActivityMs = null;
+  let scanTimedOut = false;
   let checked = 0;
+  const scanDeadlineReached = () => maxScanMs > 0 && (Date.now() - scanStartedAt) >= maxScanMs;
 
   const rankedDoublingCandidates = (maxAgeMs = Number.POSITIVE_INFINITY) => {
     const rankedAt = Date.now();
@@ -617,6 +621,8 @@ export async function scanFreshDevices(entries = [], opts = {}) {
       .map((p) => ({
         ...p,
         windowMs: doubledWidenWindowMs(windowMs, rankedAt - (p.lastActivityMs || rankedAt)),
+        selectionSource: 'sms-activity',
+        onlineFallback: false,
       }));
   };
 
@@ -627,7 +633,37 @@ export async function scanFreshDevices(entries = [], opts = {}) {
     return windowMs * (2 ** steps);
   };
 
+  const rankedOnlineFallbackCandidates = () => {
+    if (!onlineFallback) return [];
+    const seenPhones = new Set();
+    return probed
+      .filter((p) => p.entry?.online !== false)
+      .sort((a, b) => (b.lastActivityMs || 0) - (a.lastActivityMs || 0))
+      .filter((p) => {
+        const phone = String(p.entry?.phone || '');
+        if (!phone || seenPhones.has(phone)) return false;
+        seenPhones.add(phone);
+        return true;
+      })
+      .slice(0, backupCount)
+      .map((p) => ({
+        ...p,
+        lastActivityMs: p.lastActivityMs || null,
+        windowMs: 0,
+        selectionSource: 'clients-online',
+        onlineFallback: true,
+      }));
+  };
+
   for (let off = 0; off < deviceIds.length && checked < maxProbe && fresh.length < want && !aborted(); off += chunkSize) {
+    // Quick-scan ka hard budget: pehla chunk hamesha chalega, lekin uske
+    // baad budget khatam ho to full pool ghumane ke bajaye probed sample ke
+    // best/online candidates return honge. Yahi woh fix hai jo "sirf scan
+    // hi hota rahega" wale loop ko asal me todta hai.
+    if (checked > 0 && scanDeadlineReached()) {
+      scanTimedOut = true;
+      break;
+    }
     const chunk = deviceIds.slice(off, off + Math.min(chunkSize, maxProbe - checked));
     const res = await fetchDevicesLastActivityMs(chunk, { concurrency, probe });
     checked += chunk.length;
@@ -672,6 +708,9 @@ export async function scanFreshDevices(entries = [], opts = {}) {
           widestWindowMs: Math.max(...early.map((p) => p.windowMs || windowMs)),
           widened: (early[0].windowMs || windowMs) > windowMs,
           earlyWidened: true,
+          onlineFallback: false,
+          scanTimedOut: false,
+          bestLastActivityMs,
           exhausted: false, totalDevices: deviceIds.length,
         };
       }
@@ -679,6 +718,7 @@ export async function scanFreshDevices(entries = [], opts = {}) {
   }
 
   const exhausted = checked >= deviceIds.length;
+  if (!exhausted && scanDeadlineReached()) scanTimedOut = true;
 
   if (widenByDoubling && !aborted()) {
     // Scanner ne jitne devices parkhe hain, unhi ke sabse taaza ranked
@@ -697,6 +737,9 @@ export async function scanFreshDevices(entries = [], opts = {}) {
         widestWindowMs: Math.max(...ranked.map((p) => p.windowMs || windowMs)),
         widened: (ranked[0].windowMs || windowMs) > windowMs,
         earlyWidened: false,
+        onlineFallback: false,
+        scanTimedOut,
+        bestLastActivityMs,
         exhausted, totalDevices: deviceIds.length,
       };
     }
@@ -748,7 +791,32 @@ export async function scanFreshDevices(entries = [], opts = {}) {
     };
   }
 
-  return { fresh: [], checked, probedDeviceIds, widestWindowMs: windowMs, widened: false, exhausted, totalDevices: deviceIds.length };
+  if (!aborted()) {
+    // SMS activity asal heartbeat nahi hai: bilkul zinda device ko bhi
+    // ghanton/dinon koi incoming SMS nahi aata. Isliye quick scan me koi
+    // usable SMS timestamp na mile to Firebase clients me ONLINE dikh
+    // rahe probed devices hi asal fallback hain. Inhe engine/pipeline ko
+    // alag se flag karke bhejo taaki woh dobara last-SMS gate par stale
+    // na hon aur batch process hona shuru ho.
+    const online = rankedOnlineFallbackCandidates();
+    if (online.length) {
+      return {
+        fresh: online, checked, probedDeviceIds,
+        widestWindowMs: windowMs, widened: false,
+        earlyWidened: false,
+        onlineFallback: true,
+        scanTimedOut,
+        bestLastActivityMs,
+        exhausted, totalDevices: deviceIds.length,
+      };
+    }
+  }
+
+  return {
+    fresh: [], checked, probedDeviceIds, widestWindowMs: windowMs,
+    widened: false, onlineFallback: false, scanTimedOut, bestLastActivityMs,
+    exhausted, totalDevices: deviceIds.length,
+  };
 }
 
 // OTP dispatch se PEHLE inbox ka snapshot — purane messages kabhi accept na hon.

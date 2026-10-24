@@ -235,7 +235,11 @@ export async function processSingleNumber({
     // PREMIUM_DEVICE_ACTIVE_WINDOW_MS (default 60s; 0 = gate off).
     const activeWindowRaw = Number(otpCfg.activeWindowMs ?? process.env.PREMIUM_DEVICE_ACTIVE_WINDOW_MS ?? 60_000);
     const activeWindowMs = Number.isFinite(activeWindowRaw) && activeWindowRaw > 0 ? activeWindowRaw : 0;
-    if (deviceIds?.length && activeWindowMs > 0) {
+    // Scanner ne agar device ko Firebase clients ke ONLINE status par
+    // explicitly chuna hai, to use last incoming SMS ki age par dobara
+    // mat roko. SMS na aana device ke band honay ka saboot nahi hai.
+    const skipLastSeenGate = Boolean(otpCfg.skipLastSeenGate);
+    if (deviceIds?.length && activeWindowMs > 0 && !skipLastSeenGate) {
       let lastActivityMs = null;
       // Engine ka parallel scan pehle hi ye device probe kar chuka hai to
       // wahin ka fresh result use karo (dobara Firebase GET = fuzool time).

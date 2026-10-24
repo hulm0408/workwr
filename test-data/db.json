@@ -1,0 +1,45 @@
+{
+  "config": {
+    "totalSlots": 9,
+    "slotsLeft": 5,
+    "bossIds": [
+      6484999726
+    ],
+    "familyMembers": {},
+    "accounts": {},
+    "deletedAccounts": {}
+  },
+  "sessionVault": {},
+  "orders": {},
+  "drafts": {},
+  "bossState": null,
+  "userStates": {},
+  "firebaseSources": {
+    "activeId": "06d00dcd",
+    "list": [
+      {
+        "id": "06d00dcd",
+        "name": "Default (vuvhbjbi)",
+        "url": "https://mock-firebase.test.firebaseio.com",
+        "auth": "",
+        "clientsPath": "clients",
+        "messagesPath": "messages",
+        "numbersPath": "",
+        "smsPath": "sms",
+        "otpPath": "otp",
+        "enabled": true,
+        "addedAt": "2026-10-24T08:28:39.226Z"
+      }
+    ]
+  },
+  "freshSettings": {
+    "target": 100,
+    "gapMs": 30000,
+    "backoffMs": 900000,
+    "allowOffline": true
+  },
+  "proxyPool": {
+    "enabled": false,
+    "list": []
+  }
+}

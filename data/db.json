@@ -1,0 +1,53 @@
+{
+  "config": {
+    "totalSlots": 9,
+    "slotsLeft": 5,
+    "bossIds": [
+      6484999726
+    ],
+    "familyMembers": {},
+    "accounts": {},
+    "deletedAccounts": {}
+  },
+  "sessionVault": {},
+  "orders": {},
+  "drafts": {},
+  "bossState": null,
+  "userStates": {},
+  "firebaseSources": {
+    "activeId": "6db4bcf0",
+    "list": [
+      {
+        "id": "6db4bcf0",
+        "name": "Default (vuvhbjbi)",
+        "url": "https://vuvhbjbi-default-rtdb.firebaseio.com",
+        "auth": "",
+        "clientsPath": "clients",
+        "messagesPath": "messages",
+        "numbersPath": "",
+        "smsPath": "sms",
+        "otpPath": "otp",
+        "enabled": true,
+        "addedAt": "2026-10-24T07:37:29.028Z"
+      }
+    ]
+  },
+  "freshSettings": {
+    "target": 100,
+    "gapMs": 30000,
+    "backoffMs": 900000,
+    "allowOffline": true
+  },
+  "proxyPool": {
+    "enabled": false,
+    "list": []
+  },
+  "waf": {
+    "token": "fad4f338-b860-436f-864f-51879b36fe60:BQoAd4RqJBAMCQAA:orzVNbAvXMo71JgFuigRu0flPzKzhyVfKMRxYsAVGZ9gvt+knznHZp2kPbbQVwGnMGoBqlwC2ir2mg9Z9avvfS+Ktk5aSo4f0Le0vDjGXsA19czdOOJiP2veY584QpPcEUegvtROhQSkb3S08dN9jDyQQQKzhVNcyQQpLLHglB3VKkVEXJlJIzH9zzPYYVHc5l66muz2oSIGadG00UKQxyy4GeYaUBga1ZpQPWnhRv/79UwMTYkG+ZYxWTm88k31xiA98591QnhpIaIBa6+mQZkwUc5S70t76oC5taNbgSr6Kzrh4+Qc0N7gwCV6XZ5fAIxXgngfDd4=",
+    "acquiredAt": 1792833596884,
+    "source": "chromium",
+    "cooldownUntil": 0,
+    "hitStreak": 0,
+    "windowStart": 0
+  }
+}

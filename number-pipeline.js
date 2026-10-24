@@ -1,0 +1,348 @@
+// ===== Number pipeline — EK number ka poora lifecycle (single + batch dono ke liye) =====
+//
+// processSingleNumber() in sab scenarios ko handle karta hai:
+//   🆕 naya number  → OTP → verify/register → session save          → fresh_new
+//   ♻️ purana number → login → Delete OTP → verify delete →
+//        • charges/order/wallet/other block                          → skipped_delete_blocked
+//        • delete OTP hi nahi aaya (window me)                       → deferred_delete_otp_miss
+//        • delete SUCCESS → purge → usi number se fresh registration → fresh_after_delete
+//   ⚠️ infrastructure outcomes (engine alag tarah handle karta hai):
+//        • Swiggy rate limit        → rate_limited      (backoff)
+//        • Swiggy security check    → security_challenge (band karo)
+//        • OTP send/miss/verify fail→ failed_*           (agla number)
+//        • STOP dabane par           → aborted            (number untouched/retryable)
+//
+// Har outcome ka ledger + Firebase pool marking yahin hota hai.
+
+import {
+  getDb,
+  saveDb,
+  deleteAccount,
+  syncCloudVaultNow,
+  findAccountKeyByPhone,
+  getNextAutoUserName,
+} from './store.js';
+import {
+  requestSwiggyOtpViaBridge,
+  requestSwiggyDeleteOtpViaBridge,
+  verifySwiggyOtpViaBridge,
+  verifyAndDeleteSwiggyAccountViaBridge,
+  signupSwiggyViaBridge,
+} from './swiggy-bridge.js';
+import {
+  snapshotSeenOtpState,
+  waitForOtpCode,
+  markPoolNumberStatus,
+} from './firebase-numbers.js';
+import { esc, section, sub, field } from './rich-text.js';
+
+// ---------------------------------------------------------------------------
+// Ledger (db.json → premiumFlow.used) + fresh-selection helpers
+// ---------------------------------------------------------------------------
+export function getPremiumLedger() {
+  try {
+    const db = getDb();
+    if (!db.premiumFlow) db.premiumFlow = {};
+    if (!db.premiumFlow.used) db.premiumFlow.used = {};
+    return db.premiumFlow.used;
+  } catch {
+    return {};
+  }
+}
+
+export function markLedger(phone, status, extra = {}) {
+  try {
+    const db = getDb();
+    if (!db.premiumFlow) db.premiumFlow = {};
+    if (!db.premiumFlow.used) db.premiumFlow.used = {};
+    db.premiumFlow.used[phone] = { status, at: new Date().toISOString(), ...extra };
+    saveDb(db);
+  } catch (e) {
+    console.warn('[Pipeline] ledger save failed:', e?.message);
+  }
+}
+
+export async function markPoolStatus(entry, status) {
+  try {
+    await markPoolNumberStatus(entry, status);
+  } catch (e) {
+    console.warn('[Pipeline] Firebase pool status skipped:', e?.message);
+  }
+}
+
+export function freshEntriesFrom(pool) {
+  const used = getPremiumLedger();
+  return (pool || []).filter(
+    (n) => !used[n.phone] && !/^(used|skipped|deferred)$/i.test(String(n.status || '').trim())
+  );
+}
+
+// Online devices pehle (unme hi OTP aayega), phir offline fallback.
+export function preferOnline(entries) {
+  const online = entries.filter((e) => e.online !== false);
+  const offline = entries.filter((e) => e.online === false);
+  const shuffle = (arr) => arr.slice().sort(() => Math.random() - 0.5);
+  return [...shuffle(online), ...shuffle(offline)];
+}
+
+// ---------------------------------------------------------------------------
+// OTP → verify (+ ek baar retry) ka shared round
+// ---------------------------------------------------------------------------
+async function grabAndVerifyRound({
+  userId,
+  phone,
+  deviceIds,
+  seen,
+  waitCfg,
+  report,
+  waitText,
+  retryText,
+  shouldAbort,
+}) {
+  const aborted = () => Boolean(shouldAbort && shouldAbort());
+
+  if (report && waitText) await report(waitText);
+
+  const otp1 = await waitForOtpCode(phone, { ...waitCfg, excludeIds: seen, deviceIds, shouldAbort });
+  if (!otp1?.code) {
+    if (otp1?.aborted) return { status: 'aborted', stage: 'otp-wait' };
+    return { status: 'miss', reason: otp1?.error || '' };
+  }
+
+  const verifyOnce = async (code) => {
+    let v = await verifySwiggyOtpViaBridge(userId, code);
+    if (!v?.success && (v?.isNewUser || v?.needsSignup)) {
+      v = await signupSwiggyViaBridge(userId, getNextAutoUserName());
+    }
+    return v;
+  };
+
+  let v = await verifyOnce(otp1.code);
+
+  // Retry: verify fail hua to ek baar aur naya OTP dhundo (galat service ka code
+  // ya late-arriving Swiggy code dono isi se bachte hain).
+  if (!v?.success && !v?.code && !aborted()) {
+    if (report && retryText) await report(retryText);
+    const seen2 = {
+      ids: new Set([...(seen?.ids || []), otp1.idKey].filter(Boolean)),
+      codes: new Set([...(seen?.codes || []), otp1.code].filter(Boolean)),
+    };
+    const otp2 = await waitForOtpCode(phone, {
+      ...waitCfg,
+      timeoutMs: Math.min(Number(waitCfg.timeoutMs ?? 90_000), 60_000),
+      excludeIds: seen2,
+      deviceIds,
+      shouldAbort,
+    });
+    if (otp2?.aborted) return { status: 'aborted', stage: 'otp-retry-wait' };
+    if (otp2?.code) {
+      const v2 = await verifyOnce(otp2.code);
+      v = v2?.success ? v2 : (v2 || v);
+    }
+  }
+
+  if (v?.success) return { status: 'ok', account: v };
+  if (v?.code === 'SWIGGY_WAF_COOLDOWN') return { status: 'waf_cooldown', reason: v?.message || '', cooldownMs: Number(v?.cooldownMs) || 60_000 };
+  if (v?.code === 'SWIGGY_RATE_LIMIT') return { status: 'rate_limited', reason: v?.message || '' };
+  if (v?.code === 'SWIGGY_SECURITY_CHALLENGE') return { status: 'security_challenge', reason: v?.message || '' };
+  if (aborted()) return { status: 'aborted', stage: 'verify' };
+  return { status: 'failed', reason: v?.message || '', swiggyText: v?.swiggyStatus || '' };
+}
+
+// ---------------------------------------------------------------------------
+// Main: ek number ko shuru se end tak
+// ---------------------------------------------------------------------------
+export async function processSingleNumber({
+  userId,
+  entry,
+  report = null,            // async (text) => {} — stage cards (caller buttons lagata hai)
+  otpCfg = {},
+  shouldAbort = null,
+  markUsed = true,
+}) {
+  const phone = entry?.phone;
+  if (!phone) return { ok: false, kind: 'failed_bad_entry', phone: '', reason: 'Entry me phone nahi hai' };
+
+  const deviceIds = entry?.deviceId ? [entry.deviceId] : null;
+  const say = async (text) => { if (report) { try { await report(text); } catch {} } };
+  const aborted = () => Boolean(shouldAbort && shouldAbort());
+
+  const waitCfg = {
+    waitMs: Number(otpCfg.waitMs ?? 10_000),
+    timeoutMs: Number(otpCfg.timeoutMs ?? 90_000),
+    pollMs: Number(otpCfg.pollMs ?? 2_500),
+    acceptAnyAfterMs: Number(otpCfg.acceptAnyAfterMs ?? 30_000),
+  };
+
+  const mapVerify = (r, failKind) => {
+    if (r.status === 'waf_cooldown') return { ok: false, kind: 'waf_cooldown', phone, cooldownMs: r.cooldownMs, reason: r.reason };
+    if (r.status === 'rate_limited') return { ok: false, kind: 'rate_limited', phone, reason: r.reason };
+    if (r.status === 'security_challenge') return { ok: false, kind: 'security_challenge', phone, reason: r.reason };
+    if (r.status === 'aborted') return { ok: false, kind: 'aborted', phone, stage: r.stage };
+    if (r.status === 'miss') return { ok: false, kind: failKind, phone, reason: r.reason };
+    return { ok: false, kind: 'failed_verify', phone, reason: r.reason, swiggyText: r.swiggyText };
+  };
+
+  try {
+    // ---- Step 1: Swiggy OTP bhejo (purana/naya Swiggy khud detect karta hai) ----
+    const seen1 = await snapshotSeenOtpState(phone, { deviceIds });
+
+    const db = getDb();
+    const existingKey = findAccountKeyByPhone(db.config?.accounts || {}, phone) || '';
+    const existingName = existingKey ? (db.config.accounts[existingKey]?.name || existingKey) : null;
+
+    const otpReq = await requestSwiggyOtpViaBridge(userId, phone, existingKey, existingName);
+    if (!otpReq?.success) {
+      if (otpReq?.code === 'SWIGGY_WAF_COOLDOWN') {
+        return { ok: false, kind: 'waf_cooldown', phone, cooldownMs: Number(otpReq?.cooldownMs) || 60_000, reason: otpReq?.message || '' };
+      }
+      if (otpReq?.code === 'SWIGGY_RATE_LIMIT') {
+        return { ok: false, kind: 'rate_limited', phone, reason: otpReq?.message || '' };
+      }
+      if (otpReq?.code === 'SWIGGY_SECURITY_CHALLENGE') {
+        return { ok: false, kind: 'security_challenge', phone, reason: otpReq?.message || '' };
+      }
+      return { ok: false, kind: 'failed_otp_send', phone, reason: otpReq?.message || 'Swiggy OTP send fail' };
+    }
+
+    const isNew = Boolean(otpReq.isNewUser);
+    await say(
+      section(
+        isNew ? '🆕 Naya Number — Fresh Registration' : '♻️ Purana Number — Delete + Fresh Login',
+        [
+          `📱 <b>Number:</b> <code>${esc(phone)}</code>`,
+          isNew
+            ? '→ Number Swiggy par pehle se nahi hai — seedha naya account banega.'
+            : '→ Purana account mila: login → Settings → Delete Account → phir fresh registration.',
+          '',
+          sub('⏳10 second wait… phir Firebase se OTP padhunga (max ~90s aur).'),
+        ].join('\n')
+      )
+    );
+    if (aborted()) return { ok: false, kind: 'aborted', phone, stage: 'after-send' };
+
+    // ---- Step 2: OTP lana + verify (new = yahin done; old = aage delete) ----
+    const round1 = await grabAndVerifyRound({
+      userId, phone, deviceIds, seen: seen1, waitCfg, report: say, shouldAbort,
+      waitText: section('⏳ OTP Wait — Step 1/3', [
+        `📱 <b>Number:</b> <code>${esc(phone)}</code>`,
+        sub('10 second ruk ke Firebase SMS inbox padh raha hoon…'),
+      ].join('\n')),
+      retryText: section('↻ Verify Retry', [
+        `📱 <b>Number:</b> <code>${esc(phone)}</code>`,
+        sub('Pehla OTP verify nahi hua — inbox me ek nayi entry ka wait (max 60s).'),
+      ].join('\n')),
+    });
+    if (round1.status !== 'ok') return mapVerify(round1, 'failed_otp_miss');
+
+    const loginAcc = round1.account;
+    syncCloudVaultNow(getDb()).catch(() => {});
+
+    // 🆕 NAYA NUMBER — done!
+    if (isNew) {
+      if (markUsed) {
+        markLedger(phone, 'success', { accountKey: loginAcc.accountKey, kind: 'new' });
+        await markPoolStatus(entry, 'used');
+      }
+      return {
+        ok: true, kind: 'fresh_new', phone,
+        accountKey: loginAcc.accountKey, account: loginAcc,
+      };
+    }
+
+    // ---- ♻️ PURANA NUMBER: Step 2/3 — Delete Account ----
+    await say(section('♻️ Step 2/3 — Delete Account', [
+      `📱 <b>Number:</b> <code>${esc(phone)}</code>`,
+      sub('Login ho gaya — ab Settings → Delete Account ka OTP bhej raha hoon…'),
+    ].join('\n')));
+    if (aborted()) return { ok: false, kind: 'aborted', phone, stage: 'before-delete-request' };
+
+    const seen2 = await snapshotSeenOtpState(phone, { deviceIds });
+    const delReq = await requestSwiggyDeleteOtpViaBridge(userId, phone, loginAcc.accountKey, loginAcc.name || null);
+    if (!delReq?.success) {
+      if (delReq?.code === 'SWIGGY_WAF_COOLDOWN') return { ok: false, kind: 'waf_cooldown', phone, cooldownMs: Number(delReq?.cooldownMs) || 60_000, reason: delReq?.message || '' };
+      if (delReq?.code === 'SWIGGY_RATE_LIMIT') return { ok: false, kind: 'rate_limited', phone, reason: delReq?.message || '' };
+      if (delReq?.code === 'SWIGGY_SECURITY_CHALLENGE') return { ok: false, kind: 'security_challenge', phone, reason: delReq?.message || '' };
+      if (markUsed) {
+        markLedger(phone, 'skipped', { reason: String(delReq?.message || ''), accountKey: loginAcc.accountKey });
+        await markPoolStatus(entry, 'skipped');
+      }
+      return {
+        ok: false, kind: 'skipped_delete_blocked', phone,
+        reason: String(delReq?.message || 'Delete possible nahi'), accountKey: loginAcc.accountKey, account: loginAcc,
+      };
+    }
+
+    const otpD = await waitForOtpCode(phone, { ...waitCfg, excludeIds: seen2, deviceIds, shouldAbort });
+    if (!otpD?.code) {
+      if (otpD?.aborted) return { ok: false, kind: 'aborted', phone, stage: 'delete-otp-wait' };
+      if (markUsed) {
+        markLedger(phone, 'deferred', { reason: 'delete OTP not received', accountKey: loginAcc.accountKey });
+      }
+      return {
+        ok: false, kind: 'deferred_delete_otp_miss', phone,
+        reason: otpD?.error || 'Delete OTP window me nahi mila', accountKey: loginAcc.accountKey, account: loginAcc,
+      };
+    }
+
+    const delRes = await verifyAndDeleteSwiggyAccountViaBridge(userId, otpD.code, loginAcc.accountKey);
+    if (!delRes?.success) {
+      if (delRes?.code === 'SWIGGY_RATE_LIMIT') return { ok: false, kind: 'rate_limited', phone, reason: delRes?.message || '' };
+      if (delRes?.code === 'SWIGGY_SECURITY_CHALLENGE') return { ok: false, kind: 'security_challenge', phone, reason: delRes?.message || '' };
+      if (markUsed) {
+        markLedger(phone, 'skipped', { reason: String(delRes?.message || ''), accountKey: loginAcc.accountKey });
+        await markPoolStatus(entry, 'skipped');
+      }
+      return {
+        ok: false, kind: 'skipped_delete_blocked', phone,
+        reason: String(delRes?.message || 'Delete blocked'), accountKey: loginAcc.accountKey, account: loginAcc,
+      };
+    }
+
+    // Swiggy se delete OK → bot DB + vault se purge (tabhi fresh login milega)
+    deleteAccount(loginAcc.accountKey, { purgeVault: true });
+    syncCloudVaultNow(getDb()).catch(() => {});
+    if (aborted()) return { ok: false, kind: 'aborted', phone, stage: 'after-delete' };
+
+    // ---- Step 3/3: usi number se FRESH registration ----
+    await say(section('✅ Step 3/3 — Delete Ho Gaya — Fresh Registration', [
+      `📱 <b>Number:</b> <code>${esc(phone)}</code>`,
+      sub('Swiggy account delete + bot DB purge done — ab fresh OTP bhej raha hoon…'),
+    ].join('\n')));
+
+    const seen3 = await snapshotSeenOtpState(phone, { deviceIds });
+    const otpReq2 = await requestSwiggyOtpViaBridge(userId, phone, '', null);
+    if (!otpReq2?.success) {
+      if (otpReq2?.code === 'SWIGGY_RATE_LIMIT') return { ok: false, kind: 'rate_limited', phone, reason: otpReq2?.message || '' };
+      if (otpReq2?.code === 'SWIGGY_SECURITY_CHALLENGE') return { ok: false, kind: 'security_challenge', phone, reason: otpReq2?.message || '' };
+      return { ok: false, kind: 'failed_fresh_otp_send', phone, reason: otpReq2?.message || 'Fresh OTP send fail' };
+    }
+
+    const round3 = await grabAndVerifyRound({
+      userId, phone, deviceIds, seen: seen3, waitCfg, report: say, shouldAbort,
+      waitText: section('⏳ Fresh OTP Wait — Step 3/3', [
+        `📱 <b>Number:</b> <code>${esc(phone)}</code>`,
+        sub('Fresh registration OTP —10 second wait + inbox poll…'),
+      ].join('\n')),
+      retryText: section('↻ Fresh Verify Retry', [
+        `📱 <b>Number:</b> <code>${esc(phone)}</code>`,
+        sub('Pehla verify nahi hua — ek aur naye OTP ka wait (max 60s).'),
+      ].join('\n')),
+    });
+    if (round3.status !== 'ok') return mapVerify(round3, 'failed_fresh_otp_miss');
+
+    const freshAcc = round3.account;
+    syncCloudVaultNow(getDb()).catch(() => {});
+    if (markUsed) {
+      markLedger(phone, 'success', { accountKey: freshAcc.accountKey, kind: 'after-delete' });
+      await markPoolStatus(entry, 'used');
+    }
+    return {
+      ok: true, kind: 'fresh_after_delete', phone,
+      accountKey: freshAcc.accountKey, account: freshAcc,
+    };
+  } catch (err) {
+    console.error('[Pipeline]', err?.stack || err?.message);
+    return { ok: false, kind: 'failed_exception', phone, reason: String(err?.message || err) };
+  }
+}

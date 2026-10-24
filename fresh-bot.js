@@ -1,0 +1,770 @@
+// ===== 🆕 SWIGGY FRESH BOT — ek START, baaki sab khud =====
+//
+// Ye STANDALONE bot hai (alag project, alag DB):
+//   /start → ▶️ START BATCH · ⏹ STOP · 📊 STATUS · ⚙️ SETTINGS
+//
+// Ek START ke baad ye apne aap chalta hai:
+//   1️⃣ Firebase pool (clients/) se number uthata — online devices pehle
+//   2️⃣ Swiggy OTP bhejta hai → 10s wait → isi Firebase (messages/) se
+//      OTP padh kar khud paste karta hai
+//   3️⃣ 🆕 naya number = register + session save
+//      ♻️ purana number = login → delete account → usi number se fresh login
+//   4️⃣ charges/order/wallet block = SKIP · rate-limit = auto backoff ·
+//      WAF challenge = auto token-refresh + retry (batch nahi rukta) ·
+//      STOP dabane par ruk jata hai
+//
+// ⚙️ SETTINGS — user ki azadi (env chhedni ki zaroorat nahi):
+//   • 🔥 Firebase Sources — multiple DB add/remove/enable/switch (bot UI se)
+//   • 🎯 Target / ⏱ Max time / 🚦 Gap / ⏳ OTP wait — sab yahin se
+//
+// Setup (sirf 2 cheezein):
+//   .env → BOT_TOKEN=<BotFather ka token>   (AUTOPILOT_BOT_TOKEN bhi chalega)
+//          OWNER_IDS=<aapka Telegram id>    (warna store boss + fallback)
+//   FIREBASE_DB_URL ki zaroorat NAHI — default hi vuvhbjbi Firebase hai.
+//
+// Chalao:  node fresh-bot.js   (ya npm start)
+
+import dotenv from 'dotenv';
+dotenv.config();
+
+// OTP + numbers dono ISI Firebase se aate hain (premium/firebase koi third source nahi)
+process.env.FIREBASE_DB_URL ||= 'https://vuvhbjbi-default-rtdb.firebaseio.com/';
+
+// Dynamic import — defaults set karne KE BAAD hi modules load ho, warna
+// firebase-numbers.js env ko call-time par hi padhta hai, phir bhi safe side.
+const { Telegraf } = await import('telegraf');
+const { isBoss } = await import('./store.js');
+const {
+  startAutopilot,
+  requestAutopilotStop,
+  getAutopilotSnapshot,
+  isAutopilotRunning,
+} = await import('./autopilot-engine.js');
+const { isFirebaseConfigured, firebaseSetupHintLines } = await import('./firebase-numbers.js');
+const sources = await import('./firebase-sources.js');
+const bs = await import('./bot-settings.js');
+const proxyPool = await import('./proxy-pool.js');
+const { esc, section, sub, field } = await import('./rich-text.js');
+
+// ---------------------------------------------------------------------------
+// Config + owner gate
+// ---------------------------------------------------------------------------
+const TOKEN = String(process.env.BOT_TOKEN || process.env.AUTOPILOT_BOT_TOKEN || '').trim();
+
+function ownerIds() {
+  const raw = String(process.env.OWNER_IDS || process.env.AUTOPILOT_OWNER_IDS || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (raw.length) return new Set(raw);
+  return null; // fallback: store bossIds + known owner
+}
+
+function isOwner(userId) {
+  const ids = ownerIds();
+  const uid = String(userId);
+  if (ids) return ids.has(uid);
+  try { if (isBoss(Number(userId))) return true; } catch {}
+  try { if (isBoss(uid)) return true; } catch {}
+  return uid === '5393396812';
+}
+
+// ---------------------------------------------------------------------------
+// Cards
+// ---------------------------------------------------------------------------
+const kb = (rows) => ({ parse_mode: 'HTML', link_preview_options: { is_disabled: true }, reply_markup: { inline_keyboard: rows } });
+
+function fmtDuration(ms) {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  if (h) return `${h}h ${m}m`;
+  if (m) return `${m}m ${sec}s`;
+  return `${sec}s`;
+}
+
+function activeSourceLine() {
+  try {
+    const src = sources.getActiveSource();
+    if (!src) return field('🔥 Firebase', '— (koi source nahi)');
+    const list = sources.listSources();
+    return field('🔥 Firebase', `${esc(src.name)}  ·  ${list.length} source${list.length === 1 ? '' : 's'}`);
+  } catch {
+    return field('🔥 Firebase', '—');
+  }
+}
+
+function startCard() {
+  const snap = getAutopilotSnapshot();
+  const target = bs.getSetting('target');
+  const maxMin = bs.getSetting('maxMinutes');
+  return section('🆕 Swiggy Fresh Bot', [
+    `Bas <b>START</b> dabao — phone pe chhod ke aa jao,`,
+    `baaki sab ye khud karega:`,
+    ``,
+    `1️⃣ Firebase pool se number (online pehle)`,
+    `2️⃣ Swiggy OTP → <b>10s wait</b> → OTP khud padh kar paste`,
+    `3️⃣ 🆕 naya = register · ♻️ purana = delete → fresh login`,
+    `4️⃣ charges/order/wallet block = <b>SKIP</b> · WAF = <b>auto token-refresh + retry</b>`,
+    ``,
+    activeSourceLine(),
+    field('🎯 Target', `${target} fresh sessions`),
+    field('⏱ Max time', `${maxMin} minutes`),
+    snap.finishedAt
+      ? field('Last run', `${snap.fresh} fresh · ${fmtDuration(snap.elapsedMs)} · ${esc(snap.stopReason || 'done')}`)
+      : '',
+    ``,
+    isAutopilotRunning()
+      ? `● <b>RUNNING</b> — STOP/STATUS niche.`
+      : sub('Start karke chhod do — ~1 hr baad aakar summary dekh lena.'),
+  ].filter(Boolean).join('\n'));
+}
+
+function runningCard(snap, stageText = '') {
+  return section('● Autopilot RUNNING', [
+    field('Runtime', fmtDuration(snap.elapsedMs)),
+    field('Target', String(snap.target)),
+    stageText || '',
+    ``,
+    field('Processed', String(snap.processed)),
+    field('✅ Fresh', `${snap.fresh}  (naye: ${snap.freshNew} · delete+fresh: ${snap.freshAfterDelete})`),
+    field('⚠️ Skipped', `${snap.skipped} · deferred: ${snap.deferred}`),
+    field('× Failed', `${snap.failed} · rate-limit: ${snap.rateStrikes}`),
+    field('Pool', `${snap.poolFresh} fresh / ${snap.poolTotal} numbers`),
+    snap.current
+      ? `📍 <b>Abhi:</b> <code>${esc(snap.current.phone)}</code> (${fmtDuration(Date.now() - snap.current.startedAt)})`
+      : '',
+    snap.lastError ? field('Last error', snap.lastError) : '',
+  ].filter(Boolean).join('\n'));
+}
+
+function summaryCard(snap) {
+  const freshList = (snap.freshAccounts || []).slice(-12)
+    .map((a) => `• <code>${esc(a.phone)}</code> → <b>${esc(a.accountKey)}</b>`)
+    .join('\n');
+  return section('📊 Batch — Final Summary', [
+    field('Status', snap.running ? '● RUNNING' : `⏹ ${esc(snap.stopReason || 'stopped')}`),
+    field('Runtime', fmtDuration(snap.elapsedMs)),
+    ``,
+    field('Processed', String(snap.processed)),
+    field('✅ Fresh', `${snap.fresh}  (naye: ${snap.freshNew} · delete+fresh: ${snap.freshAfterDelete})`),
+    field('⚠️ Skipped', `${snap.skipped} · deferred: ${snap.deferred}`),
+    field('× Failed', `${snap.failed} · rate-limit: ${snap.rateStrikes}`),
+    field('Pool', `${snap.poolFresh} fresh / ${snap.poolTotal} numbers`),
+    snap.lastError ? field('Last error', snap.lastError) : '',
+    freshList ? `` : '',
+    freshList ? `▤ <b>Latest fresh sessions:</b>` : '',
+    freshList || sub('Abhi tak koi fresh session nahi bana.'),
+    ``,
+    sub('Saare sessions data/db.json + cloud vault me saved hain (agar vault configured).'),
+  ].filter((x) => x !== '' && x !== false).join('\n'));
+}
+
+const startRows = () => [
+  [{ text: '▶️ START BATCH', callback_data: 'ap_start', style: 'success' }],
+  [{ text: '📊 Status', callback_data: 'ap_status' }, { text: '⚙️ Settings', callback_data: 'ap_settings' }],
+];
+const stopRows = () => [
+  [{ text: '⏹ STOP BATCH', callback_data: 'ap_stop', style: 'danger' }],
+  [{ text: '📊 Status', callback_data: 'ap_status' }, { text: '⚙️ Settings', callback_data: 'ap_settings' }],
+];
+const idleRows = () => [
+  [{ text: '▶️ START BATCH', callback_data: 'ap_start', style: 'success' }],
+  [{ text: '📊 Status', callback_data: 'ap_status' }, { text: '⚙️ Settings', callback_data: 'ap_settings' }],
+];
+
+// ---------------------------------------------------------------------------
+// ⚙️ SETTINGS — Firebase sources + batch knobs (user ki azadi, env nahi)
+// ---------------------------------------------------------------------------
+function settingsCard() {
+  const ps = proxyPool.proxySummary();
+  return section('⚙️ Settings', [
+    activeSourceLine(),
+    field('🔀 Proxies', ps.enabled ? `${ps.enabledCount}/${ps.total} ON — ${ps.rotation}` : 'OFF (rukna pad sakta hai)'),
+    ``,
+    field('🎯 Target', `${bs.getSetting('target')} fresh`),
+    field('⏱ Max time', `${bs.getSetting('maxMinutes')} min`),
+    field('🚦 Gap', bs.fmtSetting('gapMs')),
+    field('⏳ OTP wait', bs.fmtSetting('otpWaitMs')),
+    field('📴 Offline devices', bs.getSetting('allowOffline') ? 'ON (try bhi karenge)' : 'OFF (sirf online)'),
+    ``,
+    sub('Sab kuch yahin se badlo — .env chhedni ki zaroorat nahi.'),
+  ].join('\n'));
+}
+
+const settingsRows = () => [
+  [{ text: '🔥 Firebase Sources', callback_data: 'ap_sources', style: 'primary' }],
+  [{ text: `🔀 Proxies: ${proxyPool.proxySummary().enabledCount}`, callback_data: 'ap_proxies', style: 'primary' }],
+  [{ text: `🎯 Target: ${bs.getSetting('target')}`, callback_data: 'ap_pick_target' }],
+  [{ text: `⏱ Max: ${bs.getSetting('maxMinutes')}m`, callback_data: 'ap_pick_time' }],
+  [{ text: `🚦 Gap: ${bs.fmtSetting('gapMs')}`, callback_data: 'ap_pick_gap' }],
+  [{ text: `📴 Offline: ${bs.getSetting('allowOffline') ? 'ON' : 'OFF'}`, callback_data: 'ap_toggle_offline' }],
+  [{ text: '↩️ Back', callback_data: 'ap_home', style: 'primary' }],
+];
+
+// ---------------------------------------------------------------------------
+// 🔀 PROXIES — "rukna hi na pare" ka tod. Multiple proxies = multiple IPs.
+//   Ek IP blocked → bot TURANT doosri IP (zero wait).
+// ---------------------------------------------------------------------------
+function proxiesCard() {
+  const list = proxyPool.listProxies();
+  const ps = proxyPool.proxySummary();
+  const rows = list.map((p) => [
+    {
+      text: `${p.enabled ? (p.cooldownLeftMs > 0 ? '🟡' : '▫️') : '🚫'} ${p.label}${p.tokenReady ? ' 🔑' : ''}`,
+      callback_data: `ap_px_${p.id}`,
+    },
+  ]);
+  rows.push([{ text: '➕ Add Proxy', callback_data: 'ap_px_add', style: 'success' }]);
+  rows.push([{ text: ps.enabled ? '⏸ Pause Rotation' : '▶️ Enable Rotation', callback_data: 'ap_px_rot' }]);
+  rows.push([{ text: '↩️ Settings', callback_data: 'ap_settings', style: 'primary' }]);
+  return {
+    text: section('🔀 Proxy Pool — IP Rotation', [
+      `Status: <b>${ps.enabled ? `ON (${ps.enabledCount}/${ps.total})` : 'OFF'}</b> — ${esc(ps.rotation)}`,
+      ``,
+      list.length
+        ? list.map((p) =>
+            `${p.enabled ? (p.cooldownLeftMs > 0 ? `🟡 (${Math.ceil(p.cooldownLeftMs / 1000)}s)` : '▫️') : '🚫'} <b>${esc(p.label)}</b>${p.tokenReady ? ' 🔑' : ''} · hits: ${p.hits || 0}`
+          ).join('\n')
+        : sub('Koi proxy nahi — abhi sab kuch EK IP se ja raha hai (rukne ka khatra).'),
+      ``,
+      sub('Proxy add karte hi rotation ON. Ek IP blocked → bot turant doosri IP (ZERO wait).'),
+    ].join('\n')),
+    rows,
+  };
+}
+
+function proxyDetailCard(pxId) {
+  const p = proxyPool.listProxies().find((x) => x.id === pxId);
+  if (!p) return { text: '❌ Proxy nahi mila.', rows: [[{ text: '↩️ Proxies', callback_data: 'ap_proxies' }]] };
+  return {
+    text: section(`🔀 ${esc(p.label)}`, [
+      `URL: <code>${esc(p.url.replace(/\/\/[^@]*@/, '//***:***@'))}</code>`,
+      `Status: ${p.enabled ? '▫️ enabled' : '🚫 disabled'}${p.cooldownLeftMs > 0 ? ` · 🟡 WAF cooldown ${Math.ceil(p.cooldownLeftMs / 1000)}s` : ''}`,
+      `WAF token: ${p.tokenReady ? '🔑 ready (per-proxy)' : '— (demand par banega)'}`,
+      `Hits: ${p.hits || 0} · errors: ${p.consecutiveErrors || 0}`,
+      ``,
+      sub('Ye proxy OFF ho to bot seedha aapke IP se karega (ruk sakta hai).'),
+    ].join('\n')),
+    rows: [
+      [{ text: p.enabled ? '🚫 Disable' : '▫️ Enable', callback_data: `ap_px_toggle_${p.id}` }],
+      [{ text: '🗑 Delete', callback_data: `ap_px_del_${p.id}`, style: 'danger' }],
+      [{ text: '↩️ Proxies', callback_data: 'ap_proxies', style: 'primary' }],
+    ],
+  };
+}
+
+function sourcesCard() {
+  const list = sources.listSources();
+  const rows = list.map((s) => [
+    {
+      text: `${s.active ? '✅' : (s.enabled ? '▫️' : '🚫')} ${s.name}${s.active ? ' (ACTIVE)' : ''}`,
+      callback_data: `ap_src_${s.id}`,
+    },
+  ]);
+  rows.push([{ text: '➕ Add Firebase', callback_data: 'ap_src_add', style: 'success' }]);
+  rows.push([{ text: '↩️ Settings', callback_data: 'ap_settings', style: 'primary' }]);
+  return {
+    text: section('🔥 Firebase Sources', [
+      `Aap jitne chahein Firebase DB add kar sakte hain — numbers + OTP`,
+      `usi se aayega jo ACTIVE hai.`,
+      ``,
+      ...list.map((s) =>
+        `${s.active ? '✅' : (s.enabled ? '▫️' : '🚫')} <b>${esc(s.name)}</b> — <code>${esc(s.url.replace('https://', ''))}</code>${s.auth ? ' 🔑' : ''}`
+      ),
+      ``,
+      sub('Source tap karke: switch / verify / enable-disable / delete.'),
+    ].join('\n')),
+    rows,
+  };
+}
+
+function sourceDetailCard(srcId) {
+  const s = sources.getSource(srcId);
+  if (!s) return { text: '❌ Source nahi mila.', rows: [[{ text: '↩️ Sources', callback_data: 'ap_sources' }]] };
+  return {
+    text: section(`🔥 ${esc(s.name)}`, [
+      `URL: <code>${esc(s.url)}</code>`,
+      s.auth ? 'Auth: 🔑 set hai' : 'Auth: nahi (open rules)',
+      `Paths: clients=<code>${esc(s.clientsPath)}</code> · messages=<code>${esc(s.messagesPath)}</code>`,
+      `Status: ${s.enabled ? '▫️ enabled' : '🚫 disabled'}${s.active ? ' · <b>ACTIVE</b>' : ''}`,
+      ``,
+      sub('Verify = test ki DB reachable hai (shallow root read).'),
+    ].join('\n')),
+    rows: [
+      [
+        { text: '✅ Use this', callback_data: `ap_src_use_${s.id}`, style: 'success' },
+        { text: s.enabled ? '🚫 Disable' : '▫️ Enable', callback_data: `ap_src_toggle_${s.id}` },
+      ],
+      [{ text: '🧪 Verify', callback_data: `ap_src_verify_${s.id}` }],
+      [{ text: '🗑 Delete', callback_data: `ap_src_del_${s.id}`, style: 'danger' }],
+      [{ text: '↩️ Sources', callback_data: 'ap_sources', style: 'primary' }],
+    ],
+  };
+}
+
+const pickRows = (prefix, opts, extra = []) => [
+  opts.map((o) => ({ text: String(o.label), callback_data: `${prefix}${o.v}` })),
+  ...extra,
+  [{ text: '↩️ Settings', callback_data: 'ap_settings', style: 'primary' }],
+];
+
+const TARGET_PRESETS = [10, 25, 50, 100, 200, 500].map((v) => ({ label: `${v}`, v }));
+const TIME_PRESETS = [15, 30, 60, 120, 240, 480].map((v) => ({ label: `${v}m`, v }));
+const GAP_PRESETS = [
+  { label: '0s', v: 0 }, { label: '5s', v: 5000 }, { label: '15s', v: 15000 },
+  { label: '30s', v: 30000 }, { label: '60s', v: 60000 },
+];
+
+// ---------------------------------------------------------------------------
+// Boot
+// ---------------------------------------------------------------------------
+if (!TOKEN) {
+  console.error('❌ BOT_TOKEN nahi mila. .env me daalo:  BOT_TOKEN=<BotFather token>');
+  process.exit(1);
+}
+
+// handlerTimeout: 0 GHALT tha — Telegraf me 0 = "0ms me timeout" (har handler
+// turant maar jaata tha). Default 90s rakhte hain; batch background me chalta
+// hai isliye handlers fast hi rehte hain.
+const bot = new Telegraf(TOKEN);
+
+const gate = async (ctx) => {
+  const uid = ctx.from?.id;
+  if (!isOwner(uid)) {
+    await ctx.answerCbQuery?.('⛔ Sirf owner.', { show_alert: true }).catch(() => {});
+    await ctx.reply(section('⛔ Ye bot sirf owner ke liye hai', [
+      `Aapki Telegram ID: <code>${uid}</code>`,
+      ``,
+      sub('Is ID ko .env me OWNER_IDS me daalein aur bot restart karein:'),
+      `<code>OWNER_IDS=${uid}</code>`,
+    ].join('\n'))).catch(() => {});
+    return false;
+  }
+  return true;
+};
+
+const sendLive = async (chatId, text, rows) => {
+  await bot.telegram.sendMessage(chatId, text, kb(rows || idleRows())).catch((e) => {
+    console.warn('[FreshBot] live send:', e?.message);
+  });
+};
+
+async function launchBatch(ctx) {
+  if (isAutopilotRunning()) {
+    await ctx.answerCbQuery('Pehle se chal raha hai!').catch(() => {});
+    return;
+  }
+  if (!isFirebaseConfigured()) {
+    await ctx.answerCbQuery('⚙️ Firebase config pending!', { show_alert: true }).catch(() => {});
+    await ctx.reply(section('⚙️ Firebase Setup Pending', firebaseSetupHintLines().join('\n')),
+      kb([[{ text: '🏠 Menu', callback_data: 'ap_home', style: 'primary' }]])).catch(() => {});
+    return;
+  }
+  await ctx.answerCbQuery('🚀 Autopilot start…').catch(() => {});
+  await ctx.editMessageText(startCard(), kb(stopRows())).catch(() => {});
+
+  // Live card: pehle usi message ko edit karo (jo START par tha), warna naya message
+  let lastText = '';
+  let lastRowsKey = '';
+  const fallback = { chatId: ctx.chat?.id, seq: 0 };
+  const ui = {
+    async update(text, rows) {
+      const rowsKey = JSON.stringify(rows);
+      if (text === lastText && rowsKey === lastRowsKey) return;
+      lastText = text;
+      lastRowsKey = rowsKey;
+      try {
+        await ctx.editMessageText(text, kb(rows));
+      } catch (e) {
+        const msg = String(e?.message || '');
+        if (/message is not modified/i.test(msg)) return;
+        // edit fail (purana message/delete) → naya message bhej do
+        if (fallback.chatId) {
+          fallback.seq += 1;
+          await sendLive(fallback.chatId, text, rows);
+        }
+      }
+    },
+  };
+
+  startAutopilot({
+    userId: String(ctx.from.id),
+    ui,
+  }).catch((e) => console.error('[FreshBot] autopilot:', e?.stack || e?.message));
+}
+
+bot.start(async (ctx) => {
+  if (!isOwner(ctx.from?.id)) {
+    return ctx.reply(section('⛔ Ye bot sirf owner ke liye hai', [
+      `Aapki Telegram ID: <code>${ctx.from?.id}</code>`,
+      ``,
+      sub('Bot band karke .env me ye line daalein:'),
+      `<code>OWNER_IDS=${ctx.from?.id}</code>`,
+      ``,
+      sub('Phir dobara chalayein (npm start) aur /start dabayein.'),
+    ].join('\n'))).catch(() => {});
+  }
+  await ctx.reply(startCard(), kb(isAutopilotRunning() ? stopRows() : startRows())).catch(() => {});
+});
+
+bot.help((ctx) => ctx.reply('/start — menu · /status — current batch', { parse_mode: 'HTML' }).catch(() => {}));
+
+bot.command('status', async (ctx) => {
+  if (!isOwner(ctx.from?.id)) return;
+  const snap = getAutopilotSnapshot();
+  await ctx.reply(snap.running || snap.finishedAt ? summaryCard(snap) : startCard(),
+    kb(snap.running ? stopRows() : idleRows())).catch(() => {});
+});
+
+bot.action('ap_start', launchBatch);
+// Engine ke rows premium callback names bhi bhejta hai — same kaam, same handler
+bot.action('prem_batch_start', launchBatch);
+
+bot.action('ap_stop', async (ctx) => {
+  if (!(await gate(ctx))) return;
+  const stopped = requestAutopilotStop('manual');
+  await ctx.answerCbQuery(stopped ? '⏹ STOP signal bhej diya…' : 'Kuch chal nahi raha.').catch(() => {});
+  if (stopped) await ctx.editMessageText('⏹ <b>Stop ho raha hai…</b> current number complete hoke ruk jayega.', kb(idleRows())).catch(() => {});
+});
+bot.action('prem_batch_stop', async (ctx) => {
+  if (!(await gate(ctx))) return;
+  const stopped = requestAutopilotStop('manual');
+  await ctx.answerCbQuery(stopped ? '⏹ STOP signal bhej diya…' : 'Kuch chal nahi raha.').catch(() => {});
+});
+
+bot.action('ap_status', async (ctx) => {
+  if (!(await gate(ctx))) return;
+  await ctx.answerCbQuery().catch(() => {});
+  const snap = getAutopilotSnapshot();
+  const text = snap.running ? runningCard(snap) : (snap.finishedAt ? summaryCard(snap) : startCard());
+  await ctx.editMessageText(text, kb(snap.running ? stopRows() : idleRows()))
+    .catch(async () => { await ctx.reply(text, kb(snap.running ? stopRows() : idleRows())).catch(() => {}); });
+});
+bot.action('prem_batch_status', async (ctx) => {
+  if (!(await gate(ctx))) return;
+  await ctx.answerCbQuery().catch(() => {});
+  const snap = getAutopilotSnapshot();
+  const text = snap.running ? runningCard(snap) : (snap.finishedAt ? summaryCard(snap) : startCard());
+  await ctx.reply(text, kb(snap.running ? stopRows() : idleRows())).catch(() => {});
+});
+
+// Engine ke rows me Main Menu / Get Number buttons bhi aate hain — yahan bas menu dikhao
+bot.action('ap_home', async (ctx) => {
+  if (!(await gate(ctx))) return;
+  await ctx.answerCbQuery().catch(() => {});
+  const text = startCard();
+  await ctx.editMessageText(text, kb(isAutopilotRunning() ? stopRows() : startRows()))
+    .catch(async () => { await ctx.reply(text, kb(isAutopilotRunning() ? stopRows() : startRows())).catch(() => {}); });
+});
+bot.action(['boss_panel_home', 'prem_get_number'], async (ctx) => {
+  if (!(await gate(ctx))) return;
+  await ctx.answerCbQuery('Is bot me sirf BATCH hai — START dabao. ✅', { show_alert: false }).catch(() => {});
+  const text = startCard();
+  await ctx.editMessageText(text, kb(isAutopilotRunning() ? stopRows() : startRows()))
+    .catch(async () => { await ctx.reply(text, kb(isAutopilotRunning() ? stopRows() : startRows())).catch(() => {}); });
+});
+
+// ---------------------------------------------------------------------------
+// ⚙️ Settings handlers — sources + knobs (kuch bhi text-input wait-state me)
+// ---------------------------------------------------------------------------
+const pending = new Map(); // uid → { action, srcId? } — text input ka wait-state
+
+const editOrSend = async (ctx, text, rows) => {
+  await ctx.editMessageText(text, kb(rows))
+    .catch(async () => { await ctx.reply(text, kb(rows)).catch(() => {}); });
+};
+
+bot.action('ap_settings', async (ctx) => {
+  if (!(await gate(ctx))) return;
+  await ctx.answerCbQuery().catch(() => {});
+  await editOrSend(ctx, settingsCard(), settingsRows());
+});
+
+bot.action('ap_sources', async (ctx) => {
+  if (!(await gate(ctx))) return;
+  await ctx.answerCbQuery().catch(() => {});
+  const { text, rows } = sourcesCard();
+  await editOrSend(ctx, text, rows);
+});
+
+// Source detail — regex har naye source id tak match karega
+bot.action(/^ap_src_(?!add$)([a-f0-9-]{1,10})$/, async (ctx) => {
+  if (!(await gate(ctx))) return;
+  await ctx.answerCbQuery().catch(() => {});
+  const { text, rows } = sourceDetailCard(ctx.match[1]);
+  await editOrSend(ctx, text, rows);
+});
+
+bot.action(/^ap_src_use_([a-f0-9-]{1,10})$/, async (ctx) => {
+  if (!(await gate(ctx))) return;
+  const r = sources.setActiveSource(ctx.match[1]);
+  await ctx.answerCbQuery(r.ok ? '✅ Active source badal diya.' : `❌ ${r.error}`, !r.ok && { show_alert: true }).catch(() => {});
+  const { text, rows } = r.ok ? sourcesCard() : sourceDetailCard(ctx.match[1]);
+  await editOrSend(ctx, text, rows);
+});
+
+bot.action(/^ap_src_toggle_([a-f0-9-]{1,10})$/, async (ctx) => {
+  if (!(await gate(ctx))) return;
+  const r = sources.toggleSource(ctx.match[1]);
+  await ctx.answerCbQuery(r.ok ? (r.enabled ? '▫️ Enabled' : '🚫 Disabled') : `❌ ${r.error}`, !r.ok && { show_alert: true }).catch(() => {});
+  const { text, rows } = sourcesCard();
+  await editOrSend(ctx, text, rows);
+});
+
+bot.action(/^ap_src_verify_(.{1,10})$/, async (ctx) => {
+  if (!(await gate(ctx))) return;
+  await ctx.answerCbQuery('🧪 Testing…').catch(() => {});
+  const id = ctx.match[1];
+  const r = await sources.verifySource(id);
+  const s = sources.getSource(id);
+  const name = s ? esc(s.name) : id;
+  const text = r.ok
+    ? section('🧪 Verify — OK', [
+        `<b>${name}</b>: reachable in ${r.ms}ms.`,
+        r.topKeys?.length ? `Top keys: <code>${esc(r.topKeys.join(', '))}</code>` : 'Root khali hai.',
+      ].join('\n'))
+    : section('🧪 Verify — FAILED', [
+        `<b>${name}</b>: ${esc(r.error)}`,
+        sub('URL/auth/rules check karein.'),
+      ].join('\n'));
+  await editOrSend(ctx, text, [
+    [{ text: '↩️ Source', callback_data: `ap_src_${id}` }],
+  ]);
+});
+
+bot.action(/^ap_src_del_(.{1,10})$/, async (ctx) => {
+  if (!(await gate(ctx))) return;
+  const r = sources.removeSource(ctx.match[1]);
+  await ctx.answerCbQuery(r.ok ? '🗑 Delete ho gaya.' : `❌ ${r.error}`, !r.ok && { show_alert: true }).catch(() => {});
+  sources.applyActiveSource();
+  const { text, rows } = sourcesCard();
+  await editOrSend(ctx, text, rows);
+});
+
+// ➕ Add Firebase — bot URL (aur chahein to auth) text me maangta hai
+bot.action('ap_src_add', async (ctx) => {
+  if (!(await gate(ctx))) return;
+  await ctx.answerCbQuery().catch(() => {});
+  pending.set(String(ctx.from.id), { action: 'add_source' });
+  await editOrSend(ctx, section('➕ Add Firebase', [
+    `Ab <b>URL bhejo</b> (Realtime Database URL):`,
+    `<code>https://xxxx-default-rtdb.firebaseio.com/</code>`,
+    ``,
+    `Auth lage to pipe ke saath:`,
+    `<code>&lt;url&gt; | &lt;DB_AUTH_secret&gt;</code>`,
+    ``,
+    sub('Cancel karne ke liye /start dabao.'),
+  ].join('\n')), [[{ text: '↩️ Cancel', callback_data: 'ap_sources', style: 'primary' }]]);
+});
+
+// ---------------------------------------------------------------------------
+// 🔀 Proxy handlers — add (text input) / toggle / delete / rotation on-off
+// ---------------------------------------------------------------------------
+bot.action('ap_proxies', async (ctx) => {
+  if (!(await gate(ctx))) return;
+  await ctx.answerCbQuery().catch(() => {});
+  const { text, rows } = proxiesCard();
+  await editOrSend(ctx, text, rows);
+});
+
+bot.action(/^ap_px_(?!add$|rot$)([a-f0-9-]{1,10})$/, async (ctx) => {
+  if (!(await gate(ctx))) return;
+  await ctx.answerCbQuery().catch(() => {});
+  const { text, rows } = proxyDetailCard(ctx.match[1]);
+  await editOrSend(ctx, text, rows);
+});
+
+bot.action(/^ap_px_toggle_([a-f0-9-]{1,10})$/, async (ctx) => {
+  if (!(await gate(ctx))) return;
+  const r = proxyPool.toggleProxy(ctx.match[1]);
+  await ctx.answerCbQuery(r.ok ? (r.enabled ? '▫️ Enabled' : '🚫 Disabled') : `❌ ${r.error}`, !r.ok && { show_alert: true }).catch(() => {});
+  const { text, rows } = proxiesCard();
+  await editOrSend(ctx, text, rows);
+});
+
+bot.action(/^ap_px_del_([a-f0-9-]{1,10})$/, async (ctx) => {
+  if (!(await gate(ctx))) return;
+  const r = proxyPool.removeProxy(ctx.match[1]);
+  await ctx.answerCbQuery(r.ok ? '🗑 Delete ho gaya.' : `❌ ${r.error}`, !r.ok && { show_alert: true }).catch(() => {});
+  const { text, rows } = proxiesCard();
+  await editOrSend(ctx, text, rows);
+});
+
+bot.action('ap_px_rot', async (ctx) => {
+  if (!(await gate(ctx))) return;
+  const cur = proxyPool.proxySummary().enabled;
+  const r = proxyPool.setPoolEnabled(!cur);
+  await ctx.answerCbQuery(r.ok ? (r.enabled ? '▶️ Rotation ON' : '⏸ Rotation OFF') : `❌ ${r.error}`, !r.ok && { show_alert: true }).catch(() => {});
+  const { text, rows } = proxiesCard();
+  await editOrSend(ctx, text, rows);
+});
+
+// ➕ Add Proxy — bot proxy string text me maangta hai
+bot.action('ap_px_add', async (ctx) => {
+  if (!(await gate(ctx))) return;
+  await ctx.answerCbQuery().catch(() => {});
+  pending.set(String(ctx.from.id), { action: 'add_proxy' });
+  await editOrSend(ctx, section('➕ Add Proxy', [
+    `Ab <b>proxy bhejo</b>. Formats:`,
+    `<code>host:port</code>`,
+    `<code>http://user:pass@host:port</code>`,
+    `<code>socks5://host:port</code>`,
+    ``,
+    `Ek saath bahut saare bhejne ho to line me (comma):`,
+    `<code>host1:port1, host2:port2</code>`,
+    ``,
+    sub('Add hote hi rotation ON — bot turant nayi IP se traffic bhejega.'),
+  ].join('\n')), [[{ text: '↩️ Cancel', callback_data: 'ap_proxies', style: 'primary' }]]);
+});
+
+// 🎯/⏱/🚦 pickers
+bot.action('ap_pick_target', async (ctx) => {
+  if (!(await gate(ctx))) return;
+  await ctx.answerCbQuery().catch(() => {});
+  await editOrSend(ctx, section('🎯 Target — kitne fresh sessions?', [
+    `Abhi: <b>${bs.getSetting('target')}</b>`,
+    ``,
+    sub('Ya koi bhi number likh kar bhejo (1–5000), jaise: 150'),
+  ].join('\n')), pickRows('ap_set_target_', TARGET_PRESETS, [[{ text: '✏️ Custom number', callback_data: 'ap_custom_target' }]]));
+});
+
+bot.action(/^ap_set_target_(\d+)$/, async (ctx) => {
+  if (!(await gate(ctx))) return;
+  const r = bs.setSetting('target', Number(ctx.match[1]));
+  await ctx.answerCbQuery(r.ok ? `🎯 Target = ${r.value}` : `❌ ${r.error}`, !r.ok && { show_alert: true }).catch(() => {});
+  await editOrSend(ctx, settingsCard(), settingsRows());
+});
+
+bot.action('ap_custom_target', async (ctx) => {
+  if (!(await gate(ctx))) return;
+  await ctx.answerCbQuery().catch(() => {});
+  pending.set(String(ctx.from.id), { action: 'custom_target' });
+  await editOrSend(ctx, section('✏️ Custom Target', [
+    `Kitne fresh sessions chahiye? <b>Number likh kar bhejo</b> (1–5000):`,
+    `Jaise: <code>150</code>`,
+  ].join('\n')), [[{ text: '↩️ Cancel', callback_data: 'ap_settings', style: 'primary' }]]);
+});
+
+bot.action('ap_pick_time', async (ctx) => {
+  if (!(await gate(ctx))) return;
+  await ctx.answerCbQuery().catch(() => {});
+  await editOrSend(ctx, section('⏱ Max Time — kitne minute chale?', [
+    `Abhi: <b>${bs.getSetting('maxMinutes')}</b> min`,
+  ].join('\n')), pickRows('ap_set_time_', TIME_PRESETS));
+});
+
+bot.action(/^ap_set_time_(\d+)$/, async (ctx) => {
+  if (!(await gate(ctx))) return;
+  const r = bs.setSetting('maxMinutes', Number(ctx.match[1]));
+  await ctx.answerCbQuery(r.ok ? `⏱ Max = ${r.value} min` : `❌ ${r.error}`, !r.ok && { show_alert: true }).catch(() => {});
+  await editOrSend(ctx, settingsCard(), settingsRows());
+});
+
+bot.action('ap_pick_gap', async (ctx) => {
+  if (!(await gate(ctx))) return;
+  await ctx.answerCbQuery().catch(() => {});
+  await editOrSend(ctx, section('🚦 Gap — do numbers ke beech kitna rukna?', [
+    `Abhi: <b>${bs.fmtSetting('gapMs')}</b>`,
+    ``,
+    sub('Kam gap = jaldi, zyada gap = Swiggy kam chances dega.'),
+  ].join('\n')), pickRows('ap_set_gap_', GAP_PRESETS));
+});
+
+bot.action(/^ap_set_gap_(\d+)$/, async (ctx) => {
+  if (!(await gate(ctx))) return;
+  const r = bs.setSetting('gapMs', Number(ctx.match[1]));
+  await ctx.answerCbQuery(r.ok ? `🚦 Gap = ${bs.fmtSetting('gapMs')}` : `❌ ${r.error}`, !r.ok && { show_alert: true }).catch(() => {});
+  await editOrSend(ctx, settingsCard(), settingsRows());
+});
+
+bot.action('ap_toggle_offline', async (ctx) => {
+  if (!(await gate(ctx))) return;
+  const cur = bs.getSetting('allowOffline');
+  const r = bs.setSetting('allowOffline', !cur);
+  await ctx.answerCbQuery(r.ok ? `📴 Offline = ${r.value ? 'ON' : 'OFF'}` : `❌ ${r.error}`, !r.ok && { show_alert: true }).catch(() => {});
+  await editOrSend(ctx, settingsCard(), settingsRows());
+});
+
+// ---------------------------------------------------------------------------
+// Text input — add-source URL / custom target (wait-state)
+// ---------------------------------------------------------------------------
+bot.on('text', async (ctx) => {
+  const uid = String(ctx.from?.id);
+  if (!isOwner(ctx.from?.id)) return;
+  const st = pending.get(uid);
+  if (!st) return;
+  const txt = String(ctx.message?.text || '').trim();
+
+  if (st.action === 'add_source') {
+    pending.delete(uid);
+    const [urlPart, authPart] = txt.split('|').map((x) => x.trim());
+    const r = sources.addSource({ url: urlPart, auth: authPart || '' });
+    if (!r.ok) {
+      await ctx.reply(`❌ ${r.error}`).catch(() => {});
+      return;
+    }
+    sources.applyActiveSource();
+    const v = await sources.verifySource(r.source.id);
+    const lines = [
+      `✅ <b>${esc(r.source.name)}</b> add ho gaya${r.source.active ? ' aur <b>ACTIVE</b>' : ''}.`,
+      v.ok
+        ? `🧪 Verify: reachable in ${v.ms}ms${v.topKeys?.length ? ` · keys: <code>${esc(v.topKeys.join(', '))}</code>` : ''}`
+        : `⚠️ Verify fail: ${esc(v.error)} — URL/auth check kar le, tab bhi use kar sakte ho.`,
+    ];
+    await ctx.reply(section('🔥 Firebase Source Added', lines.join('\n')), kb([[{ text: '↩️ Sources', callback_data: 'ap_sources', style: 'primary' }]])).catch(() => {});
+    return;
+  }
+
+  if (st.action === 'add_proxy') {
+    pending.delete(uid);
+    // Comma / newline se alag karke ek saath bahut saare add
+    const parts = txt.split(/[,\n]/).map((x) => x.trim()).filter(Boolean);
+    const added = [];
+    const errs = [];
+    for (const raw of parts) {
+      const r = proxyPool.addProxy(raw);
+      if (r.ok) added.push(r.proxy.label);
+      else errs.push(`${raw.slice(0, 30)}: ${r.error}`);
+    }
+    const lines = [];
+    if (added.length) lines.push(`✅ <b>${added.length}</b> proxy add: <code>${esc(added.join(', '))}</code>`);
+    if (errs.length) lines.push(`⚠️ ${errs.slice(0, 3).map(esc).join('\n')}`);
+    lines.push('', sub('Ab bot nayi-nayi IPs se traffic bhejega — rukna bilkul band.'));
+    await ctx.reply(section('🔀 Proxy Pool Updated', lines.join('\n')), kb([[{ text: '↩️ Proxies', callback_data: 'ap_proxies', style: 'primary' }]])).catch(() => {});
+    return;
+  }
+
+  if (st.action === 'custom_target') {
+    pending.delete(uid);
+    const n = Number(txt.replace(/\D/g, ''));
+    const r = bs.setSetting('target', n);
+    if (!r.ok) {
+      await ctx.reply(`❌ ${r.error}`).catch(() => {});
+      return;
+    }
+    await ctx.reply(`🎯 Target = ${r.value} fresh sessions ✅`, kb([[{ text: '⚙️ Settings', callback_data: 'ap_settings', style: 'primary' }]])).catch(() => {});
+    return;
+  }
+
+  pending.delete(uid);
+});
+
+// Unhandled engine callback kahin na phase — catch-all answer
+bot.on('callback_query', async (ctx) => {
+  if (!isOwner(ctx.from?.id)) return;
+  await ctx.answerCbQuery().catch(() => {});
+});
+
+try {
+  await bot.launch({ dropPendingUpdates: true }, () => {
+    console.log('🆕 Swiggy Fresh Bot chal raha hai — START dabao, phone chhod ke aa jao.');
+  });
+} catch (e) {
+  console.error('[FreshBot] launch failed:', e?.message || e);
+  process.exit(1);
+}
+
+process.once('SIGINT', () => bot.stop('SIGINT'));
+process.once('SIGTERM', () => bot.stop('SIGTERM'));

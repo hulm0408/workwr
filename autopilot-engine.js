@@ -6,6 +6,7 @@
 //
 // Env knobs:
 //   PREMIUM_BATCH_TARGET            — kitne fresh sessions (default 100)
+//   PREMIUM_BATCH_CONCURRENCY       — ek saath kitne numbers/IP lanes (default 10, max 10)
 //   PREMIUM_BATCH_MAX_MINUTES       — max run time (default 120)
 //   PREMIUM_BATCH_GAP_MS            — do numbers ke beech gap (default 6000)
 //   PREMIUM_RATE_LIMIT_BACKOFF_MS   — Swiggy rate-limit par ruk (default 15 min)
@@ -26,7 +27,7 @@ import {
   preferOnline,
   isPhoneBlockedByPremiumLedger,
 } from './number-pipeline.js';
-import { getLiveSwiggyWafToken, setBridgeProxy, getBridgeProxy, getChromeStatus } from './swiggy-bridge.js';
+import { getLiveSwiggyWafToken, runWithBridgeProxy, setBridgeProxy, getBridgeProxy, getChromeStatus } from './swiggy-bridge.js';
 import * as wafPool from './waf-pool.js';
 import * as proxyPool from './proxy-pool.js';
 import { esc, section, sub, field } from './rich-text.js';
@@ -39,6 +40,34 @@ const envInt = (key, dflt) => {
 // Bridge ke active proxy ka id (rotate karne ke liye)
 const getBridgeProxyId = () => getBridgeProxy()?.id || '';
 
+export const MAX_AUTOPILOT_LANES = 10;
+
+export function normalizeBatchConcurrency(value, fallback = MAX_AUTOPILOT_LANES) {
+  const n = Number(value);
+  const base = Number.isFinite(n) ? n : Number(fallback);
+  if (!Number.isFinite(base)) return 1;
+  return Math.min(MAX_AUTOPILOT_LANES, Math.max(1, Math.round(base)));
+}
+
+// Lane count asal distinct routes se zyada nahi ho sakta: proxy mode me
+// enabled proxies + 1 direct route, aur direct-only mode me sirf 1.
+// Cooling routes bhi count hoti hain kyunki run ke dauran free ho sakti
+// hain; allocator unhe tab tak kisi lane ko nahi dega.
+export function availableParallelLanes({
+  requested = MAX_AUTOPILOT_LANES,
+  proxyEnabled = false,
+  enabledProxyCount = 0,
+} = {}) {
+  const want = normalizeBatchConcurrency(requested);
+  if (!proxyEnabled) return 1;
+  const routes = Math.max(1, (Number(enabledProxyCount) || 0) + 1);
+  return Math.min(want, routes);
+}
+
+export function parallelWorkerUserId(baseUserId, laneId) {
+  return `${String(baseUserId || 'autopilot')}:lane${Number(laneId) || 1}`;
+}
+
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
@@ -50,6 +79,9 @@ const state = {
   startedAt: 0,
   finishedAt: 0,
   target: 0,
+  concurrency: 1,
+  requestedConcurrency: 1,
+  activeWorkers: 0,
   maxMinutes: 0,
   gapMs: 0,
   backoffMs: 0,
@@ -74,7 +106,8 @@ const state = {
   directChallenges: 0,    // direct fallback par lagatar WAF challenges
   deferredQueue: 0,
   consecutiveFails: 0,
-  current: null,          // { phone, startedAt }
+  current: null,          // backward-compat: pehli active lane ka { phone, startedAt }
+  activeNumbers: [],      // parallel lanes: [{ phone, startedAt, laneId, proxyLabel }]
   history: [],            // { phone, kind, reason? } (last 200)
   freshAccounts: [],      // { phone, accountKey } (successful sessions)
   lastError: '',
@@ -100,6 +133,9 @@ export function getAutopilotSnapshot() {
     startedAt: state.startedAt,
     finishedAt: state.finishedAt,
     target: state.target,
+    concurrency: state.concurrency || 1,
+    requestedConcurrency: state.requestedConcurrency || state.concurrency || 1,
+    activeWorkers: state.activeWorkers || 0,
     maxMinutes: state.maxMinutes,
     processed: state.processed,
     fresh: state.fresh,
@@ -121,8 +157,11 @@ export function getAutopilotSnapshot() {
     proxyChallenges: state.proxyChallenges || 0,
     directChallenges: state.directChallenges || 0,
     deferredQueue: state.deferredQueue,
-    currentProxy: getBridgeProxy()?.label || '',
+    currentProxy: state.activeNumbers?.length
+      ? state.activeNumbers.map((n) => n.proxyLabel || 'direct').join(', ')
+      : (getBridgeProxy()?.label || ''),
     current: state.current ? { ...state.current } : null,
+    activeNumbers: (state.activeNumbers || []).map((n) => ({ ...n })),
     poolTotal: state.poolTotal,
     poolFresh: state.poolFresh,
     scanning: Boolean(state.scanning),
@@ -252,10 +291,13 @@ function statsLines() {
     state.serverErrors
       ? field('↻ Swiggy 5xx', `${state.serverErrors} temporary · numbers failed nahi, retry queue me`)
       : '',
+    field('⚡ Parallel lanes', `${state.activeWorkers || 0}/${state.concurrency || 1} active${state.requestedConcurrency > state.concurrency ? ` (maangi ${state.requestedConcurrency}, distinct IPs sirf ${state.concurrency})` : ''}`),
     pSummary?.enabled
-      ? field('🔀 Proxy', state.routeMode === 'direct-fallback'
-          ? `DIRECT fallback (Render IP)  ·  pool ${pSummary.usableCount ?? pSummary.enabledCount}/${pSummary.enabledCount} usable · cooling ${pSummary.wafCoolingCount || 0}  ·  rotates: ${state.proxyRotations}`
-          : `${getBridgeProxy()?.label || '—'}  ·  ${pSummary.usableCount ?? pSummary.enabledCount}/${pSummary.enabledCount} usable · cooling ${pSummary.wafCoolingCount || 0}  ·  rotates: ${state.proxyRotations}`)
+      ? field('🔀 Proxy', state.routeMode === 'direct-fallback' && (state.concurrency || 1) <= 1
+          ? `DIRECT fallback (Render IP)  ·  ${pSummary.usableCount ?? pSummary.enabledCount}/${pSummary.enabledCount} free usable · lanes me ${pSummary.reservedCount || 0} · cooling ${pSummary.wafCoolingCount || 0}  ·  rotates: ${state.proxyRotations}`
+          : (state.concurrency || 1) > 1
+            ? `Har lane alag IP par  ·  ${pSummary.usableCount ?? pSummary.enabledCount}/${pSummary.enabledCount} free usable · lanes me ${pSummary.reservedCount || 0} · cooling ${pSummary.wafCoolingCount || 0}  ·  rotates: ${state.proxyRotations}`
+            : `${state.activeNumbers?.[0]?.proxyLabel || getBridgeProxy()?.label || '—'}  ·  ${pSummary.usableCount ?? pSummary.enabledCount}/${pSummary.enabledCount} free usable · lanes me ${pSummary.reservedCount || 0} · cooling ${pSummary.wafCoolingCount || 0}  ·  rotates: ${state.proxyRotations}`)
       : field('🔀 Proxy', 'OFF (ek hi IP — ⚙️ Settings me add karo)'),
     field('Pool', state.poolTotal
       ? `${state.poolFresh} fresh / ${state.poolTotal} numbers`
@@ -263,9 +305,11 @@ function statsLines() {
     (state.scanning || state.scanChecked)
       ? field('🔎 Device scan', `pass ${state.scanPass || 1}: ${state.scanUniqueChecked || 0}/${state.scanTotalDevices || 0} unique check · total probes ${state.scanTotalProbes || state.scanChecked || 0} · window ≤${fmtDuration(state.scanWindowMs || 0)} · ${state.scanBestActivityMs ? `scan ke waqt best SMS ~${fmtDuration(state.scanBestActivityAgeMs || Math.max(0, Date.now() - state.scanBestActivityMs))} purani · ` : ''}${state.scanFresh || 0} fresh ready${state.scanning ? ' · scanning…' : ''}`)
       : '',
-    state.current
-      ? `📍 <b>Abhi:</b> <code>${esc(state.current.phone)}</code> (${fmtDuration(Date.now() - state.current.startedAt)})`
-      : sub(state.scanning ? 'Zinda devices dhoondh raha hoon (parallel scan)…' : 'Agla number select ho raha hai…'),
+    state.activeNumbers?.length
+      ? `📍 <b>Abhi ${state.activeNumbers.length} lane(s):</b>\n${state.activeNumbers.slice(0, 10).map((n) => `• <code>${esc(n.phone)}</code> · lane ${n.laneId || '?'} · ${esc(n.proxyLabel || 'direct')} (${fmtDuration(Date.now() - n.startedAt)})`).join('\n')}`
+      : state.current
+        ? `📍 <b>Abhi:</b> <code>${esc(state.current.phone)}</code> (${fmtDuration(Date.now() - state.current.startedAt)})`
+        : sub(state.scanning ? 'Zinda devices dhoondh raha hoon (parallel scan)…' : 'Agla number select ho raha hai…'),
   ];
 }
 
@@ -281,11 +325,12 @@ function idleCard() {
         `› <b>READY.</b> Ek tap = autopilot ON.`,
         ``,
         `1️⃣ Pehle <b>zinda devices</b> parallel scan (last-seen fresh pehle)`,
-        `2️⃣ Swiggy OTP → <b>live inbox poll</b> → OTP khud padh kar paste`,
+        `2️⃣ <b>Parallel lanes</b> — alag numbers, alag IPs par Swiggy OTP → live inbox poll`,
         `3️⃣ 🆕 naya = register · ♻️ purana = delete → fresh login`,
         `4️⃣ charges/order/wallet block = <b>skip</b> · rate-limit = <b>backoff</b>`,
         ``,
         field('Target', `${state.target || envInt('PREMIUM_BATCH_TARGET', 100)} fresh sessions`),
+        field('Parallel', `${state.concurrency || envInt('PREMIUM_BATCH_CONCURRENCY', 10)} lanes tak`),
         field('Max time', `${state.maxMinutes || envInt('PREMIUM_BATCH_MAX_MINUTES', 120)} minutes`),
         last && last.stopReason
           ? field('Last run', `${state.fresh} fresh · ${fmtDuration(state.finishedAt - state.startedAt)} · ${state.stopReason}`)
@@ -315,7 +360,7 @@ function summaryCard() {
     manual: '⏹ Aapne STOP dabaya.',
     stopped: '⏹ Stop kiya gaya.',
     rate_limited: '🚦 Swiggy ne rate limit laga di — thodi der baad dobara start karein.',
-    security_challenge: '🛡 12 lagatar security challenges — ye IP abhi Swiggy ke liye pakki flagged hai. Kuch der baad, ya proxies ke saath, dobara start karein.',
+    security_challenge: '🛡 Bahut lagatar security challenges — routes abhi Swiggy ke liye flagged lag rahe hain. Kuch der baad, ya behtar proxies ke saath, dobara start karein.',
     waf_stuck: '🛡 Bahut der tak WAF cooldown raha — proxies add karke dobara start karein (nayi IP par wait khatam ho jati hai).',
     circuit_breaker: '🔌 Bahut lagatar failures (proxy rotation ke baavjood) — reason dekh kar dobara start karein.',
     'no-online-devices': '📵 Pool me koi online device nahi mila — thodi der baad try karein.',
@@ -352,9 +397,56 @@ function doneRows() {
   ];
 }
 
-async function push(text, rows) {
+// Parallel lanes ek hi Telegram message ko edit karti hain. Saari stage
+// reports ko serialize + coalesce karo: sab se latest card hi jayegi,
+// process OTP flow Telegram network ka wait nahi karega, aur flood-limit
+// bhi nahi lagegi. Final summary force=true ke saath pakka flush hoti hai.
+const UI_PUSH_MIN_INTERVAL_MS = 1_200;
+let uiPushInFlight = false;
+let pendingUiPush = null;
+let uiPushTimer = null;
+let lastUiPushAt = 0;
+
+async function flushUiPush() {
+  if (uiPushInFlight || !pendingUiPush || !ui || typeof ui.update !== 'function') return;
+  if (uiPushTimer) { clearTimeout(uiPushTimer); uiPushTimer = null; }
+  const item = pendingUiPush;
+  pendingUiPush = null;
+  uiPushInFlight = true;
+  try {
+    await ui.update(item.text, kb(item.rows));
+  } catch (e) {
+    console.warn('[Autopilot] ui:', e?.message);
+  } finally {
+    uiPushInFlight = false;
+    lastUiPushAt = Date.now();
+    if (pendingUiPush) scheduleUiPush(UI_PUSH_MIN_INTERVAL_MS);
+  }
+}
+
+function scheduleUiPush(delayMs = 0) {
+  if (uiPushTimer || uiPushInFlight) return;
+  uiPushTimer = setTimeout(() => {
+    uiPushTimer = null;
+    void flushUiPush();
+  }, Math.max(0, delayMs));
+  if (typeof uiPushTimer.unref === 'function') uiPushTimer.unref();
+}
+
+async function push(text, rows, { force = false } = {}) {
   if (!ui || typeof ui.update !== 'function') return;
-  try { await ui.update(text, kb(rows)); } catch (e) { console.warn('[Autopilot] ui:', e?.message); }
+  pendingUiPush = { text, rows };
+  if (force) {
+    if (uiPushTimer) { clearTimeout(uiPushTimer); uiPushTimer = null; }
+    while (uiPushInFlight) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    await flushUiPush();
+    return;
+  }
+  const waitMs = UI_PUSH_MIN_INTERVAL_MS - (Date.now() - lastUiPushAt);
+  if (waitMs <= 0) void flushUiPush();
+  else scheduleUiPush(waitMs);
 }
 
 // Interruptible sleep (STOP dabate hi ruk jaye)
@@ -381,6 +473,9 @@ export async function startAutopilot(opts = {}) {
     try { const v = getSetting(key); return v === undefined ? fallback : v; } catch { return fallback; }
   };
   const target = Number(opts.target || s('target', envInt('PREMIUM_BATCH_TARGET', 100)));
+  const requestedConcurrency = normalizeBatchConcurrency(
+    opts.concurrency ?? s('concurrency', envInt('PREMIUM_BATCH_CONCURRENCY', MAX_AUTOPILOT_LANES))
+  );
   const maxMinutes = Number(opts.maxMinutes || s('maxMinutes', envInt('PREMIUM_BATCH_MAX_MINUTES', 120)));
   const gapMs = Number.isFinite(Number(opts.gapMs)) && Number(opts.gapMs) >= 0
     ? Number(opts.gapMs)
@@ -411,17 +506,21 @@ export async function startAutopilot(opts = {}) {
     running: true, stopRequested: false, stopReason: '',
     startedAt: Date.now(), finishedAt: 0,
     target, maxMinutes, gapMs, backoffMs,
+    concurrency: requestedConcurrency, requestedConcurrency, activeWorkers: 0,
     processed: 0, fresh: 0, freshNew: 0, freshAfterDelete: 0,
     skipped: 0, deferred: 0, cooldownSkips: 0, staleSkips: 0, failed: 0, aborted: 0,
     rateStrikes: 0, wafStrikes: 0, wafCooldowns: 0, serverErrors: 0, transientStrikes: 0,
     consecutiveFails: 0, proxyRotations: 0,
-    routeMode: 'direct', proxyChallenges: 0, directChallenges: 0,
-    current: null, history: [], freshAccounts: [], lastError: '',
+    routeMode: 'direct', proxyChallenges: 0, directChallenges: 0, deferredQueue: 0,
+    current: null, activeNumbers: [], history: [], freshAccounts: [], lastError: '',
     poolTotal: 0, poolFresh: 0,
     scanning: false, scanChecked: 0, scanTotalProbes: 0,
     scanUniqueChecked: 0, scanTotalDevices: 0, scanPass: 1,
     scanWindowMs: Number(otpCfg.activeWindowMs) || 0, scanBestActivityMs: 0, scanBestActivityAgeMs: 0, scanFresh: 0,
   });
+  // Pichhli run kisi fatal par ruki ho to stale lane reservations nayi
+  // run ki saari IPs ko block na kar dein.
+  try { proxyPool._clearProxyReservations(); } catch {}
 
   const userId = opts.userId || 'autopilot';
   let endReason = 'target';
@@ -524,8 +623,9 @@ export async function startAutopilot(opts = {}) {
         ? `🔀 Proxy pool: ${ps.enabledCount}/${ps.total} proxies ON — ${ps.rotation}`
         : `🔀 Koi proxy nahi — 🌐 <b>free proxies auto-fetch</b> try kar raha hoon (Swiggy par test karke sirf zinda wali rakhunga)…`,
       'Swiggy WAF token arrange kar raha hoon (ek baar, ~15s)…',
+      `⚡ Parallel lanes: ${requestedConcurrency} tak — har lane alag number + alag IP legi.`,
       '📋 Saath hi pool load + zinda devices ki parallel scan chal rahi hai…',
-      sub('Sab ready hote hi pehla OTP fresh device par jayega.'),
+      sub('Sab ready hote hi lanes ke pehle OTP fresh devices par jayenge.'),
     ].join('\n')), stopRows());
 
     // Proxy assign — pehli enabled proxy (round-robin se). WAF token bhi
@@ -553,7 +653,7 @@ export async function startAutopilot(opts = {}) {
     // behavior, koi rukawat nahi.
     const freePromise = (async () => {
       try {
-        const r = await proxyPool.ensureFreeProxies({ min: 3, want: 10 });
+        const r = await proxyPool.ensureFreeProxies({ min: requestedConcurrency, want: Math.max(10, requestedConcurrency) });
         if (r && !r.skipped) {
           console.log(r.added
             ? `[Autopilot] 🌐 Free proxies: ${r.candidates || 0} candidates me se ${r.checked} parkhin, ${r.added} rakhin (clean ${r.clean || 0}, WAF-ready ${r.challenged || 0}) — IP rotation ON.`
@@ -640,6 +740,7 @@ export async function startAutopilot(opts = {}) {
       if (!entry?.phone) return;
       if (retryLater.some((r) => r.entry.phone === entry.phone)) return;
       retryLater.push({ entry, attempts: 0, why });
+      state.deferredQueue = retryLater.length;
       console.log(`[Autopilot] Deferred (${why}): ${entry.phone} — will retry in this run.`);
     };
     const removeRetryLaterPhone = (phone) => {
@@ -647,6 +748,43 @@ export async function startAutopilot(opts = {}) {
       for (let i = retryLater.length - 1; i >= 0; i--) {
         if (retryLater[i]?.entry?.phone === phone) retryLater.splice(i, 1);
       }
+      state.deferredQueue = retryLater.length;
+    };
+
+    // Parallel claim coordination. Selection ek mutex ke andar hogi aur
+    // picked phone + deviceId foran active locks me aa jayega — warna do
+    // lanes ek hi number, ya ek hi device ki do SIMs, ek saath utha kar
+    // ek hi inbox par OTP ambiguity bana sakti hain.
+    const activePhones = new Set();
+    const activeDeviceIds = new Set();
+    const activeByLane = new Map(); // laneId -> activeNumbers item
+    const isEntryActive = (entry) => Boolean(
+      entry?.phone && (activePhones.has(entry.phone) || (entry.deviceId && activeDeviceIds.has(entry.deviceId)))
+    );
+    const claimPickedEntry = (entry) => {
+      if (!entry?.phone || isEntryActive(entry)) return false;
+      activePhones.add(entry.phone);
+      if (entry.deviceId) activeDeviceIds.add(entry.deviceId);
+      return true;
+    };
+    const releaseClaimedEntry = (entry) => {
+      if (!entry?.phone) return;
+      activePhones.delete(entry.phone);
+      if (entry.deviceId) activeDeviceIds.delete(entry.deviceId);
+    };
+    const syncActiveNumbers = () => {
+      state.activeNumbers = [...activeByLane.values()].sort((a, b) => (a.laneId || 0) - (b.laneId || 0));
+      state.activeWorkers = state.activeNumbers.length;
+      state.current = state.activeNumbers[0] ? { ...state.activeNumbers[0] } : null;
+    };
+    let claimTail = Promise.resolve();
+    const withClaimLock = async (fn) => {
+      const previous = claimTail.catch(() => {});
+      let release;
+      const gate = new Promise((resolve) => { release = resolve; });
+      claimTail = previous.then(() => gate);
+      await previous;
+      try { return await fn(); } finally { release(); }
     };
 
     await poolPromise; // pool ready — warm-up abhi bhi background me ho sakta hai
@@ -705,7 +843,8 @@ export async function startAutopilot(opts = {}) {
         .filter(underTransientCap)
         .filter(underInfraCap)
         .filter((e) => !extractedThisRun.has(e.phone))
-        .filter((e) => !staleThisRun.has(e.phone));
+        .filter((e) => !staleThisRun.has(e.phone))
+        .filter((e) => !isEntryActive(e));
       if (!allowOffline) {
         const onlineOnly = list.filter((e) => e.online !== false);
         if (onlineOnly.length) list = onlineOnly;
@@ -723,21 +862,28 @@ export async function startAutopilot(opts = {}) {
     const hotQueue = [];            // { entry, lastActivityMs, windowMs, checkedAt }
     const probedDevices = new Set(); // is pass me probe ho chuke deviceIds
     const takeFromHotQueue = () => {
-      while (hotQueue.length) {
-        const h = hotQueue.shift();
-        state.scanFresh = hotQueue.length;
+      for (let i = 0; i < hotQueue.length;) {
+        const h = hotQueue[i];
+        const entry = h?.entry;
+        if (!entry?.phone) { hotQueue.splice(i, 1); continue; }
+        // Dusri lane isi phone/device par hai — entry queue me rehne do,
+        // taaki us device ki doosri SIM baad me safely try ho sake.
+        if (isEntryActive(entry)) { i++; continue; }
         if (
-          staleThisRun.has(h.entry.phone) ||
-          extractedThisRun.has(h.entry.phone) ||
-          !underFailCap(h.entry) ||
-          !underTransientCap(h.entry) ||
-          !underInfraCap(h.entry)
-        ) continue;
+          staleThisRun.has(entry.phone) ||
+          extractedThisRun.has(entry.phone) ||
+          !underFailCap(entry) ||
+          !underTransientCap(entry) ||
+          !underInfraCap(entry)
+        ) { hotQueue.splice(i, 1); continue; }
         // Sirf "ledger me entry hai" kafi nahi: success 7 din baad eligible
         // hai, aur 7 din ke andar saved-session fallback bhi block karta hai.
-        if (isPhoneBlockedByPremiumLedger(h.entry.phone)) continue;
+        if (isPhoneBlockedByPremiumLedger(entry.phone)) { hotQueue.splice(i, 1); continue; }
+        hotQueue.splice(i, 1);
+        state.scanFresh = hotQueue.length;
         return h;
       }
+      state.scanFresh = hotQueue.length;
       return null;
     };
     const purgeQueuedPhone = (phone) => {
@@ -753,10 +899,11 @@ export async function startAutopilot(opts = {}) {
     // gaya, aur baad me uski purani retry entry use dobara utha leti thi.
     // Ab retry pick par wohi saare gates dobara check hotay hain.
     const takeRetryLater = () => {
-      while (retryLater.length) {
-        const r = retryLater.shift();
+      for (let i = 0; i < retryLater.length;) {
+        const r = retryLater[i];
         const entry = r?.entry;
-        if (!entry?.phone) continue;
+        if (!entry?.phone) { retryLater.splice(i, 1); continue; }
+        if (isEntryActive(entry)) { i++; continue; }
         if (
           staleThisRun.has(entry.phone) ||
           extractedThisRun.has(entry.phone) ||
@@ -764,9 +911,12 @@ export async function startAutopilot(opts = {}) {
           !underTransientCap(entry) ||
           !underInfraCap(entry) ||
           isPhoneBlockedByPremiumLedger(entry.phone)
-        ) continue;
+        ) { retryLater.splice(i, 1); continue; }
+        retryLater.splice(i, 1);
+        state.deferredQueue = retryLater.length;
         return { entry, lastActivityMs: 0, windowMs: Number(otpCfg.activeWindowMs) || 0 };
       }
+      state.deferredQueue = retryLater.length;
       return null;
     };
     const refillHotQueue = async () => {
@@ -796,11 +946,12 @@ export async function startAutopilot(opts = {}) {
           // 10s jaise chhote window me 3 fresh jama karne ka wait pehle
           // wale ko hi stale bana deta tha. Isliye pehla zinda device milte
           // hi turant process karo; bade window par 3 ka chhota buffer rakho.
-          want: Number(otpCfg.activeWindowMs) <= 15_000 ? 1 : 3,
+          want: Math.max(Number(otpCfg.activeWindowMs) <= 15_000 ? 1 : 3, requestedConcurrency),
           // Ek hi device par poora pass zaya na karo. Sabse taaza ranked
           // backups bhi queue me rakho — pehla stale/fail ho to agla cached
-          // device turant milega, naya Firebase pass nahi ghumega.
-          backupCount: 12,
+          // device turant milega, naya Firebase pass nahi ghumega. Parallel
+          // lanes ko khilane ke liye kam az kam do guna lane-count backups.
+          backupCount: Math.max(12, requestedConcurrency * 2),
           // Full pass ke khatam hone ka intezaar hi purani susti thi. Har
           // 4s scan ke baad agli ladder window probed-so-far devices par
           // khul jati hai (≤20s, phir ≤40s, ≤80s...). 12s ka hard budget
@@ -876,91 +1027,354 @@ export async function startAutopilot(opts = {}) {
       }
     };
 
-    // Pehla scan yahin — WAF warm-up ke parallel me hi (ensureWarm pehle
-    // OTP se pehle token confirm karega).
-    if (gateOn) await refillHotQueue();
+    // ---- ⚡ Parallel lanes: route allocator + claim coordination ----
+    let lanes = [];
+    let laneCount = 1;
+    let runEndRequested = false;
+    const activeRouteKeys = new Set();
+    const routeChangeWaiters = new Set();
+    const notifyRouteChanged = () => {
+      for (const resolve of [...routeChangeWaiters]) resolve();
+      routeChangeWaiters.clear();
+    };
+    const waitForRouteChange = async (ms = 1_000) => {
+      if (state.stopRequested) return;
+      let resolveRouteChange;
+      const routeChanged = new Promise((resolve) => { resolveRouteChange = resolve; });
+      routeChangeWaiters.add(resolveRouteChange);
+      try {
+        await Promise.race([routeChanged, sleep(ms, () => state.stopRequested)]);
+      } finally {
+        routeChangeWaiters.delete(resolveRouteChange);
+      }
+    };
+    const requestRunEnd = (reason) => {
+      if (!runEndRequested) {
+        runEndRequested = true;
+        endReason = reason;
+      }
+      state.stopRequested = true;
+      if (!state.stopReason) state.stopReason = endReason;
+      notifyRouteChanged();
+    };
+    const syncRouteSummaryState = () => {
+      const modes = lanes.map((lane) => lane.routeMode).filter((m) => m && m !== 'unassigned');
+      if (!modes.length) return;
+      const hasProxy = modes.includes('proxy');
+      const hasDirect = modes.some((m) => m === 'direct' || m === 'direct-fallback');
+      state.routeMode = hasProxy && hasDirect
+        ? 'parallel'
+        : hasProxy
+          ? 'proxy'
+          : (ps.enabled ? 'direct-fallback' : 'direct');
+    };
+    const laneProxyUsable = (lane) => {
+      if (!lane?.proxy?.id) return false;
+      try {
+        const info = proxyPool.getProxy(lane.proxy.id);
+        if (!info?.enabled) return false;
+        const route = proxyPool.getProxyRouteState(lane.proxy.id);
+        return (route.cooldownLeftMs || 0) <= 5_000 && (route.consecutiveErrors || 0) < 3;
+      } catch { return false; }
+    };
+    const releaseLaneRoute = (lane) => {
+      if (!lane) return;
+      if (lane.routeKey) activeRouteKeys.delete(lane.routeKey);
+      if (lane.owner) {
+        try { proxyPool.releaseProxyReservationsForOwner(lane.owner); } catch {}
+      }
+      lane.proxy = null;
+      lane.routeKey = '';
+      lane.routeMode = 'unassigned';
+      syncRouteSummaryState();
+      notifyRouteChanged();
+    };
+    const setLaneProxy = (lane, proxy) => {
+      if (!proxy?.id) return false;
+      if (lane.routeKey && lane.routeKey !== `proxy:${proxy.id}`) activeRouteKeys.delete(lane.routeKey);
+      if (lane.proxy?.id && lane.proxy.id !== proxy.id) {
+        try { proxyPool.releaseProxyReservation(lane.proxy.id, lane.owner); } catch {}
+      }
+      lane.proxy = proxy;
+      lane.routeKey = `proxy:${proxy.id}`;
+      lane.routeMode = 'proxy';
+      activeRouteKeys.add(lane.routeKey);
+      syncRouteSummaryState();
+      return true;
+    };
+    const claimLaneDirect = (lane) => {
+      if (lane.routeKey === 'direct') return true;
+      if (activeRouteKeys.has('direct')) return false;
+      if (lane.routeKey) activeRouteKeys.delete(lane.routeKey);
+      if (lane.proxy?.id) {
+        try { proxyPool.releaseProxyReservation(lane.proxy.id, lane.owner); } catch {}
+      }
+      lane.proxy = null;
+      lane.routeKey = 'direct';
+      lane.routeMode = ps.enabled ? 'direct-fallback' : 'direct';
+      activeRouteKeys.add('direct');
+      syncRouteSummaryState();
+      return true;
+    };
+    const rotateLaneProxy = (lane, excludeId = '', { countRotation = false } = {}) => {
+      if (!proxyPool.isEnabled()) return null;
+      const beforeId = lane.proxy?.id || '';
+      const exclusions = [beforeId, excludeId].filter(Boolean);
+      const next = proxyPool.pickProxy({
+        ...(exclusions.length ? { excludeIds: [...new Set(exclusions)] } : {}),
+        reserveFor: lane.owner,
+      });
+      if (!next) return null;
+      setLaneProxy(lane, next);
+      if (countRotation && beforeId && next.id !== beforeId) {
+        state.proxyRotations = (state.proxyRotations || 0) + 1;
+      }
+      console.log(`[Autopilot] Lane ${lane.id} proxy → ${next.label}`);
+      notifyRouteChanged();
+      return next;
+    };
+    const ensureLaneRoute = (lane) => {
+      if (lane.routeKey === 'direct') return true;
+      if (lane.proxy?.id) {
+        if (laneProxyUsable(lane)) {
+          lane.routeKey = `proxy:${lane.proxy.id}`;
+          lane.routeMode = 'proxy';
+          activeRouteKeys.add(lane.routeKey);
+          return true;
+        }
+        releaseLaneRoute(lane);
+      }
+      if (proxyPool.isEnabled()) {
+        const next = proxyPool.pickProxy({ reserveFor: lane.owner });
+        if (next) {
+          setLaneProxy(lane, next);
+          console.log(`[Autopilot] Lane ${lane.id} route → ${next.label}`);
+          return true;
+        }
+      }
+      return claimLaneDirect(lane);
+    };
+    const syncLaneRouteAfterProcess = (lane, finalProxy) => {
+      const oldKey = lane.routeKey;
+      if (oldKey) activeRouteKeys.delete(oldKey);
+      if (finalProxy?.id) {
+        lane.proxy = finalProxy;
+        lane.routeKey = `proxy:${finalProxy.id}`;
+        lane.routeMode = 'proxy';
+        activeRouteKeys.add(lane.routeKey);
+        try { proxyPool.reserveProxy(finalProxy.id, lane.owner); } catch {}
+      } else if (!activeRouteKeys.has('direct') || oldKey === 'direct') {
+        lane.proxy = null;
+        lane.routeKey = 'direct';
+        lane.routeMode = ps.enabled ? 'direct-fallback' : 'direct';
+        activeRouteKeys.add('direct');
+      } else {
+        lane.proxy = null;
+        lane.routeKey = '';
+        lane.routeMode = 'unassigned';
+      }
+      syncRouteSummaryState();
+    };
+    const setLaneCurrent = (lane, entry) => {
+      if (entry) {
+        activeByLane.set(lane.id, {
+          phone: entry.phone,
+          startedAt: Date.now(),
+          laneId: lane.id,
+          proxyLabel: lane.proxy?.label || (lane.routeKey === 'direct' ? 'direct' : '—'),
+          proxyId: lane.proxy?.id || '',
+          routeMode: lane.routeMode || 'direct',
+        });
+      } else {
+        activeByLane.delete(lane.id);
+      }
+      syncActiveNumbers();
+    };
+    const solveLaneToken = async (lane, force = false) => {
+      try {
+        return await runWithBridgeProxy(
+          lane.proxy || null,
+          () => getLiveSwiggyWafToken(force, { solveBudgetMs: 25_000 }),
+          { owner: lane.owner, releaseOnExit: false }
+        );
+      } catch { return ''; }
+    };
 
-    for (;;) {
-      if (state.stopRequested) { endReason = state.stopReason || 'manual'; break; }
-      if (Date.now() - state.startedAt > maxMinutes * 60_000) { endReason = 'time'; break; }
-      if (state.fresh >= target) { endReason = 'target'; break; }
-      // Circuit breaker — proxy hone par zyada failures jhel sakte hain
-      // (rotation se IP issue solve ho sakta hai), direct mode me 6.
-      const failLimit = ps.enabled ? 10 : 6;
-      if (state.consecutiveFails >= failLimit) { endReason = 'circuit_breaker'; break; }
-
+    let freshWaitUntil = 0;
+    const claimNextPick = () => withClaimLock(async () => {
+      if (state.stopRequested) return { status: 'stopped' };
+      if (state.fresh >= target) return { status: 'target' };
+      if (state.fresh + activePhones.size >= target) return { status: 'waiting', waitMs: 500 };
       state.poolFresh = freshEntriesFrom(pool).length;
-
-      // ---- Selection: pehle hot-queue (scan kiye hue zinda devices) ----
       let picked = takeFromHotQueue();
 
+      if (!picked && gateOn && Date.now() < freshWaitUntil) {
+        picked = takeRetryLater();
+        if (!picked) return { status: 'waiting', waitMs: Math.max(250, freshWaitUntil - Date.now()) };
+      }
+
       if (!picked && gateOn) {
-        // Refill is pass ke saare unprobed candidates cover kar sakta hai.
-        // Agar mile hue entries ledger/caps ki wajah se skip ho jayein to
-        // bina wait kiye baqi unprobed candidates bhi cover karo — probed
-        // list sirf poora pass khatam hone ke baad hi clear hoti hai.
         while (!picked) {
           const scan = await refillHotQueue();
           picked = takeFromHotQueue();
           if (picked || state.stopRequested || scan?.exhausted || !(Number(scan?.checked) > 0)) break;
         }
-        if (state.stopRequested) { endReason = state.stopReason || 'manual'; break; }
+        if (state.stopRequested) return { status: 'stopped' };
         if (!picked) picked = takeRetryLater();
         if (!picked) {
-          {
-            await refreshIfStale();
-            state.poolFresh = freshEntriesFrom(pool).length;
-            // Abhi koi device taazi activity nahi dikha raha — batch band
-            // karne ke bajaye thodi der ruk kar DOBARA scan (device beech me
-            // zinda ho sakta hai). Max 40 rounds × 15s ≈ 10 min.
-            if (state.poolFresh > 0 && freshWaitRounds < 40) {
-              freshWaitRounds++;
-              await push(progressCard(section('🕐 Fresh Device Ka Wait', [
-                `› Pass ${state.scanPass || 1} ke <b>${state.scanUniqueChecked || 0}/${state.scanTotalDevices || 0}</b> unique devices me koi usable last-activity timestamp hi nahi mila.`,
-                `› Total probes: ${state.scanTotalProbes || state.scanChecked || 0} (repeated passes sameet). 15s ruk kar naya pass karunga (round ${freshWaitRounds}/40).`,
-                sub('Timestamp wala device hota to isi pass par window double karke use le liya jata — dobara scan sirf nayi activity ke intezaar ke liye hai.'),
-              ].join('\n'))), stopRows());
-              await sleep(15_000, () => state.stopRequested);
-              if (state.stopRequested) { endReason = state.stopReason || 'manual'; break; }
-              probedDevices.clear();
-              staleThisRun.clear();
-              state.scanPass = (state.scanPass || 1) + 1;
-              state.scanUniqueChecked = 0;
-              state.scanWindowMs = Number(otpCfg.activeWindowMs) || 0;
-              state.scanBestActivityMs = 0;
-              state.scanBestActivityAgeMs = 0;
-              continue;
-            }
-            endReason = 'pool-exhausted';
-            break;
+          if (activePhones.size) return { status: 'waiting', waitMs: 1_000 };
+          await refreshIfStale();
+          state.poolFresh = freshEntriesFrom(pool).length;
+          if (state.poolFresh > 0 && freshWaitRounds < 40) {
+            const now = Date.now();
+            if (now < freshWaitUntil) return { status: 'waiting', waitMs: Math.max(250, freshWaitUntil - now) };
+            freshWaitRounds++;
+            await push(progressCard(section('🕐 Fresh Device Ka Wait', [
+              `› Pass ${state.scanPass || 1} ke <b>${state.scanUniqueChecked || 0}/${state.scanTotalDevices || 0}</b> unique devices me koi usable last-activity timestamp hi nahi mila.`,
+              `› Total probes: ${state.scanTotalProbes || state.scanChecked || 0} (repeated passes sameet). 15s ruk kar naya pass karunga (round ${freshWaitRounds}/40).`,
+              sub('Timestamp wala device hota to isi pass par window double karke use le liya jata — dobara scan sirf nayi activity ke intezaar ke liye hai.'),
+            ].join('\n'))), stopRows());
+            probedDevices.clear();
+            staleThisRun.clear();
+            state.scanPass = (state.scanPass || 1) + 1;
+            state.scanUniqueChecked = 0;
+            state.scanWindowMs = Number(otpCfg.activeWindowMs) || 0;
+            state.scanBestActivityMs = 0;
+            state.scanBestActivityAgeMs = 0;
+            freshWaitUntil = now + 15_000;
+            return { status: 'waiting', waitMs: 15_000 };
           }
+          return { status: 'exhausted' };
         }
       }
 
       if (!picked && !gateOn) {
-        // Gate OFF (window=0) — purana random pick, backward compatible
         let fresh = pickFreshList();
         if (!fresh.length) {
           const retryPick = takeRetryLater();
           if (retryPick) {
-            fresh = [retryPick.entry];
+            picked = retryPick;
           } else {
+            if (activePhones.size) return { status: 'waiting', waitMs: 1_000 };
             await refreshIfStale();
             fresh = pickFreshList();
-            if (!fresh.length) { endReason = 'pool-exhausted'; break; }
+            if (!fresh.length) return { status: 'exhausted' };
+            picked = { entry: fresh[0] };
           }
+        } else {
+          picked = { entry: fresh[0] };
         }
-        picked = { entry: fresh[0] };
       }
 
-      if (!picked) { endReason = 'pool-exhausted'; break; }
-      if (picked.lastActivityMs || picked.onlineFallback) freshWaitRounds = 0;
+      if (!picked?.entry) {
+        return activePhones.size ? { status: 'waiting', waitMs: 1_000 } : { status: 'exhausted' };
+      }
+      if (picked.lastActivityMs || picked.onlineFallback) {
+        freshWaitRounds = 0;
+        freshWaitUntil = 0;
+      }
+      if (state.fresh + activePhones.size >= target) {
+        if (gateOn) {
+          hotQueue.unshift(picked);
+          state.scanFresh = hotQueue.length;
+        }
+        return { status: 'waiting', waitMs: 500 };
+      }
+      if (!claimPickedEntry(picked.entry)) {
+        if (gateOn) {
+          hotQueue.unshift(picked);
+          state.scanFresh = hotQueue.length;
+        }
+        return { status: 'waiting', waitMs: 250 };
+      }
+      removeRetryLaterPhone(picked.entry.phone);
+      return { status: 'picked', picked };
+    });
 
+    // Pehla scan yahin — WAF warm-up ke parallel me hi (ensureWarm pehle
+    // OTP se pehle token confirm karega).
+    if (gateOn) await refillHotQueue();
+
+    // Distinct routes tay hone ke baad asal lane count final karo. Free
+    // auto-fetch pool/scan ke parallel chal raha tha; uske baghair lanes
+    // ko pata hi nahi chalta kitni alag IPs asal me available hain.
+    await freePromise;
+    ps = proxyPool.proxySummary();
+    laneCount = availableParallelLanes({
+      requested: requestedConcurrency,
+      proxyEnabled: Boolean(ps.enabled),
+      enabledProxyCount: ps.enabledCount || 0,
+    });
+    state.concurrency = laneCount;
+    state.requestedConcurrency = requestedConcurrency;
+    lanes = Array.from({ length: laneCount }, (_, i) => ({
+      id: i + 1,
+      owner: `autopilot-${state.startedAt}-lane${i + 1}`,
+      userId: parallelWorkerUserId(userId, i + 1),
+      proxy: null,
+      routeKey: '',
+      routeMode: 'unassigned',
+      proxyChallenges: 0,
+      directChallenges: 0,
+      consecutiveFails: 0,
+      currentEntry: null,
+    }));
+    for (const lane of lanes) ensureLaneRoute(lane);
+    syncRouteSummaryState();
+    const securityStormLimit = Math.max(12, laneCount * 3);
+    const rotationLimit = 25 * laneCount;
+    const wafCooldownLimit = 60 * laneCount;
+    console.log(`[Autopilot] ⚡ Parallel lanes ready: ${laneCount}/${requestedConcurrency} (proxy routes ${ps.enabledCount || 0} + direct 1).`);
+    await push(progressCard(section('⚡ Parallel Lanes Ready', [
+      `› <b>${laneCount} lane(s)</b> ek saath chalengi — har lane ka alag number, alag device aur alag IP route hoga.`,
+      laneCount < requestedConcurrency
+        ? `› ${requestedConcurrency} lanes maangi gayi thi, lekin distinct routes sirf ${laneCount} hain (${ps.enabledCount || 0} proxies + 1 direct). Zyada proxies hongi to lanes bhi badhengi.`
+        : `› Saari ${requestedConcurrency} requested lanes ko distinct routes mil sakte hain.`,
+      `› Jo lane pehle free hogi wahi agla number uthayegi — slow lane baaki lanes ko nahi rokegi.`,
+      sub('Chromium WAF solver memory safety ke liye ek waqt me ek hi chalega; HTTP/OTP waits parallel rahenge.'),
+    ].join('\n'))), stopRows());
+
+    const runWorker = async (lane) => {
+      try {
+        for (;;) {
+          if (state.stopRequested) {
+            if (!runEndRequested) endReason = state.stopReason || 'manual';
+            break;
+          }
+          if (Date.now() - state.startedAt > maxMinutes * 60_000) { requestRunEnd('time'); break; }
+          if (state.fresh >= target) { requestRunEnd('target'); break; }
+          // Target ke aakhir me extra numbers start karke overshoot na karo:
+          // jitne in-flight hain unke potential fresh count kar lo.
+          if (state.fresh + activePhones.size >= target) {
+            await sleep(500, () => state.stopRequested);
+            continue;
+          }
+          const failLimit = (ps.enabled ? 10 : 6) * laneCount;
+          if (state.consecutiveFails >= failLimit) { requestRunEnd('circuit_breaker'); break; }
+
+          if (!ensureLaneRoute(lane)) {
+            await waitForRouteChange(1_000);
+            continue;
+          }
+          const claim = await claimNextPick();
+          if (claim.status === 'target') { requestRunEnd('target'); break; }
+          if (claim.status === 'stopped') break;
+          if (claim.status === 'waiting') {
+            await sleep(claim.waitMs || 1_000, () => state.stopRequested);
+            continue;
+          }
+          if (claim.status !== 'picked' || !claim.picked?.entry) {
+            requestRunEnd('pool-exhausted');
+            break;
+          }
+          const picked = claim.picked;
+          lane.currentEntry = picked.entry;
+          try {
       const entry = picked.entry;
       // Kisi bhi rasty se pick ho, isi phone ki purani retry entry saaf —
       // warna success ke baad wahi stale retry number ko dobara utha sakti thi.
       removeRetryLaterPhone(entry.phone);
-      state.current = { phone: entry.phone, startedAt: Date.now() };
+      setLaneCurrent(lane, entry);
 
       // Card par foran saaf dikhao ke scan ruk chuka hai aur asal number
       // process ho raha hai. Warna WAF warm-up / OTP wait ke dauran purana
@@ -970,11 +1384,11 @@ export async function startAutopilot(opts = {}) {
           ? Math.max(0, Date.now() - Number(picked.lastActivityMs))
           : null;
         await push(progressCard(section('📟 Device Mil Gaya — Number Process Shuru', [
-          `📱 <b>Number:</b> <code>${esc(entry.phone)}</code>`,
+          `📱 <b>Number:</b> <code>${esc(entry.phone)}</code> · lane ${lane.id} · ${esc(lane.proxy?.label || 'direct')}`,
           picked.onlineFallback
             ? '› Quick scan me taaza SMS activity nahi mili — Firebase <b>clients me ONLINE</b> dikh raha device liya hai. Full pool scan ka wait nahi kiya.'
             : `› Device ki last SMS activity ~${fmtDuration(pickedAgeMs || 0)} purani · ladder ≤${fmtDuration(Math.max(Number(otpCfg.activeWindowMs) || 0, Number(picked.windowMs) || 0))} · queue me ${hotQueue.length} backup(s).`,
-          sub('Scan ruk chuka hai — ab WAF/OTP flow chalega. Processed count is number ka result aate hi badhega.'),
+          sub('Is lane par ab WAF/OTP flow chalega; baaki lanes apna kaam jaari rakhengi. Processed count result aate hi badhega.'),
         ].join('\n'))), stopRows());
       }
 
@@ -1002,19 +1416,38 @@ export async function startAutopilot(opts = {}) {
       // honay wali asal route episode yaad rakho (bridge andar recovery
       // me IP badal sakta hai; sirf final proxy dekhna kaafi nahi).
       const routeAtProcessStart = {
-        mode: state.routeMode || 'direct',
-        proxyId: getBridgeProxyId(),
+        mode: lane.routeMode || 'direct',
+        proxyId: lane.proxy?.id || '',
       };
-      const res = await processSingleNumber({
-        userId,
-        entry,
-        otpCfg: numCfg,
-        shouldAbort: () => state.stopRequested,
-        report: async (text) => { await push(progressCard(text), stopRows()); },
+      let finalProxy = lane.proxy || null;
+      const res = await runWithBridgeProxy(lane.proxy || null, async () => {
+        try {
+          return await processSingleNumber({
+            userId: lane.userId,
+            entry,
+            otpCfg: numCfg,
+            shouldAbort: () => state.stopRequested,
+            report: async (text) => { await push(progressCard(text), stopRows()); },
+          });
+        } finally {
+          finalProxy = getBridgeProxy();
+        }
+      }, {
+        owner: lane.owner,
+        releaseOnExit: false,
+        wafTokenMode: laneCount > 1 && lane.proxy?.id ? 'defer-until-challenge' : '',
       });
+      syncLaneRouteAfterProcess(lane, finalProxy);
+      const finalProxyId = finalProxy?.id || '';
 
-      state.current = null;
+      setLaneCurrent(lane, null);
       const outcome = tally(res);
+      if (['ok', 'skipped', 'deferred', 'aborted', 'rate_limited', 'failed'].includes(outcome)) {
+        lane.proxyChallenges = 0;
+        lane.directChallenges = 0;
+      }
+      if (outcome === 'failed') lane.consecutiveFails = (lane.consecutiveFails || 0) + 1;
+      else if (['ok', 'skipped', 'deferred'].includes(outcome)) lane.consecutiveFails = 0;
       if (res.ok && res.phone) {
         extractedThisRun.add(res.phone);
         purgeQueuedPhone(res.phone);
@@ -1025,7 +1458,7 @@ export async function startAutopilot(opts = {}) {
       // Console visibility — exact failure reason (Telegram card ke alawa),
       // taaki WAF/rate-limit/verify/OTP-miss ka farq turant dikhe logs me.
       if (!res.ok) {
-        console.log(`[Autopilot] ${outcome} | ${res.kind} | ${res.phone} | ${String(res.reason || '').replace(/\s+/g, ' ').slice(0, 160)}`);
+        console.log(`[Autopilot] lane ${lane.id} | ${outcome} | ${res.kind} | ${res.phone} | ${lane.proxy?.label || 'direct'} | ${String(res.reason || '').replace(/\s+/g, ' ').slice(0, 160)}`);
       }
       // Stale devices rapid-fire skip hote hain — har ek par card edit karne
       // se Telegram flood hoga. Unka count stats me dikhta hai, card nahi.
@@ -1042,7 +1475,7 @@ export async function startAutopilot(opts = {}) {
                     ? '↻ Temporary Swiggy Error — Retry Later'
                     : '× Result',
             [
-            `📱 <b>Number:</b> <code>${esc(res.phone)}</code>`,
+            `📱 <b>Number:</b> <code>${esc(res.phone)}</code> · lane ${lane.id} · ${esc(lane.proxy?.label || 'direct')}`,
             `› <b>Outcome:</b> <code>${esc(res.kind)}</code>`,
             res.reason ? `<blockquote>${esc(String(res.reason).slice(0, 300))}</blockquote>` : '',
           ].filter(Boolean).join('\n'))
@@ -1084,7 +1517,7 @@ export async function startAutopilot(opts = {}) {
 
         let next = null;
         if (ps.enabled) {
-          next = rotateProxy(getBridgeProxyId(), { countRotation: true });
+          next = rotateLaneProxy(lane, finalProxyId, { countRotation: true });
         }
 
         const needsCoolOff = !next || (state.transientStrikes || 0) >= 3;
@@ -1098,7 +1531,7 @@ export async function startAutopilot(opts = {}) {
             ? `› Proxy rotate kar diya: <code>${esc(next.label)}</code> (rotation #${state.proxyRotations})`
             : `› Doosri proxy available nahi — isi IP par cool-off ke baad aage badhunga.`,
           waitMs
-            ? `› Lagatar ${state.transientStrikes} temporary errors — ${Math.round(waitMs / 1000)}s cool-off, phir batch khud aage badhega.`
+            ? `› Lagatar ${state.transientStrikes} temporary errors — sirf lane ${lane.id} ${Math.round(waitMs / 1000)}s cool-off legi, baaki lanes chalti rahengi.`
             : `› Nayi IP par turant agla number — batch nahi rukega.`,
         ].join('\n'))), stopRows());
 
@@ -1106,10 +1539,11 @@ export async function startAutopilot(opts = {}) {
           await sleep(waitMs, () => state.stopRequested);
           if (state.stopRequested) { endReason = state.stopReason || 'manual'; break; }
         }
-        if (next) {
-          try { await getLiveSwiggyWafToken(false, { solveBudgetMs: 25_000 }); } catch {}
+        if (next && laneCount === 1) {
+          await solveLaneToken(lane, false);
         }
         state.consecutiveFails = 0;
+        lane.consecutiveFails = 0;
         continue;
       }
 
@@ -1122,27 +1556,28 @@ export async function startAutopilot(opts = {}) {
         if (res.phone && rateInfra.willRetry) deferNumber(entry, 'rate_limited');
 
         if (ps.enabled) {
-          const before = getBridgeProxyId();
-          const next = rotateProxy(before, { countRotation: true });
+          const before = finalProxyId;
+          const next = rotateLaneProxy(lane, before, { countRotation: true });
           if (next) {
             await push(progressCard(section('🔀 Rate Limit — Proxy Rotate (zero wait)', [
               `› IP ko limit lagi — nayi IP (proxy) le liya: <code>${esc(next.label)}</code>`,
               rateInfra.willRetry
                 ? `› Number defer kiya — baad me isi run me ek aur mauqa milega.`
                 : `› Is number ke is run ke 2 infra attempts ho gaye — ab ye is run me dobara nahi uthega.`,
-              `› Strike ${state.rateStrikes} — batch nahi rukega.`,
+              `› Strike ${state.rateStrikes} — lane ${lane.id} nayi IP par, baaki lanes unaffected.`,
             ].join('\n'))), stopRows());
             state.consecutiveFails = 0;
+            lane.consecutiveFails = 0;
             continue; // turant agla number — ZERO wait
           }
         }
 
         // Direct mode (koi proxy nahi) — thoda ruk kar aage, warna poora IP
         // hi flagged ho jayega. 2 strikes se zyada = band.
-        if (state.rateStrikes >= 3) { endReason = 'rate_limited'; break; }
+        if (state.rateStrikes >= 3) { requestRunEnd('rate_limited'); break; }
         const backoff = Math.min(backoffMs, 5 * 60_000); // max 5 min (pehle 15)
         await push(progressCard(section('🚦 Swiggy Rate Limit — Short Backoff', [
-          `› ${Math.round(backoff / 60000)} min ruk kar aage badhunga (strike ${state.rateStrikes}/3).`,
+          `› Sirf lane ${lane.id} ${Math.round(backoff / 60000)} min rukegi (strike ${state.rateStrikes}/3); baaki lanes chalti rahengi.`,
           sub('⚠️ Proxies add karne se ye wait bhi hat jayegi (⚙️ Settings → 🔀 Proxies).'),
         ].join('\n'))), stopRows());
         await sleep(backoff, () => state.stopRequested);
@@ -1156,7 +1591,7 @@ export async function startAutopilot(opts = {}) {
       // sirf waqti slow hona chahiye.
       if (outcome === 'waf_cooldown') {
         state.wafCooldowns++;
-        if (state.wafCooldowns > 60) { endReason = 'waf_stuck'; break; }
+        if (state.wafCooldowns > wafCooldownLimit) { requestRunEnd('waf_stuck'); break; }
         const wafInfra = recordInfraAttempt(res.phone);
         if (res.phone && wafInfra.willRetry) deferNumber(entry, 'waf_cooldown');
 
@@ -1164,7 +1599,7 @@ export async function startAutopilot(opts = {}) {
         // baad token naya solve karke phir dekho (IP beech me thandi hogi).
         const cdMs = Math.min(Number(res.cooldownMs) || 120_000, 5 * 60_000);
         await push(progressCard(section('🛡 WAF Cooling — Short Wait', [
-          `› Swiggy ki WAF abhi IP ko thanda hone de rahi hai — ~${Math.max(1, Math.round(cdMs / 60000))} min ruk kar aage badhunga.`,
+          `› Swiggy ki WAF abhi lane ${lane.id} ki IP ko thanda hone de rahi hai — ~${Math.max(1, Math.round(cdMs / 60000))} min ruk kar aage badhunga; baaki lanes chalti rahengi.`,
           wafInfra.willRetry
             ? `› Number defer ho chuka hai (isi run me ek aur mauqa milega). Batch zinda hai.`
             : `› Is number ke is run ke 2 infra attempts ho gaye — ab ye is run me dobara nahi uthega. Batch zinda hai.`,
@@ -1172,7 +1607,7 @@ export async function startAutopilot(opts = {}) {
         ].join('\n'))), stopRows());
         await sleep(cdMs, () => state.stopRequested);
         if (state.stopRequested) { endReason = state.stopReason || 'manual'; break; }
-        const rotated = rotateProxy('', { countRotation: true }); // proxy mode me jo bhi free hua, use le lo
+        const rotated = rotateLaneProxy(lane, '', { countRotation: true }); // is lane ke liye jo bhi free hua, use le lo
         if (!rotated) {
           // Koi proxy free nahi bachi (free wali jaldi marti hain) — background
           // me nayi free proxies le aao, batch ko roke baghair.
@@ -1181,14 +1616,16 @@ export async function startAutopilot(opts = {}) {
           }).catch(() => {});
         }
         state.consecutiveFails = 0;
+        lane.consecutiveFails = 0;
         continue;
       }
 
       // Security challenge (403) — batch NAHI marta. Number defer, IP ko
       // thanda hone do, naya token lo aur aage badho. Ek success par strikes
       // reset (tally me) — isliye milawat wali run kabhi is par nahi rukti.
-      // Sirf 12 LAGATAR (bina ek bhi success ke) = IP asal me flagged hai;
-      // us se zyada zor lagana block ko aur gehra karega, tab hi roko.
+      // Sirf bahut lagatar (bina ek bhi processed outcome ke) challenges
+      // par roko. Parallel lanes me limit lane-count ke hisaab se scale
+      // hoti hai taaki pehli 10-lane wave hi batch ko premature na mare.
       // (Pehle: 4 par seedha batch band — boss ki sab se bari dikkat yahi thi.)
       if (outcome === 'security_challenge') {
         state.wafStrikes++;
@@ -1198,9 +1635,8 @@ export async function startAutopilot(opts = {}) {
         const numberRetryLine = securityInfra.willRetry
           ? 'Number defer hai — isi run me ek aur mauqa milega, failed mark nahi hua.'
           : 'Is number ke is run ke 2 infra attempts ho gaye — failed mark nahi hua, lekin ab ye is run me dobara nahi uthega.';
-        if (state.wafStrikes >= 12) { endReason = 'security_challenge'; break; }
+        if (state.wafStrikes >= securityStormLimit) { requestRunEnd('security_challenge'); break; }
 
-        const finalProxyId = getBridgeProxyId();
         const routeKind = securityChallengeRouteKind({
           proxyEnabled: Boolean(ps.enabled),
           routeModeAtStart: routeAtProcessStart.mode,
@@ -1208,11 +1644,10 @@ export async function startAutopilot(opts = {}) {
           finalProxyId,
         });
         const currentId = finalProxyId || (routeKind === 'proxy' ? routeAtProcessStart.proxyId : '');
-        state.routeMode = routeKind === 'proxy'
-          ? 'proxy'
-          : (ps.enabled ? 'direct-fallback' : 'direct');
+        syncRouteSummaryState();
         if (routeKind === 'proxy') {
           state.proxyChallenges = (state.proxyChallenges || 0) + 1;
+          lane.proxyChallenges = (lane.proxyChallenges || 0) + 1;
           // Final challenged route ki quarantine guarantee (bridge ke kuch
           // paths pehle ye miss kar dete the). Bridge ne already cooldown
           // laga diya ho to double-count na karo.
@@ -1224,74 +1659,89 @@ export async function startAutopilot(opts = {}) {
           }
         } else {
           state.directChallenges = (state.directChallenges || 0) + 1;
+          lane.directChallenges = (lane.directChallenges || 0) + 1;
         }
 
         const action = securityRouteAction({
           proxyEnabled: Boolean(ps.enabled),
           usingDirectFallback: routeKind === 'direct' && Boolean(ps.enabled),
-          proxyChallenges: state.proxyChallenges || 0,
-          directChallenges: state.directChallenges || 0,
+          proxyChallenges: lane.proxyChallenges || 0,
+          directChallenges: lane.directChallenges || 0,
         });
 
         const enterDirectFallback = async (reasonLine) => {
-          setBridgeProxy(null);
-          state.routeMode = 'direct-fallback';
+          if (!claimLaneDirect(lane)) return false;
+          lane.directChallenges = 0;
           state.directChallenges = 0;
           state.proxyRotations = (state.proxyRotations || 0) + 1; // asal IP switch hua hai
           // Direct try hota rahe, peeche nayi free proxies bhi parkh lo.
-          void proxyPool.refreshFreeProxies({ want: 10 }).then((r) => {
+          void proxyPool.refreshFreeProxies({ want: Math.max(10, requestedConcurrency) }).then((r) => {
             if (r?.added) {
               ps = proxyPool.proxySummary();
               console.log(`[Autopilot] 🌐 Direct fallback ke peeche ${r.added} free proxies refresh.`);
             }
           }).catch(() => {});
           await push(progressCard(section('🌐 Proxies Garam — Direct IP Try', [
-            `› Challenge mila (lagatar ${state.wafStrikes}). ${reasonLine}`,
-            `› Ab Render ki <b>direct IP</b> + usi IP ka fresh WAF token try hoga (route switch #${state.proxyRotations}).`,
+            `› Lane ${lane.id} ko challenge mila (global lagatar ${state.wafStrikes}). ${reasonLine}`,
+            `› Sirf ye lane Render ki <b>direct IP</b> + fresh WAF token try karegi (route switch #${state.proxyRotations}); baaki lanes apni IPs par rahengi.`,
             `› ${numberRetryLine} Direct par response milte hi challenge storm reset ho jayegi.`,
             sub('Peeche nayi free proxies bhi parkh raha hoon.'),
           ].join('\n'))), stopRows());
-          try { await getLiveSwiggyWafToken(false, { solveBudgetMs: 25_000 }); } catch {}
+          await solveLaneToken(lane, false);
+          return true;
         };
 
         if (action === 'direct_fallback') {
-          await enterDirectFallback(`${state.proxyChallenges} proxy routes challenge de chuke hain — kharab free pool me aur nahi ghumunga.`);
+          const enteredDirect = await enterDirectFallback(`Is lane par ${lane.proxyChallenges} proxy routes challenge de chuke hain — kharab free pool me aur nahi ghumunga.`);
+          if (!enteredDirect) {
+            // Direct route kisi aur lane ke paas hai. Is lane ko doosri
+            // proxy do; wo bhi na mile to route release karke allocator
+            // ke wait par chhod do (garam IP par phansna nahi).
+            const next = rotateLaneProxy(lane, currentId, { countRotation: true });
+            if (!next) releaseLaneRoute(lane);
+          }
           state.consecutiveFails = 0;
+          lane.consecutiveFails = 0;
           continue;
         }
 
         if (action === 'restore_proxy') {
-          const next = rotateProxy('', { countRotation: true });
+          const next = rotateLaneProxy(lane, '', { countRotation: true });
           if (next) {
             state.proxyRotations = (state.proxyRotations || 0) + 1; // direct → proxy switch
             state.proxyChallenges = 0;
+            lane.proxyChallenges = 0;
             await push(progressCard(section('🔀 Direct Bhi Garam — Best Proxy Wapas', [
-              `› Direct IP par 2 challenges aaye — best available proxy le liya: <code>${esc(next.label)}</code>`,
+              `› Lane ${lane.id}: direct IP par 2 challenges aaye — best available proxy le liya: <code>${esc(next.label)}</code>`,
               `› Picker ab fresh-token/Indian/clean route ko pehle rakhta hai (rotation #${state.proxyRotations}).`,
               `› ${numberRetryLine}`,
             ].join('\n'))), stopRows());
-            try { await getLiveSwiggyWafToken(false, { solveBudgetMs: 25_000 }); } catch {}
+            await solveLaneToken(lane, false);
             state.consecutiveFails = 0;
+            lane.consecutiveFails = 0;
             continue;
           }
           // Proxy bhi free nahi mili — neeche direct cooldown ladder chalega.
         } else if (action === 'rotate_proxy') {
-          const next = rotateProxy(currentId, { countRotation: true });
+          const next = rotateLaneProxy(lane, currentId, { countRotation: true });
           if (next) {
             await push(progressCard(section('🔀 Security Challenge — Proxy Rotate', [
-              `› Challenge mila (lagatar ${state.wafStrikes}) — nayi IP: <code>${esc(next.label)}</code> (rotation #${state.proxyRotations})`,
+              `› Lane ${lane.id} ko challenge mila — sirf is lane ki nayi IP: <code>${esc(next.label)}</code> (rotation #${state.proxyRotations})`,
               `› ${numberRetryLine} Nayi IP + naye token ke saath aage badh raha hoon.`,
-              sub('Batch nahi rukega. 3 proxy challenges ke baad direct fallback bhi try hoga.'),
+              sub('Baaki lanes apni IPs par chalti rahengi. Is lane par 3 proxy challenges ke baad direct fallback try hoga.'),
             ].join('\n'))), stopRows());
-            try { await getLiveSwiggyWafToken(false, { solveBudgetMs: 25_000 }); } catch {}
+            await solveLaneToken(lane, false);
             state.consecutiveFails = 0;
+            lane.consecutiveFails = 0;
             continue; // agla number nayi IP par (ye wala baad me dobara)
           }
 
           // Pehle yahan purani garam proxy hi chipki rehti thi aur code
           // "direct mode" samajh kar usi par token solve karta rehta tha.
-          await enterDirectFallback('Doosri usable proxy abhi free nahi hai.');
+          const enteredDirect = await enterDirectFallback('Doosri usable proxy abhi free nahi hai.');
+          if (!enteredDirect) releaseLaneRoute(lane);
           state.consecutiveFails = 0;
+          lane.consecutiveFails = 0;
           continue;
         }
 
@@ -1301,40 +1751,71 @@ export async function startAutopilot(opts = {}) {
         const poolCd = (() => { try { return wafPool.cooldownRemainingMs?.() || 0; } catch { return 0; } })();
         const waitMs = wafChallengeWaitMs(state.wafStrikes, poolCd);
         await push(progressCard(section('🛡 Swiggy Security Check — IP Cool-Down', [
-          `› Challenge mila (lagatar ${state.wafStrikes}) — direct IP abhi garam hai.`,
-          `› ~${Math.max(1, Math.round(waitMs / 60000))} min ruk kar naya WAF token banao-ga, phir aage. ${numberRetryLine}`,
+          `› Lane ${lane.id} ko challenge mila — direct IP abhi garam hai.`,
+          `› Sirf ye lane ~${Math.max(1, Math.round(waitMs / 60000))} min ruk kar naya WAF token banayegi; baaki lanes chalti rahengi. ${numberRetryLine}`,
           sub(ps.enabled
             ? 'Ek aur direct challenge par best proxy route dobara try hogi.'
             : 'Batch nahi rukega. Ek success milte hi ye ginti reset ho jati hai.'),
         ].join('\n'))), stopRows());
         await sleep(waitMs, () => state.stopRequested);
         if (state.stopRequested) { endReason = state.stopReason || 'manual'; break; }
-        try { await getLiveSwiggyWafToken(true, { solveBudgetMs: 25_000 }); } catch {}
+        await solveLaneToken(lane, true);
         state.consecutiveFails = 0;
+        lane.consecutiveFails = 0;
         continue; // thandi IP + fresh token → agla number
       }
 
       // Generic failure streak — pehle proxy badal kar dekho (IP issue ho
       // sakti hai), warna hi band. Pehle ye 6 par seedha band ho jata tha.
-      if (outcome === 'failed' && state.consecutiveFails >= 4 && ps.enabled) {
-        const next = rotateProxy(getBridgeProxyId(), { countRotation: true });
+      if (outcome === 'failed' && (lane.consecutiveFails || 0) >= 4 && ps.enabled) {
+        const laneFailStreak = lane.consecutiveFails || 0;
+        const next = rotateLaneProxy(lane, finalProxyId, { countRotation: true });
         if (next) {
           state.consecutiveFails = 0;
-          if (state.proxyRotations > 25) { endReason = 'circuit_breaker'; break; }
+          lane.consecutiveFails = 0;
+          if (state.proxyRotations > rotationLimit) { requestRunEnd('circuit_breaker'); break; }
           await push(progressCard(section('🔀 Fail Streak — Proxy Rotate', [
-            `› ${state.consecutiveFails} lagatar failures — IP issue lag raha hai.`,
-            `› Nayi IP: <code>${esc(next.label)}</code> (rotation #${state.proxyRotations}/25)`,
-            sub('Batch chal raha hai.'),
+            `› Lane ${lane.id} par ${laneFailStreak} lagatar failures — IP issue lag raha hai.`,
+            `› Sirf is lane ki nayi IP: <code>${esc(next.label)}</code> (rotation #${state.proxyRotations}/${rotationLimit})`,
+            sub('Baaki lanes apni IPs par chalti rahengi.'),
           ].join('\n'))), stopRows());
           continue;
         }
       }
 
-      // Gap between numbers (Swiggy ke liye thoda breathing room)
+      // Gap between numbers — ab per-lane/per-IP hai, global nahi. Ek lane
+      // ke gap ke dauran baaki 9 lanes OTP/process jaari rakhengi.
       if (state.fresh < target && !state.stopRequested) {
         const jitter = Math.floor(Math.random() * 3_000);
         await sleep(gapMs + jitter, () => state.stopRequested);
       }
+          } finally {
+            setLaneCurrent(lane, null);
+            if (lane.currentEntry) releaseClaimedEntry(lane.currentEntry);
+            lane.currentEntry = null;
+            notifyRouteChanged();
+          }
+        }
+      } catch (err) {
+        console.error(`[Autopilot] Lane ${lane.id}:`, err?.stack || err?.message);
+        state.lastError = String(err?.message || err);
+        requestRunEnd('firebase');
+      } finally {
+        if (lane.currentEntry) releaseClaimedEntry(lane.currentEntry);
+        lane.currentEntry = null;
+        setLaneCurrent(lane, null);
+        releaseLaneRoute(lane);
+      }
+    };
+
+    await Promise.all(lanes.map((lane) => runWorker(lane)));
+    for (const lane of lanes) releaseLaneRoute(lane);
+    activePhones.clear();
+    activeDeviceIds.clear();
+    activeByLane.clear();
+    syncActiveNumbers();
+    if (!runEndRequested && state.stopRequested) {
+      endReason = state.stopReason || 'manual';
     }
   } catch (err) {
     console.error('[Autopilot]', err?.stack || err?.message);
@@ -1347,6 +1828,10 @@ export async function startAutopilot(opts = {}) {
       ].join('\n')), doneRows());
     } catch {}
   } finally {
+    try { proxyPool._clearProxyReservations(); } catch {}
+    state.activeWorkers = 0;
+    state.activeNumbers = [];
+    state.current = null;
     state.running = false;
     state.stopRequested = false;
     state.finishedAt = Date.now();
@@ -1359,7 +1844,7 @@ export async function startAutopilot(opts = {}) {
 
   // Final summary (fresh session list ke saath)
   try {
-    await push(summaryCard(), doneRows());
+    await push(summaryCard(), doneRows(), { force: true });
   } catch {}
 
   return { ok: true, reason: endReason, snapshot: getAutopilotSnapshot() };

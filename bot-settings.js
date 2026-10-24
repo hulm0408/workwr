@@ -9,6 +9,7 @@ import { getDb, saveDb } from './store.js';
 
 const SPECS = {
   target:            { min: 1,    max: 5000, dflt: 100,    label: '🎯 Target (fresh sessions)' },
+  concurrency:       { min: 1,    max: 10,   dflt: 10,     label: '⚡ Parallel lanes (numbers ek saath)' },
   maxMinutes:        { min: 5,    max: 1440, dflt: 120,    label: '⏱ Max time (minutes)' },
   gapMs:             { min: 0,    max: 300000, dflt: 6000, label: 'Gap between numbers (ms)' },
   backoffMs:         { min: 30000, max: 7200000, dflt: 900000, label: 'Rate-limit backoff (ms)' },
@@ -19,6 +20,7 @@ const SPECS = {
 
 const ENV_MAP = {
   target: 'PREMIUM_BATCH_TARGET',
+  concurrency: 'PREMIUM_BATCH_CONCURRENCY',
   maxMinutes: 'PREMIUM_BATCH_MAX_MINUTES',
   gapMs: 'PREMIUM_BATCH_GAP_MS',
   backoffMs: 'PREMIUM_RATE_LIMIT_BACKOFF_MS',

@@ -2,6 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import crypto from 'crypto';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { fileURLToPath } from 'url';
 import puppeteer from 'puppeteer-core';
 import { updateAccount, getNextAutoUserName, cleanEssentialSwiggyCookies } from './store.js';
@@ -16,20 +17,69 @@ import * as proxyPool from './proxy-pool.js';
 //   Jab tak koi proxy set na ho — seedha direct (backward compatible).
 // ---------------------------------------------------------------------------
 let currentProxy = null;
+const bridgeProxyContext = new AsyncLocalStorage();
+
+// Parallel autopilot ke liye lane-local route context. Har lane apni proxy
+// reservation ke saath chalegi; ek lane ka rotate dusri lane ki IP, WAF
+// token route ya OTP session ko touch nahi karega. Context ke baghair
+// purana global route hi use hota hai (manual/sequential flows).
+export async function runWithBridgeProxy(proxy, fn, {
+  owner = '',
+  releaseOnExit = true,
+  wafTokenMode = '',
+} = {}) {
+  const ctx = {
+    proxy: proxy || null,
+    owner: String(owner || ''),
+    wafTokenMode: String(wafTokenMode || ''),
+  };
+  if (ctx.proxy?.id && ctx.owner && !proxyPool.reserveProxy(ctx.proxy.id, ctx.owner)) {
+    throw new Error(`Proxy route pehle se kisi aur lane ke paas reserved hai: ${ctx.proxy.id}`);
+  }
+  try {
+    return await bridgeProxyContext.run(ctx, fn);
+  } finally {
+    if (releaseOnExit && ctx.owner) {
+      proxyPool.releaseProxyReservationsForOwner(ctx.owner);
+    }
+  }
+}
+
+export function getBridgeProxyContextOwner() {
+  return bridgeProxyContext.getStore()?.owner || '';
+}
 
 export function setBridgeProxy(proxy) {
-  currentProxy = proxy || null;
-  return currentProxy;
+  const nextProxy = proxy || null;
+  const ctx = bridgeProxyContext.getStore();
+  if (!ctx) {
+    currentProxy = nextProxy;
+    return currentProxy;
+  }
+  const previousProxy = ctx.proxy || null;
+  if (ctx.owner) {
+    if (previousProxy?.id && previousProxy.id !== nextProxy?.id) {
+      proxyPool.releaseProxyReservation(previousProxy.id, ctx.owner);
+    }
+    if (nextProxy?.id) proxyPool.reserveProxy(nextProxy.id, ctx.owner);
+  }
+  ctx.proxy = nextProxy;
+  return ctx.proxy;
 }
 
 export function getBridgeProxy() {
-  return currentProxy;
+  const ctx = bridgeProxyContext.getStore();
+  return ctx ? (ctx.proxy || null) : currentProxy;
+}
+
+function shouldDeferWafSolveUntilChallenge() {
+  return bridgeProxyContext.getStore()?.wafTokenMode === 'defer-until-challenge';
 }
 
 // Saare swiggy.com fetch isi se guzarte hain — proxy ON ho to ProxyAgent,
 // warna normal fetch.
 async function fetchSwiggy(url, opts = {}) {
-  return proxyPool.fetchSwiggy(url, opts, currentProxy);
+  return proxyPool.fetchSwiggy(url, opts, getBridgeProxy());
 }
 
 // ---------------------------------------------------------------------------
@@ -205,6 +255,21 @@ let latestSharedWafAt = 0;
 const wafSolvePromises = new Map(); // routeKey → Promise<string>
 let wafSolveTail = Promise.resolve(''); // ek waqt me ek hi Chromium solver
 const WAF_CACHE_TTL_MS = 8 * 60 * 1000; // 8 minutes
+
+// Browser escalation solver wali hi FIFO tail use karti hai — parallel
+// lanes me solver aur escalation ke do Chromium ek saath launch nahi honge.
+async function withBrowserEscalationSlot(fn) {
+  const previous = wafSolveTail.catch(() => '');
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  wafSolveTail = previous.then(() => gate);
+  await previous;
+  try {
+    return await fn();
+  } finally {
+    release('');
+  }
+}
 
 export function _wafSolveRouteKey(proxy = null) {
   return proxy?.id ? `proxy:${proxy.id}` : 'direct';
@@ -818,7 +883,7 @@ export async function claimSwiggyBreakfastAndLateNightOffers(account, { force = 
   }
 }
 
-async function launchStealthSwiggyBrowser(routeProxy = currentProxy) {
+async function launchStealthSwiggyBrowser(routeProxy = getBridgeProxy()) {
   if (!CHROME_PATH || !_exists(CHROME_PATH)) {
     throw new Error(
       'Chrome/Chromium nahi mila is machine par. Google Chrome install karo, ' +
@@ -1050,7 +1115,7 @@ function burnSharedWafToken() {
 // Challenge ke baad SIRF wahi token jalao jo asal route par use hua tha.
 // Pehle proxy mode me bhi sirf shared/direct cache saaf hota tha — per-proxy
 // jala token cache me reh jata aur Android retry wahi dobara bhej deti thi.
-export function burnCurrentWafToken(proxy = currentProxy) {
+export function burnCurrentWafToken(proxy = getBridgeProxy()) {
   if (proxy?.id) {
     try { proxyPool.invalidateProxyToken(proxy.id); } catch {}
     return;
@@ -1060,8 +1125,8 @@ export function burnCurrentWafToken(proxy = currentProxy) {
 
 function freshWafTokenForRequests() {
   // Proxy active = per-proxy token
-  if (currentProxy?.id) {
-    return proxyPool.getProxyToken(currentProxy.id) || '';
+  if (getBridgeProxy()?.id) {
+    return proxyPool.getProxyToken(getBridgeProxy().id) || '';
   }
   try {
     const pooled = wafPool.getTokenSync?.() || '';
@@ -1222,7 +1287,11 @@ async function postSwiggyAuthJson(session, endpointUrl, payload = {}, { timeoutM
   // free me isi se protected.
   if (!session.wafToken) {
     session.wafToken = freshWafTokenForRequests();
-    if (!session.wafToken && allowBrowserEscalation && canUseStealthBrowser()) {
+    // Parallel lanes me cached token na ho to pehle HTTP attempt ko ek hi
+    // Chromium solver ki FIFO queue me minutes tak mat roko. Pehla send
+    // turant jayega; agar asal WAF challenge aaya tab neeche wali recovery
+    // token solve/rotate/browser escalation karegi.
+    if (!session.wafToken && !shouldDeferWafSolveUntilChallenge() && allowBrowserEscalation && canUseStealthBrowser()) {
       try { session.wafToken = await getLiveSwiggyWafToken(); } catch {}
     }
   }
@@ -1279,11 +1348,11 @@ async function postSwiggyAuthJson(session, endpointUrl, payload = {}, { timeoutM
   //
   // Direct mode: naya live token lo aur EK baar dobara bhejo + circuit-breaker.
   if (allowBrowserEscalation && isAwsWafChallengeResponse(out.status, out.rawText, out.headers)) {
-    if (currentProxy?.id) {
+    if (getBridgeProxy()?.id) {
       // Is proxy ko "hot" mark karo (thodi der ke liye side par), phir
       // turant doosri proxy par retry.
-      try { proxyPool.markProxyWafHit(currentProxy.id, 3 * 60_000); } catch {}
-      const nextProxy = proxyPool.pickProxy({ excludeIds: [currentProxy.id] });
+      try { proxyPool.markProxyWafHit(getBridgeProxy().id, 3 * 60_000); } catch {}
+      const nextProxy = proxyPool.pickProxy({ excludeIds: [getBridgeProxy().id] });
       if (nextProxy) {
         setBridgeProxy(nextProxy);
         session.wafToken = ''; // nayi IP = naya token chahiye
@@ -1309,7 +1378,7 @@ async function postSwiggyAuthJson(session, endpointUrl, payload = {}, { timeoutM
 
   // Auto-recover 3: Optional Stealth Browser escalation ONLY if still WAF-challenged AND local Chromium exists!
   if (allowBrowserEscalation && isAwsWafChallengeResponse(out.status, out.rawText, out.headers) && canUseStealthBrowser()) {
-    try {
+    const browserEscalationOut = await withBrowserEscalationSlot(async () => {
       if (!session.page || !session.browser?.connected) {
         const launched = await launchStealthSwiggyBrowser();
         session.browser = launched.browser;
@@ -1352,18 +1421,19 @@ async function postSwiggyAuthJson(session, endpointUrl, payload = {}, { timeoutM
       for (const c of afterCookies) {
         if (c?.name && c?.value && c.name !== 'aws-waf-token') session.cookieMap.set(c.name, c.value);
       }
-      if (currentProxy?.id && isAwsWafChallengeResponse(browserOut?.status, browserOut?.rawText, browserOut?.headers)) {
-        try { proxyPool.markProxyWafHit(currentProxy.id, 10 * 60_000); } catch {}
+      if (getBridgeProxy()?.id && isAwsWafChallengeResponse(browserOut?.status, browserOut?.rawText, browserOut?.headers)) {
+        try { proxyPool.markProxyWafHit(getBridgeProxy().id, 10 * 60_000); } catch {}
       }
       return browserOut;
-    } catch {}
+    }).catch(() => null);
+    if (browserEscalationOut) return browserEscalationOut;
   }
 
   // Final response bhi challenge hai to FINAL route ko pakka quarantine karo.
   // Pehle sirf pehli challenged proxy mark hoti thi — recovery wali doosri
   // proxy agar phir challenge de to wo pool me "clean" reh kar dobara ghumti thi.
-  if (currentProxy?.id && isAwsWafChallengeResponse(out?.status, out?.rawText, out?.headers)) {
-    try { proxyPool.markProxyWafHit(currentProxy.id, 10 * 60_000); } catch {}
+  if (getBridgeProxy()?.id && isAwsWafChallengeResponse(out?.status, out?.rawText, out?.headers)) {
+    try { proxyPool.markProxyWafHit(getBridgeProxy().id, 10 * 60_000); } catch {}
   }
 
   return out;
@@ -1409,7 +1479,7 @@ export async function prewarmBrowser() {
 
     // Prewarm ka browser jis route se launch hua, token bhi usi route ko.
     // Proxy browser ka token shared/direct pool me seed karna IP mismatch tha.
-    const routeProxy = currentProxy || null;
+    const routeProxy = getBridgeProxy() || null;
     const { browser, page } = await launchStealthSwiggyBrowser(routeProxy);
     await page.goto('https://www.swiggy.com/restaurants', { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
 
@@ -1448,7 +1518,7 @@ export async function prewarmBrowser() {
 // 80-90s solver har route par chalana batch ko maar deta tha.
 export async function getLiveSwiggyWafToken(forceRefresh = false, { solveBudgetMs = 35_000 } = {}) {
   const now = Date.now();
-  const routeProxy = currentProxy || null;
+  const routeProxy = getBridgeProxy() || null;
 
   // 🔀 PROXY MODE — token IP-bound hota hai, isliye per-proxy cache.
   if (routeProxy?.id) {
@@ -1468,7 +1538,7 @@ export async function getLiveSwiggyWafToken(forceRefresh = false, { solveBudgetM
       proxyPool.setProxyToken(pid, solved);
       // Solver ke beech route badal gaya ho to purani IP ka token nayi IP
       // ke caller ko mat chipkao.
-      return currentProxy?.id === pid ? solved : (proxyPool.getProxyToken(currentProxy?.id || '') || '');
+      return getBridgeProxy()?.id === pid ? solved : (proxyPool.getProxyToken(getBridgeProxy()?.id || '') || '');
     }
     // Chrome hi missing ho to ye proxy ki galti nahi — route ko quarantine
     // mat karo (Android/browser-less paths phir bhi chal sakte hain).
@@ -1503,20 +1573,20 @@ export async function getLiveSwiggyWafToken(forceRefresh = false, { solveBudgetM
 
   // 2. Coalesce concurrent requests — lekin SIRF usi route ke andar.
   const token = await solveWafTokenOnce(forceRefresh, null, { solveBudgetMs });
-  if (token && !currentProxy?.id) {
+  if (token && !getBridgeProxy()?.id) {
     latestSharedWafToken = token;
     latestSharedWafAt = Date.now();
     return token;
   }
-  return token && currentProxy?.id ? '' : (token || '');
+  return token && getBridgeProxy()?.id ? '' : (token || '');
 }
 
 // Chromium solver — ek valid `aws-waf-token` laata hai. Route snapshot
 // shuru me pakad lo: browser hamesha usi proxy se chalega jiske liye solve
-// maanga gaya tha, beech me global currentProxy badal bhi jaye to token
+// maanga gaya tha, beech me active bridge route badal bhi jaye to token
 // galat IP par nahi chipkega. Coalescing bhi per-route hai.
 // Time budget hard cap hai — pehle ek fail solve 80-90s kha sakta tha.
-async function solveWafTokenOnce(forceRefresh = false, routeProxy = currentProxy, { solveBudgetMs = 35_000 } = {}) {
+async function solveWafTokenOnce(forceRefresh = false, routeProxy = getBridgeProxy(), { solveBudgetMs = 35_000 } = {}) {
   const routeKey = _wafSolveRouteKey(routeProxy);
   const existing = wafSolvePromises.get(routeKey);
   if (existing) return existing;
@@ -1755,8 +1825,8 @@ export async function requestSwiggyOtpViaBridge(userId, phone, targetAcc = '', t
   const runPromise = (async () => {
     // 🔀 PROXY MODE: current proxy side par (cooldown) ho to TURANT doosri
     // proxy le lo — ZERO wait. Sab side par ho tabhi cooldown dikhao.
-    if (currentProxy?.id) {
-      const currentId = currentProxy.id;
+    if (getBridgeProxy()?.id) {
+      const currentId = getBridgeProxy().id;
       const curInfo = proxyPool.listProxies().find((p) => p.id === currentId);
       const wafCooling = (curInfo?.cooldownLeftMs || 0) > 5000;
       const solveCooling = (curInfo?.wafSolveCooldownLeftMs || 0) > 5000 && !curInfo?.tokenReady;
@@ -1931,7 +2001,7 @@ export async function requestSwiggyOtpViaBridge(userId, phone, targetAcc = '', t
 
         closeBridgeSessionCleanly(session);
         const parsedErr = parseSwiggyOtpError(signupInitResult);
-        console.warn(`[SwiggyBridge] Signup OTP send failed | phone=******${cleanPhone.slice(-4)} | code=${parsedErr.code} | http=${signupInitResult.status || 0} | proxy=${currentProxy?.label || 'direct'} | ${parsedErr.message}`);
+        console.warn(`[SwiggyBridge] Signup OTP send failed | phone=******${cleanPhone.slice(-4)} | code=${parsedErr.code} | http=${signupInitResult.status || 0} | proxy=${getBridgeProxy()?.label || 'direct'} | ${parsedErr.message}`);
         return {
           success: false,
           code: parsedErr.code,
@@ -1972,7 +2042,7 @@ export async function requestSwiggyOtpViaBridge(userId, phone, targetAcc = '', t
 
       closeBridgeSessionCleanly(session);
       const parsedErr = parseSwiggyOtpError(otpResult);
-      console.warn(`[SwiggyBridge] OTP send failed | phone=******${cleanPhone.slice(-4)} | code=${parsedErr.code} | http=${otpResult.status || 0} | proxy=${currentProxy?.label || 'direct'} | ${parsedErr.message}`);
+      console.warn(`[SwiggyBridge] OTP send failed | phone=******${cleanPhone.slice(-4)} | code=${parsedErr.code} | http=${otpResult.status || 0} | proxy=${getBridgeProxy()?.label || 'direct'} | ${parsedErr.message}`);
       return {
         success: false,
         code: parsedErr.code,
@@ -1997,7 +2067,7 @@ export async function requestSwiggyOtpViaBridge(userId, phone, targetAcc = '', t
         error: err.message,
         data: { statusMessage: err.message }
       });
-      console.warn(`[SwiggyBridge] OTP send exception | phone=******${cleanPhone.slice(-4)} | code=${diagnostic.code} | proxy=${currentProxy?.label || 'direct'} | ${err.message}`);
+      console.warn(`[SwiggyBridge] OTP send exception | phone=******${cleanPhone.slice(-4)} | code=${diagnostic.code} | proxy=${getBridgeProxy()?.label || 'direct'} | ${err.message}`);
       return {
         success: false,
         code: diagnostic.code,
@@ -2181,9 +2251,9 @@ export async function requestSwiggyDeleteOtpViaBridge(userId, phone, targetAcc =
     // 🔀 WAF ne phir bhi roka. Proxy mode = TURANT nayi IP (zero wait);
     // Direct mode = circuit-breaker + naya token + EK clean retry.
     if (isAwsWafChallengeResponse(checkOut.status, checkOut.rawText, checkOut.headers)) {
-      if (currentProxy?.id) {
-        try { proxyPool.markProxyWafHit(currentProxy.id, 3 * 60_000); } catch {}
-        const nextProxy = proxyPool.pickProxy({ excludeIds: [currentProxy.id] });
+      if (getBridgeProxy()?.id) {
+        try { proxyPool.markProxyWafHit(getBridgeProxy().id, 3 * 60_000); } catch {}
+        const nextProxy = proxyPool.pickProxy({ excludeIds: [getBridgeProxy().id] });
         if (nextProxy) {
           setBridgeProxy(nextProxy);
           delWafTok = await getLiveSwiggyWafToken().catch(() => delWafTok);
@@ -2545,11 +2615,7 @@ async function finalizeAuthenticatedSwiggyAccount(userId, session, authResult, {
   });
 
   const requestedAccountLabel = String(explicitName || session.targetAccName || '').trim();
-  const rawSlot = requestedAccountLabel && !/^user\s*\d+$/i.test(requestedAccountLabel)
-    ? requestedAccountLabel
-    : getNextAutoUserName();
   const cleanActual = String(resolvedName || session.signupName || '').replace(/\([^)]*\)/g, '').trim();
-  const finalName = rawSlot || cleanActual || getNextAutoUserName();
   const accKey = targetAcc || `acc_${phone}`;
 
   // Fast sub-second Today+Tomorrow offer pre-lock (bounded at 2.4s max so OTP verification NEVER stalls!)
@@ -2568,6 +2634,14 @@ async function finalizeAuthenticatedSwiggyAccount(userId, session, authResult, {
       new Promise(resolve => setTimeout(() => resolve({ success: false, pendingBackgroundLock: true }), 2400))
     ]);
   } catch {}
+
+  // Auto label offer-lock ke await ke BAAD lo. Parallel lanes me do
+  // finalizes ek saath aayein to dono await se pehle same "User N" nahi
+  // uthayengi; yahan se updateAccount tak koi await nahi hai.
+  const rawSlot = requestedAccountLabel && !/^user\s*\d+$/i.test(requestedAccountLabel)
+    ? requestedAccountLabel
+    : getNextAutoUserName();
+  const finalName = rawSlot || cleanActual || getNextAutoUserName();
 
   const savedData = {
     name: finalName,

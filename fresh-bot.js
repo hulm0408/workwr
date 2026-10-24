@@ -145,6 +145,7 @@ function runningCard(snap, stageText = '') {
   return section('● Autopilot RUNNING', [
     field('Runtime', fmtDuration(snap.elapsedMs)),
     field('Target', String(snap.target)),
+    field('⚡ Parallel lanes', `${snap.activeWorkers || 0}/${snap.concurrency || 1} active`),
     stageText || '',
     ``,
     field('Processed', String(snap.processed)),
@@ -155,9 +156,11 @@ function runningCard(snap, stageText = '') {
     (snap.scanning || snap.scanChecked)
       ? field('🔎 Device scan', `pass ${snap.scanPass || 1}: ${snap.scanUniqueChecked || 0}/${snap.scanTotalDevices || 0} unique · probes ${snap.scanTotalProbes || snap.scanChecked || 0} · window ≤${fmtDuration(snap.scanWindowMs || 0)} · ${snap.scanBestActivityMs ? `scan ke waqt best SMS ~${fmtDuration(snap.scanBestActivityAgeMs || Math.max(0, Date.now() - snap.scanBestActivityMs))} purani · ` : ''}${snap.scanFresh || 0} fresh ready${snap.scanning ? ' · scanning…' : ''}`)
       : '',
-    snap.current
-      ? `📍 <b>Abhi:</b> <code>${esc(snap.current.phone)}</code> (${fmtDuration(Date.now() - snap.current.startedAt)})`
-      : (snap.scanning ? '🔎 Zinda devices dhoondh raha hoon (parallel scan)…' : ''),
+    (snap.activeNumbers?.length)
+      ? `📍 <b>Abhi ${snap.activeNumbers.length} lanes:</b>\n${snap.activeNumbers.slice(0, 10).map((n) => `• <code>${esc(n.phone)}</code> · lane ${n.laneId || '?'} · ${esc(n.proxyLabel || 'direct')} (${fmtDuration(Date.now() - n.startedAt)})`).join('\n')}`
+      : (snap.current
+        ? `📍 <b>Abhi:</b> <code>${esc(snap.current.phone)}</code> (${fmtDuration(Date.now() - snap.current.startedAt)})`
+        : (snap.scanning ? '🔎 Zinda devices dhoondh raha hoon (parallel scan)…' : '')),
     snap.lastError ? field('Last error', snap.lastError) : '',
   ].filter(Boolean).join('\n'));
 }
@@ -208,6 +211,7 @@ function settingsCard() {
     field('🔀 Proxies', ps.enabled ? `${ps.enabledCount}/${ps.total} ON — ${ps.rotation}` : 'OFF (rukna pad sakta hai)'),
     ``,
     field('🎯 Target', `${bs.getSetting('target')} fresh`),
+    field('⚡ Parallel lanes', `${bs.getSetting('concurrency')} numbers/IPs ek saath`),
     field('⏱ Max time', `${bs.getSetting('maxMinutes')} min`),
     field('🚦 Gap', bs.fmtSetting('gapMs')),
     field('⏳ OTP wait', bs.fmtSetting('otpWaitMs')),
@@ -221,6 +225,7 @@ const settingsRows = () => [
   [{ text: '🔥 Firebase Sources', callback_data: 'ap_sources', style: 'primary' }],
   [{ text: `🔀 Proxies: ${proxyPool.proxySummary().enabledCount}`, callback_data: 'ap_proxies', style: 'primary' }],
   [{ text: `🎯 Target: ${bs.getSetting('target')}`, callback_data: 'ap_pick_target' }],
+  [{ text: `⚡ Parallel: ${bs.getSetting('concurrency')} lanes`, callback_data: 'ap_pick_parallel' }],
   [{ text: `⏱ Max: ${bs.getSetting('maxMinutes')}m`, callback_data: 'ap_pick_time' }],
   [{ text: `🚦 Gap: ${bs.fmtSetting('gapMs')}`, callback_data: 'ap_pick_gap' }],
   [{ text: `📴 Offline: ${bs.getSetting('allowOffline') ? 'ON' : 'OFF'}`, callback_data: 'ap_toggle_offline' }],
@@ -340,6 +345,7 @@ const pickRows = (prefix, opts, extra = []) => [
 ];
 
 const TARGET_PRESETS = [10, 25, 50, 100, 200, 500].map((v) => ({ label: `${v}`, v }));
+const PARALLEL_PRESETS = [1, 3, 5, 10].map((v) => ({ label: `${v}`, v }));
 const TIME_PRESETS = [15, 30, 60, 120, 240, 480].map((v) => ({ label: `${v}m`, v }));
 const GAP_PRESETS = [
   { label: '0s', v: 0 }, { label: '5s', v: 5000 }, { label: '15s', v: 15000 },
@@ -956,6 +962,23 @@ bot.action('ap_custom_target', async (ctx) => {
     `Kitne fresh sessions chahiye? <b>Number likh kar bhejo</b> (1–5000):`,
     `Jaise: <code>150</code>`,
   ].join('\n')), [[{ text: '↩️ Cancel', callback_data: 'ap_settings', style: 'primary' }]]);
+});
+
+bot.action('ap_pick_parallel', async (ctx) => {
+  if (!(await gate(ctx))) return;
+  await ctx.answerCbQuery().catch(() => {});
+  await editOrSend(ctx, section('⚡ Parallel Lanes — ek saath kitne numbers?', [
+    `Abhi: <b>${bs.getSetting('concurrency')}</b> lanes`,
+    ``,
+    sub('Har active lane alag number + alag proxy/IP legi. Jitni usable IPs hongi utni lanes asal me chalengi; proxy na ho to direct sirf 1 lane hogi.'),
+  ].join('\n')), pickRows('ap_set_parallel_', PARALLEL_PRESETS));
+});
+
+bot.action(/^ap_set_parallel_(\d+)$/, async (ctx) => {
+  if (!(await gate(ctx))) return;
+  const r = bs.setSetting('concurrency', Number(ctx.match[1]));
+  await ctx.answerCbQuery(r.ok ? `⚡ Parallel = ${r.value} lanes` : `❌ ${r.error}`, !r.ok && { show_alert: true }).catch(() => {});
+  await editOrSend(ctx, settingsCard(), settingsRows());
 });
 
 bot.action('ap_pick_time', async (ctx) => {

@@ -169,10 +169,10 @@ export async function processSingleNumber({
   const aborted = () => Boolean(shouldAbort && shouldAbort());
 
   const waitCfg = {
-    waitMs: Number(otpCfg.waitMs ?? 10_000),
+    waitMs: Number(otpCfg.waitMs ?? 3_000),
     timeoutMs: Number(otpCfg.timeoutMs ?? 90_000),
-    pollMs: Number(otpCfg.pollMs ?? 2_500),
-    acceptAnyAfterMs: Number(otpCfg.acceptAnyAfterMs ?? 30_000),
+    pollMs: Number(otpCfg.pollMs ?? 1_500),
+    acceptAnyAfterMs: Number(otpCfg.acceptAnyAfterMs ?? 15_000),
   };
 
   const mapVerify = (r, failKind) => {
@@ -195,9 +195,18 @@ export async function processSingleNumber({
     const activeWindowMs = Number.isFinite(activeWindowRaw) && activeWindowRaw > 0 ? activeWindowRaw : 0;
     if (deviceIds?.length && activeWindowMs > 0) {
       let lastActivityMs = null;
-      for (const devId of deviceIds) {
-        const t = await fetchDeviceLastActivityMs(devId).catch(() => null);
-        if (t && (!lastActivityMs || t > lastActivityMs)) lastActivityMs = t;
+      // Engine ka parallel scan pehle hi ye device probe kar chuka hai to
+      // wahin ka fresh result use karo (dobara Firebase GET = fuzool time).
+      // Sirf tab jab precheck 45s se purana na ho.
+      const preTs = Number(otpCfg.precheckedLastActivityMs || 0) || null;
+      const preAt = Number(otpCfg.precheckedAt || 0);
+      if (preTs && preAt && (Date.now() - preAt) < 45_000) {
+        lastActivityMs = preTs;
+      } else {
+        for (const devId of deviceIds) {
+          const t = await fetchDeviceLastActivityMs(devId).catch(() => null);
+          if (t && (!lastActivityMs || t > lastActivityMs)) lastActivityMs = t;
+        }
       }
       const ageMs = lastActivityMs ? Date.now() - lastActivityMs : Infinity;
       if (!(ageMs <= activeWindowMs)) {
@@ -242,7 +251,7 @@ export async function processSingleNumber({
             ? '→ Number Swiggy par pehle se nahi hai — seedha naya account banega.'
             : '→ Purana account mila: login → Settings → Delete Account → phir fresh registration.',
           '',
-          sub('⏳10 second wait… phir Firebase se OTP padhunga (max ~90s aur).'),
+          sub('⏳ OTP bhej diya — Firebase inbox live poll kar raha hoon (jaise hi SMS forward hoga, code mil jayega).'),
         ].join('\n')
       )
     );
@@ -253,7 +262,7 @@ export async function processSingleNumber({
       userId, phone, deviceIds, seen: seen1, waitCfg, report: say, shouldAbort,
       waitText: section('⏳ OTP Wait — Step 1/3', [
         `📱 <b>Number:</b> <code>${esc(phone)}</code>`,
-        sub('10 second ruk ke Firebase SMS inbox padh raha hoon…'),
+        sub('Firebase SMS inbox live poll kar raha hoon…'),
       ].join('\n')),
       retryText: section('↻ Verify Retry', [
         `📱 <b>Number:</b> <code>${esc(phone)}</code>`,
@@ -349,7 +358,7 @@ export async function processSingleNumber({
       userId, phone, deviceIds, seen: seen3, waitCfg, report: say, shouldAbort,
       waitText: section('⏳ Fresh OTP Wait — Step 3/3', [
         `📱 <b>Number:</b> <code>${esc(phone)}</code>`,
-        sub('Fresh registration OTP —10 second wait + inbox poll…'),
+        sub('Fresh registration OTP — inbox live poll kar raha hoon…'),
       ].join('\n')),
       retryText: section('↻ Fresh Verify Retry', [
         `📱 <b>Number:</b> <code>${esc(phone)}</code>`,

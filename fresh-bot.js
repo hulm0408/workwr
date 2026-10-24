@@ -5,7 +5,7 @@
 //
 // Ek START ke baad ye apne aap chalta hai:
 //   1️⃣ Firebase pool (clients/) se number uthata — online devices pehle
-//   2️⃣ Swiggy OTP bhejta hai → 10s wait → isi Firebase (messages/) se
+//   2️⃣ Swiggy OTP bhejta hai → isi Firebase (messages/) se live poll karke
 //      OTP padh kar khud paste karta hai
 //   3️⃣ 🆕 naya number = register + session save
 //      ♻️ purana number = login → delete account → usi number se fresh login
@@ -118,7 +118,7 @@ function startCard() {
     `baaki sab ye khud karega:`,
     ``,
     `1️⃣ Firebase pool se number (online pehle)`,
-    `2️⃣ Swiggy OTP → <b>10s wait</b> → OTP khud padh kar paste`,
+    `2️⃣ Swiggy OTP → <b>live inbox poll</b> → OTP khud padh kar paste`,
     `3️⃣ 🆕 naya = register · ♻️ purana = delete → fresh login`,
     `4️⃣ charges/order/wallet block = <b>SKIP</b> · WAF = <b>auto token-refresh + retry</b>`,
     ``,
@@ -145,10 +145,13 @@ function runningCard(snap, stageText = '') {
     field('✅ Fresh', `${snap.fresh}  (naye: ${snap.freshNew} · delete+fresh: ${snap.freshAfterDelete})`),
     field('⚠️ Skipped', `${snap.skipped} · deferred: ${snap.deferred} · 📴 stale devices: ${snap.staleSkips || 0}`),
     field('× Failed', `${snap.failed} · rate-limit: ${snap.rateStrikes}`),
-    field('Pool', `${snap.poolFresh} fresh / ${snap.poolTotal} numbers`),
+    field('Pool', snap.poolTotal ? `${snap.poolFresh} fresh / ${snap.poolTotal} numbers` : 'load ho raha hai…'),
+    (snap.scanning || snap.scanChecked)
+      ? field('🔎 Device scan', `${snap.scanChecked || 0} check · ${snap.scanFresh || 0} fresh ready${snap.scanning ? ' · scanning…' : ''}`)
+      : '',
     snap.current
       ? `📍 <b>Abhi:</b> <code>${esc(snap.current.phone)}</code> (${fmtDuration(Date.now() - snap.current.startedAt)})`
-      : '',
+      : (snap.scanning ? '🔎 Zinda devices dhoondh raha hoon (parallel scan)…' : ''),
     snap.lastError ? field('Last error', snap.lastError) : '',
   ].filter(Boolean).join('\n'));
 }
@@ -166,6 +169,7 @@ function summaryCard(snap) {
     field('⚠️ Skipped', `${snap.skipped} · deferred: ${snap.deferred} · 📴 stale devices: ${snap.staleSkips || 0}`),
     field('× Failed', `${snap.failed} · rate-limit: ${snap.rateStrikes}`),
     field('Pool', `${snap.poolFresh} fresh / ${snap.poolTotal} numbers`),
+    snap.scanChecked ? field('🔎 Devices check kiye', String(snap.scanChecked)) : '',
     snap.lastError ? field('Last error', snap.lastError) : '',
     freshList ? `` : '',
     freshList ? `▤ <b>Latest fresh sessions:</b>` : '',

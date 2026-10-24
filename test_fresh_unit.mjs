@@ -554,4 +554,78 @@ console.log('device last-seen gate (mare hue device par OTP waste nahi):');
   ok(r3.kind === 'failed_otp_send', 'activeWindowMs=0 → gate off, stale bhi aage gaya');
 }
 
+// ---------------------------------------------------------------------------
+console.log('parallel device scan (hot-queue) + pipeline precheck:');
+{
+  const fbn = await import('./firebase-numbers.js');
+  const pipe = await import('./number-pipeline.js');
+  const now = Date.now();
+  const mkEntries = (n) => Array.from({ length: n }, (_, i) => ({
+    phone: String(9000000000 + i), deviceId: `D${i}`, online: true,
+  }));
+
+  // fetchDevicesLastActivityMs — parallel probe + dedupe + error → null
+  {
+    const calls = [];
+    const probe = async (id) => {
+      calls.push(id);
+      if (id === 'boom') throw new Error('fb gone');
+      return id === 'hot' ? now - 1000 : null;
+    };
+    const m = await fbn.fetchDevicesLastActivityMs(['hot', 'cold', 'hot', 'boom', ''], { concurrency: 2, probe });
+    ok(m.get('hot') === now - 1000 && m.get('cold') === null && m.get('boom') === null, 'probe map sahi (error → null)');
+    ok(calls.filter((c) => c === 'hot').length === 1 && calls.length === 3, 'duplicate deviceIds dedupe hue');
+  }
+
+  // scanFreshDevices — window ke andar fresh, sorted desc, want milte hi stop
+  {
+    const probe = async (id) => (id === 'D3' ? now - 5000 : id === 'D7' ? now - 2000 : null);
+    const r = await fbn.scanFreshDevices(mkEntries(500), { windowMs: 60_000, want: 2, chunkSize: 50, maxProbe: 800, probe });
+    ok(r.widened === false && r.fresh.length === 2, 'window ke andar 2 fresh mile (widen nahi hua)');
+    ok(r.fresh[0].entry.deviceId === 'D7' && r.fresh[1].entry.deviceId === 'D3', 'sabse taaza device sabse pehle (sorted)');
+    ok(r.checked === 50 && r.exhausted === false, 'want milte hi scan ruk gaya (poora pool scan nahi kiya)');
+    ok(r.probedDeviceIds.length === 50, 'probedDeviceIds wapas mile (engine dubara probe nahi karega)');
+  }
+
+  // scanFreshDevices — window me koi na mile to widen (best-available), 15m+ purane exclude
+  {
+    const probe = async (id) =>
+      id === 'D40' ? now - 5 * 60_000 :
+      id === 'D90' ? now - 10 * 60_000 :
+      id === 'D60' ? now - 2 * 3600_000 : null;
+    const r = await fbn.scanFreshDevices(mkEntries(300), { windowMs: 60_000, want: 8, chunkSize: 50, maxProbe: 120, maxWidenMs: 15 * 60_000, probe });
+    ok(r.widened === true, 'window empty → widen hua (batch atka nahi)');
+    ok(r.fresh.length === 2 && r.fresh[0].entry.deviceId === 'D40', 'widened me sabse taaza pehle, 2h-purana exclude');
+    ok(r.widestWindowMs > 60_000 && r.checked === 120, 'widestWindowMs asal age tak badha + maxProbe respect');
+  }
+
+  // scanFreshDevices — bilkul khali activity → fresh [] + exhausted
+  {
+    const r = await fbn.scanFreshDevices(mkEntries(10), { windowMs: 60_000, probe: async () => null });
+    ok(r.fresh.length === 0 && r.exhausted === true && r.checked === 10, 'kuch na mile → fresh [] + exhausted');
+    const r2 = await fbn.scanFreshDevices([{ phone: '9812345670' }], { probe: async () => now });
+    ok(r2.totalDevices === 0 && r2.fresh.length === 0, 'deviceId bina entries skip');
+  }
+
+  // Pipeline precheck — engine ke scan ka result reuse (live stale data par bhi pass)
+  {
+    // mock devStale ki live activity purani (2025) hai. Fresh precheck diya to
+    // gate usi par pass hona chahiye (refetch karta to deferred ho jata).
+    const r1 = await pipe.processSingleNumber({
+      userId: 'test',
+      entry: { phone: '12345', deviceId: 'devStale', online: true },
+      otpCfg: { activeWindowMs: 60_000, waitMs: 0, timeoutMs: 100, precheckedLastActivityMs: now - 3000, precheckedAt: now },
+    });
+    ok(r1.kind === 'failed_otp_send', 'fresh precheck → gate pass bina refetch ke (bridge tak gaya)');
+
+    // Precheck EXPired (2 min purana) → live refetch → device asal me stale → deferred
+    const r2 = await pipe.processSingleNumber({
+      userId: 'test',
+      entry: { phone: '12345', deviceId: 'devStale', online: true },
+      otpCfg: { activeWindowMs: 60_000, waitMs: 0, timeoutMs: 100, precheckedLastActivityMs: now - 3000, precheckedAt: now - 120_000 },
+    });
+    ok(r2.kind === 'deferred_device_stale', 'expired precheck → live refetch → stale defer');
+  }
+}
+
 console.log(`\n✅ ALL PASSED — ${passed} checks`);

@@ -378,11 +378,14 @@ export async function fetchOtpCandidates(phone, opts = {}) {
     ? opts.deviceIds
     : await findDeviceIdsForPhone(phone);
 
-  for (const deviceId of deviceIds) {
-    let node = null;
+  // Saari reads parallel — pehle ye sequential thi (har poll par ~10 GETs ek
+  // ke peeche ek = 1-2s fuzool latency). Ab saari ek saath fire hoti hain.
+  const deviceNodes = await Promise.all(deviceIds.map(async (deviceId) => {
     try {
-      node = await fbGet(`${messagesPath}/${seg(deviceId)}`, { orderBy: '"$key"', limitToLast: 50 });
-    } catch { node = null; }
+      return [deviceId, await fbGet(`${messagesPath}/${seg(deviceId)}`, { orderBy: '"$key"', limitToLast: 50 })];
+    } catch { return [deviceId, null]; }
+  }));
+  for (const [deviceId, node] of deviceNodes) {
     if (!node) continue;
     const entries = Array.isArray(node)
       ? node.map((m, i) => [i, m])
@@ -396,9 +399,10 @@ export async function fetchOtpCandidates(phone, opts = {}) {
 
   // 2) FAST PATH — seedha OTP code likhne wale forwarder ke liye: otp/<number>
   const otpPath = cleanPath(_source?.otpPath || env('FIREBASE_OTP_PATH', 'otp'));
-  for (const variant of phoneVariants(phone)) {
-    let node = null;
-    try { node = await fbGet(`${otpPath}/${seg(variant)}`); } catch { node = null; }
+  const otpNodes = await Promise.all(phoneVariants(phone).map(async (variant) => {
+    try { return [variant, await fbGet(`${otpPath}/${seg(variant)}`)]; } catch { return [variant, null]; }
+  }));
+  for (const [variant, node] of otpNodes) {
     if (node === null || node === undefined) continue;
     if (node && typeof node === 'object' && !Array.isArray(node)) {
       const inner = node.code ?? node.otp ?? node.value ?? null;
@@ -419,9 +423,10 @@ export async function fetchOtpCandidates(phone, opts = {}) {
 
   // 3) LEGACY sms path (purane shapes)
   const smsPath = cleanPath(_source?.smsPath || env('FIREBASE_SMS_PATH', 'sms'));
-  for (const variant of phoneVariants(phone)) {
-    let node = null;
-    try { node = await fbGet(`${smsPath}/${seg(variant)}`); } catch { node = null; }
+  const smsNodes = await Promise.all(phoneVariants(phone).map(async (variant) => {
+    try { return [variant, await fbGet(`${smsPath}/${seg(variant)}`)]; } catch { return [variant, null]; }
+  }));
+  for (const [variant, node] of smsNodes) {
     if (node === null || node === undefined) continue;
     if (Array.isArray(node)) {
       node.forEach((m, i) => {
@@ -498,6 +503,100 @@ export async function fetchDeviceLastActivityMs(deviceId) {
   return best;
 }
 
+// Parallel last-activity probe — 3000-device pool me ek-ek karke probe karna
+// minutes leta tha (aur card par kuch dikhta hi nahi tha, bot phasa lagta tha).
+// Concurrency ke saath ~24 devices ek saath check hote hain.
+// Returns Map<deviceId, tsMs|null>. `probe` tests/inject ke liye.
+export async function fetchDevicesLastActivityMs(deviceIds = [], { concurrency = 24, probe = null } = {}) {
+  const out = new Map();
+  const ids = [...new Set((deviceIds || []).map((d) => String(d || '')).filter(Boolean))];
+  const fn = typeof probe === 'function' ? probe : fetchDeviceLastActivityMs;
+  let i = 0;
+  const workerCount = Math.max(1, Math.min(Number(concurrency) || 1, ids.length || 1));
+  const workers = Array.from({ length: workerCount }, async () => {
+    while (i < ids.length) {
+      const id = ids[i++];
+      try { out.set(id, await fn(id)); } catch { out.set(id, null); }
+    }
+  });
+  await Promise.all(workers);
+  return out;
+}
+
+// Hot-queue scanner: pool entries me se wo numbers dhoondho jinke device ki
+// last activity `windowMs` ke andar hai — chunks me parallel probe, `want`
+// milte hi ruk jata hai (poora pool scan zaruri nahi). Window me kuch na mile
+// to probed devices me se SABSE TAAZE (maxWidenMs ke andar) return kardo —
+// batch "koi fresh nahi" par atka rehne ke bajaye best-available par chalega.
+// Returns: { fresh:[{entry,lastActivityMs}], checked, probedDeviceIds,
+//            widestWindowMs, widened, exhausted, totalDevices }
+export async function scanFreshDevices(entries = [], opts = {}) {
+  const windowMs = Number(opts.windowMs ?? 60_000);
+  const maxWidenMs = Number(opts.maxWidenMs ?? 15 * 60_000);
+  const want = Math.max(1, Number(opts.want ?? 8));
+  const chunkSize = Math.max(20, Number(opts.chunkSize ?? 120));
+  const maxProbe = Math.max(chunkSize, Number(opts.maxProbe ?? 800));
+  const concurrency = Math.max(1, Number(opts.concurrency ?? 24));
+  const probe = typeof opts.probe === 'function' ? opts.probe : null;
+  const onProgress = typeof opts.onProgress === 'function' ? opts.onProgress : null;
+
+  const byDevice = new Map(); // deviceId → entries[]
+  for (const e of entries || []) {
+    if (!e?.deviceId) continue;
+    if (!byDevice.has(e.deviceId)) byDevice.set(e.deviceId, []);
+    byDevice.get(e.deviceId).push(e);
+  }
+  const deviceIds = [...byDevice.keys()];
+
+  const probed = [];          // { entry, lastActivityMs } — har probed device ke numbers
+  const probedDeviceIds = [];
+  const fresh = [];
+  let checked = 0;
+
+  for (let off = 0; off < deviceIds.length && checked < maxProbe && fresh.length < want; off += chunkSize) {
+    const chunk = deviceIds.slice(off, off + Math.min(chunkSize, maxProbe - checked));
+    const res = await fetchDevicesLastActivityMs(chunk, { concurrency, probe });
+    checked += chunk.length;
+    probedDeviceIds.push(...chunk);
+    const now = Date.now();
+    for (const devId of chunk) {
+      const ts = res.get(devId) ?? null;
+      for (const entry of byDevice.get(devId) || []) {
+        probed.push({ entry, lastActivityMs: ts });
+        if (ts && (now - ts) <= windowMs) fresh.push({ entry, lastActivityMs: ts });
+      }
+    }
+    if (onProgress) {
+      try { onProgress({ checked, freshCount: fresh.length, totalDevices: deviceIds.length }); } catch {}
+    }
+  }
+
+  const exhausted = checked >= deviceIds.length;
+  if (fresh.length) {
+    fresh.sort((a, b) => (b.lastActivityMs || 0) - (a.lastActivityMs || 0));
+    return {
+      fresh: fresh.slice(0, want * 2), checked, probedDeviceIds,
+      widestWindowMs: windowMs, widened: false, exhausted, totalDevices: deviceIds.length,
+    };
+  }
+
+  // Widen — probed me se sabse taaze le lo (best-available, andhera nahi)
+  const now = Date.now();
+  const recent = probed
+    .filter((p) => p.lastActivityMs && (now - p.lastActivityMs) <= maxWidenMs)
+    .sort((a, b) => (b.lastActivityMs || 0) - (a.lastActivityMs || 0));
+  if (recent.length) {
+    const top = recent.slice(0, want);
+    return {
+      fresh: top, checked, probedDeviceIds,
+      widestWindowMs: Math.max(windowMs, now - (top[top.length - 1].lastActivityMs || now)),
+      widened: true, exhausted, totalDevices: deviceIds.length,
+    };
+  }
+
+  return { fresh: [], checked, probedDeviceIds, widestWindowMs: windowMs, widened: false, exhausted, totalDevices: deviceIds.length };
+}
+
 // OTP dispatch se PEHLE inbox ka snapshot — purane messages kabhi accept na hon.
 // { ids: Set<idKey>, codes: Set<6-digit> }
 export async function snapshotSeenOtpState(phone, opts = {}) {
@@ -546,13 +645,15 @@ function pickBestCandidate(cands, exclude, sinceTs, acceptAnyAfter) {
   return fresh.slice().sort((a, b) => (b.ts || 0) - (a.ts || 0))[0];
 }
 
-// Swiggy OTP dispatch se PEHLE call karo. Pehle `waitMs` (default 10s), phir
-// `timeoutMs` tak har `pollMs` pe Firebase padho. Milne par {code,...} warna {code:''}.
+// Swiggy OTP dispatch ke BAAD call karo. Chhota `waitMs` (default 3s — SMS
+// aane ka minimum time), phir `timeoutMs` tak har `pollMs` (1.5s) pe Firebase
+// padho. Snapshot (excludeIds) purane codes se bachata hai, isliye jaldi poll
+// shuru karna safe hai. Milne par {code,...} warna {code:''}.
 export async function waitForOtpCode(phone, opts = {}) {
-  const waitMs = Number(opts.waitMs ?? 10_000);
+  const waitMs = Number(opts.waitMs ?? 3_000);
   const timeoutMs = Number(opts.timeoutMs ?? 90_000);
-  const pollMs = Number(opts.pollMs ?? 2_500);
-  const acceptAnyAfterMs = Number(opts.acceptAnyAfterMs ?? 30_000);
+  const pollMs = Number(opts.pollMs ?? 1_500);
+  const acceptAnyAfterMs = Number(opts.acceptAnyAfterMs ?? 15_000);
   const exclude = normalizeExclude(opts.excludeIds ?? opts.exclude);
   const shouldAbort = typeof opts.shouldAbort === 'function' ? opts.shouldAbort : null;
   const sinceTs = typeof opts.sinceTs === 'number' ? opts.sinceTs : Date.now() - 20_000;

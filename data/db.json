@@ -43,11 +43,14 @@
     "list": []
   },
   "waf": {
-    "token": "fad4f338-b860-436f-864f-51879b36fe60:BQoAd4RqJBAMCQAA:orzVNbAvXMo71JgFuigRu0flPzKzhyVfKMRxYsAVGZ9gvt+knznHZp2kPbbQVwGnMGoBqlwC2ir2mg9Z9avvfS+Ktk5aSo4f0Le0vDjGXsA19czdOOJiP2veY584QpPcEUegvtROhQSkb3S08dN9jDyQQQKzhVNcyQQpLLHglB3VKkVEXJlJIzH9zzPYYVHc5l66muz2oSIGadG00UKQxyy4GeYaUBga1ZpQPWnhRv/79UwMTYkG+ZYxWTm88k31xiA98591QnhpIaIBa6+mQZkwUc5S70t76oC5taNbgSr6Kzrh4+Qc0N7gwCV6XZ5fAIxXgngfDd4=",
-    "acquiredAt": 1792833596884,
+    "token": "9d62ae68-7c5d-4de2-bae6-e06ef6f053fd:BQoAkmdqB9UBBwAA:86XsyRGConmVWtJz1mvQVe+9DU7w9RIeQeVKA/0rHmG7XwIJzw69H2ZFaGjVip/3cCMOWYYnFcB2k+d+mToIpgzkLeO2+Pb/R95HZb+OKx/YZqJct/zj5LDOsQHAY7bQbkxHzB7NO3mADnfTkxo/FabQYYAAGzcF/2DkktM3D48XWhND7TeHcTzji73UknalyhEPhZrzhLehhfkN1NGTj0BP2TJBrFzV94JbFfvoa+8G4bx1zwy2+nabvscngSjFsSEVakqX+MpzVisCQtb+HbMXFg5RBO9kEbM=",
+    "acquiredAt": 1792911391740,
     "source": "chromium",
     "cooldownUntil": 0,
     "hitStreak": 0,
     "windowStart": 0
+  },
+  "premiumFlow": {
+    "used": {}
   }
 }

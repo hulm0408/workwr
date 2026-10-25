@@ -95,6 +95,7 @@ const {
 const srcMod = await import('./firebase-sources.js');
 const bs = await import('./bot-settings.js');
 const px = await import('./proxy-pool.js');
+const keepAlive = await import('./keep-alive.js');
 
 // ---------------------------------------------------------------------------
 console.log('isFirebaseConfigured:');
@@ -582,6 +583,54 @@ ok(requestAutopilotStop('manual') === false, 'na chalne wale batch ko stop = fal
   ok(availableParallelLanes({ requested: 3, proxyEnabled: true, enabledProxyCount: 9 }) === 3,
     'user ki requested lane limit respect hoti hai');
   ok(parallelWorkerUserId('owner-1', 7) === 'owner-1:lane7', 'har lane ki bridge session ID alag');
+}
+
+// ---------------------------------------------------------------------------
+console.log('Render keep-alive (free Web Service neend rokna):');
+{
+  ok(keepAlive.resolveKeepAliveUrl({ RENDER_EXTERNAL_URL: 'https://demo-bot.onrender.com' }) === 'https://demo-bot.onrender.com/health',
+    'Render external URL root → /health');
+  ok(keepAlive.resolveKeepAliveUrl({ KEEP_ALIVE_URL: 'https://demo-bot.onrender.com/robots.txt' }) === 'https://demo-bot.onrender.com/health',
+    'robots.txt wala galat cron URL /health par fix');
+  ok(keepAlive.resolveKeepAliveUrl({ KEEP_ALIVE_URL: 'https://demo-bot.onrender.com/custom-health' }) === 'https://demo-bot.onrender.com/custom-health',
+    'custom health path respect');
+  ok(keepAlive.resolveKeepAliveUrl({ RENDER_EXTERNAL_HOSTNAME: 'demo-bot.onrender.com' }) === 'https://demo-bot.onrender.com/health',
+    'Render hostname fallback');
+  ok(keepAlive.resolveKeepAliveUrl({ KEEP_ALIVE_URL: 'http://localhost:10000/health' }) === '',
+    'localhost ping reject (Render idle timer reset nahi hota)');
+  ok(keepAlive.isKeepAliveEnabled({ KEEP_ALIVE: '0' }) === false, 'KEEP_ALIVE=0 par disable');
+  ok(keepAlive.keepAliveIntervalMs({}) === 5 * 60_000, 'default interval 5 min (15 min neend se pehle)');
+  ok(keepAlive.keepAliveIntervalMs({ KEEP_ALIVE_INTERVAL_MINUTES: '30' }) === 14 * 60_000,
+    'interval max 14 min par clamp (15+ par service so jayegi)');
+
+  let scheduled = null;
+  const fakeSetTimeout = (fn, ms) => {
+    scheduled = { fn, ms };
+    return { unref() {} };
+  };
+  const fakeClearTimeout = () => { scheduled = null; };
+  let pingCalls = 0;
+  let pingShouldFail = false;
+  const handle = keepAlive.startKeepAlive({
+    env: { RENDER_EXTERNAL_URL: 'https://demo-bot.onrender.com' },
+    fetchImpl: async () => {
+      pingCalls++;
+      if (pingShouldFail) throw new Error('network down');
+      return { ok: true, status: 200, text: async () => '{"ok":true}' };
+    },
+    logger: { log() {}, warn() {} },
+    setTimeoutImpl: fakeSetTimeout,
+    clearTimeoutImpl: fakeClearTimeout,
+  });
+  ok(handle.getState().enabled === true && scheduled?.ms === 30_000, 'self-ping schedule hota hai');
+  await scheduled.fn();
+  ok(pingCalls === 1 && handle.getState().successes === 1 && scheduled?.ms === 5 * 60_000,
+    'successful ping ke baad agla 5 min par');
+  pingShouldFail = true;
+  await scheduled.fn();
+  ok(handle.getState().failures === 1 && scheduled?.ms === 30_000, 'failed ping 30s me retry (neend se pehle)');
+  handle.stop();
+  ok(scheduled === null, 'stop par timer clear');
 }
 
 // ---------------------------------------------------------------------------

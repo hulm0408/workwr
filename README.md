@@ -72,6 +72,20 @@ Repo me sab ready hai: **`Dockerfile`** (Chrome ke saath) + **`render.yaml`**
 5. Telegram me `/start`, phir **`/diag`** — sab ✅ aana chahiye (Chrome
    Docker image me pehle se hai).
 
+**Free Web Service par neend na aaye:** Render Free Web Service ko 15
+minute inbound HTTP traffic na mile to service so jati hai; sirf Telegram
+polling use jagata nahi rakhti. Bot ab khud Render ke
+`RENDER_EXTERNAL_URL` se public **`/health`** ko har 5 minute ping karta
+hai (localhost ping is timer ko reset nahi karta). `/diag` me
+**❤️ Keep-alive ✅ ON** dikhna chahiye. External cron backup bhi isiliye
+rakho: `GET https://<service>.onrender.com/health` har **5–10 min**, timeout
+kam se kam **120s**. Cron URL me **`/robots.txt` mat lagao** — spun-down
+service ko woh jagata nahi. Render ke Health Check Path me bhi `/health`
+rakho; `/health/ready` alag se Telegram polling ready hone par hi 200 deta
+hai. Soyi hui service khud ko akele nahi jaga sakti, isliye ek
+successful external ping zaroori hai — uske baad built-in ping use phir
+sone nahi dega (free monthly instance-hours baki hone chahiye).
+
 **Plan ki baat:** `render.yaml` me **Background Worker (Starter)** + **1GB
 persistent disk** (`/app/data`) set hai — yahi sahi combo hai:
 - **Worker** = 24×7 chalta hai. Free **Web Service** 15 min me so jati hai

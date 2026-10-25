@@ -53,6 +53,8 @@ const proxyPool = await import('./proxy-pool.js');
 const { getChromeStatus } = await import('./swiggy-bridge.js');
 const wafPool = await import('./waf-pool.js');
 const { esc, section, sub, field } = await import('./rich-text.js');
+const { createServer } = await import('node:http');
+const { startKeepAlive } = await import('./keep-alive.js');
 
 // ---------------------------------------------------------------------------
 // Process guards — ek stray async error poore bot ko NA maare.
@@ -65,6 +67,98 @@ process.on('unhandledRejection', (err) => {
 process.on('uncaughtException', (err) => {
   console.error('[FreshBot] uncaughtException (bot chalta rahega):', err?.stack || err?.message || err);
 });
+
+// ---------------------------------------------------------------------------
+// ❤️ Runtime health + Render keep-alive
+// Health server bot launch se pehle shuru hota hai taaki Render ko port
+// foran mile. /health hamesha process-liveness batata hai; /health/ready
+// tabhi 200 deta hai jab Telegram polling asal me launch ho gayi ho.
+// ---------------------------------------------------------------------------
+const runtimeHealth = {
+  bootAt: Date.now(),
+  telegramReady: false,
+  telegramReadyAt: 0,
+  telegramUsername: '',
+  telegramApiOkAt: 0,
+  telegramApiFailures: 0,
+  lastTelegramError: '',
+  telegramUpdates: 0,
+  lastTelegramUpdateAt: 0,
+  healthRequests: 0,
+  lastHealthRequestAt: 0,
+};
+let healthServer = null;
+let keepAliveHandle = null;
+let telegramWatchdogTimer = null;
+
+function buildHealthPayload() {
+  let snap = {};
+  try { snap = getAutopilotSnapshot(); } catch {}
+  return {
+    ok: true,
+    ready: runtimeHealth.telegramReady,
+    service: 'swiggy-fresh-bot',
+    now: new Date().toISOString(),
+    uptimeSec: Math.floor((Date.now() - runtimeHealth.bootAt) / 1000),
+    batchRunning: Boolean(snap.running),
+    processed: snap.processed ?? 0,
+    freshThisRun: snap.fresh ?? 0,
+    activeWorkers: snap.activeWorkers ?? 0,
+    concurrency: snap.concurrency ?? 1,
+    telegram: {
+      ready: runtimeHealth.telegramReady,
+      username: runtimeHealth.telegramUsername || '',
+      apiOkAt: runtimeHealth.telegramApiOkAt || 0,
+      apiFailures: runtimeHealth.telegramApiFailures || 0,
+      lastError: runtimeHealth.lastTelegramError || '',
+      updates: runtimeHealth.telegramUpdates || 0,
+      lastUpdateAt: runtimeHealth.lastTelegramUpdateAt || 0,
+    },
+    keepAlive: keepAliveHandle?.getState?.() || { enabled: false, reason: 'not-started' },
+    healthRequests: runtimeHealth.healthRequests,
+  };
+}
+
+function startHealthServer() {
+  if (healthServer || !process.env.PORT) return null;
+  const port = Number(process.env.PORT);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    console.warn(`[FreshBot] Health server start nahi hua — PORT galat hai: ${process.env.PORT}`);
+    return null;
+  }
+
+  healthServer = createServer((req, res) => {
+    runtimeHealth.healthRequests++;
+    runtimeHealth.lastHealthRequestAt = Date.now();
+
+    let pathname = '/';
+    try { pathname = new URL(req.url || '/', 'http://localhost').pathname; } catch {}
+    const readyPath = pathname === '/health/ready' || pathname === '/ready';
+    const healthPath = pathname === '/' || pathname === '/health' || pathname === '/health/live' || pathname === '/ping' || readyPath;
+    const payload = buildHealthPayload();
+    if (readyPath) payload.ok = runtimeHealth.telegramReady;
+
+    const status = !healthPath ? 404 : (readyPath && !runtimeHealth.telegramReady ? 503 : 200);
+    const body = JSON.stringify(healthPath ? payload : { ok: false, error: 'not found' });
+    res.writeHead(status, {
+      'Content-Type': 'application/json; charset=utf-8',
+      'Cache-Control': 'no-store',
+      'X-Content-Type-Options': 'nosniff',
+    });
+    res.end(req.method === 'HEAD' ? undefined : body);
+  });
+
+  healthServer.on('error', (e) => {
+    console.warn('[FreshBot] Health server error:', e?.message || e);
+  });
+  healthServer.listen(port, '0.0.0.0', () => {
+    console.log(`[FreshBot] Health server port ${port} par sun raha hai — GET /health (live) · GET /health/ready (Telegram ready).`);
+    if (!keepAliveHandle) {
+      keepAliveHandle = startKeepAlive();
+    }
+  });
+  return healthServer;
+}
 
 // ---------------------------------------------------------------------------
 // Config + owner gate
@@ -379,6 +473,18 @@ bot.catch((err, ctx) => {
   try { ctx?.answerCbQuery?.('⚠️ Error — /start dubara dabao')?.catch?.(() => {}); } catch {}
 });
 
+// Polling asal me updates de rahi hai ya nahi — /health par dikhega.
+bot.use(async (ctx, next) => {
+  runtimeHealth.telegramUpdates++;
+  runtimeHealth.lastTelegramUpdateAt = Date.now();
+  return next();
+});
+
+// Render Web Service par port sab se pehle kholo. Pehle health server
+// cloud-vault hydrate ke baad banta tha; ab deploy/cold-start par Render
+// aur bahar wale cron ko foran /health mil jayega.
+startHealthServer();
+
 const gate = async (ctx) => {
   const uid = ctx.from?.id;
   if (!isOwner(uid)) {
@@ -568,6 +674,19 @@ bot.help((ctx) => ctx.reply('/start — menu · /status — current batch · /di
 async function diagCard() {
   const lines = [];
   lines.push(field('Node', process.version));
+  lines.push(field('⏰ Uptime', fmtDuration(Date.now() - runtimeHealth.bootAt)));
+  {
+    const ka = keepAliveHandle?.getState?.() || { enabled: false, reason: 'not-started' };
+    const lastOk = ka.lastSuccessAt
+      ? `${fmtDuration(Date.now() - ka.lastSuccessAt)} pehle OK`
+      : 'abhi pehla ping baqi';
+    lines.push(field('❤️ Keep-alive', ka.enabled
+      ? `✅ ON · har ${Math.round((ka.intervalMs || 300000) / 60000)} min · ${lastOk}${ka.lastError ? ` · last error: ${esc(String(ka.lastError).slice(0, 80))}` : ''}`
+      : `❌ OFF (${esc(ka.reason || 'unknown')}) — KEEP_ALIVE_URL=https://<service>.onrender.com/health set karo`));
+  }
+  lines.push(field('📡 Telegram', runtimeHealth.telegramReady
+    ? `✅ ready${runtimeHealth.telegramUsername ? ` (@${esc(runtimeHealth.telegramUsername)})` : ''}`
+    : `❌ ready nahi${runtimeHealth.lastTelegramError ? ` — ${esc(String(runtimeHealth.lastTelegramError).slice(0, 100))}` : ''}`));
   // Chrome (WAF solver ke liye zaroori)
   try {
     const c = getChromeStatus();
@@ -1125,8 +1244,12 @@ const shutdown = (signal) => {
   if (shuttingDown) return;
   shuttingDown = true;
   console.log(`[FreshBot] ${signal} mila — batch rok kar band kar raha hoon…`);
+  runtimeHealth.telegramReady = false;
   try { requestAutopilotStop(signal); } catch {}
+  try { keepAliveHandle?.stop?.(); } catch {}
+  try { if (telegramWatchdogTimer) clearInterval(telegramWatchdogTimer); } catch {}
   try { bot.stop(signal); } catch {}
+  try { healthServer?.close?.(); } catch {}
   setTimeout(() => process.exit(0), 1500).unref?.();
 };
 process.once('SIGINT', () => shutdown('SIGINT'));
@@ -1203,6 +1326,10 @@ async function preflight() {
   for (let attempt = 1; attempt <= 6; attempt++) {
     try {
       const me = await bot.telegram.getMe();
+      runtimeHealth.telegramUsername = me.username || '';
+      runtimeHealth.telegramApiOkAt = Date.now();
+      runtimeHealth.telegramApiFailures = 0;
+      runtimeHealth.lastTelegramError = '';
       console.log(`[FreshBot] Telegram ✅ @${me.username} (id ${me.id})`);
       // Agar is token par kahin webhook laga ho (purana server, ya token
       // leak hone par kisi aur ne lagaya ho) to polling 409 marega aur bot
@@ -1210,6 +1337,8 @@ async function preflight() {
       await bot.telegram.deleteWebhook({ drop_pending_updates: true }).catch(() => {});
       return me;
     } catch (e) {
+      runtimeHealth.telegramApiFailures++;
+      runtimeHealth.lastTelegramError = String(e?.message || e || '').slice(0, 180);
       const code = tgCode(e);
       if (code === 401) {
         console.error('❌ BOT_TOKEN galat hai ya revoke ho chuka hai (Telegram 401).');
@@ -1230,6 +1359,39 @@ async function preflight() {
   }
 }
 
+// Telegram API/polling atak jaye to health server akele 200 deta rahega
+// aur user ko lagega cron kaam kar raha hai lekin bot jawab nahi de raha.
+// Watchdog har 2 minute me halka getMe check karta hai; lagatar 3 fail
+// par process exit kar deta hai taaki Render fresh instance/polling start
+// kare. Ek-aadh network jhatke par restart nahi hota.
+function startTelegramWatchdog() {
+  if (telegramWatchdogTimer) return;
+  telegramWatchdogTimer = setInterval(async () => {
+    if (shuttingDown || !runtimeHealth.telegramReady) return;
+    try {
+      const me = await Promise.race([
+        bot.telegram.getMe(),
+        sleepMs(15_000).then(() => { throw new Error('Telegram getMe timeout (15s)'); }),
+      ]);
+      runtimeHealth.telegramUsername = me?.username || runtimeHealth.telegramUsername;
+      runtimeHealth.telegramApiOkAt = Date.now();
+      runtimeHealth.telegramApiFailures = 0;
+      runtimeHealth.lastTelegramError = '';
+    } catch (e) {
+      const code = tgCode(e);
+      runtimeHealth.telegramApiFailures++;
+      runtimeHealth.lastTelegramError = String(e?.message || e || '').slice(0, 180);
+      console.warn(`[FreshBot] Telegram watchdog fail ${runtimeHealth.telegramApiFailures}/3: ${runtimeHealth.lastTelegramError}`);
+      if (code === 401 || runtimeHealth.telegramApiFailures >= 3) {
+        console.error('[FreshBot] Telegram API lagatar fail hai — Render restart ke liye process exit kar raha hoon.');
+        try { requestAutopilotStop('telegram-watchdog'); } catch {}
+        process.exit(1);
+      }
+    }
+  }, 2 * 60_000);
+  telegramWatchdogTimer.unref?.();
+}
+
 // ---------------------------------------------------------------------------
 // ☁️ Cloud-vault hydrate (Render ke liye khaas zaroori) — bina persistent
 // disk ke har deploy/restart par data/db.json fresh banta hai aur saare
@@ -1248,35 +1410,8 @@ try {
   console.warn('[FreshBot] Cloud vault hydrate skipped:', e?.message || e);
 }
 
-// ---------------------------------------------------------------------------
-// ❤️ Health server (sirf tab jab PORT env ho — Render Web Service par
-// Render khud PORT deta hai aur port khula na mile to deploy fail kar deta
-// hai). Worker/local par PORT nahi hota → ye bilkul band rehta hai.
-// GET / ya /health → { ok, bot running?, uptime } JSON.
-// ---------------------------------------------------------------------------
-if (process.env.PORT) {
-  try {
-    const { createServer } = await import('node:http');
-    const bootAt = Date.now();
-    createServer((req, res) => {
-      let snap = {};
-      try { snap = getAutopilotSnapshot(); } catch {}
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({
-        ok: true,
-        service: 'swiggy-fresh-bot',
-        uptimeSec: Math.floor((Date.now() - bootAt) / 1000),
-        batchRunning: Boolean(snap.running),
-        freshThisRun: snap.fresh ?? 0,
-      }));
-    }).listen(Number(process.env.PORT), '0.0.0.0', () => {
-      console.log(`[FreshBot] Health server port ${process.env.PORT} par sun raha hai (Render Web Service ke liye).`);
-    });
-  } catch (e) {
-    console.warn('[FreshBot] Health server start nahi hua:', e?.message || e);
-  }
-}
-
+// Health server upar bot bante hi start ho chuka hai (Render ko port
+// foran chahiye hota hai) — yahan dobara start nahi karna.
 await preflight();
 
 // 409 = doosri copy chal rahi hai. Kabhi kabhi wo copy abhi mar rahi/Restart
@@ -1289,12 +1424,17 @@ await preflight();
 // jata tha (process chup-chaap exit 0, koi message nahi).
 //
 // "Live" ka confirmation bhi asal me hi: 409 aam taur par 1-2s me aa jata
-// hai, isliye har attempt ke 6s baad bina ruke = polling stable.
+// hai, isliye har attempt ke 6s baad bina ruke = polling stable. Health
+// readiness/watchdog bhi isi stable point par ON hoti hai.
 let liveTimer = null;
 const armLiveConfirm = (attempt) => {
   if (liveTimer) clearTimeout(liveTimer);
   liveTimer = setTimeout(() => {
+    runtimeHealth.telegramReady = true;
+    runtimeHealth.telegramReadyAt = Date.now();
+    startTelegramWatchdog();
     console.log('✅ Bot LIVE — Telegram polling stable (koi conflict nahi).');
+    console.log('🆕 Swiggy Fresh Bot chal raha hai — START dabao, phone chhod ke aa jao. (/diag = health check)');
   }, 6_000);
   liveTimer.unref?.();
 };
@@ -1308,9 +1448,14 @@ for (let attempt = 1; attempt <= 4; attempt++) {
     });
     // Yahan tab aate hain jab launch resolve ho (yaani polling stop ho chuki —
     // shutdown already chal raha hoga). Dobara launch ki zaroorat nahi.
+    disarmLiveConfirm();
+    runtimeHealth.telegramReady = false;
     break;
   } catch (e) {
     disarmLiveConfirm();
+    runtimeHealth.telegramReady = false;
+    runtimeHealth.telegramApiFailures++;
+    runtimeHealth.lastTelegramError = String(e?.message || e || '').slice(0, 180);
     const code = tgCode(e);
     if (code === 409 && attempt < 4) {
       console.error(`[FreshBot] 409 Conflict (try ${attempt}/4) — doosri copy abhi band ho rahi hogi; webhook saaf karke 15s baad dobara…`);

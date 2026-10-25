@@ -1133,6 +1133,34 @@ export async function startAutopilot(opts = {}) {
       notifyRouteChanged();
       return next;
     };
+    // 🌐 Mid-run proxy refill — "rukna hi na pare". Jab saare IPs cooling
+    // ho jate hain to lanes seedha DIRECT (flagged Render IP) par chali jaati
+    // thin jahan WAF challenge guaranteed tha → 4 strikes par run khatam.
+    // Ab all-cooling par background me free pool se naye IPs test karke
+    // laya jata hai (max ek baar har 3 min) aur lanes us tak wait karti hain.
+    let lastProxyRefillAt = 0;
+    let refillInFlight = false;
+    const maybeRefillFreeProxies = () => {
+      if (refillInFlight || !proxyPool.isEnabled()) return;
+      const now = Date.now();
+      if (now - lastProxyRefillAt < 3 * 60_000) return;
+      lastProxyRefillAt = now;
+      refillInFlight = true;
+      (async () => {
+        try {
+          const before = proxyPool.proxySummary();
+          if ((before.usableCount || 0) > 0 || (before.reservedCount || 0) > 0) return;
+          const r = await proxyPool.refreshFreeProxies({ want: 10 });
+          const after = proxyPool.proxySummary();
+          console.log(`[Autopilot] 🌐 Sab IPs cooling the — refill: ${r?.checked || 0} check → ${r?.added || 0} nayi (usable ab ${after.usableCount || 0}/${after.enabledCount || 0}).`);
+          if ((after.usableCount || 0) > 0) notifyRouteChanged();
+        } catch (e) {
+          console.warn('[Autopilot] proxy refill skip:', e?.message || e);
+        } finally {
+          refillInFlight = false;
+        }
+      })();
+    };
     const ensureLaneRoute = (lane) => {
       if (lane.routeKey === 'direct') return true;
       if (lane.proxy?.id) {
@@ -1149,9 +1177,23 @@ export async function startAutopilot(opts = {}) {
         if (next) {
           setLaneProxy(lane, next);
           console.log(`[Autopilot] Lane ${lane.id} route → ${next.label}`);
+          lane.routeWaitSince = 0;
           return true;
         }
+        // Proxy pool hai par abhi koi pick-layak nahi (sab cooling ya lanes me
+        // reserved). DIRECT fallback = flagged IP par challenge jala kar strike
+        // barhana, isliye pehle naye IP ka intezaar: free refill background me
+        // chalu, cooldown khatam hote hi lane khud age badhegi. Sirf tab hi
+        // direct lo jab tak (90s) kuch na mila — rukna bhi nahi hai.
+        const s = proxyPool.proxySummary();
+        if ((s.enabledCount || 0) > 0) {
+          if (!lane.routeWaitSince) lane.routeWaitSince = Date.now();
+          maybeRefillFreeProxies();
+          if (Date.now() - lane.routeWaitSince < 90_000) return false;
+          console.log(`[Autopilot] Lane ${lane.id}: 90s me koi free IP nahi mili — direct fallback le raha hai.`);
+        }
       }
+      lane.routeWaitSince = 0;
       return claimLaneDirect(lane);
     };
     const syncLaneRouteAfterProcess = (lane, finalProxy) => {

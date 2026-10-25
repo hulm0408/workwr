@@ -1282,14 +1282,35 @@ await preflight();
 // 409 = doosri copy chal rahi hai. Kabhi kabhi wo copy abhi mar rahi/Restart
 // ho rahi hoti hai — aise me 1-2 try me yehi instance aage aa jata hai.
 // Persistent conflict ho to saaf wajah ke saath band (retry se fayda nahi).
-let launchDone = false;
-for (let attempt = 1; attempt <= 4 && !launchDone; attempt++) {
+//
+// ⚠️ Loop ka control `await bot.launch()` se hi — kabhi onLaunch callback se
+// nahi. Telegraf me wo callback getMe ke BAAD aur polling se PEHLE chalta hai,
+// to usse flag set karne par pehle hi 409 aane par bhi loop soch kar band ho
+// jata tha (process chup-chaap exit 0, koi message nahi).
+//
+// "Live" ka confirmation bhi asal me hi: 409 aam taur par 1-2s me aa jata
+// hai, isliye har attempt ke 6s baad bina ruke = polling stable.
+let liveTimer = null;
+const armLiveConfirm = (attempt) => {
+  if (liveTimer) clearTimeout(liveTimer);
+  liveTimer = setTimeout(() => {
+    console.log('✅ Bot LIVE — Telegram polling stable (koi conflict nahi).');
+  }, 6_000);
+  liveTimer.unref?.();
+};
+const disarmLiveConfirm = () => { if (liveTimer) { clearTimeout(liveTimer); liveTimer = null; } };
+
+for (let attempt = 1; attempt <= 4; attempt++) {
+  armLiveConfirm(attempt);
   try {
     await bot.launch({ dropPendingUpdates: true }, () => {
-      launchDone = true;
-      console.log('🆕 Swiggy Fresh Bot chal raha hai — START dabao, phone chhod ke aa jao. (/diag = health check)');
+      console.log(`🔄 Telegram connect ho raha hai (attempt ${attempt}/4)…`);
     });
+    // Yahan tab aate hain jab launch resolve ho (yaani polling stop ho chuki —
+    // shutdown already chal raha hoga). Dobara launch ki zaroorat nahi.
+    break;
   } catch (e) {
+    disarmLiveConfirm();
     const code = tgCode(e);
     if (code === 409 && attempt < 4) {
       console.error(`[FreshBot] 409 Conflict (try ${attempt}/4) — doosri copy abhi band ho rahi hogi; webhook saaf karke 15s baad dobara…`);

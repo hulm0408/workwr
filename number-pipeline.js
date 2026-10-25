@@ -240,7 +240,13 @@ async function grabAndVerifyRound({
   const otp1 = await waitForOtpCode(phone, { ...waitCfg, excludeIds: seen, deviceIds, shouldAbort });
   if (!otp1?.code) {
     if (otp1?.aborted) return { status: 'aborted', stage: 'otp-wait' };
-    return { status: 'miss', reason: otp1?.error || '' };
+    // Khali reason = card/console par "failed_otp_miss |" ke baad kuch nahi
+    // dikhta tha. waitForOtpCode ka error nahi to bhi window ka bata do.
+    return {
+      status: 'miss',
+      reason: otp1?.error
+        || `OTP ${Math.max(1, Math.round((Number(waitCfg.timeoutMs) || 90_000) / 1000))}s window me Firebase SMS inbox me nahi mila (device par SMS forward hua hi nahi ya abhi tak nahi aaya)`,
+    };
   }
 
   const verifyOnce = async (code) => {

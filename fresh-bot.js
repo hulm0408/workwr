@@ -394,10 +394,27 @@ const gate = async (ctx) => {
   return true;
 };
 
+// Transient network jhatke (ENOTFOUND/fetch failed/5xx) par 3 try — pehle
+// ek hi failure me progress message chup-chaap drop ho jata tha (log me
+// "live send: getaddrinfo ENOTFOUND api.telegram.org"), aur owner ko batch
+// ka haal hi nahi milta tha.
 const sendLive = async (chatId, text, rows) => {
-  await bot.telegram.sendMessage(chatId, text, kb(rows || idleRows())).catch((e) => {
-    console.warn('[FreshBot] live send:', e?.message);
-  });
+  const payload = () => bot.telegram.sendMessage(chatId, text, kb(rows || idleRows()));
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      await payload();
+      return;
+    } catch (e) {
+      const msg = String(e?.message || e);
+      const transient = tgCode(e) >= 500 || tgCode(e) === 429 ||
+        /ENOTFOUND|EAI_AGAIN|ECONNRESET|ETIMEDOUT|EHOSTUNREACH|fetch|network|socket|timed? ?out/i.test(msg);
+      if (!transient || attempt === 3) {
+        console.warn(`[FreshBot] live send (try ${attempt}/3):`, msg);
+        return;
+      }
+      await sleepMs(attempt * 1_500);
+    }
+  }
 };
 
 // Document send kisi transient Telegram/network wajah se fail ho jaye to
@@ -1133,6 +1150,52 @@ const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
 const tgCode = (e) => Number(e?.code ?? e?.response?.error_code ?? 0) || 0;
 const isNetErr = (e) => /fetch|network|socket|TLS|ECONN|ETIMEDOUT|EAI_AGAIN|timed? ?out|disconnected/i.test(`${e?.name || ''} ${e?.message || ''}`);
 
+// ---------------------------------------------------------------------------
+// 🔒 Ek hi instance — dobara "409: Conflict: terminated by other getUpdates
+// request" wala crash rokne ke liye. Ek lock file (data/bot.lock) batati hai
+// ki isi machine par pehle se ek copy chal rahi hai. Purani copy band ho chuki
+// hai to stale lock khud hata kar aage badh jaate hain.
+// ---------------------------------------------------------------------------
+async function acquireInstanceLock() {
+  try {
+    const fs = await import('node:fs');
+    const path = await import('node:path');
+    const { fileURLToPath } = await import('node:url');
+    const dir = process.env.DATA_DIR
+      ? path.resolve(process.env.DATA_DIR)
+      : path.join(path.dirname(fileURLToPath(import.meta.url)), 'data');
+    fs.mkdirSync(dir, { recursive: true });
+    const lock = path.join(dir, 'bot.lock');
+    if (fs.existsSync(lock)) {
+      const pid = parseInt(String(fs.readFileSync(lock, 'utf8')).trim(), 10);
+      if (pid && pid !== process.pid) {
+        let alive = true;
+        try { process.kill(pid, 0); } catch (e) { alive = e?.code === 'EPERM'; }
+        if (alive) return { ok: false, pid, lock };
+      }
+      fs.unlinkSync(lock); // stale lock (purani copy mar chuki hai)
+    }
+    fs.writeFileSync(lock, String(process.pid));
+    const mine = String(process.pid);
+    process.on('exit', () => {
+      try {
+        if (String(fs.readFileSync(lock, 'utf8')).trim() === mine) fs.unlinkSync(lock);
+      } catch {}
+    });
+    return { ok: true, lock };
+  } catch {
+    return { ok: true }; // lock na bane to bot band mat karo
+  }
+}
+
+const lockState = await acquireInstanceLock();
+if (!lockState.ok) {
+  console.error(`❌ Isi machine par bot ALREADY chal raha hai (PID ${lockState.pid}).`);
+  console.error('   Ek token = ek copy. Purani copy band karo (Ctrl+C wale terminal ya us service ko),');
+  console.error('   phir npm start. Do copy ek saath = Telegram 409 Conflict.');
+  process.exit(1);
+}
+
 // Token + internet pehle test karo (getMe) — network par retry, token galat
 // ho to turant saaf wajah. Bina is test ke bot chup-chaap "launch failed"
 // bolkar mar jata tha.
@@ -1216,20 +1279,35 @@ if (process.env.PORT) {
 
 await preflight();
 
-try {
-  await bot.launch({ dropPendingUpdates: true }, () => {
-    console.log('🆕 Swiggy Fresh Bot chal raha hai — START dabao, phone chhod ke aa jao. (/diag = health check)');
-  });
-} catch (e) {
-  const code = tgCode(e);
-  if (code === 409) {
-    console.error('❌ Telegram 409 Conflict — isi BOT_TOKEN se bot ki DOOSRI copy pehle se chal rahi hai.');
-    console.error('   Fix: purani copy band karo (doosra terminal/server/PC jahan bot chal raha ho),');
-    console.error('   phir yahan npm start. Ek token = ek hi copy ek waqt par.');
-  } else if (code === 401) {
-    console.error('❌ Telegram 401 — BOT_TOKEN revoke/galat. @BotFather se naya token lekar .env me daalo.');
-  } else {
-    console.error('[FreshBot] launch failed:', e?.stack || e?.message || e);
+// 409 = doosri copy chal rahi hai. Kabhi kabhi wo copy abhi mar rahi/Restart
+// ho rahi hoti hai — aise me 1-2 try me yehi instance aage aa jata hai.
+// Persistent conflict ho to saaf wajah ke saath band (retry se fayda nahi).
+let launchDone = false;
+for (let attempt = 1; attempt <= 4 && !launchDone; attempt++) {
+  try {
+    await bot.launch({ dropPendingUpdates: true }, () => {
+      launchDone = true;
+      console.log('🆕 Swiggy Fresh Bot chal raha hai — START dabao, phone chhod ke aa jao. (/diag = health check)');
+    });
+  } catch (e) {
+    const code = tgCode(e);
+    if (code === 409 && attempt < 4) {
+      console.error(`[FreshBot] 409 Conflict (try ${attempt}/4) — doosri copy abhi band ho rahi hogi; webhook saaf karke 15s baad dobara…`);
+      try { bot.stop('retry-409'); } catch {}
+      await bot.telegram.deleteWebhook({ drop_pending_updates: true }).catch(() => {});
+      await sleepMs(15_000);
+      continue;
+    }
+    if (code === 409) {
+      console.error('❌ Telegram 409 Conflict — isi BOT_TOKEN se bot ki DOOSRI copy pehle se chal rahi hai.');
+      console.error('   Fix: purani copy band karo (doosra terminal/server/PC jahan bot chal raha ho),');
+      console.error('   phir yahan npm start. Ek token = ek hi copy ek waqt par.');
+      console.error('   (Agar bot Render par bhi chalta hai to wahan aur yahan se EK HI jagah chalao.)');
+    } else if (code === 401) {
+      console.error('❌ Telegram 401 — BOT_TOKEN revoke/galat. @BotFather se naya token lekar .env me daalo.');
+    } else {
+      console.error('[FreshBot] launch failed:', e?.stack || e?.message || e);
+    }
+    process.exit(1);
   }
-  process.exit(1);
 }

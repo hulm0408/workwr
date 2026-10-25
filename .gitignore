@@ -16,5 +16,6 @@ test-data/
 # Runtime data / scratch
 data/*.tmp
 data/db.json.corrupt-*
+data/bot.lock
 *.log
 accounts.json

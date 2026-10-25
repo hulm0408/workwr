@@ -2,6 +2,8 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import crypto from 'crypto';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { fileURLToPath } from 'url';
 import puppeteer from 'puppeteer-core';
 import { updateAccount, getNextAutoUserName, cleanEssentialSwiggyCookies } from './store.js';
 import { normalizeIndianMobileNumber } from './phone-utils.js';
@@ -15,55 +17,222 @@ import * as proxyPool from './proxy-pool.js';
 //   Jab tak koi proxy set na ho — seedha direct (backward compatible).
 // ---------------------------------------------------------------------------
 let currentProxy = null;
+const bridgeProxyContext = new AsyncLocalStorage();
+
+// Parallel autopilot ke liye lane-local route context. Har lane apni proxy
+// reservation ke saath chalegi; ek lane ka rotate dusri lane ki IP, WAF
+// token route ya OTP session ko touch nahi karega. Context ke baghair
+// purana global route hi use hota hai (manual/sequential flows).
+export async function runWithBridgeProxy(proxy, fn, {
+  owner = '',
+  releaseOnExit = true,
+  wafTokenMode = '',
+} = {}) {
+  const ctx = {
+    proxy: proxy || null,
+    owner: String(owner || ''),
+    wafTokenMode: String(wafTokenMode || ''),
+  };
+  if (ctx.proxy?.id && ctx.owner && !proxyPool.reserveProxy(ctx.proxy.id, ctx.owner)) {
+    throw new Error(`Proxy route pehle se kisi aur lane ke paas reserved hai: ${ctx.proxy.id}`);
+  }
+  try {
+    return await bridgeProxyContext.run(ctx, fn);
+  } finally {
+    if (releaseOnExit && ctx.owner) {
+      proxyPool.releaseProxyReservationsForOwner(ctx.owner);
+    }
+  }
+}
+
+export function getBridgeProxyContextOwner() {
+  return bridgeProxyContext.getStore()?.owner || '';
+}
 
 export function setBridgeProxy(proxy) {
-  currentProxy = proxy || null;
-  return currentProxy;
+  const nextProxy = proxy || null;
+  const ctx = bridgeProxyContext.getStore();
+  if (!ctx) {
+    currentProxy = nextProxy;
+    return currentProxy;
+  }
+  const previousProxy = ctx.proxy || null;
+  if (ctx.owner) {
+    if (previousProxy?.id && previousProxy.id !== nextProxy?.id) {
+      proxyPool.releaseProxyReservation(previousProxy.id, ctx.owner);
+    }
+    if (nextProxy?.id) proxyPool.reserveProxy(nextProxy.id, ctx.owner);
+  }
+  ctx.proxy = nextProxy;
+  return ctx.proxy;
 }
 
 export function getBridgeProxy() {
-  return currentProxy;
+  const ctx = bridgeProxyContext.getStore();
+  return ctx ? (ctx.proxy || null) : currentProxy;
+}
+
+function shouldDeferWafSolveUntilChallenge() {
+  return bridgeProxyContext.getStore()?.wafTokenMode === 'defer-until-challenge';
 }
 
 // Saare swiggy.com fetch isi se guzarte hain — proxy ON ho to ProxyAgent,
 // warna normal fetch.
 async function fetchSwiggy(url, opts = {}) {
-  return proxyPool.fetchSwiggy(url, opts, currentProxy);
+  return proxyPool.fetchSwiggy(url, opts, getBridgeProxy());
 }
 
+// ---------------------------------------------------------------------------
+// Chrome/Chromium discovery — puppeteer-core ke paas APNA browser nahi hota,
+// isliye system par installed Chrome/Chromium/Edge dhoondhna zaroori hai.
+//
+// PEHLA BUG (bot "work nahi kar raha" ki sabse badi wajah): pehle Windows par
+// sirf `C:\Program Files\...\chrome.exe` hard-coded tha (exist check bhi
+// nahi!). Jiski Chrome per-user install (LocalAppData), Program Files (x86)
+// ya sirf Edge ho — uske yahan WAF solver har baar chup-chaap fail hota,
+// token kabhi banta hi nahi, har OTP request 403 aur batch band.
+//
+// Ab: env override → saare common install paths (Win/mac/Linux) →
+// puppeteer/playwright cache folders. Na mile to '' (jhootha path nahi) —
+// taaki canUseStealthBrowser() sahi `false` de aur user ko saaf warning mile.
+// Custom path: .env me  PUPPETEER_EXECUTABLE_PATH=C:\path\to\chrome.exe
+// ---------------------------------------------------------------------------
+const _exists = (p) => { try { return Boolean(p && fs.existsSync(p)); } catch { return false; } };
+let _badEnvChromeWarned = false;
+
 export function findChromePath() {
-  if (process.env.PUPPETEER_EXECUTABLE_PATH) return process.env.PUPPETEER_EXECUTABLE_PATH;
-  if (process.env.CHROME_BIN) return process.env.CHROME_BIN;
+  // 1) Explicit override (sabse pehle) — lekin galat path ho to warn karke
+  //    auto-detect par gir jao, warna bot bina wajah atka rahega.
+  for (const key of ['PUPPETEER_EXECUTABLE_PATH', 'CHROME_BIN', 'CHROME_PATH']) {
+    const v = String(process.env[key] || '').trim();
+    if (!v) continue;
+    if (_exists(v)) return v;
+    if (!_badEnvChromeWarned) {
+      _badEnvChromeWarned = true;
+      console.warn(`[SwiggyBridge] ${key} set hai lekin file nahi mili: ${v} — auto-detect try kar raha hoon.`);
+    }
+  }
+
+  const candidates = [];
   if (process.platform === 'win32') {
-    return 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe';
+    const pf = process.env.ProgramFiles || 'C:\\Program Files';
+    const pf86 = process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)';
+    const local = process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local');
+    for (const root of [pf, pf86, local]) {
+      candidates.push(path.join(root, 'Google', 'Chrome', 'Application', 'chrome.exe'));
+      candidates.push(path.join(root, 'Chromium', 'Application', 'chrome.exe'));
+    }
+    // Edge (Chromium-based) puppeteer-core ke saath chal jata hai — Chrome na
+    // ho to ye aakhri bharosa hai, har Windows par pehle se hota hai.
+    for (const root of [pf, pf86, local]) {
+      candidates.push(path.join(root, 'Microsoft', 'Edge', 'Application', 'msedge.exe'));
+    }
+    candidates.push(path.join(local, 'BraveSoftware', 'Brave-Browser', 'Application', 'brave.exe'));
+  } else if (process.platform === 'darwin') {
+    candidates.push(
+      '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+      '/Applications/Chromium.app/Contents/MacOS/Chromium',
+      '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
+      '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser',
+    );
+  } else {
+    candidates.push(
+      '/usr/bin/google-chrome',
+      '/usr/bin/google-chrome-stable',
+      '/usr/bin/chromium',
+      '/usr/bin/chromium-browser',
+      '/usr/bin/microsoft-edge',
+      '/usr/bin/brave-browser',
+      '/snap/bin/chromium',
+      '/usr/local/bin/chromium',
+      '/usr/local/bin/google-chrome',
+    );
   }
-  const linuxPaths = [
-    '/usr/bin/chromium',
-    '/usr/bin/chromium-browser',
-    '/usr/bin/google-chrome',
-    '/usr/bin/google-chrome-stable',
-    '/opt/playwright/browsers/chromium-1247/chrome-linux64/chrome'
-  ];
-  for (const p of linuxPaths) {
-    try { if (fs.existsSync(p)) return p; } catch (e) {}
+  for (const p of candidates) if (_exists(p)) return p;
+
+  // 2) Puppeteer / Playwright download caches (Linux servers par aksar yahi
+  //    ekmatra browser hota hai) — 2 level deep scan.
+  const cacheRoots = [
+    process.env.PUPPETEER_CACHE_DIR,
+    path.join(os.homedir(), '.cache', 'puppeteer'),
+    '/root/.cache/puppeteer',
+    '/opt/playwright/browsers',
+    path.join(os.homedir(), '.cache', 'ms-playwright'),
+    '/ms-playwright',
+  ].filter(Boolean);
+  const binNames = process.platform === 'win32'
+    ? ['chrome.exe']
+    : ['chrome', 'chrome-headless-shell', 'headless_shell', 'chromium'];
+  const scan = (dir, depth) => {
+    if (depth < 0 || !_exists(dir)) return '';
+    let entries = [];
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return ''; }
+    for (const e of entries) {
+      const full = path.join(dir, e.name);
+      if (!e.isDirectory() && binNames.includes(e.name)) return full;
+    }
+    for (const e of entries) {
+      if (!e.isDirectory()) continue;
+      const hit = scan(path.join(dir, e.name), depth - 1);
+      if (hit) return hit;
+    }
+    return '';
+  };
+  for (const root of cacheRoots) {
+    const hit = scan(root, 3);
+    if (hit) return hit;
   }
-  for (const rootDir of ['/opt/playwright/browsers', path.join(os.homedir(), '.cache', 'puppeteer'), '/root/.cache/puppeteer']) {
-    try {
-      if (!fs.existsSync(rootDir)) continue;
-      for (const entry of fs.readdirSync(rootDir)) {
-        for (const sub of ['chrome-linux64/chrome', 'chrome-linux/chrome']) {
-          const full = path.join(rootDir, entry, sub);
-          if (fs.existsSync(full)) return full;
-        }
-      }
-    } catch (e) {}
-  }
-  return '/usr/bin/chromium';
+
+  return ''; // nahi mila — jhootha default path mat do
 }
 
 const CHROME_PATH = findChromePath();
 const IS_LINUX = process.platform === 'linux';
-const HEADLESS_MODE = (IS_LINUX || process.env.RAILWAY_ENVIRONMENT || process.env.HEADLESS === 'true') ? 'new' : false;
+
+// puppeteer-core v25 me headless sirf `boolean | 'shell'` hai — purana 'new'
+// invalid hai (galti se chal jata tha). HEADLESS=1/true → har jagah headless,
+// HEADLESS=0/false → window ke saath (debug ke liye).
+function resolveHeadless() {
+  const v = String(process.env.HEADLESS || '').trim().toLowerCase();
+  if (['1', 'true', 'yes'].includes(v)) return true;
+  if (['0', 'false', 'no'].includes(v)) return false;
+  return Boolean(IS_LINUX || process.env.RAILWAY_ENVIRONMENT || process.env.RENDER || process.env.CI);
+}
+const HEADLESS_MODE = resolveHeadless();
+
+// Bot startup + /diag ke liye — Chrome mila ya nahi, saaf-saaf.
+export function getChromeStatus() {
+  return {
+    found: Boolean(CHROME_PATH && _exists(CHROME_PATH)),
+    path: CHROME_PATH || '',
+    headless: HEADLESS_MODE,
+    platform: process.platform,
+  };
+}
+
+// swiggy-cart.js is standalone repo me NAHI hai (purane bade bot ka module
+// tha) — pehle iska dynamic import har call par fail hota aur catch{} me
+// chup jata tha. Ab: file ho tabhi import, warna ek baar warn karke skip.
+let _cartBootstrap = undefined; // undefined = try nahi kiya, null = unavailable
+async function loadAndroidBootstrap() {
+  if (_cartBootstrap !== undefined) return _cartBootstrap;
+  try {
+    const cartFile = fileURLToPath(new URL('./swiggy-cart.js', import.meta.url));
+    if (!_exists(cartFile)) {
+      console.warn('[SwiggyBridge] swiggy-cart.js repo me nahi hai — Android-token → web-session bootstrap skip (sirf imported Android accounts par asar).');
+      _cartBootstrap = null;
+      return null;
+    }
+    const mod = await import('./swiggy-cart.js');
+    _cartBootstrap = typeof mod.bootstrapSwiggyWebSessionFromAndroidTokens === 'function'
+      ? mod.bootstrapSwiggyWebSessionFromAndroidTokens
+      : null;
+  } catch (e) {
+    console.warn('[SwiggyBridge] swiggy-cart.js load fail:', e?.message);
+    _cartBootstrap = null;
+  }
+  return _cartBootstrap;
+}
 
 // Active login sessions keyed by userId:
 // { [userId]: { browser, page, phone, otp, targetAcc, targetAccName, signupEmail, isNewUser, safetyTimer } }
@@ -80,8 +249,35 @@ let isPrewarming = false;
 let prewarmedAt = 0;
 let latestSharedWafToken = '';
 let latestSharedWafAt = 0;
-let wafSolvePromise = null;
+// Route-keyed solver locks. PEHLA BUG: ek hi global promise tha — proxy B
+// ke liye token maangne wala proxy A par chal raha solver join karke A ka
+// IP-bound token B par chipka deta tha, phir challenge pakka tha.
+const wafSolvePromises = new Map(); // routeKey → Promise<string>
+let wafSolveTail = Promise.resolve(''); // ek waqt me ek hi Chromium solver
 const WAF_CACHE_TTL_MS = 8 * 60 * 1000; // 8 minutes
+
+// Browser escalation solver wali hi FIFO tail use karti hai — parallel
+// lanes me solver aur escalation ke do Chromium ek saath launch nahi honge.
+async function withBrowserEscalationSlot(fn) {
+  const previous = wafSolveTail.catch(() => '');
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  wafSolveTail = previous.then(() => gate);
+  await previous;
+  try {
+    return await fn();
+  } finally {
+    release('');
+  }
+}
+
+export function _wafSolveRouteKey(proxy = null) {
+  return proxy?.id ? `proxy:${proxy.id}` : 'direct';
+}
+
+function routeLabel(proxy = null) {
+  return proxy?.label || proxy?.url || 'direct';
+}
 
 const SWIGGY_WAF_COOKIE_WAIT_MS = 15000;
 const SWIGGY_WAF_COOKIE_POLL_MS = 250;
@@ -687,7 +883,14 @@ export async function claimSwiggyBreakfastAndLateNightOffers(account, { force = 
   }
 }
 
-async function launchStealthSwiggyBrowser() {
+async function launchStealthSwiggyBrowser(routeProxy = getBridgeProxy()) {
+  if (!CHROME_PATH || !_exists(CHROME_PATH)) {
+    throw new Error(
+      'Chrome/Chromium nahi mila is machine par. Google Chrome install karo, ' +
+      'ya .env me PUPPETEER_EXECUTABLE_PATH=<chrome.exe ka full path> set karo. ' +
+      '(puppeteer-core ke saath browser bundled NAHI aata.)'
+    );
+  }
   const browser = await puppeteer.launch({
     executablePath: CHROME_PATH,
     headless: HEADLESS_MODE,
@@ -708,13 +911,13 @@ async function launchStealthSwiggyBrowser() {
       '--lang=en-IN,en-US,en',
       // 🔀 Browser bhi active proxy (nayi IP) se chale — warna WAF IP ko
       // proxy-wala aur browser-wala traffic alag-alag dekh lega.
-      ...proxyPool.puppeteerProxyArgs(currentProxy)
+      ...proxyPool.puppeteerProxyArgs(routeProxy)
     ]
   });
 
   const page = await browser.newPage();
   // Proxy auth (user:pass wale proxies) — page par pehle se authenticate
-  await proxyPool.puppeteerProxyAuth(page, currentProxy);
+  await proxyPool.puppeteerProxyAuth(page, routeProxy);
   const cleanSyntheticEntityId = crypto.randomUUID();
   await page.setViewport({ width: 1366, height: 768 });
   await page.emulateTimezone('Asia/Kolkata').catch(() => {});
@@ -899,10 +1102,31 @@ function createSwiggyHttpAuthSession(phone, targetAcc = '', targetAccName = null
 // 🔀 PROXY MODE: aws-waf-token IP-bound hota hai — jo token ek IP (proxy) ke
 // liye valid hai, doosri IP par kaam NAHI karta. Isliye jab proxy active ho,
 // sirf USI proxy ka token bhejo (warna WAF ko mismatch dikhega).
+// Jala hua token har cache se saaf karo (bridge-local + shared pool) —
+// challenge ke baad agli request fresh solve par majboor ho jaye.
+// Proxy mode me pool shared nahi hota (per-proxy tokens proxy-pool rakhta
+// hai, WAF hit par wo proxy waisay hi side par chali jati hai).
+function burnSharedWafToken() {
+  latestSharedWafToken = '';
+  latestSharedWafAt = 0;
+  try { wafPool.invalidateToken?.(); } catch {}
+}
+
+// Challenge ke baad SIRF wahi token jalao jo asal route par use hua tha.
+// Pehle proxy mode me bhi sirf shared/direct cache saaf hota tha — per-proxy
+// jala token cache me reh jata aur Android retry wahi dobara bhej deti thi.
+export function burnCurrentWafToken(proxy = getBridgeProxy()) {
+  if (proxy?.id) {
+    try { proxyPool.invalidateProxyToken(proxy.id); } catch {}
+    return;
+  }
+  burnSharedWafToken();
+}
+
 function freshWafTokenForRequests() {
   // Proxy active = per-proxy token
-  if (currentProxy?.id) {
-    return proxyPool.getProxyToken(currentProxy.id) || '';
+  if (getBridgeProxy()?.id) {
+    return proxyPool.getProxyToken(getBridgeProxy().id) || '';
   }
   try {
     const pooled = wafPool.getTokenSync?.() || '';
@@ -1063,7 +1287,11 @@ async function postSwiggyAuthJson(session, endpointUrl, payload = {}, { timeoutM
   // free me isi se protected.
   if (!session.wafToken) {
     session.wafToken = freshWafTokenForRequests();
-    if (!session.wafToken && allowBrowserEscalation && canUseStealthBrowser()) {
+    // Parallel lanes me cached token na ho to pehle HTTP attempt ko ek hi
+    // Chromium solver ki FIFO queue me minutes tak mat roko. Pehla send
+    // turant jayega; agar asal WAF challenge aaya tab neeche wali recovery
+    // token solve/rotate/browser escalation karegi.
+    if (!session.wafToken && !shouldDeferWafSolveUntilChallenge() && allowBrowserEscalation && canUseStealthBrowser()) {
       try { session.wafToken = await getLiveSwiggyWafToken(); } catch {}
     }
   }
@@ -1102,8 +1330,12 @@ async function postSwiggyAuthJson(session, endpointUrl, payload = {}, { timeoutM
   }
 
   // Auto-recover 2: If mWeb transport hit an AWS WAF challenge, retry once over `Swiggy-Android` transport!
+  // Challenge matlab maujooda token jala hua hai — use retry me dobara mat
+  // chipkao (session + shared caches dono se saaf).
   if (isAwsWafChallengeResponse(out.status, out.rawText, out.headers) && session.transportMode !== 'android') {
     session.transportMode = 'android';
+    session.wafToken = '';
+    burnCurrentWafToken();
     await bootstrapSwiggyAuthJar(session, { forceFresh: true });
     out = await sendOnce(true);
   }
@@ -1116,26 +1348,25 @@ async function postSwiggyAuthJson(session, endpointUrl, payload = {}, { timeoutM
   //
   // Direct mode: naya live token lo aur EK baar dobara bhejo + circuit-breaker.
   if (allowBrowserEscalation && isAwsWafChallengeResponse(out.status, out.rawText, out.headers)) {
-    if (currentProxy?.id) {
+    if (getBridgeProxy()?.id) {
       // Is proxy ko "hot" mark karo (thodi der ke liye side par), phir
       // turant doosri proxy par retry.
-      try { proxyPool.markProxyWafHit(currentProxy.id, 3 * 60_000); } catch {}
-      const nextProxy = proxyPool.pickProxy({ excludeIds: [currentProxy.id] });
+      try { proxyPool.markProxyWafHit(getBridgeProxy().id, 3 * 60_000); } catch {}
+      const nextProxy = proxyPool.pickProxy({ excludeIds: [getBridgeProxy().id] });
       if (nextProxy) {
         setBridgeProxy(nextProxy);
         session.wafToken = ''; // nayi IP = naya token chahiye
-        try { session.wafToken = await getLiveSwiggyWafToken(); } catch {}
+        try { session.wafToken = await getLiveSwiggyWafToken(false, { solveBudgetMs: 25_000 }); } catch {}
         await bootstrapSwiggyAuthJar(session, { forceFresh: true });
         out = await sendOnce(session.transportMode === 'android');
       } else {
-        // Sab proxies side par hain — abhi bhi ek baar naya token try
-        const refreshed = await getLiveSwiggyWafToken(true).catch(() => '');
-        if (refreshed && refreshed !== session.wafToken) {
-          session.wafToken = refreshed;
-          out = await sendOnce(session.transportMode === 'android');
-        }
+        // Sab proxies side par hain. Abhi garam hui isi IP par full solver
+        // dobara chala kar 25-35s zaya na karo — neeche browser escalation
+        // ko ek mauqa milega, warna engine direct fallback/rotate karega.
+        session.wafToken = '';
       }
     } else {
+      burnCurrentWafToken(); // bridge cache bhi saaf (pool markWafHit me saaf hoga)
       try { wafPool.markWafHit(); } catch {}
       const refreshed = await getLiveSwiggyWafToken(true).catch(() => '');
       if (refreshed && refreshed !== session.wafToken) {
@@ -1147,14 +1378,20 @@ async function postSwiggyAuthJson(session, endpointUrl, payload = {}, { timeoutM
 
   // Auto-recover 3: Optional Stealth Browser escalation ONLY if still WAF-challenged AND local Chromium exists!
   if (allowBrowserEscalation && isAwsWafChallengeResponse(out.status, out.rawText, out.headers) && canUseStealthBrowser()) {
-    try {
+    const browserEscalationOut = await withBrowserEscalationSlot(async () => {
       if (!session.page || !session.browser?.connected) {
         const launched = await launchStealthSwiggyBrowser();
         session.browser = launched.browser;
         session.page = launched.page;
         session.mode = 'browser';
         await session.page.goto('https://www.swiggy.com/auth', { waitUntil: 'domcontentloaded', timeout: 10000 }).catch(() => {});
-        await waitForSwiggyWafCookie(session.page, 2500);
+        // Challenge aksar thodi insaan-jaisi harkat ke baad khud solve ho jata
+        // hai — sirf khade khade cookie ka intezaar kamzor padta tha.
+        try {
+          await session.page.mouse.move(320 + Math.random() * 240, 240 + Math.random() * 160, { steps: 14 });
+          await session.page.mouse.wheel({ deltaY: 600 });
+        } catch {}
+        await waitForSwiggyWafCookie(session.page, 8000);
       }
       const pageCookies = await session.page.cookies().catch(() => []);
       const wafToken = pageCookies.find(c => c.name === 'aws-waf-token')?.value || '';
@@ -1184,26 +1421,47 @@ async function postSwiggyAuthJson(session, endpointUrl, payload = {}, { timeoutM
       for (const c of afterCookies) {
         if (c?.name && c?.value && c.name !== 'aws-waf-token') session.cookieMap.set(c.name, c.value);
       }
+      if (getBridgeProxy()?.id && isAwsWafChallengeResponse(browserOut?.status, browserOut?.rawText, browserOut?.headers)) {
+        try { proxyPool.markProxyWafHit(getBridgeProxy().id, 10 * 60_000); } catch {}
+      }
       return browserOut;
-    } catch {}
+    }).catch(() => null);
+    if (browserEscalationOut) return browserEscalationOut;
+  }
+
+  // Final response bhi challenge hai to FINAL route ko pakka quarantine karo.
+  // Pehle sirf pehli challenged proxy mark hoti thi — recovery wali doosri
+  // proxy agar phir challenge de to wo pool me "clean" reh kar dobara ghumti thi.
+  if (getBridgeProxy()?.id && isAwsWafChallengeResponse(out?.status, out?.rawText, out?.headers)) {
+    try { proxyPool.markProxyWafHit(getBridgeProxy().id, 10 * 60_000); } catch {}
   }
 
   return out;
 }
 
-function isUnregisteredSwiggyAuthResponse(result) {
+export function isUnregisteredSwiggyAuthResponse(result) {
   if (!result || (result.status !== 200 && result.status !== 202)) return false;
-  const msgLower = `${result.data?.statusMessage || ''} ${result.data?.message || ''} ${result.rawText || ''}`.toLowerCase();
-  if (/rate limit|too many|limit reached|maximum|valid 10 digit|invalid otp|incorrect otp|wrong otp|expired otp|something went wrong|internal server|csrf|blocked|suspended/.test(msgLower)) {
+  // ⚠️ BUG FIX (Render par har naya number `failed_otp_send` ho raha tha):
+  // Negative checks AB SIRF human message (statusMessage/message) par lagenge,
+  // poore raw JSON par NAHI. Pehle regex me akela `csrf` tha aur Swiggy ke
+  // har normal response me `csrfToken` FIELD hota hai — to detector
+  // "user not registered" wale response ko bhi pehle hi reject kar deta tha,
+  // bot fresh-registration branch me kabhi jata hi nahi tha.
+  const statusMsg = `${result.data?.statusMessage || ''} ${result.data?.message || ''}`.toLowerCase();
+  if (/rate limit|too many|limit reached|maximum attempts|valid 10 digit|invalid mobile|invalid otp|incorrect otp|wrong otp|expired otp|something went wrong|internal server|invalid csrf|csrf.*(invalid|expire|mismatch)|blocked|suspended/.test(statusMsg)) {
     return false;
   }
   if (isAwsWafChallengeResponse(result.status, result.rawText, result.headers)) {
     return false;
   }
-  if (/not\s*registered|user\s*not\s*found|does\s*not\s*exist|no\s*account|new\s*user|sign\s*up|signup|register\s*first|unregistered/.test(msgLower)) {
+  // Positive check poori body par chal sakta hai (message kabhi nested bhi
+  // aata hai) — field-naam isse galat trigger nahi karenge.
+  const allText = `${statusMsg} ${String(result.rawText || '').toLowerCase()}`;
+  if (/not\s*registered|user\s*not\s*found|does\s*not\s*exist|no\s*account|new\s*user|sign\s*up|signup|register\s*first|unregistered/.test(allText)) {
     return true;
   }
-  return result.data?.statusCode === 999;
+  if (result.data?.data?.registered === false) return true;
+  return Number(result.data?.statusCode) === 999;
 }
 
 // Pre-warm browser in background (safe no-op on cloud runtimes without local Chromium)
@@ -1219,11 +1477,20 @@ export async function prewarmBrowser() {
       prewarmedPage = null;
     }
 
-    const { browser, page } = await launchStealthSwiggyBrowser();
+    // Prewarm ka browser jis route se launch hua, token bhi usi route ko.
+    // Proxy browser ka token shared/direct pool me seed karna IP mismatch tha.
+    const routeProxy = getBridgeProxy() || null;
+    const { browser, page } = await launchStealthSwiggyBrowser(routeProxy);
     await page.goto('https://www.swiggy.com/restaurants', { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
 
     const wafToken = await waitForSwiggyWafCookie(page, 4000);
     if (!wafToken) {
+      await browser.close().catch(() => {});
+      return;
+    }
+
+    if (routeProxy?.id) {
+      proxyPool.setProxyToken(routeProxy.id, wafToken);
       await browser.close().catch(() => {});
       return;
     }
@@ -1246,25 +1513,37 @@ export async function prewarmBrowser() {
   }
 }
 
-// Universal cached / live AWS WAF token provider for both swiggy-bridge and swiggy-cart
-export async function getLiveSwiggyWafToken(forceRefresh = false) {
+// Universal cached / live AWS WAF token provider for both swiggy-bridge and swiggy-cart.
+// Doosra argument solver ka time budget hai — proxy screening me full
+// 80-90s solver har route par chalana batch ko maar deta tha.
+export async function getLiveSwiggyWafToken(forceRefresh = false, { solveBudgetMs = 35_000 } = {}) {
   const now = Date.now();
+  const routeProxy = getBridgeProxy() || null;
 
   // 🔀 PROXY MODE — token IP-bound hota hai, isliye per-proxy cache.
-  if (currentProxy?.id) {
-    const pid = currentProxy.id;
+  if (routeProxy?.id) {
+    const pid = routeProxy.id;
     if (!forceRefresh) {
       const cached = proxyPool.getProxyToken(pid);
       if (cached) return cached;
+      // Isi proxy par solver abhi fail hua tha — dobara full Chromium
+      // chalane ke bajaye caller ko turant khali token do taaki route
+      // rotate/direct fallback foran ho.
+      if (proxyPool.proxyWafSolveCooldownLeftMs(pid) > 0) return '';
     }
-    // Har naye proxy ke liye ek baar Chromium solver chalao (browser bhi
-    // usi proxy se guzrega — token usi IP ke liye banega).
-    const solved = await solveWafTokenOnce(forceRefresh);
+
+    const solved = await solveWafTokenOnce(forceRefresh, routeProxy, { solveBudgetMs });
     if (solved) {
+      // Token hamesha USI proxy ke naam store hoga jiske browser se bana.
       proxyPool.setProxyToken(pid, solved);
-      return solved;
+      // Solver ke beech route badal gaya ho to purani IP ka token nayi IP
+      // ke caller ko mat chipkao.
+      return getBridgeProxy()?.id === pid ? solved : (proxyPool.getProxyToken(getBridgeProxy()?.id || '') || '');
     }
-    return proxyPool.getProxyToken(pid) || '';
+    // Chrome hi missing ho to ye proxy ki galti nahi — route ko quarantine
+    // mat karo (Android/browser-less paths phir bhi chal sakte hain).
+    if (canUseStealthBrowser()) proxyPool.markProxyWafSolveFailure(pid);
+    return '';
   }
 
   // Check shared pool token first:
@@ -1292,56 +1571,95 @@ export async function getLiveSwiggyWafToken(forceRefresh = false) {
     } catch {}
   }
 
-  // 2. Coalesce concurrent requests so we only launch one solver:
-  const token = await solveWafTokenOnce(forceRefresh);
-  if (token && !currentProxy?.id) {
+  // 2. Coalesce concurrent requests — lekin SIRF usi route ke andar.
+  const token = await solveWafTokenOnce(forceRefresh, null, { solveBudgetMs });
+  if (token && !getBridgeProxy()?.id) {
     latestSharedWafToken = token;
     latestSharedWafAt = Date.now();
+    return token;
   }
-  return token;
+  return token && getBridgeProxy()?.id ? '' : (token || '');
 }
 
-// Chromium solver — ek valid `aws-waf-token` laata hai. Agar proxy active hai
-// to browser USI proxy se chalega (token usi IP ke liye banega).
-// Coalesced: ek saath kayi callers ho to sirf EK solver chalega.
-async function solveWafTokenOnce(forceRefresh = false) {
-  if (wafSolvePromise) return wafSolvePromise;
+// Chromium solver — ek valid `aws-waf-token` laata hai. Route snapshot
+// shuru me pakad lo: browser hamesha usi proxy se chalega jiske liye solve
+// maanga gaya tha, beech me active bridge route badal bhi jaye to token
+// galat IP par nahi chipkega. Coalescing bhi per-route hai.
+// Time budget hard cap hai — pehle ek fail solve 80-90s kha sakta tha.
+async function solveWafTokenOnce(forceRefresh = false, routeProxy = getBridgeProxy(), { solveBudgetMs = 35_000 } = {}) {
+  const routeKey = _wafSolveRouteKey(routeProxy);
+  const existing = wafSolvePromises.get(routeKey);
+  if (existing) return existing;
 
-  wafSolvePromise = (async () => {
+  // Route locks alag hain, lekin ek waqt me Chromium solver sirf EK hi
+  // chalega (free Render par 2 browser = memory/time dono ka nuqsan).
+  // Proper FIFO tail hai — har route sirf apne se pehle wali baari ka
+  // intezaar karti hai, isliye cross-route deadlock bhi nahi ban sakta.
+  const previousSolve = wafSolveTail;
+  let releaseSolve;
+  const solveGate = new Promise((resolve) => { releaseSolve = resolve; });
+  wafSolveTail = previousSolve.catch(() => '').then(() => solveGate);
+
+  const solvePromise = (async () => {
+    await previousSolve.catch(() => '');
+    const startedAt = Date.now();
+    const budgetMs = Math.max(8_000, Number(solveBudgetMs) || 35_000);
+    const deadline = startedAt + budgetMs;
+    const remaining = () => Math.max(0, deadline - Date.now());
     let browser = null;
     try {
-      const launched = await launchStealthSwiggyBrowser();
+      const launched = await launchStealthSwiggyBrowser(routeProxy);
       browser = launched.browser;
       const page = launched.page;
 
       await page.goto('https://www.swiggy.com/', {
         waitUntil: 'domcontentloaded',
-        timeout: 30000
+        timeout: Math.min(20_000, Math.max(3_000, remaining()))
       }).catch(() => {});
 
-      const token = await waitForSwiggyWafCookie(page, SWIGGY_WAF_COOKIE_WAIT_MS);
+      let token = await waitForSwiggyWafCookie(page, Math.min(SWIGGY_WAF_COOKIE_WAIT_MS, remaining()));
+      if (!token && remaining() > 5_000) {
+        // Pehle pass me cookie nahi aayi — challenge page aksar harkat
+        // (mouse/scroll) ke baad khud token de deta hai. Ek aur mauqa do,
+        // phir doosra page try karo — lekin budget ke andar hi.
+        try {
+          await page.mouse.move(320 + Math.random() * 240, 240 + Math.random() * 160, { steps: 14 });
+          await page.mouse.wheel({ deltaY: 700 });
+          await new Promise((r) => setTimeout(r, Math.min(1200, Math.max(0, remaining() - 3_000))));
+        } catch {}
+        token = await waitForSwiggyWafCookie(page, Math.min(8_000, remaining()));
+      }
+      if (!token && remaining() > 8_000) {
+        await page.goto('https://www.swiggy.com/restaurants', {
+          waitUntil: 'domcontentloaded',
+          timeout: Math.min(15_000, Math.max(3_000, remaining() - 2_000))
+        }).catch(() => {});
+        token = await waitForSwiggyWafCookie(page, Math.min(10_000, remaining()));
+      }
       if (token) {
-        // Non-proxy mode = shared pool; proxy mode = caller per-proxy me store karega
-        if (!currentProxy?.id) {
+        // Direct route = shared pool; proxy route = caller per-proxy store karega.
+        if (!routeProxy?.id) {
           latestSharedWafToken = token;
           latestSharedWafAt = Date.now();
           try { wafPool.seedToken(token, { source: 'chromium' }); } catch {}
         }
-        // Allow challenge reload/navigation to settle
-        await new Promise(r => setTimeout(r, 1500));
+        await new Promise(r => setTimeout(r, Math.min(1500, remaining())));
       }
+      console.log(`[SwiggyBridge] WAF solver ${token ? 'OK' : 'FAIL'} | route=${routeLabel(routeProxy)} | ${Date.now() - startedAt}ms`);
       await browser.close().catch(() => {});
       return token || '';
     } catch (err) {
       if (browser) await browser.close().catch(() => {});
-      console.warn('[SwiggyBridge] WAF solver error:', err.message);
+      console.warn(`[SwiggyBridge] WAF solver error | route=${routeLabel(routeProxy)} | ${err.message}`);
       return '';
     } finally {
-      wafSolvePromise = null;
+      wafSolvePromises.delete(routeKey);
     }
   })();
 
-  return wafSolvePromise;
+  wafSolvePromises.set(routeKey, solvePromise);
+  solvePromise.then(() => releaseSolve(''), () => releaseSolve(''));
+  return solvePromise;
 }
 
 export async function safeEvaluateAuthOnce(page, fn, ...args) {
@@ -1423,16 +1741,10 @@ export function parseSwiggyOtpError(otpResult) {
     };
   }
 
-  if ([500, 502, 503, 504].includes(status)) {
-    return {
-      code: 'SWIGGY_SERVER_ERROR',
-      retryable: true,
-      message: `Swiggy returned a temporary server error (HTTP ${status}). Wait a minute or two before retrying.`,
-      swiggyStatus: swiggyMsg || `Swiggy Server Error (${status})`,
-      details: `HTTP ${status}`
-    };
-  }
-
+  // Error field wala 5xx aksar asal Swiggy response nahi hota — browser /
+  // proxy / network exception ko synthetic status 500 de kar yahan bheja
+  // jata hai. Use "Swiggy server error" kehna gumrah-kun tha (asli wajah
+  // chhup jati thi), isliye pehle SYSTEM_ERROR classify karo.
   if (otpResult.error) {
     return {
       code: 'SYSTEM_ERROR',
@@ -1440,6 +1752,16 @@ export function parseSwiggyOtpError(otpResult) {
       message: `Could not complete the OTP request: ${otpResult.error}`,
       swiggyStatus: otpResult.error,
       details: 'Network or session context error'
+    };
+  }
+
+  if ([500, 502, 503, 504].includes(status)) {
+    return {
+      code: 'SWIGGY_SERVER_ERROR',
+      retryable: true,
+      message: `Swiggy returned a temporary server error (HTTP ${status}). Wait a minute or two before retrying.`,
+      swiggyStatus: swiggyMsg || `Swiggy Server Error (${status})`,
+      details: `HTTP ${status}`
     };
   }
 
@@ -1503,15 +1825,23 @@ export async function requestSwiggyOtpViaBridge(userId, phone, targetAcc = '', t
   const runPromise = (async () => {
     // 🔀 PROXY MODE: current proxy side par (cooldown) ho to TURANT doosri
     // proxy le lo — ZERO wait. Sab side par ho tabhi cooldown dikhao.
-    if (currentProxy?.id) {
-      const nextProxy = proxyPool.pickProxy({ excludeIds: [currentProxy.id] });
-      const curCooling = (proxyPool.listProxies().find((p) => p.id === currentProxy.id)?.cooldownLeftMs || 0) > 5000;
-      if (curCooling && nextProxy) {
+    if (getBridgeProxy()?.id) {
+      const currentId = getBridgeProxy().id;
+      const curInfo = proxyPool.listProxies().find((p) => p.id === currentId);
+      const wafCooling = (curInfo?.cooldownLeftMs || 0) > 5000;
+      const solveCooling = (curInfo?.wafSolveCooldownLeftMs || 0) > 5000 && !curInfo?.tokenReady;
+      // Pehle har OTP par yunhi pickProxy() chal jata tha — rotation hue
+      // baghair hi doosri proxy ke hits/last-used badh jate the. Ab sirf
+      // asal garam/unsolvable route par alternative dhoondo.
+      const nextProxy = (wafCooling || solveCooling)
+        ? proxyPool.pickProxy({ excludeIds: [currentId] })
+        : null;
+      if ((wafCooling || solveCooling) && nextProxy) {
         setBridgeProxy(nextProxy);
-        console.log(`[SwiggyBridge] Proxy rotated (cooldown) → ${nextProxy.label}`);
-      } else if (curCooling && !nextProxy) {
+        console.log(`[SwiggyBridge] Proxy rotated (${wafCooling ? 'cooldown' : 'solve-failed'}) → ${nextProxy.label}`);
+      } else if (wafCooling && !nextProxy) {
         // Sab proxies side par — engine ko bolo thodi der ruk kar aage badhe
-        const cd = proxyPool.listProxies().find((p) => p.id === currentProxy.id)?.cooldownLeftMs || 60_000;
+        const cd = curInfo?.cooldownLeftMs || 60_000;
         return {
           success: false,
           code: 'SWIGGY_WAF_COOLDOWN',
@@ -1626,8 +1956,13 @@ export async function requestSwiggyOtpViaBridge(userId, phone, targetAcc = '', t
         if (!signupSecurityBlocked && signupInitResult.status === 200 && (signupInitResult.data?.statusCode === 0 || signupInitResult.data?.statusCode === undefined)) {
           signupPreRegistered = true;
           signupOtpDispatched = true;
-        } else if (!signupSecurityBlocked && /otp.*required|enter.*otp|invalid.*otp/i.test(finalInitLower)) {
+        } else if (!signupSecurityBlocked && signupInitResult.status === 200) {
           // Cluster requires `sms-otp` (with `type: 'register'`) first and `signup` WITH `otp` on verification!
+          // (Pehle ye fallback sirf "otp required/invalid otp" wording par
+          // chalta tha — Swiggy wording badle to number seedha fail ho jata
+          // tha. Ab signup-init ka koi bhi non-success 200 aaye to register
+          // OTP ek baar try hoga; wo bhi fail ho tab hi asli error.)
+          console.log(`[SwiggyBridge] signup-init non-success (HTTP ${signupInitResult.status}, code=${signupInitResult.data?.statusCode}, msg="${signupInitResult.data?.statusMessage || signupInitResult.data?.message || ''}") — sms-otp type=register fallback try kar raha hoon.`);
           const regSms = await postSwiggyAuthJson(session, 'https://www.swiggy.com/dapi/auth/sms-otp', {
             mobile: cleanPhone,
             type: 'register'
@@ -1666,10 +2001,12 @@ export async function requestSwiggyOtpViaBridge(userId, phone, targetAcc = '', t
 
         closeBridgeSessionCleanly(session);
         const parsedErr = parseSwiggyOtpError(signupInitResult);
+        console.warn(`[SwiggyBridge] Signup OTP send failed | phone=******${cleanPhone.slice(-4)} | code=${parsedErr.code} | http=${signupInitResult.status || 0} | proxy=${getBridgeProxy()?.label || 'direct'} | ${parsedErr.message}`);
         return {
           success: false,
           code: parsedErr.code,
           retryable: parsedErr.retryable,
+          httpStatus: Number(signupInitResult.status) || 0,
           message: parsedErr.message,
           swiggyStatus: parsedErr.swiggyStatus,
           details: parsedErr.details
@@ -1705,10 +2042,12 @@ export async function requestSwiggyOtpViaBridge(userId, phone, targetAcc = '', t
 
       closeBridgeSessionCleanly(session);
       const parsedErr = parseSwiggyOtpError(otpResult);
+      console.warn(`[SwiggyBridge] OTP send failed | phone=******${cleanPhone.slice(-4)} | code=${parsedErr.code} | http=${otpResult.status || 0} | proxy=${getBridgeProxy()?.label || 'direct'} | ${parsedErr.message}`);
       return {
         success: false,
         code: parsedErr.code,
         retryable: parsedErr.retryable,
+        httpStatus: Number(otpResult.status) || 0,
         message: parsedErr.message,
         swiggyStatus: parsedErr.swiggyStatus,
         details: parsedErr.details
@@ -1717,18 +2056,23 @@ export async function requestSwiggyOtpViaBridge(userId, phone, targetAcc = '', t
       closeBridgeSessionCleanly(session);
       delete activeSessions[userId];
       const lower = String(err.message || '').toLowerCase();
+      // Generic exception ko synthetic HTTP 500 mat banao — wo aksar proxy /
+      // network fail hota hai, Swiggy server ka jawab nahi. Sirf rate-limit
+      // aur WAF wording se status infer karo; baki SYSTEM_ERROR rahega.
       const inferredStatus = /429|rate limit|too many requests/.test(lower)
         ? 429
-        : (/waf|captcha|challenge|verify you are human|bot verification|automated traffic/.test(lower) ? 403 : 500);
+        : (/waf|captcha|challenge|verify you are human|bot verification|automated traffic/.test(lower) ? 403 : 0);
       const diagnostic = parseSwiggyOtpError({
         status: inferredStatus,
         error: err.message,
         data: { statusMessage: err.message }
       });
+      console.warn(`[SwiggyBridge] OTP send exception | phone=******${cleanPhone.slice(-4)} | code=${diagnostic.code} | proxy=${getBridgeProxy()?.label || 'direct'} | ${err.message}`);
       return {
         success: false,
         code: diagnostic.code,
         retryable: diagnostic.retryable,
+        httpStatus: inferredStatus,
         message: diagnostic.message,
         swiggyStatus: diagnostic.swiggyStatus,
         details: err.stack ? err.stack.split('\n')[0] : diagnostic.details
@@ -1762,8 +2106,8 @@ async function resolveDeleteCookieJarAndCsrf(acc, cleanPhone = '', targetAcc = '
   // Auto-mint `_session_tid` if account was imported with Android tokens (`tid` + `token`) without web `_session_tid`!
   if (!cookieString.includes('_session_tid=') && effectiveAcc && (effectiveAcc.tid || effectiveAcc.token)) {
     try {
-      const { bootstrapSwiggyWebSessionFromAndroidTokens } = await import('./swiggy-cart.js');
-      const minted = await bootstrapSwiggyWebSessionFromAndroidTokens(effectiveAcc, 3500);
+      const bootstrap = await loadAndroidBootstrap();
+      const minted = bootstrap ? await bootstrap(effectiveAcc, 3500) : null;
       if (minted) {
         cookieString = stripStaleWafCookie(minted);
       }
@@ -1907,9 +2251,9 @@ export async function requestSwiggyDeleteOtpViaBridge(userId, phone, targetAcc =
     // 🔀 WAF ne phir bhi roka. Proxy mode = TURANT nayi IP (zero wait);
     // Direct mode = circuit-breaker + naya token + EK clean retry.
     if (isAwsWafChallengeResponse(checkOut.status, checkOut.rawText, checkOut.headers)) {
-      if (currentProxy?.id) {
-        try { proxyPool.markProxyWafHit(currentProxy.id, 3 * 60_000); } catch {}
-        const nextProxy = proxyPool.pickProxy({ excludeIds: [currentProxy.id] });
+      if (getBridgeProxy()?.id) {
+        try { proxyPool.markProxyWafHit(getBridgeProxy().id, 3 * 60_000); } catch {}
+        const nextProxy = proxyPool.pickProxy({ excludeIds: [getBridgeProxy().id] });
         if (nextProxy) {
           setBridgeProxy(nextProxy);
           delWafTok = await getLiveSwiggyWafToken().catch(() => delWafTok);
@@ -2271,11 +2615,7 @@ async function finalizeAuthenticatedSwiggyAccount(userId, session, authResult, {
   });
 
   const requestedAccountLabel = String(explicitName || session.targetAccName || '').trim();
-  const rawSlot = requestedAccountLabel && !/^user\s*\d+$/i.test(requestedAccountLabel)
-    ? requestedAccountLabel
-    : getNextAutoUserName();
   const cleanActual = String(resolvedName || session.signupName || '').replace(/\([^)]*\)/g, '').trim();
-  const finalName = rawSlot || cleanActual || getNextAutoUserName();
   const accKey = targetAcc || `acc_${phone}`;
 
   // Fast sub-second Today+Tomorrow offer pre-lock (bounded at 2.4s max so OTP verification NEVER stalls!)
@@ -2294,6 +2634,14 @@ async function finalizeAuthenticatedSwiggyAccount(userId, session, authResult, {
       new Promise(resolve => setTimeout(() => resolve({ success: false, pendingBackgroundLock: true }), 2400))
     ]);
   } catch {}
+
+  // Auto label offer-lock ke await ke BAAD lo. Parallel lanes me do
+  // finalizes ek saath aayein to dono await se pehle same "User N" nahi
+  // uthayengi; yahan se updateAccount tak koi await nahi hai.
+  const rawSlot = requestedAccountLabel && !/^user\s*\d+$/i.test(requestedAccountLabel)
+    ? requestedAccountLabel
+    : getNextAutoUserName();
+  const finalName = rawSlot || cleanActual || getNextAutoUserName();
 
   const savedData = {
     name: finalName,
@@ -2683,8 +3031,8 @@ export async function logoutSwiggySessionRemote(accountOrKey) {
   let webSessionEstablished = Boolean(cookieMap.get('_session_tid'));
   if (!webSessionEstablished && (tid || token)) {
     try {
-      const { bootstrapSwiggyWebSessionFromAndroidTokens } = await import('./swiggy-cart.js');
-      const minted = await bootstrapSwiggyWebSessionFromAndroidTokens(source);
+      const bootstrap = await loadAndroidBootstrap();
+      const minted = bootstrap ? await bootstrap(source) : null;
       if (minted && /(?:^|;\s*)_session_tid=/.test(minted)) {
         for (const part of String(minted).split(';')) {
           const t = part.trim();

@@ -8,7 +8,8 @@
 //        • delete SUCCESS → purge → usi number se fresh registration → fresh_after_delete
 //   ⚠️ infrastructure outcomes (engine alag tarah handle karta hai):
 //        • Swiggy rate limit        → rate_limited      (backoff)
-//        • Swiggy security check    → security_challenge (band karo)
+//        • Swiggy security check    → security_challenge (engine auto-recover: defer + IP cool-down)
+//        • Swiggy/proxy 5xx/network → deferred_swiggy_transient (number safe, proxy rotate + retry)
 //        • OTP send/miss/verify fail→ failed_*           (agla number)
 //        • STOP dabane par           → aborted            (number untouched/retryable)
 //
@@ -33,12 +34,134 @@ import {
   snapshotSeenOtpState,
   waitForOtpCode,
   markPoolNumberStatus,
+  fetchDeviceLastActivityMs,
+  doubledWidenWindowMs,
 } from './firebase-numbers.js';
 import { esc, section, sub, field } from './rich-text.js';
+import { normalizeIndianMobileNumber } from './phone-utils.js';
 
 // ---------------------------------------------------------------------------
 // Ledger (db.json → premiumFlow.used) + fresh-selection helpers
 // ---------------------------------------------------------------------------
+// Boss ka hard rule: jis number ka fresh session ek baar extract/send ho
+// gaya, woh number 7 din se pehle dobara process NAHI hoga. Ledger local
+// db ke saath cloud vault me bhi sync hota hai (store.js snapshot), warna
+// Render restart/deploy par sirf accounts wapas aate aur used-list ud jati.
+export const EXTRACTED_NUMBER_COOLDOWN_MS = 7 * 24 * 60 * 60 * 1000;
+
+function timestampMs(value) {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    if (value > 1e12) return value;
+    if (value > 1e9) return value * 1000;
+    return 0;
+  }
+  const parsed = Date.parse(String(value || ''));
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+}
+
+function ledgerTimestampMs(entry) {
+  return timestampMs(
+    entry?.extractedAt || entry?.sentAt || entry?.at || entry?.updatedAt || entry?.createdAt || ''
+  );
+}
+
+function isExtractedLedgerStatus(status) {
+  return /^(success|extracted|sent)$/i.test(String(status || '').trim());
+}
+
+function savedSessionTimestampsByPhone(db) {
+  const out = new Map();
+  const add = (rawPhone, value) => {
+    const phone = normalizeIndianMobileNumber(rawPhone);
+    if (!phone || !value || typeof value !== 'object') return;
+    const ts = timestampMs(value.savedAt || value.updatedAt || value.createdAt || value.at || '');
+    if (ts && ts > (out.get(phone) || 0)) out.set(phone, ts);
+  };
+
+  for (const [key, acc] of Object.entries(db?.config?.accounts || {})) {
+    if (!acc || acc.isLoggedIn === false || acc.isLoggedOut || acc.sessionExpired) continue;
+    if (!(acc.cookies || acc.tid || acc.token || acc._session_tid || acc.isLoggedIn)) continue;
+    add(acc.phone || acc.mobile || String(key).replace(/^acc_/, ''), acc);
+  }
+  for (const [key, value] of Object.entries(db?.sessionVault || {})) {
+    add(value?.phone || value?.mobile || value?.account || String(key).replace(/^acc_/, ''), value);
+  }
+  return out;
+}
+
+function extractedCooldownFromMaps(phone, { now = Date.now(), used = {}, savedSessions = new Map() } = {}) {
+  const cleanPhone = normalizeIndianMobileNumber(phone) || String(phone || '');
+  const entry = used?.[cleanPhone] || used?.[phone] || null;
+  let extractedAtMs = 0;
+  let source = '';
+
+  if (entry && isExtractedLedgerStatus(entry.status)) {
+    extractedAtMs = ledgerTimestampMs(entry);
+    source = 'ledger';
+    if (!extractedAtMs) {
+      // Purani/malformed success entry ka time hi na mile to andazay se
+      // number ko release mat karo — boss ka 7-day rule fail-closed hai.
+      return {
+        blocked: true,
+        extractedAtMs: 0,
+        cooldownUntilMs: null,
+        remainingMs: null,
+        source,
+      };
+    }
+  } else if (!entry) {
+    // Ledger kisi restart/deploy me reh gaya ho to saved account/session
+    // ka savedAt hi pichhle extraction ka saboot hai. Ledger maujood ho
+    // to wahi authoritative hai; account baad me use honay se savedAt
+    // badal bhi sakta hai, isliye use ledger ke upar nahi lagate.
+    extractedAtMs = Number(savedSessions?.get(cleanPhone) || 0);
+    source = extractedAtMs ? 'saved-session' : '';
+  }
+
+  if (!extractedAtMs) {
+    return { blocked: false, extractedAtMs: 0, cooldownUntilMs: 0, remainingMs: 0, source: '' };
+  }
+  const cooldownUntilMs = extractedAtMs + EXTRACTED_NUMBER_COOLDOWN_MS;
+  return {
+    blocked: now < cooldownUntilMs,
+    extractedAtMs,
+    cooldownUntilMs,
+    remainingMs: Math.max(0, cooldownUntilMs - now),
+    source,
+  };
+}
+
+function premiumSelectionMaps(opts = {}) {
+  let used = opts.ledger || null;
+  let savedSessions = opts.savedSessions || null;
+  if (!used || !savedSessions) {
+    try {
+      const db = opts.db || getDb();
+      if (!used) used = db?.premiumFlow?.used || {};
+      if (!savedSessions) savedSessions = savedSessionTimestampsByPhone(db);
+    } catch {
+      if (!used) used = {};
+      if (!savedSessions) savedSessions = new Map();
+    }
+  }
+  return { used, savedSessions };
+}
+
+export function getExtractedNumberCooldown(phone, opts = {}) {
+  const now = Number(opts.now) || Date.now();
+  const { used, savedSessions } = premiumSelectionMaps(opts);
+  return extractedCooldownFromMaps(phone, { now, used, savedSessions });
+}
+
+export function isPhoneBlockedByPremiumLedger(phone, opts = {}) {
+  const now = Number(opts.now) || Date.now();
+  const { used, savedSessions } = premiumSelectionMaps(opts);
+  const cleanPhone = normalizeIndianMobileNumber(phone) || String(phone || '');
+  const entry = used?.[cleanPhone] || used?.[phone] || null;
+  if (entry && !isExtractedLedgerStatus(entry.status)) return true;
+  return extractedCooldownFromMaps(phone, { now, used, savedSessions }).blocked;
+}
+
 export function getPremiumLedger() {
   try {
     const db = getDb();
@@ -55,8 +178,15 @@ export function markLedger(phone, status, extra = {}) {
     const db = getDb();
     if (!db.premiumFlow) db.premiumFlow = {};
     if (!db.premiumFlow.used) db.premiumFlow.used = {};
-    db.premiumFlow.used[phone] = { status, at: new Date().toISOString(), ...extra };
+    const at = new Date().toISOString();
+    const record = { status, at, ...extra };
+    if (isExtractedLedgerStatus(status) && !record.extractedAt) record.extractedAt = at;
+    db.premiumFlow.used[phone] = record;
     saveDb(db);
+    // Ledger ko bhi cloud vault snapshot ke saath bhej do. Warna account
+    // to restart ke baad wapas aa jata tha, magar "ye number nikal chuka
+    // hai" wali list local disk ke saath ghayab ho jati thi.
+    void syncCloudVaultNow(getDb()).catch(() => {});
   } catch (e) {
     console.warn('[Pipeline] ledger save failed:', e?.message);
   }
@@ -70,11 +200,15 @@ export async function markPoolStatus(entry, status) {
   }
 }
 
-export function freshEntriesFrom(pool) {
-  const used = getPremiumLedger();
-  return (pool || []).filter(
-    (n) => !used[n.phone] && !/^(used|skipped|deferred)$/i.test(String(n.status || '').trim())
-  );
+export function freshEntriesFrom(pool, opts = {}) {
+  const now = Number(opts.now) || Date.now();
+  const { used, savedSessions } = premiumSelectionMaps(opts);
+  return (pool || []).filter((n) => {
+    if (/^(used|skipped|deferred)$/i.test(String(n.status || '').trim())) return false;
+    const entry = used?.[n.phone] || null;
+    if (entry && !isExtractedLedgerStatus(entry.status)) return false;
+    return !extractedCooldownFromMaps(n.phone, { now, used, savedSessions }).blocked;
+  });
 }
 
 // Online devices pehle (unme hi OTP aayega), phir offline fallback.
@@ -149,6 +283,46 @@ async function grabAndVerifyRound({
   return { status: 'failed', reason: v?.message || '', swiggyText: v?.swiggyStatus || '' };
 }
 
+// OTP-send failures ko engine ke samajhne wali shakl do. Khaas taur par
+// Swiggy/proxy ke temporary 5xx ya network errors number ki galti NAHI hain:
+// pehle ye sab `failed_otp_send` ban kar processed+failed count ho jate the
+// aur number retry queue me bhi nahi jata tha. Ab ye alag transient outcome
+// hai — engine number ko safe rakh kar proxy rotate + isi run me retry karega.
+export function _classifyOtpSendFailure(otpReq, phone, {
+  failKind = 'failed_otp_send',
+  stage = 'otp_send',
+} = {}) {
+  if (!otpReq || otpReq.success) return null;
+  const code = String(otpReq.code || '');
+  const httpStatus = Number(otpReq.httpStatus ?? otpReq.status) || 0;
+  const reason = otpReq.message || 'Swiggy OTP send fail';
+  const base = {
+    ok: false,
+    phone,
+    code: code || undefined,
+    httpStatus: httpStatus || undefined,
+    stage,
+    reason,
+  };
+
+  if (code === 'SWIGGY_WAF_COOLDOWN') {
+    return { ...base, kind: 'waf_cooldown', cooldownMs: Number(otpReq.cooldownMs) || 60_000 };
+  }
+  if (code === 'SWIGGY_RATE_LIMIT') return { ...base, kind: 'rate_limited' };
+  if (code === 'SWIGGY_SECURITY_CHALLENGE') return { ...base, kind: 'security_challenge' };
+
+  const isTransient =
+    code === 'SWIGGY_SERVER_ERROR' ||
+    code === 'SYSTEM_ERROR' ||
+    code === 'NO_RESPONSE' ||
+    (otpReq.retryable === true && httpStatus >= 500);
+  if (isTransient) {
+    return { ...base, kind: 'deferred_swiggy_transient', retryable: true };
+  }
+
+  return { ...base, kind: failKind };
+}
+
 // ---------------------------------------------------------------------------
 // Main: ek number ko shuru se end tak
 // ---------------------------------------------------------------------------
@@ -163,15 +337,37 @@ export async function processSingleNumber({
   const phone = entry?.phone;
   if (!phone) return { ok: false, kind: 'failed_bad_entry', phone: '', reason: 'Entry me phone nahi hai' };
 
+  // 7-day extracted-number cooldown — selection ke ilawa yahan bhi hard
+  // gate hai. Pehle retry-later queue ki purani entry ledger check bypass
+  // karke wohi number dobara utha sakti thi jo thodi der pehle extract /
+  // send ho chuka tha. Ab kisi bhi rasty se aaye, OTP se pehle ruk jayega.
+  if (markUsed) {
+    const cooldown = getExtractedNumberCooldown(phone);
+    if (cooldown.blocked) {
+      const until = cooldown.cooldownUntilMs
+        ? new Date(cooldown.cooldownUntilMs).toISOString()
+        : 'unknown (purani success entry me timestamp nahi)';
+      return {
+        ok: false,
+        kind: 'deferred_number_cooldown',
+        phone,
+        extractedAtMs: cooldown.extractedAtMs || null,
+        cooldownUntilMs: cooldown.cooldownUntilMs,
+        remainingMs: cooldown.remainingMs,
+        reason: `Ye number pehle extract/send ho chuka hai — 7-day cooldown ${until} tak hai, OTP nahi bheja`,
+      };
+    }
+  }
+
   const deviceIds = entry?.deviceId ? [entry.deviceId] : null;
   const say = async (text) => { if (report) { try { await report(text); } catch {} } };
   const aborted = () => Boolean(shouldAbort && shouldAbort());
 
   const waitCfg = {
-    waitMs: Number(otpCfg.waitMs ?? 10_000),
+    waitMs: Number(otpCfg.waitMs ?? 3_000),
     timeoutMs: Number(otpCfg.timeoutMs ?? 90_000),
-    pollMs: Number(otpCfg.pollMs ?? 2_500),
-    acceptAnyAfterMs: Number(otpCfg.acceptAnyAfterMs ?? 30_000),
+    pollMs: Number(otpCfg.pollMs ?? 1_500),
+    acceptAnyAfterMs: Number(otpCfg.acceptAnyAfterMs ?? 15_000),
   };
 
   const mapVerify = (r, failKind) => {
@@ -184,6 +380,64 @@ export async function processSingleNumber({
   };
 
   try {
+    // ---- Step 0: DEVICE LAST-SEEN GATE ----
+    // Andhere me random number try karne ka koi faida nahi — OTP sirf usi
+    // device ko jayega jiski last activity (taaza forwarded message) window
+    // ke andar hai. Stale device = OTP bheje baghair turant skip (na 100s
+    // wait, na Swiggy rate-limit burn, na fail count). Window:
+    // PREMIUM_DEVICE_ACTIVE_WINDOW_MS (default 60s; 0 = gate off).
+    const activeWindowRaw = Number(otpCfg.activeWindowMs ?? process.env.PREMIUM_DEVICE_ACTIVE_WINDOW_MS ?? 60_000);
+    const activeWindowMs = Number.isFinite(activeWindowRaw) && activeWindowRaw > 0 ? activeWindowRaw : 0;
+    // Scanner ne agar device ko Firebase clients ke ONLINE status par
+    // explicitly chuna hai, to use last incoming SMS ki age par dobara
+    // mat roko. SMS na aana device ke band honay ka saboot nahi hai.
+    const skipLastSeenGate = Boolean(otpCfg.skipLastSeenGate);
+    if (deviceIds?.length && activeWindowMs > 0 && !skipLastSeenGate) {
+      let lastActivityMs = null;
+      // Engine ka parallel scan pehle hi ye device probe kar chuka hai to
+      // wahin ka fresh result use karo (dobara Firebase GET = fuzool time).
+      // Lekin 10s jaise sakht window me queue me baithe-baithe activity
+      // purani ho sakti hai — aur beech me device par NAYI activity bhi aa
+      // sakti hai. Isliye prechecked activity ab window se bahar ho to
+      // number ko seedha stale kehne se pehle EK live refetch lazmi hai.
+      const preTs = Number(otpCfg.precheckedLastActivityMs || 0) || null;
+      const preAt = Number(otpCfg.precheckedAt || 0);
+      const precheckNow = Date.now();
+      const precheckStillFresh = Boolean(
+        preTs && preAt &&
+        (precheckNow - preAt) < 45_000 &&
+        (precheckNow - preTs) <= activeWindowMs
+      );
+      if (precheckStillFresh) {
+        lastActivityMs = preTs;
+      } else {
+        for (const devId of deviceIds) {
+          const t = await fetchDeviceLastActivityMs(devId).catch(() => null);
+          if (t && (!lastActivityMs || t > lastActivityMs)) lastActivityMs = t;
+        }
+      }
+      const ageMs = lastActivityMs ? Date.now() - lastActivityMs : Infinity;
+      // Autopilot ladder mode me scanner ne is device ko sabse taaza
+      // available samajh kar chuna hota hai. Scan/queue/WAF warm-up ke
+      // beech woh chuni hui limit se chand second bahar ho jaye to use
+      // stale keh kar poora scan dobara ghumana pagalpan hai — wahin
+      // window ko double karke aage badho (10s→20s→40s→…), jab tak asal
+      // activity age andar na aa jaye. Sirf bilkul timestamp na hona stale hai.
+      const allowDoubling = Boolean(otpCfg.widenLastSeenByDoubling);
+      const effectiveWindowMs = allowDoubling && Number.isFinite(ageMs)
+        ? doubledWidenWindowMs(activeWindowMs, ageMs)
+        : activeWindowMs;
+      if (!(ageMs <= effectiveWindowMs)) {
+        return {
+          ok: false, kind: 'deferred_device_stale', phone,
+          lastActivityMs, ageMs: ageMs === Infinity ? null : ageMs, activeWindowMs: effectiveWindowMs,
+          reason: lastActivityMs
+            ? `Device ki last activity ${Math.round(ageMs / 1000)}s purani hai (limit ${Math.round(effectiveWindowMs / 1000)}s) — OTP nahi bheja`
+            : 'Device ki koi recent activity mili hi nahi — OTP nahi bheja',
+        };
+      }
+    }
+
     // ---- Step 1: Swiggy OTP bhejo (purana/naya Swiggy khud detect karta hai) ----
     const seen1 = await snapshotSeenOtpState(phone, { deviceIds });
 
@@ -193,16 +447,10 @@ export async function processSingleNumber({
 
     const otpReq = await requestSwiggyOtpViaBridge(userId, phone, existingKey, existingName);
     if (!otpReq?.success) {
-      if (otpReq?.code === 'SWIGGY_WAF_COOLDOWN') {
-        return { ok: false, kind: 'waf_cooldown', phone, cooldownMs: Number(otpReq?.cooldownMs) || 60_000, reason: otpReq?.message || '' };
-      }
-      if (otpReq?.code === 'SWIGGY_RATE_LIMIT') {
-        return { ok: false, kind: 'rate_limited', phone, reason: otpReq?.message || '' };
-      }
-      if (otpReq?.code === 'SWIGGY_SECURITY_CHALLENGE') {
-        return { ok: false, kind: 'security_challenge', phone, reason: otpReq?.message || '' };
-      }
-      return { ok: false, kind: 'failed_otp_send', phone, reason: otpReq?.message || 'Swiggy OTP send fail' };
+      return _classifyOtpSendFailure(otpReq, phone, {
+        failKind: 'failed_otp_send',
+        stage: 'otp_send',
+      });
     }
 
     const isNew = Boolean(otpReq.isNewUser);
@@ -215,7 +463,7 @@ export async function processSingleNumber({
             ? '→ Number Swiggy par pehle se nahi hai — seedha naya account banega.'
             : '→ Purana account mila: login → Settings → Delete Account → phir fresh registration.',
           '',
-          sub('⏳10 second wait… phir Firebase se OTP padhunga (max ~90s aur).'),
+          sub('⏳ OTP bhej diya — Firebase inbox live poll kar raha hoon (jaise hi SMS forward hoga, code mil jayega).'),
         ].join('\n')
       )
     );
@@ -226,7 +474,7 @@ export async function processSingleNumber({
       userId, phone, deviceIds, seen: seen1, waitCfg, report: say, shouldAbort,
       waitText: section('⏳ OTP Wait — Step 1/3', [
         `📱 <b>Number:</b> <code>${esc(phone)}</code>`,
-        sub('10 second ruk ke Firebase SMS inbox padh raha hoon…'),
+        sub('Firebase SMS inbox live poll kar raha hoon…'),
       ].join('\n')),
       retryText: section('↻ Verify Retry', [
         `📱 <b>Number:</b> <code>${esc(phone)}</code>`,
@@ -313,16 +561,17 @@ export async function processSingleNumber({
     const seen3 = await snapshotSeenOtpState(phone, { deviceIds });
     const otpReq2 = await requestSwiggyOtpViaBridge(userId, phone, '', null);
     if (!otpReq2?.success) {
-      if (otpReq2?.code === 'SWIGGY_RATE_LIMIT') return { ok: false, kind: 'rate_limited', phone, reason: otpReq2?.message || '' };
-      if (otpReq2?.code === 'SWIGGY_SECURITY_CHALLENGE') return { ok: false, kind: 'security_challenge', phone, reason: otpReq2?.message || '' };
-      return { ok: false, kind: 'failed_fresh_otp_send', phone, reason: otpReq2?.message || 'Fresh OTP send fail' };
+      return _classifyOtpSendFailure(otpReq2, phone, {
+        failKind: 'failed_fresh_otp_send',
+        stage: 'fresh_otp_send',
+      });
     }
 
     const round3 = await grabAndVerifyRound({
       userId, phone, deviceIds, seen: seen3, waitCfg, report: say, shouldAbort,
       waitText: section('⏳ Fresh OTP Wait — Step 3/3', [
         `📱 <b>Number:</b> <code>${esc(phone)}</code>`,
-        sub('Fresh registration OTP —10 second wait + inbox poll…'),
+        sub('Fresh registration OTP — inbox live poll kar raha hoon…'),
       ].join('\n')),
       retryText: section('↻ Fresh Verify Retry', [
         `📱 <b>Number:</b> <code>${esc(phone)}</code>`,

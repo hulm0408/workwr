@@ -54,7 +54,14 @@ globalThis.fetch = async (url) => {
   if (path === 'numbers') return respond(mock.numbers);
   if (path.startsWith('messages/')) {
     const devId = decodeURIComponent(path.slice('messages/'.length));
-    return respond(mock.messages[devId] ?? null);
+    let data = mock.messages[devId] ?? null;
+    const limit = Number(new URL(u).searchParams.get('limitToLast') || 0);
+    if (data && typeof data === 'object' && !Array.isArray(data) && limit > 0) {
+      const entries = Object.entries(data)
+        .sort(([a], [b]) => String(a).localeCompare(String(b), undefined, { numeric: true }));
+      data = Object.fromEntries(entries.slice(-limit));
+    }
+    return respond(data);
   }
   if (path.startsWith('otp/')) {
     const phone = decodeURIComponent(path.slice('otp/'.length));
@@ -73,8 +80,18 @@ const {
   listPoolNumbers, fetchOtpCandidates, snapshotSeenOtpState, waitForOtpCode,
   setFirebaseSource, getFirebaseSource,
 } = await import('./firebase-numbers.js');
-const { freshEntriesFrom, preferOnline, getPremiumLedger } = await import('./number-pipeline.js');
-const { getAutopilotSnapshot, isAutopilotRunning, requestAutopilotStop } = await import('./autopilot-engine.js');
+const {
+  freshEntriesFrom,
+  preferOnline,
+  getPremiumLedger,
+  getExtractedNumberCooldown,
+  isPhoneBlockedByPremiumLedger,
+  EXTRACTED_NUMBER_COOLDOWN_MS,
+} = await import('./number-pipeline.js');
+const {
+  getAutopilotSnapshot, isAutopilotRunning, requestAutopilotStop,
+  normalizeBatchConcurrency, availableParallelLanes, parallelWorkerUserId,
+} = await import('./autopilot-engine.js');
 const srcMod = await import('./firebase-sources.js');
 const bs = await import('./bot-settings.js');
 const px = await import('./proxy-pool.js');
@@ -289,6 +306,67 @@ console.log('freshEntriesFrom + preferOnline (pipeline helpers):');
 
   const ordered = preferOnline(fresh);
   ok(ordered[0].online === true && ordered[ordered.length - 1].online === false, 'online pehle, offline baad me');
+
+  // 7-day extracted-number cooldown: 6 din pehle bheja number block,
+  // exact 7 din guzarne ke baad hi dobara eligible.
+  const now = Date.now();
+  const cooldownLedger = {
+    '9876500011': { status: 'success', at: new Date(now - 6 * 24 * 60 * 60 * 1000).toISOString() },
+    '9876500012': { status: 'success', at: new Date(now - EXTRACTED_NUMBER_COOLDOWN_MS - 1).toISOString() },
+    '9876500013': { status: 'skipped', at: new Date(now - EXTRACTED_NUMBER_COOLDOWN_MS - 1).toISOString() },
+  };
+  const cooldownPool = ['9876500011', '9876500012', '9876500013', '9876500014']
+    .map((phone) => ({ phone, status: '', online: true }));
+  const afterCooldownFilter = freshEntriesFrom(cooldownPool, {
+    now,
+    ledger: cooldownLedger,
+    savedSessions: new Map(),
+  }).map((n) => n.phone);
+  ok(!afterCooldownFilter.includes('9876500011'), '7-day cooldown: 6 din pehle extracted number block');
+  ok(afterCooldownFilter.includes('9876500012'), '7-day cooldown: 7 din guzarne ke baad number eligible');
+  ok(!afterCooldownFilter.includes('9876500013'), 'skipped ledger entry 7 din baad bhi block (purani safety barqarar)');
+  ok(getExtractedNumberCooldown('9876500011', {
+    now,
+    ledger: cooldownLedger,
+    savedSessions: new Map(),
+  }).blocked === true, 'cooldown helper: recent extracted number blocked');
+  ok(isPhoneBlockedByPremiumLedger('9876500012', {
+    now,
+    ledger: cooldownLedger,
+    savedSessions: new Map(),
+  }) === false, 'cooldown helper: expired success dobara allowed');
+
+  // Agar local ledger restart/deploy me kho jaye lekin saved session
+  // cloud se wapas aa jaye, to uska savedAt bhi wahi 7 din rokega.
+  const savedFallback = freshEntriesFrom([{ phone: '9876500015', status: '', online: true }], {
+    now,
+    ledger: {},
+    savedSessions: new Map([['9876500015', now - 60_000]]),
+  });
+  ok(savedFallback.length === 0, 'ledger missing ho to saved-session savedAt se 7-day cooldown');
+
+  // Cloud snapshot/merge: premium ledger ab accounts ke saath durable hai.
+  const store = await import('./store.js');
+  const snapshot = store.buildCloudVaultSnapshot({
+    config: { accounts: {}, deletedAccounts: {} },
+    sessionVault: {},
+    orders: {},
+    premiumFlow: { used: cooldownLedger },
+  });
+  ok(snapshot.premiumFlow.used['9876500011'].status === 'success', 'cloud snapshot me extracted-number ledger shamil');
+  const mergedLedger = store._mergePremiumLedgerEntries(
+    { '9876500016': { status: 'success', at: new Date(now - 10_000).toISOString() } },
+    { '9876500016': { status: 'success', at: new Date(now - 1_000).toISOString() } },
+  );
+  ok(mergedLedger.changed === 1 && Date.parse(mergedLedger.used['9876500016'].at) === now - 1_000,
+    'cloud ledger merge: nayi extracted timestamp jeet-ti hai');
+  const vaultSync = await import('./vault-sync.js');
+  const safePushPayload = vaultSync._mergeVaultPremiumLedger(
+    { premiumFlow: { used: {} } },
+    { premiumFlow: { used: cooldownLedger } },
+  );
+  ok(safePushPayload.premiumFlow.used['9876500011'].status === 'success',
+    'cloud push safeguard: khali local snapshot remote 7-day ledger erase nahi karta');
 }
 
 // ---------------------------------------------------------------------------
@@ -368,9 +446,15 @@ console.log('bot-settings (UI se knobs — validation + clamp):');
   ok(r6.ok && bs.fmtSetting('backoffMs') === '15 min', 'backoff fmt minutes');
   const r7 = bs.setSetting('allowOffline', true);
   ok(r7.ok && bs.getSetting('allowOffline') === true, 'bool toggle');
+  ok(bs.getSetting('concurrency') === 10, 'parallel lanes default = 10');
+  const r8 = bs.setSetting('concurrency', 5);
+  ok(r8.ok && bs.getSetting('concurrency') === 5, 'parallel lanes set + readback');
+  ok(bs.setSetting('concurrency', 11).ok === false, 'parallel lanes 10 se zyada reject');
+  ok(bs.setSetting('concurrency', 0).ok === false, 'parallel lanes 0 reject');
   const all = bs.getAllSettings();
-  ok(all.target === 150 && all.allowOffline === true, 'getAllSettings consistent');
+  ok(all.target === 150 && all.allowOffline === true && all.concurrency === 5, 'getAllSettings consistent');
   bs.setSetting('target', 100); // restore default
+  bs.setSetting('concurrency', 10);
 }
 
 // ---------------------------------------------------------------------------
@@ -409,6 +493,18 @@ console.log('proxy-pool (IP rotation — "rukna hi na pare"):');
   const c = px.pickProxy({ excludeIds: [a.id] });
   ok(c && c.id !== a.id, 'exclude kaam karta hai');
 
+  // Parallel lane reservations — ek proxy do lanes ko ek saath kabhi
+  // nahi milni chahiye, warna "10 alag IP" wala dawa jhootha hoga.
+  ok(px.reserveProxy(a.id, 'lane-a') === true, 'lane reservation: pehli lane ko route mila');
+  ok(px.reserveProxy(a.id, 'lane-b') === false, 'lane reservation: same IP doosri lane ko reject');
+  const reservedPick = px.pickProxy({ reserveFor: 'lane-b' });
+  ok(reservedPick?.id === b.id && px.getProxyReservationOwner(b.id) === 'lane-b',
+    'lane reservation: picker doosri free IP reserve karke deta hai');
+  ok(px.pickProxy({ reserveFor: 'lane-c' }) === null, 'lane reservation: free IP na ho to koi route nahi');
+  ok(px.releaseProxyReservation(a.id, 'lane-b') === false, 'lane reservation: ghalat owner release nahi kar sakta');
+  ok(px.releaseProxyReservationsForOwner('lane-a') === 1, 'lane reservation: owner ki route release');
+  ok(px.releaseProxyReservationsForOwner('lane-b') === 1, 'lane reservation: doosri route bhi release');
+
   // Per-proxy WAF token (IP-bound hota hai)
   px.setProxyToken(a.id, 'TOKEN_FOR_IP_A'.padEnd(60, 'x'));
   ok(px.getProxyToken(a.id).startsWith('TOKEN_FOR_IP_A'), 'token per-proxy store');
@@ -416,12 +512,30 @@ console.log('proxy-pool (IP rotation — "rukna hi na pare"):');
   px.invalidateProxyToken(a.id);
   ok(px.getProxyToken(a.id) === '', 'token invalidate');
 
+  // Route priority — jis IP par fresh WAF token pehle se hai, rotation
+  // usi ko pehle le (warna har rotate par naya Chromium solve lagta tha).
+  px.setProxyToken(b.id, 'TOKEN_FOR_IP_B'.padEnd(60, 'y'));
+  ok(px.pickProxy()?.id === b.id, 'picker: fresh-token wali proxy pehle');
+  ok(px.pickProxy({ requireToken: true })?.id === b.id, 'picker: requireToken sirf token-ready route');
+  ok(px.proxySummary().tokenReadyCount === 1, 'summary: token-ready count');
+
+  // Solver jis proxy par fail hua, use turant dobara mat uthao — full
+  // Chromium solve dobara chalana hi 4-minute loop ki asal wajah thi.
+  px.markProxyWafSolveFailure(b.id, 60_000);
+  const bDetail = px.listProxies().find((x) => x.id === b.id);
+  ok(bDetail.wafSolveCooldownLeftMs > 50_000 && bDetail.wafSolveFailures === 1 && !bDetail.tokenReady,
+    'solve failure: route quarantine + token clear');
+  ok(px.pickProxy()?.id === a.id, 'picker: solve-failed proxy side par');
+
   // Cooldown — hit hone par proxy thodi der side par
   px.markProxyWafHit(a.id, 60_000);
   const detail = px.listProxies().find((x) => x.id === a.id);
   ok(detail.cooldownLeftMs > 50_000, 'cooldown set (proxy side par)');
+  ok(detail.wafHits === 1 && !detail.tokenReady, 'WAF hit: count + jala token clear');
   const d = px.pickProxy({ excludeIds: [] });
   ok(d && d.id !== a.id, 'cooldown wala proxy pick nahi hua');
+  ok(px.proxySummary().usableCount === 1 && px.proxySummary().wafCoolingCount >= 1,
+    'summary: ON ke bajaye asal usable/cooling proxy count');
 
   // Error / success streak
   px.markProxyError(b.id);
@@ -454,6 +568,799 @@ ok(requestAutopilotStop('manual') === false, 'na chalne wale batch ko stop = fal
 {
   const snap = getAutopilotSnapshot();
   ok(snap.running === false && snap.processed === 0, 'default snapshot clean');
+  ok(snap.concurrency >= 1 && Array.isArray(snap.activeNumbers) && snap.activeWorkers === 0,
+    'snapshot: parallel lane fields maujood');
+  ok(normalizeBatchConcurrency(99) === 10, 'parallel lanes max 10 par cap');
+  ok(normalizeBatchConcurrency(0) === 1, 'parallel lanes min 1');
+  ok(normalizeBatchConcurrency('x') === 10, 'parallel lanes invalid value par default 10');
+  ok(availableParallelLanes({ requested: 10, proxyEnabled: false, enabledProxyCount: 0 }) === 1,
+    'direct-only mode: ek hi IP isliye 1 lane');
+  ok(availableParallelLanes({ requested: 10, proxyEnabled: true, enabledProxyCount: 9 }) === 10,
+    '9 proxies + 1 direct = 10 distinct lanes');
+  ok(availableParallelLanes({ requested: 10, proxyEnabled: true, enabledProxyCount: 3 }) === 4,
+    'routes kam hon to lanes bhi distinct routes tak limited');
+  ok(availableParallelLanes({ requested: 3, proxyEnabled: true, enabledProxyCount: 9 }) === 3,
+    'user ki requested lane limit respect hoti hai');
+  ok(parallelWorkerUserId('owner-1', 7) === 'owner-1:lane7', 'har lane ki bridge session ID alag');
+}
+
+// ---------------------------------------------------------------------------
+console.log('chrome discovery + proxy dispatcher (2026 fixes):');
+{
+  const bridge = await import('./swiggy-bridge.js');
+  // Env me maujud file do to wahi mile (process.execPath hamesha exist karta hai)
+  const prevEnv = process.env.PUPPETEER_EXECUTABLE_PATH;
+  process.env.PUPPETEER_EXECUTABLE_PATH = process.execPath;
+  ok(bridge.findChromePath() === process.execPath, 'PUPPETEER_EXECUTABLE_PATH (valid file) respect');
+  // Env me GALAT path ho to usi jhoothe path par latke na rahe — auto-detect
+  process.env.PUPPETEER_EXECUTABLE_PATH = '/definitely/not/chrome-xyz.exe';
+  ok(bridge.findChromePath() !== '/definitely/not/chrome-xyz.exe', 'galat env Chrome path par fallback (latakta nahi)');
+  if (prevEnv === undefined) delete process.env.PUPPETEER_EXECUTABLE_PATH;
+  else process.env.PUPPETEER_EXECUTABLE_PATH = prevEnv;
+
+  const cs = bridge.getChromeStatus();
+  ok(typeof cs.found === 'boolean' && 'path' in cs && 'headless' in cs, 'getChromeStatus shape (found/path/headless)');
+
+  // Kaunsa undici agent kis protocol par — socks5 ko HTTP agent na mile
+  ok(px.dispatcherKind('http://1.2.3.4:8080') === 'http', 'http proxy → http dispatcher');
+  ok(px.dispatcherKind('https://1.2.3.4:8443') === 'http', 'https proxy → http dispatcher');
+  ok(px.dispatcherKind('socks5://1.2.3.4:1080') === 'socks5', 'socks5 proxy → socks5 dispatcher');
+  ok(px.dispatcherKind('socks4://1.2.3.4:1080') === 'unsupported', 'socks4 → unsupported (saaf error milega)');
+  ok(px.dispatcherKind('not-a-url') === 'unsupported', 'ganda URL → unsupported');
+
+  // WAF solver coalescing route-keyed hai — ek proxy ka token doosri
+  // proxy ke solver promise se leak nahi hona chahiye.
+  ok(bridge._wafSolveRouteKey(null) === 'direct', 'WAF solver route-key: direct');
+  ok(bridge._wafSolveRouteKey({ id: 'proxy-a' }) !== bridge._wafSolveRouteKey({ id: 'proxy-b' }),
+    'WAF solver route-key: har proxy alag (IP-bound token safety)');
+
+  // Challenge ke baad current proxy ka token asal me burn hona chahiye.
+  // Pehle sirf direct/shared cache saaf hota tha — retry wahi jala token
+  // dobara chipka deti thi.
+  const burnProxy = px.addProxy('8.8.8.8:8080').proxy;
+  px.setProxyToken(burnProxy.id, 'BURN_ME'.padEnd(60, 'z'));
+  bridge.setBridgeProxy(burnProxy);
+  bridge.burnCurrentWafToken();
+  ok(px.getProxyToken(burnProxy.id) === '', 'burnCurrentWafToken: per-proxy jala token clear');
+  bridge.setBridgeProxy(null);
+  px.removeProxy(burnProxy.id);
+  px.setPoolEnabled(false);
+
+  // Lane-local bridge routes — do parallel contexts ek dusre ki IP
+  // kabhi overwrite na karein. Ye naive Promise.all wale sabse bare
+  // corruption bug ki regression guard hai.
+  const laneRouteA = { id: 'lane-route-a', label: 'lane A' };
+  const laneRouteA2 = { id: 'lane-route-a2', label: 'lane A rotated' };
+  const laneRouteB = { id: 'lane-route-b', label: 'lane B' };
+  const laneRoutesSeen = await Promise.all([
+    bridge.runWithBridgeProxy(laneRouteA, async () => {
+      await new Promise((resolve) => setTimeout(resolve, 15));
+      bridge.setBridgeProxy(laneRouteA2);
+      return bridge.getBridgeProxy()?.id;
+    }, { owner: 'test-lane-a' }),
+    bridge.runWithBridgeProxy(laneRouteB, async () => {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+      return bridge.getBridgeProxy()?.id;
+    }, { owner: 'test-lane-b' }),
+  ]);
+  ok(laneRoutesSeen[0] === 'lane-route-a2' && laneRoutesSeen[1] === 'lane-route-b',
+    'bridge ALS: parallel lanes ki IPs alag rehti hain');
+  ok(bridge.getBridgeProxy() === null, 'bridge ALS: lane rotate global route ko touch nahi karta');
+  ok(px.getProxyReservationOwner('lane-route-a2') === '' && px.getProxyReservationOwner('lane-route-b') === '',
+    'bridge ALS: context khatam hone par reservations release');
+  let laneRouteConflict = false;
+  await bridge.runWithBridgeProxy(laneRouteA, async () => {
+    try {
+      await bridge.runWithBridgeProxy(laneRouteA, async () => {}, { owner: 'test-lane-other' });
+    } catch { laneRouteConflict = true; }
+  }, { owner: 'test-lane-a' });
+  ok(laneRouteConflict === true, 'bridge ALS: reserved IP doosri lane ko reject');
+
+  // Security route policy — 3 proxy challenges ke baad kharab pool me
+  // ghoomne ke bajaye direct, 2 direct challenges ke baad best proxy wapas.
+  const engine = await import('./autopilot-engine.js');
+  ok(engine.securityRouteAction({ proxyEnabled: true, proxyChallenges: 2 }) === 'rotate_proxy',
+    'security route: 2 proxy challenges tak rotate');
+  ok(engine.securityRouteAction({ proxyEnabled: true, proxyChallenges: 3 }) === 'direct_fallback',
+    'security route: 3 proxy challenges ke baad direct fallback');
+  ok(engine.securityRouteAction({ proxyEnabled: true, usingDirectFallback: true, directChallenges: 1 }) === 'direct_cooldown',
+    'security route: pehla direct challenge cooldown');
+  ok(engine.securityRouteAction({ proxyEnabled: true, usingDirectFallback: true, directChallenges: 2 }) === 'restore_proxy',
+    'security route: 2 direct challenges ke baad proxy restore');
+  ok(engine.securityRouteAction({ proxyEnabled: false, proxyChallenges: 0 }) === 'direct_cooldown',
+    'security route: proxy OFF par direct cooldown');
+  ok(engine.securityChallengeRouteKind({
+    proxyEnabled: true,
+    routeModeAtStart: 'proxy',
+    proxyIdAtStart: 'proxy-a',
+    finalProxyId: '',
+  }) === 'proxy', 'security route kind: proxy episode ko final empty ID par direct mat gino');
+  ok(engine.securityChallengeRouteKind({
+    proxyEnabled: true,
+    routeModeAtStart: 'direct-fallback',
+    proxyIdAtStart: '',
+    finalProxyId: '',
+  }) === 'direct', 'security route kind: direct-fallback episode direct hi hai');
+}
+
+// ---------------------------------------------------------------------------
+console.log('isUnregisteredSwiggyAuthResponse (failed_otp_send wala bug):');
+{
+  const bridge = await import('./swiggy-bridge.js');
+  const det = bridge.isUnregisteredSwiggyAuthResponse;
+  // ASLI BUG: raw JSON me `csrfToken` field hone se purana detector
+  // "user not registered" ko bhi reject kar deta tha → har naya number fail
+  const newUser = { statusCode: 1, statusMessage: 'user not registered', csrfToken: 'tok123', tid: 't1' };
+  ok(det({ status: 200, data: newUser, rawText: JSON.stringify(newUser) }) === true,
+    'csrfToken field ke bawjood "user not registered" detect (REGRESSION)');
+  ok(det({ status: 200, data: { statusCode: 1, statusMessage: 'Invalid OTP' }, rawText: '' }) === false,
+    'Invalid OTP → unregistered NAHI');
+  ok(det({ status: 200, data: { statusCode: 1, statusMessage: 'Invalid CSRF token' }, rawText: '' }) === false,
+    'asli CSRF error → unregistered NAHI');
+  ok(det({ status: 200, data: { statusCode: 0, statusMessage: 'OTP sent successfully', csrfToken: 'x' }, rawText: '{"csrfToken":"x"}' }) === false,
+    'normal OTP-sent (registered number) → false');
+  ok(det({ status: 200, data: { statusCode: 999, statusMessage: '' }, rawText: '' }) === true,
+    'statusCode 999 → unregistered');
+  ok(det({ status: 200, data: { statusCode: 1, statusMessage: 'Too many requests, rate limit' }, rawText: '' }) === false,
+    'rate limit → unregistered NAHI');
+  ok(det({ status: 403, data: { statusCode: 1, statusMessage: 'user not registered' }, rawText: '' }) === false,
+    'HTTP 403 par kabhi true nahi');
+  ok(det(null) === false && det(undefined) === false, 'null/undefined safe');
+}
+
+// ---------------------------------------------------------------------------
+console.log('Swiggy temporary 5xx/network — number FAILED nahi, retry queue:');
+{
+  const bridge = await import('./swiggy-bridge.js');
+  const pipe = await import('./number-pipeline.js');
+  const engine = await import('./autopilot-engine.js');
+
+  const serverErr = bridge.parseSwiggyOtpError({
+    status: 500,
+    rawText: '{"statusCode":1,"statusMessage":"Internal server error"}',
+    data: { statusCode: 1, statusMessage: 'Internal server error' },
+  });
+  ok(serverErr.code === 'SWIGGY_SERVER_ERROR' && serverErr.retryable === true,
+    'asal HTTP 500 response → SWIGGY_SERVER_ERROR (retryable)');
+
+  const systemErr = bridge.parseSwiggyOtpError({
+    status: 500,
+    error: 'ECONNRESET socket hang up',
+    rawText: '',
+    data: { statusMessage: 'ECONNRESET socket hang up' },
+  });
+  ok(systemErr.code === 'SYSTEM_ERROR' && /ECONNRESET/.test(systemErr.message),
+    'proxy/network exception wala synthetic 500 → SYSTEM_ERROR (asli wajah barkarar)');
+
+  const c1 = pipe._classifyOtpSendFailure({
+    success: false,
+    code: 'SWIGGY_SERVER_ERROR',
+    httpStatus: 500,
+    retryable: true,
+    message: serverErr.message,
+  }, '6306779573');
+  ok(c1.kind === 'deferred_swiggy_transient' && c1.retryable === true && c1.httpStatus === 500 && c1.stage === 'otp_send',
+    'pipeline: HTTP 500 → deferred_swiggy_transient (failed_otp_send nahi)');
+
+  const c2 = pipe._classifyOtpSendFailure({
+    success: false,
+    code: 'SYSTEM_ERROR',
+    httpStatus: 0,
+    retryable: true,
+    message: systemErr.message,
+  }, '6306779573', { failKind: 'failed_fresh_otp_send', stage: 'fresh_otp_send' });
+  ok(c2.kind === 'deferred_swiggy_transient' && c2.stage === 'fresh_otp_send',
+    'pipeline: network/system error bhi transient retry outcome');
+
+  const c3 = pipe._classifyOtpSendFailure({
+    success: false,
+    code: 'INVALID_MOBILE',
+    httpStatus: 400,
+    retryable: false,
+    message: 'invalid',
+  }, '12345');
+  ok(c3.kind === 'failed_otp_send', 'pipeline: invalid mobile transient nahi — asli failed_otp_send');
+
+  ok(pipe._classifyOtpSendFailure({ success: false, code: 'SWIGGY_RATE_LIMIT', message: 'limit' }, '9812345670').kind === 'rate_limited'
+    && pipe._classifyOtpSendFailure({ success: false, code: 'SWIGGY_SECURITY_CHALLENGE', message: 'waf' }, '9812345670').kind === 'security_challenge',
+  'pipeline: rate-limit/security apne purane infra outcomes par hi');
+  ok(pipe._classifyOtpSendFailure({ success: true }, '9812345670') === null,
+    'pipeline: successful OTP send par failure classification null');
+
+  ok(engine.transientSwiggyRetryWaitMs(1) === 20_000
+    && engine.transientSwiggyRetryWaitMs(2) === 45_000
+    && engine.transientSwiggyRetryWaitMs(3) === 60_000
+    && engine.transientSwiggyRetryWaitMs(99) === 60_000,
+  'engine: transient cool-off ladder 20s→45s→60s cap');
+  const snap = engine.getAutopilotSnapshot();
+  ok(Number.isFinite(snap.serverErrors) && Number.isFinite(snap.transientStrikes),
+    'engine snapshot: serverErrors/transientStrikes counters maujood');
+}
+
+// ---------------------------------------------------------------------------
+console.log('device last-seen gate (mare hue device par OTP waste nahi):');
+{
+  const fbn = await import('./firebase-numbers.js');
+  const pipe = await import('./number-pipeline.js');
+  const now = Date.now();
+  mock.messages['devFresh'] = {
+    [String(now - 5000)]: { message: 'hello', dateTime: '' },
+    '42': { message: 'old inbox', dateTime: '01-01-2025 | 10:00 AM' },
+  };
+  mock.messages['devStale'] = { '7': { message: 'purana', dateTime: '01-01-2025 | 10:00 AM' } };
+
+  const t1 = await fbn.fetchDeviceLastActivityMs('devFresh');
+  ok(t1 === now - 5000, 'epoch-ms key se last activity mili (chhote inbox ids ignore)');
+  ok(mock.calls.at(-1).includes('messages/devFresh') && mock.calls.at(-1).includes('limitToLast=5'),
+    'last-seen probe halki hai: pehle sirf last 5 messages (50 full SMS nahi)');
+  const t2 = await fbn.fetchDeviceLastActivityMs('devStale');
+  ok(Boolean(t2) && (now - t2) > 60_000, 'purani dateTime wali activity stale pehchani');
+  ok((await fbn.fetchDeviceLastActivityMs('devMissing')) === null, 'khali/missing device → null');
+
+  // Agar last 5 entries me koi parseable timestamp na ho to purani
+  // 50-entry query fallback ke tor par chalegi.
+  mock.messages['devOdd'] = {
+    a: { message: 'old but parseable', dateTime: '01-01-2025 | 10:00 AM' },
+    b: { message: 'no date 1' },
+    c: { message: 'no date 2' },
+    d: { message: 'no date 3' },
+    e: { message: 'no date 4' },
+    f: { message: 'no date 5' },
+  };
+  const oddCallsBefore = mock.calls.length;
+  const tOdd = await fbn.fetchDeviceLastActivityMs('devOdd');
+  const oddCalls = mock.calls.slice(oddCallsBefore).filter((u) => u.includes('messages/devOdd'));
+  ok(Boolean(tOdd) && oddCalls.length === 2 && oddCalls[1].includes('limitToLast=50'),
+    'last 5 me timestamp na mile to 50-entry fallback query');
+
+  // Stale device: OTP request Swiggy tak jani hi nahi chahiye
+  const callsBefore = mock.calls.length;
+  const r1 = await pipe.processSingleNumber({
+    userId: 'test',
+    entry: { phone: '9812345672', deviceId: 'devStale', online: true },
+    otpCfg: { activeWindowMs: 60_000, waitMs: 0, timeoutMs: 100 },
+  });
+  ok(r1.kind === 'deferred_device_stale', 'stale device → deferred_device_stale (OTP nahi bheja)');
+  ok(!mock.calls.slice(callsBefore).some((u) => u.includes('swiggy.com')), 'stale par Swiggy ko ek bhi request nahi gayi');
+  ok(r1.ok === false && Boolean(r1.reason), 'stale result me wajah hai');
+
+  // Pipeline-level hard gate: retry/hot queue me purani entry reh bhi jaye
+  // to recently extracted number OTP se pehle hi ruk jaye.
+  pipe.markLedger('9812345671', 'success');
+  const rCooldown = await pipe.processSingleNumber({
+    userId: 'test',
+    entry: { phone: '9812345671', deviceId: 'devFresh', online: true },
+    otpCfg: { activeWindowMs: 60_000, waitMs: 0, timeoutMs: 100 },
+  });
+  ok(rCooldown.kind === 'deferred_number_cooldown', '7-day cooldown: pipeline extracted number ko OTP se pehle rokta hai');
+
+  // Fresh device: gate pass karke bridge tak jaye. Galat-format number rakha
+  // taaki bridge bina network ke turant INVALID_MOBILE de (test pure rahe) —
+  // pipeline use failed_otp_send me map karegi, matlab gate PASS hua tha.
+  const r2 = await pipe.processSingleNumber({
+    userId: 'test',
+    entry: { phone: '12345', deviceId: 'devFresh', online: true },
+    otpCfg: { activeWindowMs: 60_000, waitMs: 0, timeoutMs: 100 },
+  });
+  ok(r2.kind === 'failed_otp_send', 'fresh device gate pass (bridge tak gaya)');
+
+  // Gate off (0): stale device bhi aage badhe
+  const r3 = await pipe.processSingleNumber({
+    userId: 'test',
+    entry: { phone: '12345', deviceId: 'devStale', online: true },
+    otpCfg: { activeWindowMs: 0, waitMs: 0, timeoutMs: 100 },
+  });
+  ok(r3.kind === 'failed_otp_send', 'activeWindowMs=0 → gate off, stale bhi aage gaya');
+
+  // Autopilot ladder mode: selected device ki activity fixed limit se
+  // bahar ho to pipeline use stale kehne ke bajaye window double karke
+  // aage badhegi. Invalid-format number par bridge wala failed_otp_send
+  // hi saboot hai ke gate pass hua.
+  const r4 = await pipe.processSingleNumber({
+    userId: 'test',
+    entry: { phone: '12345', deviceId: 'devStale', online: true },
+    otpCfg: {
+      activeWindowMs: 10_000, waitMs: 0, timeoutMs: 100,
+      widenLastSeenByDoubling: true,
+    },
+  });
+  ok(r4.kind === 'failed_otp_send', 'pipeline doubling: purani activity bhi ladder se gate pass (stale loop nahi)');
+
+  // Scanner ka explicit clients-ONLINE fallback: device ke paas koi SMS
+  // timestamp hi na ho tab bhi pipeline use stale keh kar wapas scan par
+  // nahi bhejegi. SMS ka na aana device band honay ka saboot nahi hai.
+  const r5 = await pipe.processSingleNumber({
+    userId: 'test',
+    entry: { phone: '12345', deviceId: 'devMissing', online: true },
+    otpCfg: {
+      activeWindowMs: 10_000, waitMs: 0, timeoutMs: 100,
+      skipLastSeenGate: true,
+    },
+  });
+  ok(r5.kind === 'failed_otp_send', 'pipeline ONLINE fallback: SMS timestamp na ho tab bhi gate pass');
+}
+
+// ---------------------------------------------------------------------------
+console.log('parallel device scan (hot-queue) + pipeline precheck:');
+{
+  const fbn = await import('./firebase-numbers.js');
+  const pipe = await import('./number-pipeline.js');
+  const now = Date.now();
+  const mkEntries = (n) => Array.from({ length: n }, (_, i) => ({
+    phone: String(9000000000 + i), deviceId: `D${i}`, online: true,
+  }));
+
+  // fetchDevicesLastActivityMs — parallel probe + dedupe + error → null
+  {
+    const calls = [];
+    const probe = async (id) => {
+      calls.push(id);
+      if (id === 'boom') throw new Error('fb gone');
+      return id === 'hot' ? now - 1000 : null;
+    };
+    const m = await fbn.fetchDevicesLastActivityMs(['hot', 'cold', 'hot', 'boom', ''], { concurrency: 2, probe });
+    ok(m.get('hot') === now - 1000 && m.get('cold') === null && m.get('boom') === null, 'probe map sahi (error → null)');
+    ok(calls.filter((c) => c === 'hot').length === 1 && calls.length === 3, 'duplicate deviceIds dedupe hue');
+  }
+
+  // scanFreshDevices — window ke andar fresh, sorted desc, want milte hi stop
+  {
+    const probe = async (id) => (id === 'D3' ? now - 5000 : id === 'D7' ? now - 2000 : null);
+    const r = await fbn.scanFreshDevices(mkEntries(500), { windowMs: 60_000, want: 2, chunkSize: 50, maxProbe: 800, probe });
+    ok(r.widened === false && r.fresh.length === 2, 'window ke andar 2 fresh mile (widen nahi hua)');
+    ok(r.fresh[0].entry.deviceId === 'D7' && r.fresh[1].entry.deviceId === 'D3', 'sabse taaza device sabse pehle (sorted)');
+    ok(r.checked === 50 && r.exhausted === false, 'want milte hi scan ruk gaya (poora pool scan nahi kiya)');
+    ok(r.probedDeviceIds.length === 50, 'probedDeviceIds wapas mile (engine dubara probe nahi karega)');
+  }
+
+  // scanFreshDevices — window me koi na mile to widen (best-available), 15m+ purane exclude
+  {
+    const probe = async (id) =>
+      id === 'D40' ? now - 5 * 60_000 :
+      id === 'D90' ? now - 10 * 60_000 :
+      id === 'D60' ? now - 2 * 3600_000 : null;
+    const r = await fbn.scanFreshDevices(mkEntries(300), { windowMs: 60_000, want: 8, chunkSize: 50, maxProbe: 120, maxWidenMs: 15 * 60_000, probe });
+    ok(r.widened === true, 'window empty → widen hua (batch atka nahi)');
+    ok(r.fresh.length === 2 && r.fresh[0].entry.deviceId === 'D40', 'widened me sabse taaza pehle, 2h-purana exclude');
+    ok(r.widestWindowMs > 60_000 && r.checked === 120, 'widestWindowMs asal age tak badha + maxProbe respect');
+  }
+
+  // Generic cap mode — maxWidenMs = windowMs ho to purani activity fresh
+  // nahi banti. (Engine ab is mode ki jagah neeche wala doubling ladder
+  // use karta hai.)
+  {
+    const probe = async (id) => (id === 'D2' ? now - 30_000 : null);
+    const r = await fbn.scanFreshDevices(mkEntries(20), {
+      windowMs: 10_000, maxWidenMs: 10_000, want: 1, chunkSize: 20, probe,
+    });
+    ok(r.fresh.length === 0 && r.widened === false && r.widestWindowMs === 10_000,
+      'cap mode: maxWiden=window par 10s se purani activity fresh nahi banti');
+  }
+
+  // Doubling ladder — base 10s me koi na mile to ISI pass ke cached
+  // timestamps par 20s → 40s → 80s → 160s ... Firebase ko har ladder step
+  // par dobara scan nahi karna chahiye.
+  {
+    ok(fbn.doubledWidenWindowMs(10_000, 10_000) === 10_000 &&
+      fbn.doubledWidenWindowMs(10_000, 10_001) === 20_000 &&
+      fbn.doubledWidenWindowMs(10_000, 40_001) === 80_000 &&
+      fbn.doubledWidenWindowMs(10_000, 120_000) === 160_000,
+    'doubling helper: 10s → 20s → 40s → 80s → 160s');
+
+    const calls = [];
+    const probe = async (id) => {
+      calls.push(id);
+      return id === 'D2' ? now - 97_000 : id === 'D5' ? now - 300_000 : null;
+    };
+    const r = await fbn.scanFreshDevices(mkEntries(20), {
+      windowMs: 10_000,
+      maxWidenMs: Number.POSITIVE_INFINITY,
+      widenByDoubling: true,
+      want: 1,
+      chunkSize: 20,
+      maxProbe: 20,
+      probe,
+    });
+    ok(r.fresh.length === 1 && r.fresh[0].entry.deviceId === 'D2' && r.fresh[0].windowMs === 160_000,
+      'doubling ladder: 97s purani sabse taazi activity ≤160s window me mili');
+    ok(r.widened === true && r.widestWindowMs === 160_000 && r.checked === 20 && calls.length === 20,
+      'doubling ladder: ek hi pass ke cached probes reuse (koi rescan nahi)');
+  }
+
+  // Ranked backups + early ladder: full pool khatam hone ka intezaar nahi.
+  // Pehle chunk ke baad hi ≤20s/40s wala candidate mil jaye to backups ke
+  // saath return, aur pehla miss ho to agla cached device engine ke paas hai.
+  {
+    const calls = [];
+    const probe = async (id) => {
+      calls.push(id);
+      await new Promise((resolve) => setTimeout(resolve, 2));
+      return id === 'D2' ? now - 15_000 : id === 'D3' ? now - 18_000 : id === 'D90' ? now - 1000 : null;
+    };
+    const r = await fbn.scanFreshDevices(mkEntries(100), {
+      windowMs: 10_000,
+      maxWidenMs: Number.POSITIVE_INFINITY,
+      widenByDoubling: true,
+      earlyWidenStepMs: 1,
+      backupCount: 2,
+      want: 1,
+      chunkSize: 20,
+      maxProbe: 100,
+      probe,
+    });
+    ok(r.checked === 20 && calls.length === 20 && r.exhausted === false,
+      'early ladder: full pool scan kiye baghair pehle chunk ke baad return');
+    ok(r.fresh.length === 2 && r.fresh[0].entry.deviceId === 'D2' && r.fresh[1].entry.deviceId === 'D3',
+      'early ladder: ranked backup devices bhi mile (agla miss par rescan nahi)');
+    ok(r.earlyWidened === true && r.fresh[0].windowMs === 20_000,
+      'early ladder: 15s activity ≤20s window me select');
+  }
+
+  // Hard quick-scan budget: agar koi bhi device ki last SMS taazi nahi hai
+  // (zinda device ko bhi dinon SMS nahi aata), to full pool ghumane ke
+  // bajaye budget ke andar probed sample ka sabse taaza device mil jaye.
+  {
+    const calls = [];
+    const probe = async (id) => {
+      calls.push(id);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      return id === 'D2' ? now - 2 * 24 * 3600_000 : id === 'D90' ? now - 1000 : null;
+    };
+    const r = await fbn.scanFreshDevices(mkEntries(100), {
+      windowMs: 10_000,
+      maxWidenMs: Number.POSITIVE_INFINITY,
+      widenByDoubling: true,
+      maxScanMs: 1,
+      backupCount: 2,
+      want: 1,
+      chunkSize: 20,
+      maxProbe: 100,
+      probe,
+    });
+    ok(r.scanTimedOut === true && r.checked === 20 && calls.length === 20 && r.exhausted === false,
+      'quick-scan budget: deadline par full pool scan ruk gaya');
+    ok(r.fresh.length === 1 && r.fresh[0].entry.deviceId === 'D2' && r.bestLastActivityMs === now - 2 * 24 * 3600_000,
+      'quick-scan budget: probed sample ka sabse taaza SMS device process ke liye mila');
+  }
+
+  // ONLINE fallback: probed sample me SMS timestamp ek bhi na ho, lekin
+  // clients status ONLINE ho, to scanner khali haath lot kar dobara scan
+  // nahi ghumayega — online devices ko explicit flag ke saath dega.
+  {
+    const calls = [];
+    const probe = async (id) => {
+      calls.push(id);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      return null;
+    };
+    const r = await fbn.scanFreshDevices(mkEntries(100), {
+      windowMs: 10_000,
+      maxWidenMs: Number.POSITIVE_INFINITY,
+      widenByDoubling: true,
+      maxScanMs: 1,
+      onlineFallback: true,
+      backupCount: 2,
+      want: 1,
+      chunkSize: 20,
+      maxProbe: 100,
+      probe,
+    });
+    ok(r.scanTimedOut === true && r.checked === 20 && calls.length === 20,
+      'ONLINE fallback: deadline ke baad baqi pool scan nahi hua');
+    ok(r.onlineFallback === true && r.fresh.length === 2 && r.fresh.every((f) => f.onlineFallback && !f.lastActivityMs),
+      'ONLINE fallback: SMS timestamp na hone par clients-online backups mile');
+  }
+
+  // scanFreshDevices — bilkul khali activity → fresh [] + exhausted
+  {
+    const r = await fbn.scanFreshDevices(mkEntries(10), { windowMs: 60_000, probe: async () => null });
+    ok(r.fresh.length === 0 && r.exhausted === true && r.checked === 10, 'kuch na mile → fresh [] + exhausted');
+    const r2 = await fbn.scanFreshDevices([{ phone: '9812345670' }], { probe: async () => now });
+    ok(r2.totalDevices === 0 && r2.fresh.length === 0, 'deviceId bina entries skip');
+  }
+
+  // Pipeline precheck — engine ke scan ka result reuse (live stale data par bhi pass)
+  {
+    // mock devStale ki live activity purani (2025) hai. Fresh precheck diya to
+    // gate usi par pass hona chahiye (refetch karta to deferred ho jata).
+    const r1 = await pipe.processSingleNumber({
+      userId: 'test',
+      entry: { phone: '12345', deviceId: 'devStale', online: true },
+      otpCfg: { activeWindowMs: 60_000, waitMs: 0, timeoutMs: 100, precheckedLastActivityMs: now - 3000, precheckedAt: now },
+    });
+    ok(r1.kind === 'failed_otp_send', 'fresh precheck → gate pass bina refetch ke (bridge tak gaya)');
+
+    // Precheck EXPired (2 min purana) → live refetch → device asal me stale → deferred
+    const r2 = await pipe.processSingleNumber({
+      userId: 'test',
+      entry: { phone: '12345', deviceId: 'devStale', online: true },
+      otpCfg: { activeWindowMs: 60_000, waitMs: 0, timeoutMs: 100, precheckedLastActivityMs: now - 3000, precheckedAt: now - 120_000 },
+    });
+    ok(r2.kind === 'deferred_device_stale', 'expired precheck → live refetch → stale defer');
+
+    // Scan ke baad queue me activity 10s window se baahar ho gayi, lekin
+    // mock devFresh par live taazi activity maujud hai. Purana code 45s ke
+    // andar wala precheck hi use karke number ko galat stale keh deta tha;
+    // ab window se bahar precheck par live refetch lazmi hai.
+    const r3 = await pipe.processSingleNumber({
+      userId: 'test',
+      entry: { phone: '12345', deviceId: 'devFresh', online: true },
+      otpCfg: {
+        activeWindowMs: 10_000, waitMs: 0, timeoutMs: 100,
+        precheckedLastActivityMs: now - 30_000, precheckedAt: now,
+      },
+    });
+    ok(r3.kind === 'failed_otp_send', 'window se bahar precheck → live refetch → taazi activity par gate pass');
+  }
+}
+
+// ---------------------------------------------------------------------------
+console.log('fresh JSON chat me turant bhejna (export + engine notify):');
+{
+  const store = await import('./store.js');
+  const engine = await import('./autopilot-engine.js');
+
+  // Bridge ke diye exportJson ko waisi ka waisa tarjeeh
+  const bridgeJson = { account: 'AK1', name: 'Naya', phone: '9812345670', token: 'TOK', cookies: 'x=y' };
+  ok(store.getSessionExportJson('AK1', { exportJson: bridgeJson }) === bridgeJson,
+    'bridge exportJson passthrough (wahi fresh JSON chat me jayega)');
+
+  // Bridge ka na mile to DB ke saved account se wahi shape banao
+  store.updateAccount('TESTEXPORT1', {
+    name: 'Test User', swiggyName: 'Swg', botTag: 'tag1', phone: '9812345670',
+    customerId: 'CUST9', token: 'TOKEN9', tid: 'TID9', sid: 'SID9', deviceId: 'DEV9',
+    isLoggedIn: true, savedAt: '2026-10-24T00:00:00.000Z',
+  });
+  const rebuilt = store.getSessionExportJson('TESTEXPORT1', null);
+  ok(Boolean(rebuilt) && rebuilt.account === 'TESTEXPORT1' && rebuilt.token === 'TOKEN9'
+    && rebuilt.tid === 'TID9' && rebuilt.sid === 'SID9' && rebuilt.deviceId === 'DEV9'
+    && rebuilt.phone === '9812345670' && rebuilt.mobile === '9812345670'
+    && rebuilt.customerId === 'CUST9',
+    'DB account se export shape rebuild (token/tid/sid/phone sahi)');
+
+  ok(store.getSessionExportJson('NO_SUCH_ACCOUNT_XYZ', null) === null, 'account na mile → null (crash nahi)');
+
+  // Engine notify — fresh bante hi ui.sendSession ko payload jaye
+  const sent = [];
+  const uiOk = { sendSession: async (p) => { sent.push(p); } };
+  ok(engine.notifyFreshSession(uiOk, { phone: '9812345670', accountKey: 'AK1', kind: 'fresh_new', account: { exportJson: bridgeJson } }) === true,
+    'notifyFreshSession → sendSession bulaaya');
+  ok(sent.length === 1 && sent[0].phone === '9812345670' && sent[0].accountKey === 'AK1' && sent[0].kind === 'fresh_new',
+    'payload me phone/accountKey/kind sahi gaya');
+
+  ok(engine.notifyFreshSession({}, {}) === false && engine.notifyFreshSession(null, {}) === false,
+    'sendSession na ho → false (batch normal chalta rahe)');
+
+  ok(engine.notifyFreshSession({ sendSession: () => { throw new Error('tg down'); } }, {}) === false,
+    'sendSession throw kare → bhi crash nahi');
+
+  const rej = engine.notifyFreshSession({ sendSession: async () => { throw new Error('tg 500'); } }, {});
+  ok(rej === true, 'async reject fire-and-forget (batch nahi rukta)');
+  await new Promise((r) => setTimeout(r, 10)); // unhandledRejection hota to yahin crash hota
+}
+
+// ---------------------------------------------------------------------------
+console.log('WAF challenge survival (jala token invalidate + batch-marta-nahi ladder):');
+{
+  const wafPool = await import('./waf-pool.js');
+  const engine = await import('./autopilot-engine.js');
+  const fakeToken = 't'.repeat(80);
+
+  // Seed → mile; invalidate → gayab (challenge ke baad jala token reuse na ho)
+  ok(wafPool.seedToken(fakeToken, { source: 'manual' }) === true && wafPool.getTokenSync() === fakeToken,
+    'seedToken ke baad token milta hai');
+  wafPool.invalidateToken();
+  ok(wafPool.getTokenSync() === '', 'invalidateToken ke baad token nahi milta');
+
+  // TTL 30 min — 31 min purana token dead (pehle 2h tak jala token chalta rehta tha)
+  wafPool.seedToken(fakeToken, { source: 'manual', acquiredAt: Date.now() - 31 * 60_000 });
+  ok(wafPool.getTokenSync() === '', '31 min purana token TTL se bahar (fresh solve hoga)');
+
+  // Challenge (markWafHit) → token turant invalidate + cooldown lag jaye
+  wafPool.seedToken(fakeToken, { source: 'manual' });
+  wafPool.markWafHit();
+  ok(wafPool.getTokenSync() === '', 'markWafHit par jala token invalidate ho gaya');
+  ok(wafPool.cooldownRemainingMs() > 0, 'markWafHit par circuit-breaker cooldown laga');
+  wafPool.clearCooldown();
+  ok(wafPool.cooldownRemainingMs() === 0, 'clearCooldown reset karta hai');
+
+  // Engine wait ladder: 30s → 60s → 120s → 240s; pool cooldown lamba ho to wahi (5 min cap)
+  ok(engine.wafChallengeWaitMs(1, 0) === 30_000, 'ladder strike1 = 30s (pehle seedha 1-3 min tha)');
+  ok(engine.wafChallengeWaitMs(2, 0) === 60_000 && engine.wafChallengeWaitMs(3, 0) === 120_000, 'ladder strike2/3 = 60s/120s');
+  ok(engine.wafChallengeWaitMs(9, 0) === 240_000, 'ladder cap 240s (strike chahe kitne bhi)');
+  ok(engine.wafChallengeWaitMs(1, 4 * 60_000) === 4 * 60_000, 'pool cooldown lamba ho to wahi jeet');
+  ok(engine.wafChallengeWaitMs(1, 30 * 60_000) === 5 * 60_000, 'ek saath max 5 min (batch zinda rahe)');
+  ok(engine.wafChallengeWaitMs(0, 0) === 30_000, 'strikes 0/invalid → pehla step (30s)');
+}
+
+// ---------------------------------------------------------------------------
+console.log('🌐 free proxies auto-fetch (ProxyScrape parse/rank/probe/refresh):');
+{
+  const pp = await import('./proxy-pool.js');
+  const before = pp.proxySummary();
+
+  // JSON parse — socks4 + dead bahar, fields mapped
+  const sample = {
+    proxies: [
+      { proxy: 'socks5://1.2.3.4:1080', protocol: 'socks5', alive: true, ssl: true, uptime: 90, average_timeout: 800, ip_data: { countryCode: 'IN', hosting: false } },
+      { proxy: 'socks4://5.6.7.8:4145', protocol: 'socks4', alive: true, ssl: true, uptime: 99, average_timeout: 100, ip_data: { countryCode: 'IN', hosting: false } },
+      { proxy: 'http://9.9.9.9:8080', protocol: 'http', alive: false, ssl: true, uptime: 99, average_timeout: 100, ip_data: { countryCode: 'US', hosting: true } },
+      { proxy: 'http://8.8.8.8:3128', protocol: 'http', alive: true, ssl: true, uptime: 70, average_timeout: 1500, ip_data: { countryCode: 'US', hosting: true } },
+    ],
+  };
+  const parsed = pp._parseFreeProxyListJson(sample);
+  ok(parsed.length === 2, 'JSON: socks4 + dead exclude, 2 kaam ke bache');
+  ok(parsed[0].country === 'IN' && parsed[0].hosting === false && parsed[0].avgTimeoutMs === 800, 'JSON: country/hosting/timeout fields mapped');
+
+  // GitHub shard / Proxifly array shapes bhi parse hon (multi-source v2)
+  const generic = pp._parseFreeProxyListJson([
+    { protocol: 'http', ip: '4.4.4.4', port: 8080, country_code: 'IN', uptime_percent: 88, latency_ms: 250, anonymity: 'elite', ssl: true },
+    { proxy: 'socks5://5.5.5.5:1080', geolocation: { country: 'IN' }, score: 2, https: true },
+  ]);
+  ok(generic.length === 2 && generic[0].country === 'IN' && generic[0].uptime === 88 && generic[0].avgTimeoutMs === 250 && generic[0].ssl === true,
+    'JSON arrays: GitHub/Proxifly metadata mapped');
+
+  // Text parse
+  const txt = pp._parseFreeProxyListText('socks5://1.1.1.1:1080\nGARBAGE LINE\nhttp://2.2.2.2:8080\nsocks4://3.3.3.3:1080\n');
+  ok(txt.length === 2, 'text: garbage + socks4 exclude');
+  const bareSocks = pp._parseFreeProxyListText('7.7.7.7:1080\n', { defaultProtocol: 'socks5', country: 'IN' });
+  ok(bareSocks.length === 1 && bareSocks[0].url.startsWith('socks5://') && bareSocks[0].country === 'IN',
+    'text: bare ip:port par source protocol/country apply');
+
+  // Ranking — IN pehle, phir non-hosting, phir uptime/timeout
+  const ranked = pp._rankFreeCandidates([
+    { url: 'http://us-host:1', country: 'US', hosting: true, uptime: 99, avgTimeoutMs: 100 },
+    { url: 'http://in-host:1', country: 'IN', hosting: true, uptime: 50, avgTimeoutMs: 900 },
+    { url: 'http://in-resi:1', country: 'IN', hosting: false, uptime: 40, avgTimeoutMs: 500 },
+    { url: 'http://de-resi:1', country: 'DE', hosting: false, uptime: 95, avgTimeoutMs: 200 },
+    { url: 'http://in-resi:1', country: 'IN', hosting: false, uptime: 40, avgTimeoutMs: 500 }, // duplicate
+  ]);
+  ok(ranked.length === 4 && ranked[0].url.includes('in-resi') && ranked[1].url.includes('in-host') && ranked[2].url.includes('de-resi'),
+    'ranking: IN residential sab se pehle + dedupe');
+
+  // Ek hi IP ke kai ports probe queue ke top par ghus kar diversity na marein
+  const diversified = pp._rankFreeCandidates([
+    { url: 'http://same-host:1001', country: 'IN', uptime: 100, avgTimeoutMs: 100, ssl: true },
+    { url: 'http://same-host:1002', country: 'IN', uptime: 99, avgTimeoutMs: 100, ssl: true },
+    { url: 'http://other-host:1003', country: 'IN', uptime: 98, avgTimeoutMs: 100, ssl: true },
+  ]);
+  ok(diversified[1].url.includes('other-host'), 'ranking: per-IP diversity (same host ke ports peeche)');
+  ok(ranked[0].sourceCount === 2, 'ranking: duplicate sources corroboration count me merge');
+
+  // Probe — early stop + tez pehle sorted
+  {
+    const cands = Array.from({ length: 30 }, (_, i) => ({ url: `http://bad${i}:80`, country: '', hosting: false, uptime: 0, avgTimeoutMs: 1 }));
+    cands[10] = { url: 'http://good-slow:80', country: '', hosting: false, uptime: 0, avgTimeoutMs: 1 };
+    cands[11] = { url: 'http://good-fast:80', country: '', hosting: false, uptime: 0, avgTimeoutMs: 1 };
+    const check = async (c) => c.url.includes('good-fast') ? { ok: true, latencyMs: 90 }
+      : c.url.includes('good-slow') ? { ok: true, latencyMs: 400 } : { ok: false, latencyMs: 10 };
+    const r = await pp.probeFreeCandidates(cands, { want: 2, concurrency: 4, check });
+    ok(r.good.length === 2 && r.good[0].url.includes('good-fast'), 'probe: 2 zinda mile, tez wala pehle');
+    ok(r.checked < 30, 'probe: want milte hi ruk gaya (poori list nahi parkhi)');
+  }
+
+  // Challenged-but-reachable fallback — clean pehle, WAF-ready baad me.
+  // (Yahi purani "0 proxies" ki ek wajah thi: challenged = dead phenk dete the.)
+  {
+    const cands = [
+      { url: 'http://challenged-fast:80', country: 'IN', hosting: false, uptime: 90, avgTimeoutMs: 100 },
+      { url: 'http://clean-slow:80', country: 'IN', hosting: false, uptime: 80, avgTimeoutMs: 100 },
+      { url: 'http://dead-one:80', country: 'IN', hosting: false, uptime: 10, avgTimeoutMs: 100 },
+    ];
+    const tierCheck = async (c) => c.url.includes('clean')
+      ? { ok: true, quality: 'clean', latencyMs: 500, status: 200 }
+      : c.url.includes('challenged')
+        ? { ok: true, quality: 'challenged', challenged: true, latencyMs: 50, status: 403 }
+        : { ok: false, quality: 'dead', latencyMs: 10, reason: 'ECONNREFUSED' };
+    const r = await pp.probeFreeCandidates(cands, { want: 2, concurrency: 2, check: tierCheck });
+    ok(r.good.length === 2 && r.good[0].quality === 'clean' && r.good[1].quality === 'challenged',
+      'probe tiers: clean pehle, WAF-challenged fallback baad me');
+    ok(r.cleanCount === 1 && r.challengedCount === 1 && r.stats.dead === 1 && r.stats.reasons[0]?.reason === 'ECONNREFUSED',
+      'probe diagnostics: clean/challenged/dead + top reason');
+  }
+
+  // REGRESSION: npm undici agent global fetch ke saath incompatible tha
+  // ("invalid onRequestStart method") — har check network se pehle fail.
+  // Band local port par ab asli ECONNREFUSED aana chahiye, compat error nahi.
+  {
+    const r = await pp.checkProxyOnce('http://127.0.0.1:9', { timeoutMs: 1500 });
+    ok(r.ok === false && r.quality === 'dead' && !/onRequestStart|UND_ERR_INVALID_ARG/i.test(r.reason || ''),
+      'undici regression: dispatcher apne hi fetch se chalta hai (no onRequestStart)');
+  }
+
+  // Local loopback par asal HTTP proxy se end-to-end — sirf compat error
+  // gayab hona kaafi nahi, request proxy hokar origin tak jaani chahiye.
+  {
+    const http = await import('node:http');
+    const origin = http.createServer((req, res) => {
+      if (req.url === '/generic') { res.writeHead(204); res.end(); return; }
+      res.writeHead(200, { 'content-type': 'text/plain' }); res.end('ok');
+    });
+    const proxy = http.createServer((req, res) => {
+      const upstream = http.request(req.url, { method: req.method, headers: req.headers }, (up) => {
+        res.writeHead(up.statusCode || 502, up.headers);
+        up.pipe(res);
+      });
+      upstream.on('error', () => { if (!res.headersSent) res.writeHead(502); res.end(); });
+      req.pipe(upstream);
+    });
+    await new Promise((resolve) => origin.listen(0, '127.0.0.1', resolve));
+    await new Promise((resolve) => proxy.listen(0, '127.0.0.1', resolve));
+    try {
+      const originBase = `http://127.0.0.1:${origin.address().port}`;
+      const r = await pp.checkProxyOnce(`http://127.0.0.1:${proxy.address().port}`, {
+        timeoutMs: 2500,
+        genericTarget: `${originBase}/generic`,
+        target: `${originBase}/swiggy`,
+      });
+      ok(r.ok === true && r.quality === 'clean' && r.genericStatus === 204 && r.status === 200,
+        'undici regression: local HTTP proxy se asal request origin tak gayi');
+
+      // Sticky-route regression: session-bound request fail ho to
+      // fetchSwiggy khud doosri IP se chup-chaap retry NAHI karega.
+      // Cookies/WAF token pehli IP ke hote hain; rotation bridge/engine
+      // ki explicit recovery hi karegi.
+      const goodProxy = pp.addProxy(`http://127.0.0.1:${proxy.address().port}`).proxy;
+      const badProxy = pp.addProxy('127.0.0.1:9').proxy;
+      let stickyThrew = false;
+      try {
+        await pp.fetchSwiggy(`${originBase}/swiggy`, { signal: AbortSignal.timeout(2000) }, badProxy);
+      } catch {
+        stickyThrew = true;
+      }
+      ok(stickyThrew === true, 'fetchSwiggy sticky: bad route par silent alternate-IP retry nahi');
+      pp.removeProxy(goodProxy.id);
+      pp.removeProxy(badProxy.id);
+      if (!before.enabled) pp.setPoolEnabled(false);
+    } finally {
+      await Promise.allSettled([
+        new Promise((resolve) => proxy.close(resolve)),
+        new Promise((resolve) => origin.close(resolve)),
+      ]);
+    }
+  }
+
+  // Refresh glue — injected list + check; pool me auto entries; dobara me zinda ki id barkarar
+  const fetchImpl = async () => ({ ok: true, text: async () => JSON.stringify(sample) });
+  const okCheck = async (c) => ({ ok: true, latencyMs: 120, status: 200 });
+  const r1 = await pp.refreshFreeProxies({ want: 2, fetchImpl, check: okCheck });
+  ok(r1.ok && r1.added === 2, 'refresh: 2 auto proxies pool me gayin');
+  const autos1 = pp.listProxies().filter((p) => p.auto);
+  ok(autos1.length === 2 && autos1.every((p) => p.enabled), 'auto entries enabled + tagged hain');
+  const keepId = autos1.find((p) => p.url.includes('1.2.3.4'))?.id;
+
+  const pickyCheck = async (c) => ({ ok: c.url.includes('1.2.3.4'), latencyMs: 100, status: 200 });
+  const r2 = await pp.refreshFreeProxies({ want: 2, fetchImpl, check: pickyCheck });
+  const autos2 = pp.listProxies().filter((p) => p.auto);
+  ok(r2.added === 1 && autos2.length === 1 && autos2[0].id === keepId,
+    'dusra refresh: mari hui auto nikal gayi, zinda ki ID wahi rahi (token continuity)');
+
+  // Multi-source v2: baki sources fail hon tab bhi ek zinda source kaafi;
+  // sirf WAF-challenged reachable mile to bhi pool 0 nahi rehta.
+  const oneSourceFetch = async (url) => {
+    if (!String(url).includes('api.proxyscrape.com')) throw new Error('source down');
+    return { ok: true, text: async () => JSON.stringify(sample) };
+  };
+  const challengedCheck = async (c) => c.url.includes('1.2.3.4')
+    ? { ok: true, quality: 'challenged', challenged: true, latencyMs: 140, status: 403 }
+    : { ok: false, quality: 'dead', latencyMs: 10, reason: 'timeout' };
+  const r3 = await pp.refreshFreeProxies({ want: 2, fetchImpl: oneSourceFetch, check: challengedCheck });
+  const autos3 = pp.listProxies().filter((p) => p.auto);
+  ok(r3.added === 1 && autos3.length === 1 && autos3[0].id === keepId && autos3[0].quality === 'challenged',
+    'refresh v2: ek source + sirf WAF-ready proxy par bhi pool me entry');
+  ok(r3.sourcesOk >= 1 && r3.sourcesTotal >= 10 && r3.candidates >= 2 && r3.stats?.challenged === 1,
+    'refresh v2: source/candidate/tier diagnostics wapas');
+
+  // Kill switch — env 0 par auto band
+  process.env.PREMIUM_AUTO_FREE_PROXIES = '0';
+  ok(pp.freeProxiesEnabled() === false, 'PREMIUM_AUTO_FREE_PROXIES=0 → auto-fetch OFF');
+  const skipped = await pp.ensureFreeProxies({ min: 99 });
+  ok(skipped.skipped === true && skipped.reason === 'disabled', 'ensureFreeProxies disabled par seedha skip');
+  delete process.env.PREMIUM_AUTO_FREE_PROXIES;
+
+  // Cleanup — test DB ko wapas waisa chhodo jaisa mila tha
+  for (const p of pp.listProxies().filter((x) => x.auto)) pp.removeProxy(p.id);
+  if (!before.enabled) pp.setPoolEnabled(false);
 }
 
 console.log(`\n✅ ALL PASSED — ${passed} checks`);

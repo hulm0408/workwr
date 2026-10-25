@@ -9,16 +9,18 @@ import { getDb, saveDb } from './store.js';
 
 const SPECS = {
   target:            { min: 1,    max: 5000, dflt: 100,    label: '🎯 Target (fresh sessions)' },
+  concurrency:       { min: 1,    max: 10,   dflt: 10,     label: '⚡ Parallel lanes (numbers ek saath)' },
   maxMinutes:        { min: 5,    max: 1440, dflt: 120,    label: '⏱ Max time (minutes)' },
-  gapMs:             { min: 0,    max: 300000, dflt: 15000, label: 'Gap between numbers (ms)' },
+  gapMs:             { min: 0,    max: 300000, dflt: 6000, label: 'Gap between numbers (ms)' },
   backoffMs:         { min: 30000, max: 7200000, dflt: 900000, label: 'Rate-limit backoff (ms)' },
-  otpWaitMs:         { min: 0,    max: 60000, dflt: 10000, label: 'OTP se pehle wait (ms)' },
+  otpWaitMs:         { min: 0,    max: 60000, dflt: 3000, label: 'OTP poll shuru karne se pehle wait (ms)' },
   otpTimeoutMs:      { min: 5000, max: 300000, dflt: 90000, label: 'OTP poll budget (ms)' },
   allowOffline:      { bool: true, dflt: false, label: 'Offline devices bhi try karein' },
 };
 
 const ENV_MAP = {
   target: 'PREMIUM_BATCH_TARGET',
+  concurrency: 'PREMIUM_BATCH_CONCURRENCY',
   maxMinutes: 'PREMIUM_BATCH_MAX_MINUTES',
   gapMs: 'PREMIUM_BATCH_GAP_MS',
   backoffMs: 'PREMIUM_RATE_LIMIT_BACKOFF_MS',

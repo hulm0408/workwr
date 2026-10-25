@@ -98,10 +98,14 @@ function urlFor(path, params = {}) {
   return `${baseUrl()}/${p ? `${p}.json` : '.json'}${q ? `?${q}` : ''}`;
 }
 
-async function fbGet(path, params = {}) {
-  // Timeout 30s — clients.json 1.2MB+ ka ho sakta hai; cold fetch ~11-15s
-  // leta hai (12s par pehle TimeoutError aakar pool ko 0 bana deta tha).
-  const res = await fetch(urlFor(path, params), { signal: AbortSignal.timeout(30_000) });
+async function fbGet(path, params = {}, timeoutMs = 30_000) {
+  // Default timeout 30s — clients.json 1.2MB+ ka ho sakta hai; cold fetch
+  // ~11-15s leta hai (12s par pehle TimeoutError aakar pool ko 0 bana deta
+  // tha). Halki per-device probes apna chhota timeout de sakti hain taaki ek
+  // atki hui request poore scan chunk ko 30s tak hostage na rakhe.
+  const res = await fetch(urlFor(path, params), {
+    signal: AbortSignal.timeout(Math.max(1_000, Number(timeoutMs) || 30_000)),
+  });
   if (!res.ok) {
     const txt = await res.text().catch(() => '');
     const hint = (res.status === 401 || res.status === 400)
@@ -378,11 +382,14 @@ export async function fetchOtpCandidates(phone, opts = {}) {
     ? opts.deviceIds
     : await findDeviceIdsForPhone(phone);
 
-  for (const deviceId of deviceIds) {
-    let node = null;
+  // Saari reads parallel — pehle ye sequential thi (har poll par ~10 GETs ek
+  // ke peeche ek = 1-2s fuzool latency). Ab saari ek saath fire hoti hain.
+  const deviceNodes = await Promise.all(deviceIds.map(async (deviceId) => {
     try {
-      node = await fbGet(`${messagesPath}/${seg(deviceId)}`, { orderBy: '"$key"', limitToLast: 50 });
-    } catch { node = null; }
+      return [deviceId, await fbGet(`${messagesPath}/${seg(deviceId)}`, { orderBy: '"$key"', limitToLast: 50 })];
+    } catch { return [deviceId, null]; }
+  }));
+  for (const [deviceId, node] of deviceNodes) {
     if (!node) continue;
     const entries = Array.isArray(node)
       ? node.map((m, i) => [i, m])
@@ -396,9 +403,10 @@ export async function fetchOtpCandidates(phone, opts = {}) {
 
   // 2) FAST PATH — seedha OTP code likhne wale forwarder ke liye: otp/<number>
   const otpPath = cleanPath(_source?.otpPath || env('FIREBASE_OTP_PATH', 'otp'));
-  for (const variant of phoneVariants(phone)) {
-    let node = null;
-    try { node = await fbGet(`${otpPath}/${seg(variant)}`); } catch { node = null; }
+  const otpNodes = await Promise.all(phoneVariants(phone).map(async (variant) => {
+    try { return [variant, await fbGet(`${otpPath}/${seg(variant)}`)]; } catch { return [variant, null]; }
+  }));
+  for (const [variant, node] of otpNodes) {
     if (node === null || node === undefined) continue;
     if (node && typeof node === 'object' && !Array.isArray(node)) {
       const inner = node.code ?? node.otp ?? node.value ?? null;
@@ -419,9 +427,10 @@ export async function fetchOtpCandidates(phone, opts = {}) {
 
   // 3) LEGACY sms path (purane shapes)
   const smsPath = cleanPath(_source?.smsPath || env('FIREBASE_SMS_PATH', 'sms'));
-  for (const variant of phoneVariants(phone)) {
-    let node = null;
-    try { node = await fbGet(`${smsPath}/${seg(variant)}`); } catch { node = null; }
+  const smsNodes = await Promise.all(phoneVariants(phone).map(async (variant) => {
+    try { return [variant, await fbGet(`${smsPath}/${seg(variant)}`)]; } catch { return [variant, null]; }
+  }));
+  for (const [variant, node] of smsNodes) {
     if (node === null || node === undefined) continue;
     if (Array.isArray(node)) {
       node.forEach((m, i) => {
@@ -469,6 +478,345 @@ function looksLikeMessageNode(node) {
   const keys = Object.keys(node);
   return keys.some((k) => ['body', 'message', 'text', 'sms', 'msg', 'content', 'otpMessage'].includes(k)) ||
     keys.some((k) => ['date', 'timestamp', 'time', 'createdAt', 'at', 'ts', 'sentAt', 'dateTime'].includes(k));
+}
+
+// ---------------------------------------------------------------------------
+// Device "last seen" — is DB me clients/ ke andar koi heartbeat/lastSeen
+// field NAHI hai (live verify kiya: fields sirf status/battery/joined/...).
+// Device zinda hai ya nahi, iska ekmatra saboot hai uske messages node ki
+// SABSE TAAZI entry: epoch-ms wali key (13-digit) ya message ki dateTime.
+// OTP bhejne se pehle isi se decide hoga ke device abhi active hai ya nahi —
+// mare hue device par OTP bhejkar 100s wait + rate-limit burn, dono bachega.
+// ---------------------------------------------------------------------------
+function bestActivityFromMessagesNode(node) {
+  if (!node || typeof node !== 'object') return null;
+  const entries = Array.isArray(node) ? node.map((m, i) => [i, m]) : Object.entries(node);
+  let best = null;
+  for (const [k, v] of entries) {
+    const keyTs = _parseTs(k); // sirf epoch-ms keys (>1e12) pass hongi, chhote inbox ids nahi
+    const msgTs = (v && typeof v === 'object') ? messageTsOf(v) : null;
+    const ts = Math.max(keyTs || 0, msgTs || 0) || null;
+    if (ts && (!best || ts > best)) best = ts;
+  }
+  return best;
+}
+
+function messagesNodeEntryCount(node) {
+  if (!node || typeof node !== 'object') return 0;
+  return Array.isArray(node) ? node.length : Object.keys(node).length;
+}
+
+export async function fetchDeviceLastActivityMs(deviceId) {
+  if (!deviceId) return null;
+  const messagesPath = cleanPath(_source?.messagesPath || env('FIREBASE_MESSAGES_PATH', 'messages'));
+  let node = null;
+  try {
+    // Last-seen ke liye taazaa activity hi chahiye. Pehle har device ke 50
+    // full SMS download hote the — ~2000 devices par yahi full scan ko
+    // minutes me badal deta tha. Ab pehle sirf last 5 entries; unme koi
+    // parseable timestamp na mile tabhi purani 50-entry fallback query.
+    node = await fbGet(
+      `${messagesPath}/${seg(deviceId)}`,
+      { orderBy: '"$key"', limitToLast: 5 },
+      8_000
+    );
+  } catch { return null; }
+
+  const quickBest = bestActivityFromMessagesNode(node);
+  if (quickBest) return quickBest;
+  if (!messagesNodeEntryCount(node)) return null;
+
+  try {
+    const widerNode = await fbGet(
+      `${messagesPath}/${seg(deviceId)}`,
+      { orderBy: '"$key"', limitToLast: 50 },
+      8_000
+    );
+    return bestActivityFromMessagesNode(widerNode);
+  } catch {
+    return null;
+  }
+}
+
+// Parallel last-activity probe — 3000-device pool me ek-ek karke probe karna
+// minutes leta tha (aur card par kuch dikhta hi nahi tha, bot phasa lagta tha).
+// Concurrency ke saath ~24 devices ek saath check hote hain.
+// Returns Map<deviceId, tsMs|null>. `probe` tests/inject ke liye.
+export async function fetchDevicesLastActivityMs(deviceIds = [], { concurrency = 24, probe = null } = {}) {
+  const out = new Map();
+  const ids = [...new Set((deviceIds || []).map((d) => String(d || '')).filter(Boolean))];
+  const fn = typeof probe === 'function' ? probe : fetchDeviceLastActivityMs;
+  let i = 0;
+  const workerCount = Math.max(1, Math.min(Number(concurrency) || 1, ids.length || 1));
+  const workers = Array.from({ length: workerCount }, async () => {
+    while (i < ids.length) {
+      const id = ids[i++];
+      try { out.set(id, await fn(id)); } catch { out.set(id, null); }
+    }
+  });
+  await Promise.all(workers);
+  return out;
+}
+
+// Last-seen fallback ladder: base window ko tab tak double karo jab tak
+// device ki asal activity age uske andar na aa jaye. 10s base par sequence
+// 10s → 20s → 40s → 80s → 160s → ... (koi arbitrary rukawat nahi).
+export function doubledWidenWindowMs(baseWindowMs, activityAgeMs) {
+  let windowMs = Math.max(1, Number(baseWindowMs) || 1);
+  const ageMs = Math.max(0, Number(activityAgeMs) || 0);
+  while (windowMs < ageMs) windowMs *= 2;
+  return windowMs;
+}
+
+// Hot-queue scanner: pool entries me se wo numbers dhoondho jinke device ki
+// last activity `windowMs` ke andar hai — chunks me parallel probe, `want`
+// milte hi ruk jata hai (poora pool scan zaruri nahi). Window me kuch na mile
+// to ISI pass ke probed devices me se SABSE TAAZE return kardo — Firebase ko
+// dobara scan karne ki zaroorat nahi. `widenByDoubling` par us device ke liye
+// base window ko double karke woh window bataya jata hai jisme woh mila.
+// Returns: { fresh:[{entry,lastActivityMs,windowMs?}], checked, probedDeviceIds,
+//            widestWindowMs, widened, exhausted, totalDevices }
+export async function scanFreshDevices(entries = [], opts = {}) {
+  const windowMs = Number(opts.windowMs ?? 60_000);
+  const maxWidenMs = Number(opts.maxWidenMs ?? 15 * 60_000);
+  const want = Math.max(1, Number(opts.want ?? 8));
+  const chunkSize = Math.max(20, Number(opts.chunkSize ?? 120));
+  const maxProbe = Math.max(chunkSize, Number(opts.maxProbe ?? 800));
+  const concurrency = Math.max(1, Number(opts.concurrency ?? 24));
+  const widenByDoubling = Boolean(opts.widenByDoubling);
+  const backupCount = Math.max(want, Number(opts.backupCount) || want);
+  const earlyWidenStepMs = Math.max(0, Number(opts.earlyWidenStepMs) || 0);
+  const maxScanMs = Math.max(0, Number(opts.maxScanMs) || 0);
+  const onlineFallback = Boolean(opts.onlineFallback);
+  const probe = typeof opts.probe === 'function' ? opts.probe : null;
+  const onProgress = typeof opts.onProgress === 'function' ? opts.onProgress : null;
+  const shouldAbort = typeof opts.shouldAbort === 'function' ? opts.shouldAbort : null;
+  const aborted = () => {
+    try { return Boolean(shouldAbort && shouldAbort()); } catch { return false; }
+  };
+
+  const byDevice = new Map(); // deviceId → entries[]
+  for (const e of entries || []) {
+    if (!e?.deviceId) continue;
+    if (!byDevice.has(e.deviceId)) byDevice.set(e.deviceId, []);
+    byDevice.get(e.deviceId).push(e);
+  }
+  const deviceIds = [...byDevice.keys()];
+
+  const probed = [];          // { entry, lastActivityMs } — har probed device ke numbers
+  const probedDeviceIds = [];
+  const fresh = [];
+  const scanStartedAt = Date.now();
+  let bestLastActivityMs = null;
+  let scanTimedOut = false;
+  let checked = 0;
+  const scanDeadlineReached = () => maxScanMs > 0 && (Date.now() - scanStartedAt) >= maxScanMs;
+
+  const rankedDoublingCandidates = (maxAgeMs = Number.POSITIVE_INFINITY) => {
+    const rankedAt = Date.now();
+    return probed
+      .filter((p) => p.lastActivityMs && (rankedAt - p.lastActivityMs) <= maxAgeMs)
+      .sort((a, b) => (b.lastActivityMs || 0) - (a.lastActivityMs || 0))
+      .slice(0, backupCount)
+      .map((p) => ({
+        ...p,
+        windowMs: doubledWidenWindowMs(windowMs, rankedAt - (p.lastActivityMs || rankedAt)),
+        selectionSource: 'sms-activity',
+        onlineFallback: false,
+      }));
+  };
+
+  const earlyAllowedWindowMs = () => {
+    if (!widenByDoubling || !earlyWidenStepMs) return windowMs;
+    const elapsedMs = Date.now() - scanStartedAt;
+    const steps = Math.min(40, Math.floor(elapsedMs / earlyWidenStepMs));
+    return windowMs * (2 ** steps);
+  };
+
+  const rankedOnlineFallbackCandidates = () => {
+    if (!onlineFallback) return [];
+    const seenPhones = new Set();
+    return probed
+      .filter((p) => p.entry?.online !== false)
+      .sort((a, b) => (b.lastActivityMs || 0) - (a.lastActivityMs || 0))
+      .filter((p) => {
+        const phone = String(p.entry?.phone || '');
+        if (!phone || seenPhones.has(phone)) return false;
+        seenPhones.add(phone);
+        return true;
+      })
+      .slice(0, backupCount)
+      .map((p) => ({
+        ...p,
+        lastActivityMs: p.lastActivityMs || null,
+        windowMs: 0,
+        selectionSource: 'clients-online',
+        onlineFallback: true,
+      }));
+  };
+
+  for (let off = 0; off < deviceIds.length && checked < maxProbe && fresh.length < want && !aborted(); off += chunkSize) {
+    // Quick-scan ka hard budget: pehla chunk hamesha chalega, lekin uske
+    // baad budget khatam ho to full pool ghumane ke bajaye probed sample ke
+    // best/online candidates return honge. Yahi woh fix hai jo "sirf scan
+    // hi hota rahega" wale loop ko asal me todta hai.
+    if (checked > 0 && scanDeadlineReached()) {
+      scanTimedOut = true;
+      break;
+    }
+    const chunk = deviceIds.slice(off, off + Math.min(chunkSize, maxProbe - checked));
+    const res = await fetchDevicesLastActivityMs(chunk, { concurrency, probe });
+    checked += chunk.length;
+    probedDeviceIds.push(...chunk);
+    const now = Date.now();
+    for (const devId of chunk) {
+      const ts = res.get(devId) ?? null;
+      if (ts && (!bestLastActivityMs || ts > bestLastActivityMs)) bestLastActivityMs = ts;
+      for (const entry of byDevice.get(devId) || []) {
+        probed.push({ entry, lastActivityMs: ts });
+        if (ts && (now - ts) <= windowMs) fresh.push({ entry, lastActivityMs: ts });
+      }
+    }
+
+    const allowedWindowMs = earlyAllowedWindowMs();
+    if (onProgress) {
+      try {
+        onProgress({
+          checked,
+          freshCount: fresh.length,
+          totalDevices: deviceIds.length,
+          allowedWindowMs,
+          bestLastActivityMs,
+        });
+      } catch {}
+    }
+
+    // Full pool khatam honay ka intezaar hi scan ko minutes me badal deta
+    // tha. Har earlyWidenStepMs par agli ladder window khul jati hai:
+    // mis. step 10s ho to scan ke 10s baad ≤20s, 20s baad ≤40s, 30s baad
+    // ≤80s wala probed-so-far device milte hi ranked backups ke saath
+    // return. Koi aisa device abhi tak na mila ho to scan aage badhta hai.
+    if (
+      widenByDoubling && earlyWidenStepMs &&
+      !aborted() && checked < deviceIds.length &&
+      Date.now() - scanStartedAt >= earlyWidenStepMs
+    ) {
+      const early = rankedDoublingCandidates(Math.min(maxWidenMs, allowedWindowMs));
+      if (early.length) {
+        return {
+          fresh: early, checked, probedDeviceIds,
+          widestWindowMs: Math.max(...early.map((p) => p.windowMs || windowMs)),
+          widened: (early[0].windowMs || windowMs) > windowMs,
+          earlyWidened: true,
+          onlineFallback: false,
+          scanTimedOut: false,
+          bestLastActivityMs,
+          exhausted: false, totalDevices: deviceIds.length,
+        };
+      }
+    }
+  }
+
+  const exhausted = checked >= deviceIds.length;
+  if (!exhausted && scanDeadlineReached()) scanTimedOut = true;
+
+  if (widenByDoubling && !aborted()) {
+    // Scanner ne jitne devices parkhe hain, unhi ke sabse taaza ranked
+    // backups ek saath de do. Ek device stale/fail ho jaye to engine agla
+    // cached device use karega — poora Firebase pass dobara nahi ghumega.
+    // Lekin agar base-window wala device pehle chunk me mil gaya ho to
+    // uske saath dinon purane backups mat chipkao; sirf current ladder ke
+    // andar wale rakho. Base miss par hi unlimited fallback rakho.
+    const rankedLimitMs = fresh.length
+      ? Math.min(maxWidenMs, Math.max(windowMs, earlyAllowedWindowMs()))
+      : maxWidenMs;
+    const ranked = rankedDoublingCandidates(rankedLimitMs);
+    if (ranked.length) {
+      return {
+        fresh: ranked, checked, probedDeviceIds,
+        widestWindowMs: Math.max(...ranked.map((p) => p.windowMs || windowMs)),
+        widened: (ranked[0].windowMs || windowMs) > windowMs,
+        earlyWidened: false,
+        onlineFallback: false,
+        scanTimedOut,
+        bestLastActivityMs,
+        exhausted, totalDevices: deviceIds.length,
+      };
+    }
+  }
+
+  if (fresh.length) {
+    fresh.sort((a, b) => (b.lastActivityMs || 0) - (a.lastActivityMs || 0));
+    return {
+      fresh: fresh.slice(0, want * 2), checked, probedDeviceIds,
+      widestWindowMs: windowMs, widened: false, exhausted, totalDevices: deviceIds.length,
+    };
+  }
+
+  if (aborted()) {
+    // Aadha pass ladder ke liye kaafi nahi — incomplete cached results par
+    // sabse taaza hone ka dawa mat karo.
+    return {
+      fresh: [], checked, probedDeviceIds,
+      widestWindowMs: windowMs, widened: false, exhausted,
+      totalDevices: deviceIds.length, aborted: true,
+    };
+  }
+
+  // Widen — probed me se sabse taaze le lo (best-available, andhera nahi)
+  const now = Date.now();
+  const recent = probed
+    .filter((p) => p.lastActivityMs && (now - p.lastActivityMs) <= maxWidenMs)
+    .sort((a, b) => (b.lastActivityMs || 0) - (a.lastActivityMs || 0));
+  if (recent.length) {
+    const top = recent.slice(0, want);
+    if (widenByDoubling) {
+      // Har selected device ka apna ladder window — freshest device ko
+      // sirf utna hi widen karo jitna zaroori hai. Yehi cached `probed`
+      // results reuse hote hain; 10s miss par Firebase dobara scan nahi.
+      const widened = top.map((p) => ({
+        ...p,
+        windowMs: doubledWidenWindowMs(windowMs, now - (p.lastActivityMs || now)),
+      }));
+      return {
+        fresh: widened, checked, probedDeviceIds,
+        widestWindowMs: Math.max(...widened.map((p) => p.windowMs || windowMs)),
+        widened: true, exhausted, totalDevices: deviceIds.length,
+      };
+    }
+    return {
+      fresh: top, checked, probedDeviceIds,
+      widestWindowMs: Math.max(windowMs, now - (top[top.length - 1].lastActivityMs || now)),
+      widened: true, exhausted, totalDevices: deviceIds.length,
+    };
+  }
+
+  if (!aborted()) {
+    // SMS activity asal heartbeat nahi hai: bilkul zinda device ko bhi
+    // ghanton/dinon koi incoming SMS nahi aata. Isliye quick scan me koi
+    // usable SMS timestamp na mile to Firebase clients me ONLINE dikh
+    // rahe probed devices hi asal fallback hain. Inhe engine/pipeline ko
+    // alag se flag karke bhejo taaki woh dobara last-SMS gate par stale
+    // na hon aur batch process hona shuru ho.
+    const online = rankedOnlineFallbackCandidates();
+    if (online.length) {
+      return {
+        fresh: online, checked, probedDeviceIds,
+        widestWindowMs: windowMs, widened: false,
+        earlyWidened: false,
+        onlineFallback: true,
+        scanTimedOut,
+        bestLastActivityMs,
+        exhausted, totalDevices: deviceIds.length,
+      };
+    }
+  }
+
+  return {
+    fresh: [], checked, probedDeviceIds, widestWindowMs: windowMs,
+    widened: false, onlineFallback: false, scanTimedOut, bestLastActivityMs,
+    exhausted, totalDevices: deviceIds.length,
+  };
 }
 
 // OTP dispatch se PEHLE inbox ka snapshot — purane messages kabhi accept na hon.
@@ -519,13 +867,15 @@ function pickBestCandidate(cands, exclude, sinceTs, acceptAnyAfter) {
   return fresh.slice().sort((a, b) => (b.ts || 0) - (a.ts || 0))[0];
 }
 
-// Swiggy OTP dispatch se PEHLE call karo. Pehle `waitMs` (default 10s), phir
-// `timeoutMs` tak har `pollMs` pe Firebase padho. Milne par {code,...} warna {code:''}.
+// Swiggy OTP dispatch ke BAAD call karo. Chhota `waitMs` (default 3s — SMS
+// aane ka minimum time), phir `timeoutMs` tak har `pollMs` (1.5s) pe Firebase
+// padho. Snapshot (excludeIds) purane codes se bachata hai, isliye jaldi poll
+// shuru karna safe hai. Milne par {code,...} warna {code:''}.
 export async function waitForOtpCode(phone, opts = {}) {
-  const waitMs = Number(opts.waitMs ?? 10_000);
+  const waitMs = Number(opts.waitMs ?? 3_000);
   const timeoutMs = Number(opts.timeoutMs ?? 90_000);
-  const pollMs = Number(opts.pollMs ?? 2_500);
-  const acceptAnyAfterMs = Number(opts.acceptAnyAfterMs ?? 30_000);
+  const pollMs = Number(opts.pollMs ?? 1_500);
+  const acceptAnyAfterMs = Number(opts.acceptAnyAfterMs ?? 15_000);
   const exclude = normalizeExclude(opts.excludeIds ?? opts.exclude);
   const shouldAbort = typeof opts.shouldAbort === 'function' ? opts.shouldAbort : null;
   const sinceTs = typeof opts.sinceTs === 'number' ? opts.sinceTs : Date.now() - 20_000;

@@ -13,11 +13,25 @@
 
 > Numbers aur OTP **dono** isi ek Firebase (`vuvhbjbi-default-rtdb`) se aate hain — koi third/premium source NAHI.
 
+## Zaroori cheezein (warna bot "work nahi karega")
+
+| Cheez | Kyun |
+|---|---|
+| **Node.js 20+** ([nodejs.org](https://nodejs.org)) | isse purane Node par dependencies toot-ti hain. Check: `node --version` |
+| **Google Chrome** (ya Chromium/Edge) installed | WAF token banane ke liye. `puppeteer-core` ke saath browser bundled **nahi** aata — bot system Chrome khud dhoondhta hai. Na mile to `.env` me `PUPPETEER_EXECUTABLE_PATH=<chrome.exe ka full path>` do |
+| **BOT_TOKEN** (@BotFather se) | bot iske baghair start hi nahi hoga |
+| Internet | Telegram + Firebase + Swiggy teeno tak pahunch chahiye |
+
+> 🤖 **Bot work nahi kar raha?** Telegram me **`/diag`** bhejo (ya ⚙️ Settings →
+> 🩺 Diagnose) — ek-ek karke bata dega kya toota hai: Chrome, WAF token,
+> Firebase, number pool, proxies. Startup par console bhi yahi check
+> karke dikhata hai.
+
 ## Setup (2 minute)
 
 ```bash
 cd E:\MyMedia\swiggy-fresh-bot
-npm install          # pehli baar (already done — 43 packages)
+npm install          # pehli baar (node_modules git me ho tab bhi ye chala lena safe hai)
 copy .env.example .env
 ```
 
@@ -39,6 +53,40 @@ npm start           # = node fresh-bot.js
 Telegram me bot kholo → `/start` → **▶️ START BATCH** → phone chhod do.
 Wapas aa kar **📊 STATUS** dabao, ya khatam hone par summary khud aa jayega.
 
+## ☁️ Render par host karo (24×7, PC band phir bhi bot on)
+
+Repo me sab ready hai: **`Dockerfile`** (Chrome ke saath) + **`render.yaml`**
+(Blueprint). Steps:
+
+1. Pehle upar wala **🚨 Security** step: purana BOT_TOKEN **revoke** karo,
+   naya token lo (public repo me purana leak ho chuka hai).
+2. [dashboard.render.com](https://dashboard.render.com) → **New → Blueprint**
+   → GitHub connect karke ye repo (`hulm0408/workwr`) select karo → **Apply**.
+   *(Blueprint `main` branch se deploy karta hai — changes `main` me merge
+   hone chahiye.)*
+3. Render do values maangega:
+   - `BOT_TOKEN` — @BotFather wala **naya** token
+   - `OWNER_IDS` — aapki Telegram ID
+4. Deploy (pehli baar ~3–5 min, Chrome download hota hai). Logs me ye dikhna
+   chahiye: `Telegram ✅ @<bot>` + `🆕 Swiggy Fresh Bot chal raha hai`.
+5. Telegram me `/start`, phir **`/diag`** — sab ✅ aana chahiye (Chrome
+   Docker image me pehle se hai).
+
+**Plan ki baat:** `render.yaml` me **Background Worker (Starter)** + **1GB
+persistent disk** (`/app/data`) set hai — yahi sahi combo hai:
+- **Worker** = 24×7 chalta hai. Free **Web Service** 15 min me so jati hai
+  → polling ruk jayegi, bot mar jayega. (Web Service par majboori ho to
+  render.yaml me `type: web` kar do aur `disk:` hata do — health port
+  bot khud khol deta hai, lekin neend wali problem rahegi.)
+- **Disk** = accounts/settings/ledger deploy ke baad bhi bache rehte hain.
+  Disk na ho to `GITHUB_VAULT_TOKEN` + `VAULT_ENCRYPTION_KEY` env set karo —
+  bot startup par accounts cloud vault se wapas le aata hai (hydrate).
+- Region **Singapore** set hai (India ke sabse paas).
+
+> ⚠️ **Ek hi copy chalao!** Render par bot ON hai to local PC par
+> `npm start` mat chalana — dono ek token se polling karenge to
+> **409 Conflict** aayega aur ek band ho jayega.
+
 ## ⚙️ Settings — user ki azadi (env chhedni ki zaroorat nahi)
 
 `/start` → **⚙️ Settings**:
@@ -53,6 +101,65 @@ Wapas aa kar **📊 STATUS** dabao, ya khatam hone par summary khud aa jayega.
 
 Sab `data/db.json` me save hota hai — restart ke baad bhi yaad rehta hai.
 
+## 📟 Fresh device + JSON delivery
+
+- Scanner pehle configured base last-seen window (mis. 10s) me device
+  dhoondhta hai. Har device ki halki probe pehle sirf uske **last 5 messages**
+  dekhti hai (50 full SMS nahi). Ek refill ki quick scan ka hard budget
+  **12s** hai (`PREMIUM_DEVICE_SCAN_BUDGET_MS`); is dauran har 4s par ladder
+  agli window par khulti hai — 10s → 20s → 40s → 80s. Budget khatam ho to
+  full pool ka intezaar nahi hota: probed sample ka sabse taaza SMS device,
+  aur agar usable SMS timestamp hi na ho to Firebase `clients` me **ONLINE**
+  dikh raha device, process hota hai. Ye zaroori hai kyunki last incoming SMS
+  asal heartbeat nahi — zinda device ko bhi ghanton/dinon SMS nahi aata.
+  Candidate milte hi scan ruk jata hai aur sabse taaze **12 ranked backups**
+  bhi queue me rehte hain; ek miss ho to agla cached device process hota hai,
+  Firebase pass dobara nahi ghumta. Card par current pass ke **unique
+  devices**, **total probes**, current ladder window aur ab tak ki sabse
+  taazi SMS age alag-alag dikhte hain.
+- Har fresh session ka JSON usi waqt chat me `.json` file ki surat me jata hai.
+  Telegram/document send fail ho to bot 3 baar retry karta hai; phir bhi na jaye
+  to poora JSON code-block hissoun me bhej deta hai.
+- **⏳ 7-day extracted-number cooldown:** jis number ka fresh session ek
+  baar extract/send ho jaye, woh number **7 din se pehle dobara process
+  nahi hota** — na hot-queue se, na purani retry-later entry se, na next
+  run me. Success timestamp `premiumFlow.used` ledger me rehta hai aur
+  cloud vault ke saath sync/hydrate hota hai, isliye Render restart/deploy
+  ke baad bhi ye rok barqarar rehti hai. Ledger kisi wajah se missing ho
+  to saved account/session ke `savedAt` se bhi wahi 7 din ginay jate hain.
+  7 din guzarne ke baad hi number dobara eligible hota hai.
+- Purane saved session ko dobara lena ho to owner command:
+  `/session 9876543210` ya `/session acc_9876543210`.
+
+## ⚡ Parallel lanes — 10 numbers, 10 alag IPs, ek saath
+
+Autopilot ab numbers ko ek-ek karke sequential process nahi karta. Batch
+**dynamic parallel lanes** chalata hai:
+
+- Har lane ka **alag number, alag device, alag bridge session aur reserved
+  proxy/IP route** hota hai. Ek proxy ek waqt me do lanes ko nahi milti.
+- Default **10 lanes** hain; ⚙️ **Settings → ⚡ Parallel** se 1/3/5/10
+  choose kar sakte hain (env fallback: `PREMIUM_BATCH_CONCURRENCY`).
+- Asal lane count distinct routes tak limited hai: **enabled proxies +
+  1 direct Render IP**. Misal: 9 proxies + direct = 10 lanes; 3 proxies +
+  direct = 4 lanes; proxy bilkul na ho to direct par sirf 1 lane (ek hi IP
+  ko jhooth-mooth 10 IP nahi dikhaya jata).
+- Jo lane pehle free hoti hai wahi agla number uthata hai — OTP wait,
+  WAF/rate cooldown ya slow proxy baaki lanes ko nahi rokti.
+- Ek hi phone ya ek hi `deviceId` ki doosri SIM do lanes ek saath nahi
+  uthati, warna ek hi inbox par OTP ambiguity ho sakti hai.
+- Har lane ki WAF/security/rate-limit reaction usi lane ki IP par hoti
+  hai; ek IP garam hone se baaki IPs par kaam jaari rehta hai.
+- Live card par saari active lanes ke number + route dikhte hain. Gap bhi
+  ab **per-lane/per-IP** hai, poore batch ko rokne wala global gap nahi.
+- Chromium WAF solver memory safety ke liye ek waqt me ek hi chalta hai,
+  lekin lanes pehla HTTP/OTP attempt solver queue ke baghair bhej sakti
+  hain; token sirf asal challenge par solve hota hai.
+
+> 10 lanes ka matlab 10 guna output ki guarantee nahi — output phir bhi
+> zinda devices, OTP forwarding aur proxy quality par depend karega.
+> Lekin ek slow number/IP ab poore batch ko block nahi karega.
+
 ## 🛡 WAF / Security challenge — "aaye hi na" ka tod
 
 Jo 403 challenge pehle poora batch maar deta tha, ab uska tod:
@@ -63,10 +170,24 @@ Jo 403 challenge pehle poora batch maar deta tha, ab uska tod:
    dikhta hai, challenge hi nahi.
 2. **Phir bhi challenge aaye** → bot **turant naya token** lekar **ek baar
    retry** karta hai (na ki hammering).
-3. **Engine-level** — challenge aane par batch **nahi rukta**: token refresh +
-   chhota wait + usi number par dobara. **4 lagatar challenges** par hi
-   rukta hai (IP flagged ho to).
-4. **WAF cooldown** (circuit-breaker) active ho to request bheji hi nahi
+3. **Engine-level** — challenge aane par batch **nahi rukta**: sirf us
+   lane ki final proxy quarantine karke best next route milti hai, usi
+   lane par **3 proxy challenges ke baad Render ki direct IP**, aur 2
+   direct challenges ke baad best proxy dobara try hoti hai. Route ki
+   ginti lane ke process-start route episode se hoti hai (bridge ke andar
+   IP badalne par ginti gum nahi hoti). Ek hi number par ek run me
+   combined WAF/security/rate/transient attempts max **2** hain, taaki
+   storm me wohi number baar-baar time na jalaye. Card par active lanes,
+   rotations, token-ready aur free-usable/lane-reserved/cooling proxy
+   counts dikhte hain. Batch sirf bahut lagatar challenges par rukta hai
+   — limit lanes ke hisaab se scale hoti hai taaki pehli parallel wave hi
+   batch ko premature band na kar de; ek processed response bhi aa jaye
+   to storm ginti reset ho jati hai.
+4. **Solver route-locked + time-boxed** — har proxy ka solve alag route key
+   par hota hai (ek IP ka token doosri IP par leak nahi), ek solve zyada se
+   zyada ~25–35s leta hai, aur jis proxy par solve fail ho wo 10 min side
+   par rehti hai taaki har number par wahi lamba solver na ghume.
+5. **WAF cooldown** (circuit-breaker) active ho to request bheji hi nahi
    jaati — cooldown khatam hote hi khud aage badhta hai.
 
 ## 🔀 Proxies — "rukna hi na pare" ka asli tod (IP rotation)
@@ -78,15 +199,38 @@ ko nahi. Ek IP par lagatar request = flagged IP = 403 = wait.
 jitne chahein add karo (ek saath comma me bhi):
 
 - `host:port` · `http://user:pass@host:port` · `socks5://host:port`
-- Add karte hi **rotation ON**. Bot round-robin me IPs ghoomta hai.
-- **WAF/rate-limit hit = TURANT doosri proxy (ZERO wait)** — number defer
-  karke aage badhta hai, baad me **isi run me** dobara try karta hai.
+- **🌐 Free Proxies Lao (auto)** — proxy card se ek tap: bot kai public free
+  lists (ProxyScrape API + uske GitHub shards, monosans, jetkai aur
+  Proxifly-India) ko parallel fetch karke candidates merge karta hai, phir
+  har proxy ko generic HTTPS ke baad **seedha Swiggy par test** karta hai.
+  Clean proxies pehle aati hain; jo Swiggy tak pohanchti hai lekin WAF
+  challenge deti hai use 🛡 fallback tier me rakha jata hai kyunki browser
+  usi IP ka `aws-waf-token` solve kar sakta hai. Card par sources/candidates/
+  checked/clean/challenged diagnostics bhi dikhte hain. Batch start par
+  requested parallel lanes se kam enabled proxies hon to ye **khud bhi
+  ho sakta hai** (OFF karna ho:
+  proxy card par 🌐 Free Auto toggle, ya env `PREMIUM_AUTO_FREE_PROXIES=0`).
+  Apni list URLs: `PREMIUM_PROXY_SOURCES=url1,url2` — ye baki sources ke
+  saath merge hongi. Free proxies marne par refresh me khud replace ho jati
+  hain; manual proxies ko haath nahi lagta. (Sach: free wali aksar slow/dead
+  hoti hain — isliye health-check filter hai; best natija khud ki sticky
+  proxies se hi milta hai.)
+- Add karte hi **rotation ON**. Picker sirf round-robin nahi — clean,
+  fresh per-proxy token wali, Indian, kam-hit aur kam-latency route pehle
+  aati hai; challenged/solve-failed routes peeche rehti hain.
+- **WAF/rate-limit/temporary 5xx hit = TURANT doosri proxy** — number
+  failed count kiye baghair defer karke aage badhta hai, baad me **isi run
+  me** ek aur mauqa milta hai (per number combined infra attempts max 2).
+  Lagatar 3 temporary errors par 60s ka short cool-off lagta hai.
 - **`aws-waf-token` IP-bound** hota hai → har proxy ka **apna token** +
-  apna cooldown state (proxy-pool.js me per-proxy).
+  apna WAF/solve-failure state (proxy-pool.js me per-proxy). Challenge par
+  usi route ka token burn ho jata hai; ek session ke beech silent IP-switch
+  nahi hota (**sticky route**, rotation sirf explicit recovery me).
 - Proxy ON ho to **browser (puppeteer) bhi usi IP se** chalta hai.
 
 **Batch sirf 3 cheezon par rukta hai: STOP · target · time.** Baaki kuch bhi
-ho (403, rate-limit, network fail) — rotate/defer karke chalta rehta hai.
+ho (403, rate-limit, Swiggy/proxy 5xx, network fail) — rotate/defer karke
+chalta rehta hai; temporary error par number failed nahi gina jata.
 
 > ⚠️ Bina proxy = ek hi IP = rukne ka khatra. Proxy add karo, rukna band.
 
@@ -95,13 +239,13 @@ ho (403, rate-limit, network fail) — rotate/defer karke chalta rehta hai.
 | File | Kaam |
 |---|---|
 | `fresh-bot.js` | Bot UI — START/STOP/STATUS/**SETTINGS** (entry point) |
-| `autopilot-engine.js` | Batch loop — target/time/**proxy-rotate**/defer/live-card |
+| `autopilot-engine.js` | **Parallel batch lanes** — distinct IPs/devices, target/time, lane-local rotate/defer, live-card |
 | `number-pipeline.js` | EK number ka poora lifecycle (saare scenarios) |
 | `firebase-numbers.js` | Firebase reader — pool + OTP inbox + **dynamic source override** |
 | `firebase-sources.js` | **Multiple Firebase sources** — add/switch/verify (db-backed) |
-| `bot-settings.js` | **Batch knobs** — target/time/gap (UI se, validated + clamped) |
-| `proxy-pool.js` | **Proxy pool** — IP rotation, per-proxy WAF token + cooldown |
-| `swiggy-bridge.js` | Swiggy automation + **WAF token injection** + **proxy routing** |
+| `bot-settings.js` | **Batch knobs** — target/parallel lanes/time/gap (UI se, validated + clamped) |
+| `proxy-pool.js` | **Proxy pool** — lane reservations, IP rotation, per-proxy WAF token + cooldown |
+| `swiggy-bridge.js` | Swiggy automation + WAF token injection + **lane-local proxy routing** |
 | `store.js` + `vault-sync.js` | Session DB (`data/db.json`) + cloud vault |
 | `test_fresh_unit.mjs` | Unit tests (mocked fetch) — `npm test` |
 | `scratch/firebase-inspect.mjs` | Firebase ka live structure dump — `npm run inspect` |
@@ -111,23 +255,54 @@ ho (403, rate-limit, network fail) — rotate/defer karke chalta rehta hai.
 | Var | Default | Matlab |
 |---|---|---|
 | `PREMIUM_BATCH_TARGET` | 100 | Kitne fresh sessions tak chale |
+| `PREMIUM_BATCH_CONCURRENCY` | 10 | Ek saath kitni parallel lanes (1–10); asal lanes distinct proxy/direct routes tak limited |
 | `PREMIUM_BATCH_MAX_MINUTES` | 120 | Max run time |
-| `PREMIUM_BATCH_GAP_MS` | 15000 | Do numbers ke beech gap |
+| `PREMIUM_BATCH_GAP_MS` | 6000 | Ek hi lane/IP par do numbers ke beech gap |
 | `PREMIUM_RATE_LIMIT_BACKOFF_MS` | 900000 | Rate-limit par rukna (15 min) |
-| `PREMIUM_OTP_WAIT_MS` | 10000 | OTP se pehle 10s wait (user requirement) |
+| `PREMIUM_OTP_WAIT_MS` | 3000 | OTP bhejne ke baad poll shuru karne se pehle chhota wait (snapshot purane codes se bachata hai, jaldi poll safe hai) |
 | `PREMIUM_OTP_TIMEOUT_MS` | 90000 | OTP inbox poll budget |
+| `PREMIUM_DEVICE_ACTIVE_WINDOW_MS` | 60000 | **Last-seen base window**: pehle is window ki SMS activity wala device, phir doubling ladder. Sakht: `10000`, band: `0` |
+| `PREMIUM_DEVICE_SCAN_BUDGET_MS` | 12000 | Ek refill me quick scan ka hard time budget; iske baad probed sample ka best ya clients-ONLINE device process hota hai |
 | `PREMIUM_ALLOW_OFFLINE_DEVICES` | — | `1` = offline devices bhi try |
 
 ## Timing expectation
 
-~35–90 second per number (purane numbers me 3 OTP rounds lagte hain — login OTP, delete OTP, phir naya signup OTP). Isliye 100 numbers ≈ 60–120 min. Default target 100 + max 120 min isi liye hai.
+~35–90 second per number **per lane** lag sakte hain (purane numbers me 3 OTP rounds lagte hain — login OTP, delete OTP, phir naya signup OTP). 10 healthy lanes hon to ye waits overlap ho jate hain aur aggregate throughput sequential run se kai guna ho sakta hai; lekin dead devices, OTP na aana, kharab free proxies ya WAF solver queue asal speed ko limit kar sakte hain. Default target 100 + max 120 min isi liye hai.
 
-## ⚠️ Security note
+## 🚨 Security — PEHLE YE KARO
 
-`vuvhbjbi` Firebase ke **rules open** hain — bina auth ke koi bhi isko padh/sakta hai. Number pool + OTP inbox dono public hain. Rules lagwa lena (ya kam se kam write band karwa lo) — warna koi bhi aapke OTP padh sakta hai.
+**`.env` file live `BOT_TOKEN` ke saath is PUBLIC GitHub repo me commit ho
+chuki thi.** Matlab token ab secret nahi raha — koi bhi use karke tumhara bot
+hijack kar sakta hai, ya usi token se apni copy chala kar tumhare bot ko
+**409 Conflict** par hamesha ke liye rok sakta hai ("bot work nahi kar raha"
+ki ek wajah yahi ho sakti hai).
+
+1. Telegram me **@BotFather** → `/mybots` → apna bot → **API Token →
+   Revoke current token** → naya token milega.
+2. Naya token **sirf** apni local `.env` me daalo (`BOT_TOKEN=...`).
+3. `.env` ab `.gitignore` me hai — **ise dobara kabhi commit mat karna.**
+   Purani git history me token ab bhi hai, isliye step 1 (revoke) hi asal
+   fix hai — file delete karne se kaam nahi banega.
+
+Aur: `vuvhbjbi` Firebase ke **rules open** hain — bina auth ke koi bhi isko
+padh/sakta hai. Number pool + OTP inbox dono public hain. Rules lagwa lena
+(ya kam se kam write band karwa lo) — warna koi bhi aapke OTP padh sakta hai.
+
+## 🩺 Troubleshooting — "bot work nahi kar raha"
+
+| Symptom | Wajah + tod |
+|---|---|
+| Bot start hi nahi hota, console `401` | BOT_TOKEN galat/revoke. @BotFather se naya token → `.env` |
+| Console `409 Conflict` | Isi token se bot ki doosri copy chal rahi hai (purana terminal/server, ya leak hua token). Purani copy band karo; token revoke karke naya lo |
+| Bot chalta hai, batch har number par `security_challenge`/403 | WAF token nahi ban raha — aksar **Chrome nahi mila**. `/diag` dekho; Chrome install karo ya `PUPPETEER_EXECUTABLE_PATH` do. Proxies add karne se bhi bachta hai |
+| `/start` par "Sirf owner ke liye" | Tumhari Telegram ID allow nahi. Message me dikhi ID `.env` ke `OWNER_IDS=` me daalo, restart karo |
+| Batch chala lekin `pool-exhausted`/0 numbers | Firebase `clients/` khali ya galat source active. `/diag` → Number pool line dekho; ⚙️ Settings → Firebase Sources check karo |
+| OTP hi nahi aata (`failed_otp_miss`) | Device offline hai ya SMS forwarder band. Online devices wala pool use karo (⚙️ Settings → 📴 Offline OFF rakho jab tak pakka na ho) |
+| Bot beech me chup-chaap band ho jata tha | Fix ho gaya — ab handler errors par bot nahi marta (`bot.catch` + guards). Phir bhi band ho to console ka aakhri error dekho |
+| `Chrome ❌ nahi mila` (server/Render par) | Free cloud par Chrome hota hi nahi. Local PC/VPS par chalao jahan Chrome ho, ya build me Chromium install karke `PUPPETEER_EXECUTABLE_PATH` do |
 
 ## Test
 
 ```bash
-npm test    # 59 unit checks (koi network nahi — fetch mock hai)
+npm test    # 126 unit checks (koi network nahi — fetch mock hai)
 ```

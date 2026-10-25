@@ -28,6 +28,7 @@ const defaultData = {
     deletedAccounts: {}
   },
   sessionVault: {},
+  premiumFlow: { used: {} },
   orders: {},
   drafts: {},
   bossState: null,
@@ -407,6 +408,36 @@ function consolidateDuplicatePhoneSlots(db, winningKey, cleanPhone) {
   }
 }
 
+function premiumLedgerTimestampMs(entry) {
+  const raw = entry?.extractedAt || entry?.sentAt || entry?.at || entry?.updatedAt || entry?.createdAt || '';
+  if (typeof raw === 'number' && Number.isFinite(raw)) {
+    if (raw > 1e12) return raw;
+    if (raw > 1e9) return raw * 1000;
+    return 0;
+  }
+  const parsed = Date.parse(String(raw || ''));
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+}
+
+// Extracted/used-number ledger ko local + cloud copies ke beech merge karo.
+// Har phone par nayi timestamp wali entry jeet-ti hai; isse Render ki
+// ephemeral disk udnay ke baad bhi 7-day cooldown wapas aa jata hai.
+export function _mergePremiumLedgerEntries(localUsed = {}, remoteUsed = {}) {
+  const used = { ...(localUsed || {}) };
+  let changed = 0;
+  for (const [rawPhone, remoteEntry] of Object.entries(remoteUsed || {})) {
+    if (!remoteEntry || typeof remoteEntry !== 'object') continue;
+    const phone = normalizeTenDigitPhone(rawPhone || remoteEntry.phone || '');
+    if (!phone) continue;
+    const localEntry = used[phone];
+    if (!localEntry || premiumLedgerTimestampMs(remoteEntry) > premiumLedgerTimestampMs(localEntry)) {
+      used[phone] = { ...remoteEntry };
+      changed++;
+    }
+  }
+  return { used, changed };
+}
+
 export function buildCloudVaultSnapshot(data = null) {
   const src = data || getDb();
   const accountsOut = {};
@@ -422,12 +453,20 @@ export function buildCloudVaultSnapshot(data = null) {
     if (!o || !o.id) continue;
     ordersOut[k] = { ...o };
   }
+  const premiumUsedOut = {};
+  for (const [phone, entry] of Object.entries(src?.premiumFlow?.used || {})) {
+    if (entry && typeof entry === 'object') premiumUsedOut[phone] = { ...entry };
+  }
   return {
-    version: 16,
+    version: 17,
     updatedAt: new Date().toISOString(),
     accounts: accountsOut,
     deletedAccounts: { ...(src?.config?.deletedAccounts || {}) },
     sessionVault: { ...(src?.sessionVault || {}) },
+    // Extracted/used numbers ki ledger bhi durable rakho — warna har
+    // Render deploy/restart ke baad wohi numbers dobara process hote the
+    // jo thodi der pehle hi JSON bana kar bheje ja chuke thay.
+    premiumFlow: { used: premiumUsedOut },
     orders: ordersOut,
     // Shared WAF token (encrypted at rest by the vault transport) so a fresh
     // Render deploy starts WARM — no cold-start challenge storm on scans.
@@ -453,6 +492,15 @@ export async function hydrateAccountsFromCloudVault() {
     if (!db.config.accounts) db.config.accounts = {};
     if (!db.config.deletedAccounts) db.config.deletedAccounts = {};
     if (!db.sessionVault) db.sessionVault = {};
+    if (!db.premiumFlow || typeof db.premiumFlow !== 'object') db.premiumFlow = { used: {} };
+    if (!db.premiumFlow.used || typeof db.premiumFlow.used !== 'object') db.premiumFlow.used = {};
+
+    // 7-day extracted-number cooldown ko restart/deploy ke baad restore karo.
+    const mergedLedger = _mergePremiumLedgerEntries(db.premiumFlow.used, remote.premiumFlow?.used || {});
+    if (mergedLedger.changed) {
+      db.premiumFlow.used = mergedLedger.used;
+      mutated = true;
+    }
 
     for (const [delKey, delVal] of Object.entries(remote.deletedAccounts || {})) {
       if (!delVal) continue;
@@ -599,6 +647,7 @@ function ensureDb() {
 }
 
 let accountsSeeded = false;
+let _corruptBackupMade = false; // getDb() baar-baar bulaaya jata hai — corrupt backup sirf ek baar/process
 function seedAccountsFromJson(data) {
   if (accountsSeeded) return;
   try {
@@ -674,6 +723,12 @@ export function getDb() {
     if (!data.sessionVault) {
       data.sessionVault = {};
     }
+    if (!data.premiumFlow || typeof data.premiumFlow !== 'object') {
+      data.premiumFlow = { used: {} };
+    }
+    if (!data.premiumFlow.used || typeof data.premiumFlow.used !== 'object') {
+      data.premiumFlow.used = {};
+    }
     seedAccountsFromJson(data);
     delete data.config.depositAmount;
     // Tag non-enumerable baseline snapshots for orders, accounts, deletedAccounts & sessionVault so NO concurrent async fiber ever clobbers newly uploaded accounts OR resurrects concurrently deleted accounts!
@@ -708,7 +763,20 @@ export function getDb() {
     return data;
   } catch (err) {
     console.error('Error reading db:', err);
-    return defaultData;
+    // Corrupt/adhuri db.json (bijli gayi, disk full, aadhi copy…) — pehle
+    // yahan shared `defaultData` return ho jata tha, phir koi saveDb() usi
+    // khali data se asli file overwrite kar deta = accounts/settings SAAF.
+    // Ab: kharab file ko backup karke rakho (recovery ke liye), aur
+    // default ki DEEP COPY do (shared object mutation na mare).
+    try {
+      if (!_corruptBackupMade && fs.existsSync(DB_FILE)) {
+        _corruptBackupMade = true;
+        const bak = `${DB_FILE}.corrupt-${Date.now()}`;
+        fs.copyFileSync(DB_FILE, bak);
+        console.error(`[store] db.json corrupt lagi — backup banaya: ${bak} (agar accounts wapas chahiye to is file ko check karo).`);
+      }
+    } catch {}
+    return JSON.parse(JSON.stringify(defaultData));
   }
 }
 
@@ -980,6 +1048,39 @@ export function getFamilyRole(userId, fallback = 'Parent') {
 export function getAccounts() {
   const db = getDb();
   return db.config.accounts || defaultData.config.accounts;
+}
+
+// Fresh session ka "JSON" — wahi shape jo bridge verify/signup par
+// exportJson ki surat me deta hai (account/name/token/tid/sid/cookies...).
+// Pehle bridge ke diye hue exportJson ko tarjeeh do; na ho to DB me saved
+// account se wahi shape bana do — taaki chat me bhejne ke liye JSON hamesha
+// mil jaye. Account hi na mile to null.
+export function getSessionExportJson(accountKey, bridgeAccount = null) {
+  if (bridgeAccount?.exportJson && typeof bridgeAccount.exportJson === 'object') {
+    return bridgeAccount.exportJson;
+  }
+  try {
+    const acc = getDb()?.config?.accounts?.[accountKey];
+    if (!acc) return null;
+    const phone = acc.phone || acc.mobile || '';
+    return {
+      account: accountKey,
+      name: acc.name || '',
+      swiggyName: acc.swiggyName || '',
+      botTag: acc.botTag || '',
+      mobile: phone,
+      phone,
+      customerId: acc.customerId || '',
+      token: acc.token || acc.tid || '',
+      tid: acc.tid || '',
+      sid: acc.sid || '',
+      deviceId: acc.deviceId || '',
+      cookies: acc.cookies || '',
+      savedAt: acc.savedAt || '',
+    };
+  } catch {
+    return null;
+  }
 }
 
 export function updateAccount(key, updates) {

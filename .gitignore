@@ -1,0 +1,14 @@
+# Dependencies (npm install se bante hain — repo me kabhi na ho)
+node_modules/
+
+# Secrets — BOT_TOKEN wala .env KABHI commit na ho (repo public hai!)
+.env
+.env.*
+!.env.example
+
+# Test isolation folder (tests yahan apna alag DB banate hain)
+test-data/
+
+# Runtime/log junk
+*.log
+*.tmp

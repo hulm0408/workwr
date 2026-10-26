@@ -1,0 +1,37 @@
+name: Docker build check
+
+on:
+  push:
+    paths:
+      - Dockerfile
+      - .dockerignore
+      - package.json
+      - package-lock.json
+      - .github/workflows/docker-build.yml
+  pull_request:
+    paths:
+      - Dockerfile
+      - .dockerignore
+      - package.json
+      - package-lock.json
+      - .github/workflows/docker-build.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build --progress=plain --tag swiggy-fresh-bot:test .
+
+      - name: Smoke-check Node and Chrome in image
+        run: >-
+          docker run --rm swiggy-fresh-bot:test
+          sh -lc 'node --version && google-chrome-stable --version && node --check fresh-bot.js'

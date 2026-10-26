@@ -47,9 +47,10 @@ const {
   isAutopilotRunning,
   formatPoolStatus,
   formatFirebaseSourceStatus,
+  formatScanCandidateStates,
   poolExhaustedReasonText,
 } = await import('./autopilot-engine.js');
-const { isFirebaseConfigured, firebaseSetupHintLines, listPoolNumbers } = await import('./firebase-numbers.js');
+const { isFirebaseConfigured, firebaseSetupHintLines, listPoolNumbers, _countDeviceOnlineStates } = await import('./firebase-numbers.js');
 const sources = await import('./firebase-sources.js');
 const bs = await import('./bot-settings.js');
 const proxyPool = await import('./proxy-pool.js');
@@ -253,7 +254,7 @@ function runningCard(snap, stageText = '') {
     field('🔥 Firebase', formatFirebaseSourceStatus(snap)),
     field('Pool', formatPoolStatus(snap)),
     (snap.scanning || snap.scanChecked)
-      ? field('🔎 Device scan', `pass ${snap.scanPass || 1}: ${snap.scanUniqueChecked || 0}/${snap.scanTotalDevices || 0} unique · probes ${snap.scanTotalProbes || snap.scanChecked || 0} · window ≤${fmtDuration(snap.scanWindowMs || 0)} · ${snap.scanBestActivityMs ? `scan ke waqt best SMS ~${fmtDuration(snap.scanBestActivityAgeMs || Math.max(0, Date.now() - snap.scanBestActivityMs))} purani · ` : ''}${snap.scanFresh || 0} fresh ready${snap.scanning ? ' · scanning…' : ''}`)
+      ? field('🔎 Device scan', `pass ${snap.scanPass || 1}: ${snap.scanUniqueChecked || 0}/${snap.scanTotalDevices || 0} unique · probes ${snap.scanTotalProbes || snap.scanChecked || 0} · window ≤${fmtDuration(snap.scanWindowMs || 0)} · ${snap.scanBestActivityMs ? `scan ke waqt best SMS ~${fmtDuration(snap.scanBestActivityAgeMs || Math.max(0, Date.now() - snap.scanBestActivityMs))} purani · ` : ''}${snap.scanFresh || 0} fresh ready${formatScanCandidateStates(snap) ? ` · candidates: ${formatScanCandidateStates(snap)}` : ''}${snap.scanning ? ' · scanning…' : ''}`)
       : '',
     (snap.activeNumbers?.length)
       ? `📍 <b>Abhi ${snap.activeNumbers.length} lanes:</b>\n${snap.activeNumbers.slice(0, 10).map((n) => `• <code>${esc(n.phone)}</code> · lane ${n.laneId || '?'} · ${esc(n.proxyLabel || 'direct')} (${fmtDuration(Date.now() - n.startedAt)})`).join('\n')}`
@@ -279,7 +280,7 @@ function summaryCard(snap) {
     field('🔥 Firebase', formatFirebaseSourceStatus(snap)),
     field('Pool', formatPoolStatus(snap)),
     snap.stopReason === 'pool-exhausted' ? poolExhaustedReasonText(snap) : '',
-    snap.scanChecked ? field('🔎 Device scan', `pass ${snap.scanPass || 1}: ${snap.scanUniqueChecked || 0}/${snap.scanTotalDevices || 0} unique · total probes ${snap.scanTotalProbes || snap.scanChecked}`) : '',
+    snap.scanChecked ? field('🔎 Device scan', `pass ${snap.scanPass || 1}: ${snap.scanUniqueChecked || 0}/${snap.scanTotalDevices || 0} unique · total probes ${snap.scanTotalProbes || snap.scanChecked}${formatScanCandidateStates(snap) ? ` · candidates: ${formatScanCandidateStates(snap)}` : ''}`) : '',
     snap.lastError ? field('Last error', snap.lastError) : '',
     freshList ? `` : '',
     freshList ? `▤ <b>Latest fresh sessions:</b>` : '',
@@ -753,10 +754,10 @@ async function diagCard() {
     } else {
       sources.applyActiveSource();
       const pool = await listPoolNumbers();
-      const online = pool.filter((p) => p.online !== false).length;
+      const deviceStates = _countDeviceOnlineStates(pool);
       const fallbackCount = Math.max(0, sources.listRunSources().length - 1);
       lines.push(field('📱 Number pool', pool.length
-        ? `✅ ACTIVE source: ${pool.length} numbers (${online} online)`
+        ? `✅ ACTIVE source: ${pool.length} numbers · devices: ONLINE ${deviceStates.online} · status-unknown ${deviceStates.unknown} · offline ${deviceStates.offline}`
         : `⚠️ ACTIVE source: 0 numbers mile — clients/ node khali ya paths galat${fallbackCount ? `; batch me baaki ${fallbackCount} enabled source(s) auto-try honge` : ''}`));
     }
   } catch (e) {

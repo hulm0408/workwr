@@ -98,6 +98,17 @@ function urlFor(path, params = {}) {
   return `${baseUrl()}/${p ? `${p}.json` : '.json'}${q ? `?${q}` : ''}`;
 }
 
+// Firebase kabhi HTTP error ke saath, aur kuch edge cases me 200 ke saath
+// bhi, sirf {"error":"...deactivated..."} bhejta hai. Use data samajh kar
+// parser se guzarna pool ko jhooth-mooth 0 bana deta tha; asal error ko
+// error hi rakho taaki engine agla enabled source try kar sake.
+export function _firebaseErrorMessage(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return '';
+  const keys = Object.keys(value);
+  if (!keys.length || !keys.every((k) => ['error', 'code', 'status'].includes(k))) return '';
+  return typeof value.error === 'string' ? value.error.trim() : '';
+}
+
 async function fbGet(path, params = {}, timeoutMs = 30_000) {
   // Default timeout 30s — clients.json 1.2MB+ ka ho sakta hai; cold fetch
   // ~11-15s leta hai (12s par pehle TimeoutError aakar pool ko 0 bana deta
@@ -113,7 +124,12 @@ async function fbGet(path, params = {}, timeoutMs = 30_000) {
       : '';
     throw new Error(`Firebase ${res.status} (GET ${cleanPath(path)})${hint} ${txt.slice(0, 120)}`);
   }
-  return res.json();
+  const data = await res.json();
+  const firebaseError = _firebaseErrorMessage(data);
+  if (firebaseError) {
+    throw new Error(`Firebase error (GET ${cleanPath(path)}): ${firebaseError.slice(0, 160)}`);
+  }
+  return data;
 }
 
 async function fbPatch(path, obj) {
@@ -127,7 +143,12 @@ async function fbPatch(path, obj) {
     const txt = await res.text().catch(() => '');
     throw new Error(`Firebase ${res.status} (PATCH ${cleanPath(path)}) ${txt.slice(0, 120)}`);
   }
-  return res.json().catch(() => null);
+  const data = await res.json().catch(() => null);
+  const firebaseError = _firebaseErrorMessage(data);
+  if (firebaseError) {
+    throw new Error(`Firebase error (PATCH ${cleanPath(path)}): ${firebaseError.slice(0, 160)}`);
+  }
+  return data;
 }
 
 // ---------------------------------------------------------------------------
@@ -258,17 +279,20 @@ export async function findDeviceIdsForPhone(phone) {
 // ---------------------------------------------------------------------------
 // listPoolNumbers — clients (default) ya legacy numbers path
 // ---------------------------------------------------------------------------
-export async function listPoolNumbers({ useCacheIndex = false } = {}) {
+export async function listPoolNumbers({ useCacheIndex = false, timeoutMs = 30_000 } = {}) {
   const forcedLegacy = _source ? _source.numbersPath : env('FIREBASE_NUMBERS_PATH', '');
 
   if (!forcedLegacy) {
     const clientsPath = _source?.clientsPath || env('FIREBASE_CLIENTS_PATH', 'clients');
     let raw = null;
     try {
-      raw = await fbGet(clientsPath);
+      raw = await fbGet(clientsPath, {}, timeoutMs);
     } catch (e) {
-      // 401/400 jaise config errors ko propagate karo; missing path (null) chalega
-      if (/Firebase 40[01]/.test(String(e?.message || ''))) throw e;
+      // Missing node Firebase me aam taur par 200/null hota hai. Sirf asal
+      // 404 par legacy fallback do; timeout/network/401/423 (deactivated)
+      // ko chhupa kar "pool khali" mat banao — caller ko exact wajah mile
+      // aur autopilot agla enabled Firebase source try kar sake.
+      if (!/Firebase 404\b/.test(String(e?.message || ''))) throw e;
       raw = null;
     }
     if (raw && typeof raw === 'object') {
@@ -281,7 +305,7 @@ export async function listPoolNumbers({ useCacheIndex = false } = {}) {
   }
 
   const legacyPath = _source?.numbersPath || env('FIREBASE_NUMBERS_PATH', 'numbers');
-  const legacyRaw = await fbGet(legacyPath);
+  const legacyRaw = await fbGet(legacyPath, {}, timeoutMs);
   const pool = _parsePool(legacyRaw);
   rebuildIndex(pool);
   return pool;

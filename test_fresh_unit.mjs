@@ -397,6 +397,19 @@ console.log('firebase-sources (db-backed manager):');
   const seeded = srcMod.listSources();
   ok(seeded.length >= 1, 'ensureSeeded — default source auto-seed');
   ok(Boolean(srcMod.getActiveSource()), 'active source set');
+  ok(srcMod.BUILTIN_FIREBASE_SOURCE_URLS.length === 55, 'owner ke 55 Firebase URLs built-in list me hain');
+  ok(new Set(srcMod.BUILTIN_FIREBASE_SOURCE_URLS).size === 55, 'built-in Firebase URLs me duplicate nahi');
+  ok(srcMod.BUILTIN_FIREBASE_SOURCE_URLS[0] === 'https://admin143-dab82-default-rtdb.firebaseio.com', 'pehla built-in Firebase URL sahi');
+  ok(srcMod.BUILTIN_FIREBASE_SOURCE_URLS.at(-1) === 'https://do-admin-v21-default-rtdb.firebaseio.com', 'aakhri built-in Firebase URL sahi');
+  ok(srcMod.BUILTIN_FIREBASE_SOURCE_URLS.includes('https://choduu00111-default-rtdb.firebaseio.com'), 'choduu00111 Firebase URL shamil');
+  ok(srcMod.BUILTIN_FIREBASE_SOURCE_URLS.includes('https://myypppp-default-rtdb.asia-southeast1.firebasedatabase.app'), 'asia-southeast1 Firebase URL shamil');
+  {
+    const seededUrls = new Set(seeded.map((s) => s.url.replace(/\/+$/, '').toLowerCase()));
+    ok(srcMod.BUILTIN_FIREBASE_SOURCE_URLS.every((u) => seededUrls.has(u.toLowerCase())), 'saare built-in Firebase sources seed ho gaye');
+    ok(seeded.filter((s) => s.builtin).length === 55, '55 built-in sources builtin tag ke saath save');
+    ok(new Set(seeded.map((s) => s.id)).size === seeded.length, 'source IDs unique hain');
+    ok(seeded.every((s) => /^[a-f0-9-]{1,10}$/.test(s.id)), 'source IDs Telegram callback-compatible hain');
+  }
 
   const before = srcMod.listSources().length;
   const bad = srcMod.addSource({ url: 'https://not-a-firebase.example.com' });

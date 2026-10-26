@@ -105,9 +105,11 @@ persistent disk** (`/app/data`) set hai — yahi sahi combo hai:
 
 `/start` → **⚙️ Settings**:
 
-- **🔥 Firebase Sources** — multiple Firebase DB add/remove/enable/disable/switch,
-  sab bot UI se. Har add par **auto-verify** (reachable + top keys). Jo source
-  **ACTIVE** hai, usi se numbers + OTP aate hain.
+- **🔥 Firebase Sources** — default DB ke saath owner ke **55 Firebase DB**
+  pehle se seed milte hain; iske alawa bhi multiple DB add/remove/enable/disable/
+  switch, sab bot UI se. Badi list 10-per-page pagination me dikhti hai. Har
+  manual add par **auto-verify** (reachable + top keys). Jo source **ACTIVE**
+  hai, usi se numbers + OTP aate hain.
 - **🎯 Target** — presets (10/50/100/200/500) ya custom number text me likho
 - **⏱ Max time** — 15m se 480m tak
 - **🚦 Gap** — do numbers ke beech 0s–60s

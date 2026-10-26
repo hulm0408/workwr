@@ -108,8 +108,11 @@ persistent disk** (`/app/data`) set hai — yahi sahi combo hai:
 - **🔥 Firebase Sources** — default DB ke saath owner ke **55 Firebase DB**
   pehle se seed milte hain; iske alawa bhi multiple DB add/remove/enable/disable/
   switch, sab bot UI se. Badi list 10-per-page pagination me dikhti hai. Har
-  manual add par **auto-verify** (reachable + top keys). Jo source **ACTIVE**
-  hai, usi se numbers + OTP aate hain.
+  manual add par **auto-verify** (reachable + top keys). Batch pehle **ACTIVE**
+  source use karta hai; woh khali, error/deactivated ya exhaust ho to baaki
+  **enabled** sources isi run me ek-ek karke auto-try hote hain. Numbers + OTP
+  current run-source se hi aate hain, aur source tabhi badalta hai jab koi
+  number active na ho.
 - **🎯 Target** — presets (10/50/100/200/500) ya custom number text me likho
 - **⏱ Max time** — 15m se 480m tak
 - **🚦 Gap** — do numbers ke beech 0s–60s
@@ -312,7 +315,7 @@ padh/sakta hai. Number pool + OTP inbox dono public hain. Rules lagwa lena
 | Console `409 Conflict` | Isi token se bot ki doosri copy chal rahi hai (purana terminal/server, ya leak hua token). Purani copy band karo; token revoke karke naya lo |
 | Bot chalta hai, batch har number par `security_challenge`/403 | WAF token nahi ban raha — aksar **Chrome nahi mila**. `/diag` dekho; Chrome install karo ya `PUPPETEER_EXECUTABLE_PATH` do. Proxies add karne se bhi bachta hai |
 | `/start` par "Sirf owner ke liye" | Tumhari Telegram ID allow nahi. Message me dikhi ID `.env` ke `OWNER_IDS=` me daalo, restart karo |
-| Batch chala lekin `pool-exhausted`/0 numbers | Firebase `clients/` khali ya galat source active. `/diag` → Number pool line dekho; ⚙️ Settings → Firebase Sources check karo |
+| Batch chala lekin `pool-exhausted`/0 numbers | Card ki **🔥 Firebase** + **Pool** lines dekho: kitne enabled sources check hue aur current source par kitne valid numbers mile. ACTIVE khali/error ho to baaki enabled sources auto-try hote hain; sab par 0 aaye to `clients/` paths/data check karo ya bekaar/deactivated DBs disable karo. `/diag` ACTIVE source ka alag test dikhata hai |
 | OTP hi nahi aata (`failed_otp_miss`) | Device offline hai ya SMS forwarder band. Online devices wala pool use karo (⚙️ Settings → 📴 Offline OFF rakho jab tak pakka na ho) |
 | Bot beech me chup-chaap band ho jata tha | Fix ho gaya — ab handler errors par bot nahi marta (`bot.catch` + guards). Phir bhi band ho to console ka aakhri error dekho |
 | `Chrome ❌ nahi mila` (server/Render par) | Free cloud par Chrome hota hi nahi. Local PC/VPS par chalao jahan Chrome ho, ya build me Chromium install karke `PUPPETEER_EXECUTABLE_PATH` do |
@@ -320,5 +323,5 @@ padh/sakta hai. Number pool + OTP inbox dono public hain. Rules lagwa lena
 ## Test
 
 ```bash
-npm test    # 126 unit checks (koi network nahi — fetch mock hai)
+npm test    # unit checks (koi network nahi — fetch mock hai)
 ```

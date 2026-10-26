@@ -19,7 +19,7 @@
 // Engine process-singleton hai: dono bots (main + autopilot) isi state ko dekhte hain.
 
 import { isFirebaseConfigured, firebaseSetupHintLines, listPoolNumbers, scanFreshDevices } from './firebase-numbers.js';
-import { applyActiveSource } from './firebase-sources.js';
+import { applyActiveSource, applySourceForRun, listRunSources } from './firebase-sources.js';
 import { getSetting } from './bot-settings.js';
 import {
   processSingleNumber,
@@ -68,6 +68,45 @@ export function parallelWorkerUserId(baseUserId, laneId) {
   return `${String(baseUserId || 'autopilot')}:lane${Number(laneId) || 1}`;
 }
 
+export function firebaseSourceHost(url) {
+  try { return new URL(String(url || '')).hostname; } catch { return ''; }
+}
+
+export function formatPoolStatus(snapshot = {}) {
+  const runFinished = Number(snapshot.finishedAt) > 0;
+  if (snapshot.poolLoaded === false && !runFinished) return 'load ho raha hai…';
+  const fresh = Number(snapshot.poolFresh) || 0;
+  const total = Number(snapshot.poolTotal) || 0;
+  return total > 0
+    ? `${fresh} fresh / ${total} numbers`
+    : '0 fresh / 0 numbers — is source me koi valid number nahi mila';
+}
+
+export function formatFirebaseSourceStatus(snapshot = {}) {
+  const name = String(snapshot.poolSourceName || '').trim();
+  const tried = Number(snapshot.poolSourcesTried) || 0;
+  const total = Number(snapshot.poolSourcesTotal) || 0;
+  if (!name) return 'source load ho raha hai…';
+  const progress = total > 0 ? ` · source ${Math.min(Math.max(tried, 1), total)}/${total}` : '';
+  const errors = Number(snapshot.poolSourceErrors) || 0;
+  return `${name}${progress}${errors ? ` · ${errors} source error` : ''}`;
+}
+
+export function poolExhaustedReasonText(snapshot = {}) {
+  const tried = Number(snapshot.poolSourcesTried) || 0;
+  const total = Number(snapshot.poolSourcesTotal) || 0;
+  const sourcePart = total > 0
+    ? `${Math.min(Math.max(tried, 1), total)}/${total} enabled Firebase sources check hue`
+    : 'Firebase source check hua';
+  if ((Number(snapshot.poolTotal) || 0) <= 0) {
+    return `🕳 Kisi enabled Firebase source se valid number nahi mila — ${sourcePart}. ACTIVE source khali/error ho to baaki enabled sources isi run me auto-try hote hain.`;
+  }
+  if ((Number(snapshot.processed) || 0) <= 0) {
+    return `🕳 Pool me numbers mile, lekin koi fresh/usable candidate process ke liye nahi bacha — ${sourcePart} (cooldown/used/caps/device scan ke baad).`;
+  }
+  return `🕳 Saare enabled Firebase sources ke usable fresh numbers khatam ho gaye — ${sourcePart}.`;
+}
+
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
@@ -111,8 +150,17 @@ const state = {
   history: [],            // { phone, kind, reason? } (last 200)
   freshAccounts: [],      // { phone, accountKey } (successful sessions)
   lastError: '',
+  poolLoaded: false,      // false = asal me load ho raha hai; true + 0 = source sach me khali
   poolTotal: 0,
   poolFresh: 0,
+  poolSourceId: '',
+  poolSourceName: '',
+  poolSourceHost: '',
+  poolSourcesTried: 0,
+  poolSourcesTotal: 0,
+  poolSourceErrors: 0,
+  poolEmptySources: 0,
+  poolStatus: 'idle',     // loading | ready | empty | no-fresh | error
   scanning: false,        // abhi devices ki parallel last-seen scan chal rahi hai
   scanChecked: 0,         // backward-compat: is run ke TOTAL probes (unique devices nahi)
   scanTotalProbes: 0,     // repeated passes sameet saare Firebase probes
@@ -162,8 +210,17 @@ export function getAutopilotSnapshot() {
       : (getBridgeProxy()?.label || ''),
     current: state.current ? { ...state.current } : null,
     activeNumbers: (state.activeNumbers || []).map((n) => ({ ...n })),
+    poolLoaded: Boolean(state.poolLoaded),
     poolTotal: state.poolTotal,
     poolFresh: state.poolFresh,
+    poolSourceId: state.poolSourceId || '',
+    poolSourceName: state.poolSourceName || '',
+    poolSourceHost: state.poolSourceHost || '',
+    poolSourcesTried: state.poolSourcesTried || 0,
+    poolSourcesTotal: state.poolSourcesTotal || 0,
+    poolSourceErrors: state.poolSourceErrors || 0,
+    poolEmptySources: state.poolEmptySources || 0,
+    poolStatus: state.poolStatus || 'idle',
     scanning: Boolean(state.scanning),
     scanChecked: state.scanChecked || 0,
     scanTotalProbes: state.scanTotalProbes || state.scanChecked || 0,
@@ -299,9 +356,8 @@ function statsLines() {
             ? `Har lane alag IP par  ·  ${pSummary.usableCount ?? pSummary.enabledCount}/${pSummary.enabledCount} free usable · lanes me ${pSummary.reservedCount || 0} · cooling ${pSummary.wafCoolingCount || 0}  ·  rotates: ${state.proxyRotations}`
             : `${state.activeNumbers?.[0]?.proxyLabel || getBridgeProxy()?.label || '—'}  ·  ${pSummary.usableCount ?? pSummary.enabledCount}/${pSummary.enabledCount} free usable · lanes me ${pSummary.reservedCount || 0} · cooling ${pSummary.wafCoolingCount || 0}  ·  rotates: ${state.proxyRotations}`)
       : field('🔀 Proxy', 'OFF (ek hi IP — ⚙️ Settings me add karo)'),
-    field('Pool', state.poolTotal
-      ? `${state.poolFresh} fresh / ${state.poolTotal} numbers`
-      : 'load ho raha hai…'),
+    field('🔥 Firebase', formatFirebaseSourceStatus(state)),
+    field('Pool', formatPoolStatus(state)),
     (state.scanning || state.scanChecked)
       ? field('🔎 Device scan', `pass ${state.scanPass || 1}: ${state.scanUniqueChecked || 0}/${state.scanTotalDevices || 0} unique check · total probes ${state.scanTotalProbes || state.scanChecked || 0} · window ≤${fmtDuration(state.scanWindowMs || 0)} · ${state.scanBestActivityMs ? `scan ke waqt best SMS ~${fmtDuration(state.scanBestActivityAgeMs || Math.max(0, Date.now() - state.scanBestActivityMs))} purani · ` : ''}${state.scanFresh || 0} fresh ready${state.scanning ? ' · scanning…' : ''}`)
       : '',
@@ -356,7 +412,7 @@ function summaryCard() {
   const reasonText = {
     target: '🎯 Target pura ho gaya!',
     time: '⏱ Max time ho gaya.',
-    'pool-exhausted': '🕳 Pool ke saare fresh numbers process ho gaye.',
+    'pool-exhausted': poolExhaustedReasonText(state),
     manual: '⏹ Aapne STOP dabaya.',
     stopped: '⏹ Stop kiya gaya.',
     rate_limited: '🚦 Swiggy ne rate limit laga di — thodi der baad dobara start karein.',
@@ -513,7 +569,10 @@ export async function startAutopilot(opts = {}) {
     consecutiveFails: 0, proxyRotations: 0,
     routeMode: 'direct', proxyChallenges: 0, directChallenges: 0, deferredQueue: 0,
     current: null, activeNumbers: [], history: [], freshAccounts: [], lastError: '',
-    poolTotal: 0, poolFresh: 0,
+    poolLoaded: false, poolTotal: 0, poolFresh: 0,
+    poolSourceId: '', poolSourceName: '', poolSourceHost: '',
+    poolSourcesTried: 0, poolSourcesTotal: 0, poolSourceErrors: 0,
+    poolEmptySources: 0, poolStatus: 'loading',
     scanning: false, scanChecked: 0, scanTotalProbes: 0,
     scanUniqueChecked: 0, scanTotalDevices: 0, scanPass: 1,
     scanWindowMs: Number(otpCfg.activeWindowMs) || 0, scanBestActivityMs: 0, scanBestActivityAgeMs: 0, scanFresh: 0,
@@ -524,6 +583,29 @@ export async function startAutopilot(opts = {}) {
 
   const userId = opts.userId || 'autopilot';
   let endReason = 'target';
+  // Is run ke Firebase sources: saved ACTIVE pehle, phir baaki enabled.
+  // Numbers + OTP hamesha current run-source se aayenge; source sirf tab
+  // badlega jab koi number active na ho, warna OTP doosri DB me dhoondha
+  // jayega. Saved ACTIVE setting run ke baad restore ho jati hai.
+  let runSources = [];
+  let runSourceIndex = -1;
+  let currentRunSource = null;
+  const triedRunSourceKeys = new Set();
+  const markRunSourceState = (src) => {
+    currentRunSource = src || null;
+    if (src) {
+      triedRunSourceKeys.add(src.id || src.url || `source-${runSourceIndex}`);
+      state.poolSourceId = src.id || '';
+      state.poolSourceName = src.name || firebaseSourceHost(src.url) || 'Firebase';
+      state.poolSourceHost = firebaseSourceHost(src.url);
+    } else {
+      state.poolSourceId = '';
+      state.poolSourceName = 'ENV Firebase';
+      state.poolSourceHost = firebaseSourceHost(process.env.FIREBASE_DB_URL || '');
+    }
+    state.poolSourcesTried = triedRunSourceKeys.size;
+    state.poolSourcesTotal = runSources.length;
+  };
 
   const tally = (res) => {
     // WAF cooldown = number bilkul untouched (sirf wait hui) — count me mat lo,
@@ -601,8 +683,19 @@ export async function startAutopilot(opts = {}) {
   };
 
   try {
-    // Dynamic Firebase — user ne bot UI me jo active source chuna hai wahi use
-    applyActiveSource();
+    // Dynamic Firebase — saved ACTIVE pehle. Woh khali/error nikle to
+    // baaki enabled sources isi batch me khud try honge; user ko har DB
+    // alag se ACTIVE karke batch dobara chalane ki zaroorat nahi.
+    try { runSources = listRunSources(); } catch { runSources = []; }
+    state.poolSourcesTotal = runSources.length;
+    if (runSources.length) {
+      runSourceIndex = 0;
+      applySourceForRun(runSources[0]);
+      markRunSourceState(runSources[0]);
+    } else {
+      applyActiveSource();
+      markRunSourceState(null);
+    }
 
     if (!isFirebaseConfigured()) {
       endReason = 'firebase';
@@ -624,6 +717,7 @@ export async function startAutopilot(opts = {}) {
         : `🔀 Koi proxy nahi — 🌐 <b>free proxies auto-fetch</b> try kar raha hoon (Swiggy par test karke sirf zinda wali rakhunga)…`,
       'Swiggy WAF token arrange kar raha hoon (ek baar, ~15s)…',
       `⚡ Parallel lanes: ${requestedConcurrency} tak — har lane alag number + alag IP legi.`,
+      `🔥 Firebase: <b>${esc(state.poolSourceName || 'ACTIVE source')}</b> pehle${runSources.length > 1 ? ` — khali/error ho to baaki <b>${runSources.length - 1} enabled</b> sources isi batch me auto-try honge.` : ''}`,
       '📋 Saath hi pool load + zinda devices ki parallel scan chal rahi hai…',
       sub('Sab ready hote hi lanes ke pehle OTP fresh devices par jayenge.'),
     ].join('\n')), stopRows());
@@ -669,14 +763,99 @@ export async function startAutopilot(opts = {}) {
     let pool = [];
     let poolLoadedAt = 0;
     const loadPool = async () => {
-      pool = await listPoolNumbers();
+      const nextPool = await listPoolNumbers();
+      pool = nextPool;
       poolLoadedAt = Date.now();
+      state.poolLoaded = true;
       state.poolTotal = pool.length;
       state.poolFresh = freshEntriesFrom(pool).length;
+      state.poolStatus = !pool.length
+        ? 'empty'
+        : state.poolFresh > 0
+          ? 'ready'
+          : 'no-fresh';
       return pool;
     };
-    const poolPromise = loadPool().catch((e) => {
+    const usablePoolCount = () => {
+      const gateNeedsDevice = Number(otpCfg.activeWindowMs) > 0;
+      return freshEntriesFrom(pool).filter((e) => !gateNeedsDevice || e.deviceId).length;
+    };
+    const loadInitialPool = async () => {
+      if (!runSources.length) {
+        await loadPool();
+        return pool;
+      }
+
+      let sawSuccessfulLoad = false;
+      let lastSourceError = '';
+      for (let i = 0; i < runSources.length; i++) {
+        if (state.stopRequested) break;
+        const src = runSources[i];
+        runSourceIndex = i;
+        applySourceForRun(src);
+        markRunSourceState(src);
+        pool = [];
+        poolLoadedAt = 0;
+        state.poolLoaded = false;
+        state.poolTotal = 0;
+        state.poolFresh = 0;
+        state.poolStatus = 'loading';
+        if (i > 0) {
+          void push(progressCard(section('🔁 Firebase Source Fallback', [
+            `› Pichhle source se usable number nahi mila.`,
+            `› Ab <b>${esc(src.name || firebaseSourceHost(src.url))}</b> load kar raha hoon — source ${i + 1}/${runSources.length}.`,
+            sub('Batch band nahi hoga; pehla usable pool milte hi lanes usi source se shuru hongi.'),
+          ].join('\n'))), stopRows());
+        }
+
+        try {
+          await loadPool();
+          sawSuccessfulLoad = true;
+          const usable = usablePoolCount();
+          if (!pool.length) state.poolEmptySources = (state.poolEmptySources || 0) + 1;
+          console.log(
+            `[Autopilot] 🔥 Firebase source ${i + 1}/${runSources.length} (${src.name || firebaseSourceHost(src.url)}): ` +
+            `${state.poolFresh} fresh / ${pool.length} numbers, usable ${usable}.`
+          );
+          if (usable > 0) {
+            state.lastError = '';
+            state.poolStatus = 'ready';
+            return pool;
+          }
+          // Khali hai ya saare numbers cooldown/used/no-device hain —
+          // batch ko yahin pool-exhausted mat karo, agla enabled DB dekho.
+        } catch (e) {
+          lastSourceError = String(e?.message || e);
+          state.poolSourceErrors = (state.poolSourceErrors || 0) + 1;
+          state.poolLoaded = false;
+          state.poolTotal = 0;
+          state.poolFresh = 0;
+          state.poolStatus = 'error';
+          pool = [];
+          console.warn(
+            `[Autopilot] 🔥 Firebase source ${i + 1}/${runSources.length} (${src.name || firebaseSourceHost(src.url)}) fail: ${lastSourceError}`
+          );
+        }
+      }
+
+      if (!sawSuccessfulLoad && lastSourceError) {
+        throw new Error(
+          `Kisi bhi enabled Firebase source se pool load nahi hua (${triedRunSourceKeys.size}/${runSources.length} check). Last error: ${lastSourceError}`
+        );
+      }
+      // Kam az kam ek source safalta se load hua, magar kahin usable
+      // candidate nahi mila. Ye "abhi load ho raha hai" nahi hai — card
+      // par asal 0/status dikhega.
+      state.poolLoaded = true;
+      state.poolTotal = pool.length;
+      state.poolFresh = freshEntriesFrom(pool).length;
+      state.poolStatus = pool.length ? 'no-fresh' : 'empty';
+      return pool;
+    };
+    const poolPromise = loadInitialPool().catch((e) => {
       state.lastError = e?.message || 'pool load fail';
+      state.poolLoaded = true;
+      state.poolStatus = 'error';
       return pool;
     });
 
@@ -1243,7 +1422,95 @@ export async function startAutopilot(opts = {}) {
     };
 
     let freshWaitUntil = 0;
+    const resetPoolScanStateForSourceSwitch = () => {
+      hotQueue.length = 0;
+      retryLater.length = 0;
+      probedDevices.clear();
+      staleThisRun.clear();
+      freshWaitRounds = 0;
+      freshWaitUntil = 0;
+      state.deferredQueue = 0;
+      state.scanning = false;
+      state.scanUniqueChecked = 0;
+      state.scanTotalDevices = 0;
+      state.scanPass = 1;
+      state.scanWindowMs = Number(otpCfg.activeWindowMs) || 0;
+      state.scanBestActivityMs = 0;
+      state.scanBestActivityAgeMs = 0;
+      state.scanFresh = 0;
+    };
+    // Current source khatam/khali ho aur koi lane kisi number par active
+    // na ho to batch band karne ke bajaye agla enabled Firebase lagao.
+    // Active number hote hue switch kabhi nahi: uska OTP purani DB ke
+    // messages node me aayega.
+    const tryRotateRunSource = async (why = 'pool-exhausted') => {
+      if (!runSources.length || activePhones.size || state.stopRequested) return false;
+      const fromName = state.poolSourceName || currentRunSource?.name || 'current source';
+      let sawSuccessfulLoad = false;
+      let lastSourceError = '';
+
+      for (let nextIndex = runSourceIndex + 1; nextIndex < runSources.length; nextIndex++) {
+        if (state.stopRequested || activePhones.size) return false;
+        const src = runSources[nextIndex];
+        runSourceIndex = nextIndex;
+        applySourceForRun(src);
+        markRunSourceState(src);
+        resetPoolScanStateForSourceSwitch();
+        pool = [];
+        poolLoadedAt = 0;
+        state.poolLoaded = false;
+        state.poolTotal = 0;
+        state.poolFresh = 0;
+        state.poolStatus = 'loading';
+        await push(progressCard(section('🔁 Firebase Source Switch', [
+          `› <b>${esc(fromName)}</b> par usable number nahi bacha (${esc(why)}).`,
+          `› Ab <b>${esc(src.name || firebaseSourceHost(src.url))}</b> load kar raha hoon — source ${nextIndex + 1}/${runSources.length}. Batch band nahi hoga.`,
+          sub('Numbers aur OTP dono ab isi naye source se aayenge; pehle source ka koi number active nahi hai.'),
+        ].join('\n'))), stopRows());
+
+        try {
+          await loadPool();
+          sawSuccessfulLoad = true;
+          const usable = usablePoolCount();
+          if (!pool.length) state.poolEmptySources = (state.poolEmptySources || 0) + 1;
+          console.log(
+            `[Autopilot] 🔁 Firebase source switch → ${src.name || firebaseSourceHost(src.url)}: ` +
+            `${state.poolFresh} fresh / ${pool.length} numbers, usable ${usable}.`
+          );
+          if (usable > 0) {
+            state.lastError = '';
+            state.poolStatus = 'ready';
+            await push(progressCard(section('🔥 Naya Firebase Source Ready', [
+              `› <b>${esc(src.name || firebaseSourceHost(src.url))}</b>: ${state.poolFresh} fresh / ${pool.length} numbers.`,
+              `› Isi batch me aage ke numbers ab is source se process honge.`,
+            ].join('\n'))), stopRows());
+            return true;
+          }
+        } catch (e) {
+          lastSourceError = String(e?.message || e);
+          state.poolSourceErrors = (state.poolSourceErrors || 0) + 1;
+          state.poolLoaded = false;
+          state.poolTotal = 0;
+          state.poolFresh = 0;
+          state.poolStatus = 'error';
+          pool = [];
+          console.warn(`[Autopilot] 🔁 Firebase source ${src.name || firebaseSourceHost(src.url)} fail: ${lastSourceError}`);
+        }
+      }
+
+      if (sawSuccessfulLoad || triedRunSourceKeys.size >= runSources.length) {
+        state.poolLoaded = true;
+        state.poolTotal = pool.length;
+        state.poolFresh = freshEntriesFrom(pool).length;
+        state.poolStatus = pool.length ? 'no-fresh' : (lastSourceError ? 'error' : 'empty');
+      }
+      if (lastSourceError && !state.processed) {
+        state.lastError = `Firebase sources ${triedRunSourceKeys.size}/${runSources.length} check hue. Last error: ${lastSourceError}`.slice(0, 220);
+      }
+      return false;
+    };
     const claimNextPick = () => withClaimLock(async () => {
+    for (;;) {
       if (state.stopRequested) return { status: 'stopped' };
       if (state.fresh >= target) return { status: 'target' };
       if (state.fresh + activePhones.size >= target) return { status: 'waiting', waitMs: 500 };
@@ -1267,6 +1534,10 @@ export async function startAutopilot(opts = {}) {
           if (activePhones.size) return { status: 'waiting', waitMs: 1_000 };
           await refreshIfStale();
           state.poolFresh = freshEntriesFrom(pool).length;
+          if (usablePoolCount() <= 0) {
+            if (await tryRotateRunSource(pool.length ? 'no-usable-fresh-candidate' : 'empty-pool')) continue;
+            return { status: 'exhausted' };
+          }
           if (state.poolFresh > 0 && freshWaitRounds < 40) {
             const now = Date.now();
             if (now < freshWaitUntil) return { status: 'waiting', waitMs: Math.max(250, freshWaitUntil - now) };
@@ -1286,6 +1557,7 @@ export async function startAutopilot(opts = {}) {
             freshWaitUntil = now + 15_000;
             return { status: 'waiting', waitMs: 15_000 };
           }
+          if (await tryRotateRunSource('device-scan-exhausted')) continue;
           return { status: 'exhausted' };
         }
       }
@@ -1300,7 +1572,10 @@ export async function startAutopilot(opts = {}) {
             if (activePhones.size) return { status: 'waiting', waitMs: 1_000 };
             await refreshIfStale();
             fresh = pickFreshList();
-            if (!fresh.length) return { status: 'exhausted' };
+            if (!fresh.length) {
+              if (await tryRotateRunSource(pool.length ? 'no-usable-fresh-candidate' : 'empty-pool')) continue;
+              return { status: 'exhausted' };
+            }
             picked = { entry: fresh[0] };
           }
         } else {
@@ -1309,7 +1584,9 @@ export async function startAutopilot(opts = {}) {
       }
 
       if (!picked?.entry) {
-        return activePhones.size ? { status: 'waiting', waitMs: 1_000 } : { status: 'exhausted' };
+        if (activePhones.size) return { status: 'waiting', waitMs: 1_000 };
+        if (await tryRotateRunSource(pool.length ? 'no-usable-fresh-candidate' : 'empty-pool')) continue;
+        return { status: 'exhausted' };
       }
       if (picked.lastActivityMs || picked.onlineFallback) {
         freshWaitRounds = 0;
@@ -1331,6 +1608,7 @@ export async function startAutopilot(opts = {}) {
       }
       removeRetryLaterPhone(picked.entry.phone);
       return { status: 'picked', picked };
+    }
     });
 
     // Pehla scan yahin — WAF warm-up ke parallel me hi (ensureWarm pehle
@@ -1871,6 +2149,10 @@ export async function startAutopilot(opts = {}) {
     } catch {}
   } finally {
     try { proxyPool._clearProxyReservations(); } catch {}
+    // Run ke andar fallback source laga ho to saved ACTIVE wapas lagao —
+    // agli manual/diag call user ki asal choice se hi chalni chahiye.
+    // Snapshot ke poolSource* fields final summary ke liye waise hi rahenge.
+    try { applyActiveSource(); } catch {}
     state.activeWorkers = 0;
     state.activeNumbers = [];
     state.current = null;

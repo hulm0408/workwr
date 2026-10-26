@@ -15,7 +15,7 @@
 
 import crypto from 'crypto';
 import { getDb, saveDb } from './store.js';
-import { setFirebaseSource } from './firebase-numbers.js';
+import { setFirebaseSource, _firebaseErrorMessage } from './firebase-numbers.js';
 
 const DEFAULT_URL = 'https://vuvhbjbi-default-rtdb.firebaseio.com/';
 
@@ -200,6 +200,33 @@ export function getSource(id) {
   return src ? { ...src, active: src.id === state.activeId } : null;
 }
 
+// Batch ke liye source order: ACTIVE pehle, phir baaki enabled sources
+// usi list order me. Ek source khali/error/exhaust ho to engine isi order
+// se agla source try karta hai; duplicate URL par ek hi DB dobara load
+// nahi hota. Disabled sources kabhi fallback nahi bante.
+export function orderSourcesForRun(sources = [], activeId = '') {
+  const enabled = (Array.isArray(sources) ? sources : []).filter(
+    (s) => s && s.enabled !== false && String(s.url || '').trim()
+  );
+  const active = enabled.find((s) => s.id === activeId || s.active === true) || null;
+  const ordered = active
+    ? [active, ...enabled.filter((s) => s !== active)]
+    : enabled;
+  const seenUrls = new Set();
+  return ordered.filter((s) => {
+    const key = normalizeSourceUrl(s.url);
+    if (!key || seenUrls.has(key)) return false;
+    seenUrls.add(key);
+    return true;
+  });
+}
+
+export function listRunSources() {
+  const state = ensureSeeded();
+  return orderSourcesForRun(state.list, state.activeId)
+    .map((s) => ({ ...s, active: s.id === state.activeId }));
+}
+
 function validateSourceInput({ name, url, auth, clientsPath, messagesPath, numbersPath, smsPath, otpPath }) {
   const cleanUrl = String(url || '').trim().replace(/\/+$/, '');
   if (!/^https:\/\/[a-z0-9-]+\.firebaseio\.com$/i.test(cleanUrl) &&
@@ -292,6 +319,14 @@ export function applyActiveSource() {
   return src;
 }
 
+// Batch ke andar fallback source ko reader par lagao — saved ACTIVE
+// setting nahi badalti. Run khatam hone par engine applyActiveSource()
+// se user ki asal choice restore kar deta hai.
+export function applySourceForRun(src) {
+  setFirebaseSource(src || null);
+  return src || null;
+}
+
 // Naya source add karte hi turant test — user ko feedback mile
 export async function verifySource(id) {
   const src = getSource(id);
@@ -306,6 +341,8 @@ export async function verifySource(id) {
       return { ok: false, error: `HTTP ${res.status} ${txt.slice(0, 100)}` };
     }
     const json = await res.json().catch(() => null);
+    const firebaseError = _firebaseErrorMessage(json);
+    if (firebaseError) return { ok: false, error: firebaseError.slice(0, 160) };
     const topKeys = json && typeof json === 'object' ? Object.keys(json).slice(0, 8) : [];
     return { ok: true, ms, topKeys };
   } catch (e) {

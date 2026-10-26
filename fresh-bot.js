@@ -45,6 +45,9 @@ const {
   requestAutopilotStop,
   getAutopilotSnapshot,
   isAutopilotRunning,
+  formatPoolStatus,
+  formatFirebaseSourceStatus,
+  poolExhaustedReasonText,
 } = await import('./autopilot-engine.js');
 const { isFirebaseConfigured, firebaseSetupHintLines, listPoolNumbers } = await import('./firebase-numbers.js');
 const sources = await import('./firebase-sources.js');
@@ -203,7 +206,8 @@ function activeSourceLine() {
     const src = sources.getActiveSource();
     if (!src) return field('🔥 Firebase', '— (koi source nahi)');
     const list = sources.listSources();
-    return field('🔥 Firebase', `${esc(src.name)}  ·  ${list.length} source${list.length === 1 ? '' : 's'}`);
+    const enabledCount = list.filter((s) => s.enabled).length;
+    return field('🔥 Firebase', `${esc(src.name)}  ·  ${enabledCount} enabled source${enabledCount === 1 ? '' : 's'} (batch me auto-fallback)`);
   } catch {
     return field('🔥 Firebase', '—');
   }
@@ -246,7 +250,8 @@ function runningCard(snap, stageText = '') {
     field('✅ Fresh', `${snap.fresh}  (naye: ${snap.freshNew} · delete+fresh: ${snap.freshAfterDelete})`),
     field('⚠️ Skipped', `${snap.skipped} · deferred: ${snap.deferred} · 7-day cooldown: ${snap.cooldownSkips || 0} · 📴 stale devices: ${snap.staleSkips || 0}`),
     field('× Failed', `${snap.failed} · rate-limit: ${snap.rateStrikes}`),
-    field('Pool', snap.poolTotal ? `${snap.poolFresh} fresh / ${snap.poolTotal} numbers` : 'load ho raha hai…'),
+    field('🔥 Firebase', formatFirebaseSourceStatus(snap)),
+    field('Pool', formatPoolStatus(snap)),
     (snap.scanning || snap.scanChecked)
       ? field('🔎 Device scan', `pass ${snap.scanPass || 1}: ${snap.scanUniqueChecked || 0}/${snap.scanTotalDevices || 0} unique · probes ${snap.scanTotalProbes || snap.scanChecked || 0} · window ≤${fmtDuration(snap.scanWindowMs || 0)} · ${snap.scanBestActivityMs ? `scan ke waqt best SMS ~${fmtDuration(snap.scanBestActivityAgeMs || Math.max(0, Date.now() - snap.scanBestActivityMs))} purani · ` : ''}${snap.scanFresh || 0} fresh ready${snap.scanning ? ' · scanning…' : ''}`)
       : '',
@@ -271,7 +276,9 @@ function summaryCard(snap) {
     field('✅ Fresh', `${snap.fresh}  (naye: ${snap.freshNew} · delete+fresh: ${snap.freshAfterDelete})`),
     field('⚠️ Skipped', `${snap.skipped} · deferred: ${snap.deferred} · 7-day cooldown: ${snap.cooldownSkips || 0} · 📴 stale devices: ${snap.staleSkips || 0}`),
     field('× Failed', `${snap.failed} · rate-limit: ${snap.rateStrikes}`),
-    field('Pool', `${snap.poolFresh} fresh / ${snap.poolTotal} numbers`),
+    field('🔥 Firebase', formatFirebaseSourceStatus(snap)),
+    field('Pool', formatPoolStatus(snap)),
+    snap.stopReason === 'pool-exhausted' ? poolExhaustedReasonText(snap) : '',
     snap.scanChecked ? field('🔎 Device scan', `pass ${snap.scanPass || 1}: ${snap.scanUniqueChecked || 0}/${snap.scanTotalDevices || 0} unique · total probes ${snap.scanTotalProbes || snap.scanChecked}`) : '',
     snap.lastError ? field('Last error', snap.lastError) : '',
     freshList ? `` : '',
@@ -416,8 +423,9 @@ function sourcesCard(requestedPage = 0) {
 
   return {
     text: section('🔥 Firebase Sources', [
-      `Aap jitne chahein Firebase DB add kar sakte hain — numbers + OTP`,
-      `usi se aayega jo ACTIVE hai.`,
+      `Aap jitne chahein Firebase DB add kar sakte hain — batch pehle`,
+      `<b>ACTIVE</b> source use karega. Woh khali, error ya exhaust ho to`,
+      `baaki <b>enabled</b> sources isi batch me ek-ek karke auto-try honge.`,
       ``,
       `Total: <b>${list.length}</b> sources · Page <b>${page + 1}/${totalPages}</b>`,
       active ? `ACTIVE: <b>${esc(active.name)}</b>` : 'ACTIVE: —',
@@ -735,13 +743,30 @@ async function diagCard() {
       lines.push(field('🔥 Firebase', '❌ koi active source nahi (⚙️ Settings → Firebase Sources)'));
     }
   } catch (e) { lines.push(field('🔥 Firebase', `❌ ${esc(String(e?.message || e).slice(0, 120))}`)); }
-  // Pool count (asli test — thoda slow ho sakta hai, isliye alag try)
+  // Pool count (asli test — thoda slow ho sakta hai, isliye alag try).
+  // Batch chal raha ho to yahan ACTIVE dobara apply NAHI karte: engine
+  // kisi fallback source par ho sakta hai aur uske OTP usi DB me aayenge.
   try {
-    sources.applyActiveSource();
-    const pool = await listPoolNumbers();
-    const online = pool.filter((p) => p.online !== false).length;
-    lines.push(field('📱 Number pool', pool.length ? `✅ ${pool.length} numbers (${online} online)` : '❌ 0 numbers mile — Firebase clients/ node khali ya paths galat'));
-  } catch (e) { lines.push(field('📱 Number pool', `❌ ${esc(String(e?.message || e).slice(0, 140))}`)); }
+    const runSnap = getAutopilotSnapshot();
+    if (runSnap.running) {
+      lines.push(field('📱 Number pool', `● batch chal raha hai — ${esc(formatFirebaseSourceStatus(runSnap))}: ${esc(formatPoolStatus(runSnap))}`));
+    } else {
+      sources.applyActiveSource();
+      const pool = await listPoolNumbers();
+      const online = pool.filter((p) => p.online !== false).length;
+      const fallbackCount = Math.max(0, sources.listRunSources().length - 1);
+      lines.push(field('📱 Number pool', pool.length
+        ? `✅ ACTIVE source: ${pool.length} numbers (${online} online)`
+        : `⚠️ ACTIVE source: 0 numbers mile — clients/ node khali ya paths galat${fallbackCount ? `; batch me baaki ${fallbackCount} enabled source(s) auto-try honge` : ''}`));
+    }
+  } catch (e) {
+    let fallbackNote = '';
+    try {
+      const fallbackCount = Math.max(0, sources.listRunSources().length - 1);
+      if (fallbackCount) fallbackNote = ` · batch me baaki ${fallbackCount} enabled source(s) auto-try honge`;
+    } catch {}
+    lines.push(field('📱 Number pool', `❌ ACTIVE source: ${esc(String(e?.message || e).slice(0, 140))}${fallbackNote}`));
+  }
   // Device last-seen gate
   {
     const w = Number(process.env.PREMIUM_DEVICE_ACTIVE_WINDOW_MS);
@@ -914,8 +939,18 @@ bot.action(/^ap_src_(?!add$)([a-f0-9-]{1,10})$/, async (ctx) => {
   await editOrSend(ctx, text, rows);
 });
 
+async function blockSourceChangeWhileRunning(ctx) {
+  if (!isAutopilotRunning()) return false;
+  await ctx.answerCbQuery(
+    '⏳ Batch chal raha hai — pehle STOP karein. Beech me Firebase badalna OTP ko galat DB par bhej dega.',
+    { show_alert: true }
+  ).catch(() => {});
+  return true;
+}
+
 bot.action(/^ap_src_use_([a-f0-9-]{1,10})$/, async (ctx) => {
   if (!(await gate(ctx))) return;
+  if (await blockSourceChangeWhileRunning(ctx)) return;
   const r = sources.setActiveSource(ctx.match[1]);
   await ctx.answerCbQuery(r.ok ? '✅ Active source badal diya.' : `❌ ${r.error}`, !r.ok && { show_alert: true }).catch(() => {});
   const { text, rows } = r.ok ? sourcesCard(sourcePageFor(ctx.match[1])) : sourceDetailCard(ctx.match[1]);
@@ -924,6 +959,7 @@ bot.action(/^ap_src_use_([a-f0-9-]{1,10})$/, async (ctx) => {
 
 bot.action(/^ap_src_toggle_([a-f0-9-]{1,10})$/, async (ctx) => {
   if (!(await gate(ctx))) return;
+  if (await blockSourceChangeWhileRunning(ctx)) return;
   const r = sources.toggleSource(ctx.match[1]);
   await ctx.answerCbQuery(r.ok ? (r.enabled ? '▫️ Enabled' : '🚫 Disabled') : `❌ ${r.error}`, !r.ok && { show_alert: true }).catch(() => {});
   const { text, rows } = sourcesCard(sourcePageFor(ctx.match[1]));
@@ -953,6 +989,7 @@ bot.action(/^ap_src_verify_(.{1,10})$/, async (ctx) => {
 
 bot.action(/^ap_src_del_(.{1,10})$/, async (ctx) => {
   if (!(await gate(ctx))) return;
+  if (await blockSourceChangeWhileRunning(ctx)) return;
   const r = sources.removeSource(ctx.match[1]);
   await ctx.answerCbQuery(r.ok ? '🗑 Delete ho gaya.' : `❌ ${r.error}`, !r.ok && { show_alert: true }).catch(() => {});
   sources.applyActiveSource();
@@ -963,6 +1000,7 @@ bot.action(/^ap_src_del_(.{1,10})$/, async (ctx) => {
 // ➕ Add Firebase — bot URL (aur chahein to auth) text me maangta hai
 bot.action('ap_src_add', async (ctx) => {
   if (!(await gate(ctx))) return;
+  if (await blockSourceChangeWhileRunning(ctx)) return;
   await ctx.answerCbQuery().catch(() => {});
   pending.set(String(ctx.from.id), { action: 'add_source' });
   await editOrSend(ctx, section('➕ Add Firebase', [
@@ -1201,15 +1239,20 @@ bot.on('text', async (ctx) => {
   if (st.action === 'add_source') {
     pending.delete(uid);
     const [urlPart, authPart] = txt.split('|').map((x) => x.trim());
-    const r = sources.addSource({ url: urlPart, auth: authPart || '' });
+    const batchRunning = isAutopilotRunning();
+    const r = sources.addSource(
+      { url: urlPart, auth: authPart || '' },
+      { activate: !batchRunning }
+    );
     if (!r.ok) {
       await ctx.reply(`❌ ${r.error}`).catch(() => {});
       return;
     }
-    sources.applyActiveSource();
+    if (!batchRunning) sources.applyActiveSource();
     const v = await sources.verifySource(r.source.id);
     const lines = [
       `✅ <b>${esc(r.source.name)}</b> add ho gaya${r.source.active ? ' aur <b>ACTIVE</b>' : ''}.`,
+      ...(batchRunning ? ['⏳ Batch chal raha hai — ye source current OTP flow disturb kiye bina agle batch se lagega.'] : []),
       v.ok
         ? `🧪 Verify: reachable in ${v.ms}ms${v.topKeys?.length ? ` · keys: <code>${esc(v.topKeys.join(', '))}</code>` : ''}`
         : `⚠️ Verify fail: ${esc(v.error)} — URL/auth check kar le, tab bhi use kar sakte ho.`,

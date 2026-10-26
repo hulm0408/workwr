@@ -73,9 +73,10 @@ globalThis.fetch = async (url) => {
   }
   return respond(null);
 };
+const mockFetch = globalThis.fetch;
 
 const {
-  normalizePoolPhone, _parsePool, _parseClientsPool, _parseTs,
+  normalizePoolPhone, _parsePool, _parseClientsPool, _parseTs, _firebaseErrorMessage,
   parseForwarderDateTime, _extractSixDigitCode, isFirebaseConfigured,
   listPoolNumbers, fetchOtpCandidates, snapshotSeenOtpState, waitForOtpCode,
   setFirebaseSource, getFirebaseSource,
@@ -91,6 +92,7 @@ const {
 const {
   getAutopilotSnapshot, isAutopilotRunning, requestAutopilotStop,
   normalizeBatchConcurrency, availableParallelLanes, parallelWorkerUserId,
+  formatPoolStatus, formatFirebaseSourceStatus, poolExhaustedReasonText,
 } = await import('./autopilot-engine.js');
 const srcMod = await import('./firebase-sources.js');
 const bs = await import('./bot-settings.js');
@@ -203,6 +205,37 @@ console.log('listPoolNumbers (clients primary, numbers legacy fallback):');
   mock.numbers = ['9876543255', '9876543256'];
   const pool = await listPoolNumbers();
   ok(pool.length === 2, 'clients khali → legacy numbers fallback');
+}
+ok(_firebaseErrorMessage({ error: 'The Firebase database has been deactivated.' }).includes('deactivated'), 'Firebase error JSON pehchana gaya');
+ok(_firebaseErrorMessage({ error: 'not-an-error', DEV1: {} }) === '', 'data node ke random error child ko Firebase error nahi samjha');
+{
+  mock.clients = { error: 'The Firebase database has been deactivated.' };
+  mock.numbers = ['9876543255'];
+  let err = '';
+  try { await listPoolNumbers(); } catch (e) { err = String(e?.message || e); }
+  ok(/deactivated/.test(err), 'deactivated Firebase error empty pool bankar chhupta nahi');
+}
+{
+  mock.numbers = ['9876543255'];
+  globalThis.fetch = async (url, opts) => {
+    if (String(url).includes('/clients.json')) throw new Error('socket reset');
+    return mockFetch(url, opts);
+  };
+  let err = '';
+  try { await listPoolNumbers(); } catch (e) { err = String(e?.message || e); } finally { globalThis.fetch = mockFetch; }
+  ok(/socket reset/.test(err), 'clients transient fetch fail empty pool nahi banta (agla source try hoga)');
+}
+{
+  mock.numbers = ['9876543255', '9876543256'];
+  globalThis.fetch = async (url, opts) => {
+    if (String(url).includes('/clients.json')) {
+      return { ok: false, status: 404, json: async () => null, text: async () => 'missing' };
+    }
+    return mockFetch(url, opts);
+  };
+  let pool = [];
+  try { pool = await listPoolNumbers(); } finally { globalThis.fetch = mockFetch; }
+  ok(pool.length === 2, 'sirf clients 404 par legacy numbers fallback');
 }
 mock.clients = { DEV1: { mobNo: '9876543210', status: true } };
 
@@ -410,6 +443,19 @@ console.log('firebase-sources (db-backed manager):');
     ok(new Set(seeded.map((s) => s.id)).size === seeded.length, 'source IDs unique hain');
     ok(seeded.every((s) => /^[a-f0-9-]{1,10}$/.test(s.id)), 'source IDs Telegram callback-compatible hain');
   }
+  {
+    const ordered = srcMod.orderSourcesForRun([
+      { id: 'a', url: 'https://a-default-rtdb.firebaseio.com', enabled: true },
+      { id: 'b', url: 'https://b-default-rtdb.firebaseio.com', enabled: true },
+      { id: 'c', url: 'https://c-default-rtdb.firebaseio.com', enabled: false },
+      { id: 'dup', url: 'https://a-default-rtdb.firebaseio.com/', enabled: true },
+      { id: 'd', url: 'https://d-default-rtdb.firebaseio.com', enabled: true },
+    ], 'b');
+    ok(ordered.map((s) => s.id).join(',') === 'b,a,d', 'batch source order: ACTIVE pehle, disabled/duplicate bahar');
+    const runSources = srcMod.listRunSources();
+    ok(runSources[0]?.id === srcMod.getActiveSource()?.id, 'listRunSources ACTIVE ko pehle rakhta hai');
+    ok(runSources.every((s) => s.enabled), 'listRunSources sirf enabled fallbacks deta hai');
+  }
 
   const before = srcMod.listSources().length;
   const bad = srcMod.addSource({ url: 'https://not-a-firebase.example.com' });
@@ -439,6 +485,18 @@ console.log('firebase-sources (db-backed manager):');
   }
   srcMod.applyActiveSource();
   ok(getFirebaseSource() !== null || isFirebaseConfigured(), 'applyActiveSource baad bhi safe');
+  {
+    globalThis.fetch = async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({ error: 'The Firebase database has been deactivated.' }),
+      text: async () => '{"error":"deactivated"}',
+    });
+    let verified;
+    try { verified = await srcMod.verifySource(srcMod.getActiveSource().id); }
+    finally { globalThis.fetch = mockFetch; }
+    ok(verified.ok === false && /deactivated/.test(verified.error), 'verifySource Firebase error JSON ko fail kehta hai');
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -584,6 +642,18 @@ ok(requestAutopilotStop('manual') === false, 'na chalne wale batch ko stop = fal
   ok(snap.running === false && snap.processed === 0, 'default snapshot clean');
   ok(snap.concurrency >= 1 && Array.isArray(snap.activeNumbers) && snap.activeWorkers === 0,
     'snapshot: parallel lane fields maujood');
+  ok(snap.poolLoaded === false && 'poolSourceName' in snap && 'poolSourcesTotal' in snap,
+    'snapshot: pool loading vs loaded-empty + Firebase source fields maujood');
+  ok(formatPoolStatus({ poolLoaded: false, poolFresh: 0, poolTotal: 0 }) === 'load ho raha hai…',
+    'pool asal me load ho raha ho tabhi loading text');
+  ok(formatPoolStatus({ poolLoaded: true, poolFresh: 0, poolTotal: 0 }).startsWith('0 fresh / 0 numbers'),
+    'loaded-empty pool ko loading nahi dikhaya jata');
+  ok(formatPoolStatus({ poolLoaded: false, poolFresh: 0, poolTotal: 0, finishedAt: Date.now() }).startsWith('0 fresh / 0 numbers'),
+    'finished run ki final summary loading par nahi atki rehti');
+  ok(formatFirebaseSourceStatus({ poolSourceName: 'tinku-152d3', poolSourcesTried: 3, poolSourcesTotal: 56 }).includes('source 3/56'),
+    'Firebase card current source + fallback progress dikhata hai');
+  ok(poolExhaustedReasonText({ poolTotal: 0, processed: 0, poolSourcesTried: 56, poolSourcesTotal: 56 }).includes('Kisi enabled Firebase source se valid number nahi mila'),
+    '0-processed summary jhootha “saare process ho gaye” nahi kehta');
   ok(normalizeBatchConcurrency(99) === 10, 'parallel lanes max 10 par cap');
   ok(normalizeBatchConcurrency(0) === 1, 'parallel lanes min 1');
   ok(normalizeBatchConcurrency('x') === 10, 'parallel lanes invalid value par default 10');

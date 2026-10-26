@@ -383,26 +383,50 @@ function proxyDetailCard(pxId) {
   };
 }
 
-function sourcesCard() {
+const SOURCES_PER_PAGE = 10;
+
+function sourcePageFor(sourceId) {
+  const idx = sources.listSources().findIndex((s) => s.id === sourceId);
+  return idx < 0 ? 0 : Math.floor(idx / SOURCES_PER_PAGE);
+}
+
+function sourcesCard(requestedPage = 0) {
   const list = sources.listSources();
-  const rows = list.map((s) => [
+  const totalPages = Math.max(1, Math.ceil(list.length / SOURCES_PER_PAGE));
+  const page = Math.min(Math.max(0, Number(requestedPage) || 0), totalPages - 1);
+  const start = page * SOURCES_PER_PAGE;
+  const pageItems = list.slice(start, start + SOURCES_PER_PAGE);
+  const active = list.find((s) => s.active);
+
+  const rows = pageItems.map((s) => [
     {
       text: `${s.active ? '✅' : (s.enabled ? '▫️' : '🚫')} ${s.name}${s.active ? ' (ACTIVE)' : ''}`,
       callback_data: `ap_src_${s.id}`,
     },
   ]);
+  if (totalPages > 1) {
+    const nav = [];
+    if (page > 0) nav.push({ text: '◀️ Prev', callback_data: `ap_sources_p${page - 1}` });
+    nav.push({ text: `${page + 1}/${totalPages}`, callback_data: `ap_sources_p${page}` });
+    if (page < totalPages - 1) nav.push({ text: 'Next ▶️', callback_data: `ap_sources_p${page + 1}` });
+    rows.push(nav);
+  }
   rows.push([{ text: '➕ Add Firebase', callback_data: 'ap_src_add', style: 'success' }]);
   rows.push([{ text: '↩️ Settings', callback_data: 'ap_settings', style: 'primary' }]);
+
   return {
     text: section('🔥 Firebase Sources', [
       `Aap jitne chahein Firebase DB add kar sakte hain — numbers + OTP`,
       `usi se aayega jo ACTIVE hai.`,
       ``,
-      ...list.map((s) =>
-        `${s.active ? '✅' : (s.enabled ? '▫️' : '🚫')} <b>${esc(s.name)}</b> — <code>${esc(s.url.replace('https://', ''))}</code>${s.auth ? ' 🔑' : ''}`
+      `Total: <b>${list.length}</b> sources · Page <b>${page + 1}/${totalPages}</b>`,
+      active ? `ACTIVE: <b>${esc(active.name)}</b>` : 'ACTIVE: —',
+      ``,
+      ...pageItems.map((s, i) =>
+        `${start + i + 1}. ${s.active ? '✅' : (s.enabled ? '▫️' : '🚫')} <b>${esc(s.name)}</b> — <code>${esc(s.url.replace('https://', ''))}</code>${s.auth ? ' 🔑' : ''}`
       ),
       ``,
-      sub('Source tap karke: switch / verify / enable-disable / delete.'),
+      sub('Source tap karke: switch / verify / enable-disable / delete. Badi list ke liye Prev/Next use karein.'),
     ].join('\n')),
     rows,
   };
@@ -427,7 +451,7 @@ function sourceDetailCard(srcId) {
       ],
       [{ text: '🧪 Verify', callback_data: `ap_src_verify_${s.id}` }],
       [{ text: '🗑 Delete', callback_data: `ap_src_del_${s.id}`, style: 'danger' }],
-      [{ text: '↩️ Sources', callback_data: 'ap_sources', style: 'primary' }],
+      [{ text: '↩️ Sources', callback_data: `ap_sources_p${sourcePageFor(s.id)}`, style: 'primary' }],
     ],
   };
 }
@@ -875,6 +899,13 @@ bot.action('ap_sources', async (ctx) => {
   await editOrSend(ctx, text, rows);
 });
 
+bot.action(/^ap_sources_p(\d+)$/, async (ctx) => {
+  if (!(await gate(ctx))) return;
+  await ctx.answerCbQuery().catch(() => {});
+  const { text, rows } = sourcesCard(Number(ctx.match[1]));
+  await editOrSend(ctx, text, rows);
+});
+
 // Source detail — regex har naye source id tak match karega
 bot.action(/^ap_src_(?!add$)([a-f0-9-]{1,10})$/, async (ctx) => {
   if (!(await gate(ctx))) return;
@@ -887,7 +918,7 @@ bot.action(/^ap_src_use_([a-f0-9-]{1,10})$/, async (ctx) => {
   if (!(await gate(ctx))) return;
   const r = sources.setActiveSource(ctx.match[1]);
   await ctx.answerCbQuery(r.ok ? '✅ Active source badal diya.' : `❌ ${r.error}`, !r.ok && { show_alert: true }).catch(() => {});
-  const { text, rows } = r.ok ? sourcesCard() : sourceDetailCard(ctx.match[1]);
+  const { text, rows } = r.ok ? sourcesCard(sourcePageFor(ctx.match[1])) : sourceDetailCard(ctx.match[1]);
   await editOrSend(ctx, text, rows);
 });
 
@@ -895,7 +926,7 @@ bot.action(/^ap_src_toggle_([a-f0-9-]{1,10})$/, async (ctx) => {
   if (!(await gate(ctx))) return;
   const r = sources.toggleSource(ctx.match[1]);
   await ctx.answerCbQuery(r.ok ? (r.enabled ? '▫️ Enabled' : '🚫 Disabled') : `❌ ${r.error}`, !r.ok && { show_alert: true }).catch(() => {});
-  const { text, rows } = sourcesCard();
+  const { text, rows } = sourcesCard(sourcePageFor(ctx.match[1]));
   await editOrSend(ctx, text, rows);
 });
 
@@ -925,7 +956,7 @@ bot.action(/^ap_src_del_(.{1,10})$/, async (ctx) => {
   const r = sources.removeSource(ctx.match[1]);
   await ctx.answerCbQuery(r.ok ? '🗑 Delete ho gaya.' : `❌ ${r.error}`, !r.ok && { show_alert: true }).catch(() => {});
   sources.applyActiveSource();
-  const { text, rows } = sourcesCard();
+  const { text, rows } = sourcesCard(sourcePageFor(sources.getActiveSource()?.id));
   await editOrSend(ctx, text, rows);
 });
 

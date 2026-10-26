@@ -129,13 +129,21 @@ Sab `data/db.json` me save hota hai — restart ke baad bhi yaad rehta hai.
   agli window par khulti hai — 10s → 20s → 40s → 80s. Budget khatam ho to
   full pool ka intezaar nahi hota: probed sample ka sabse taaza SMS device,
   aur agar usable SMS timestamp hi na ho to Firebase `clients` me **ONLINE**
-  dikh raha device, process hota hai. Ye zaroori hai kyunki last incoming SMS
-  asal heartbeat nahi — zinda device ko bhi ghanton/dinon SMS nahi aata.
+  dikh raha device, process hota hai. `clients` presence boolean ke alawa
+  `online`/`active`/`connected` jaise text aur `1/0` formats me bhi samjhi
+  jati hai; status missing/unknown ho to usay zabardasti offline ya ONLINE
+  nahi mana jata — woh sirf SMS timestamp se hi aage badh sakta hai. Ek full
+  pass + ek retry pass me na timestamp mile na pakka ONLINE device, aur agla
+  enabled Firebase maujood ho, to bot usi dead source par 40 passes nahi
+  ghumata — agla source try karta hai. 40-pass fresh-wait sirf aakhri/ekmatra
+  source ke liye hai. Ye zaroori hai kyunki last incoming SMS asal heartbeat
+  nahi — zinda device ko bhi ghanton/dinon SMS nahi aata.
   Candidate milte hi scan ruk jata hai aur sabse taaze **12 ranked backups**
   bhi queue me rehte hain; ek miss ho to agla cached device process hota hai,
   Firebase pass dobara nahi ghumta. Card par current pass ke **unique
-  devices**, **total probes**, current ladder window aur ab tak ki sabse
-  taazi SMS age alag-alag dikhte hain.
+  devices**, **total probes**, current ladder window, candidate devices ke
+  **ONLINE/status-unknown/offline** counts aur ab tak ki sabse taazi SMS age
+  alag-alag dikhte hain.
 - Har fresh session ka JSON usi waqt chat me `.json` file ki surat me jata hai.
   Telegram/document send fail ho to bot 3 baar retry karta hai; phir bhi na jaye
   to poora JSON code-block hissoun me bhej deta hai.

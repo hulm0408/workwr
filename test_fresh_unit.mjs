@@ -76,7 +76,8 @@ globalThis.fetch = async (url) => {
 const mockFetch = globalThis.fetch;
 
 const {
-  normalizePoolPhone, _parsePool, _parseClientsPool, _parseTs, _firebaseErrorMessage,
+  normalizePoolPhone, _parsePool, _parseClientsPool, _clientOnlineState, _countDeviceOnlineStates,
+  _parseTs, _firebaseErrorMessage,
   parseForwarderDateTime, _extractSixDigitCode, isFirebaseConfigured,
   listPoolNumbers, fetchOtpCandidates, snapshotSeenOtpState, waitForOtpCode,
   setFirebaseSource, getFirebaseSource,
@@ -92,7 +93,8 @@ const {
 const {
   getAutopilotSnapshot, isAutopilotRunning, requestAutopilotStop,
   normalizeBatchConcurrency, availableParallelLanes, parallelWorkerUserId,
-  formatPoolStatus, formatFirebaseSourceStatus, poolExhaustedReasonText,
+  formatPoolStatus, formatFirebaseSourceStatus, formatScanCandidateStates,
+  noEvidenceWaitPassLimit, poolExhaustedReasonText,
 } = await import('./autopilot-engine.js');
 const srcMod = await import('./firebase-sources.js');
 const bs = await import('./bot-settings.js');
@@ -159,6 +161,34 @@ console.log('_parseClientsPool (clients — asli structure):');
 ok(_parseClientsPool(null).length === 0, 'null → empty');
 ok(_parseClientsPool([]).length === 0, 'array → empty (clients object hi chalega)');
 ok(_parseClientsPool({ A: { mobNo: '12345' } }).length === 0, 'sirf garbage phone → empty');
+{
+  ok(_clientOnlineState({ status: true }) === true, 'presence: boolean true ONLINE');
+  ok(_clientOnlineState({ status: 'online' }) === true, 'presence: "online" string ONLINE');
+  ok(_clientOnlineState({ isOnline: 'TRUE' }) === true, 'presence: isOnline text ONLINE');
+  ok(_clientOnlineState({ online: 1 }) === true, 'presence: numeric 1 ONLINE');
+  ok(_clientOnlineState({ presence: 'connected' }) === true, 'presence: connected ONLINE');
+  ok(_clientOnlineState({ status: false }) === false, 'presence: boolean false offline');
+  ok(_clientOnlineState({ status: 'offline' }) === false, 'presence: "offline" offline');
+  ok(_clientOnlineState({ active: 0 }) === false, 'presence: numeric 0 offline');
+  ok(_clientOnlineState({ status: 'busy' }) === null, 'presence: unknown string ko zabardasti offline nahi');
+  ok(_clientOnlineState({}) === null, 'presence: missing status unknown');
+  ok(_clientOnlineState({ online: 'garbage', status: true }) === true, 'presence: bad early field ke baad valid status bhi check');
+  const parsed = _parseClientsPool({
+    DEV_ONLINE: { mobNo: '9876501001', status: 'online' },
+    DEV_UNKNOWN: { mobNo: '9876501002' },
+    DEV_OFFLINE: { mobNo: '9876501003', status: 'offline' },
+  });
+  ok(parsed.find((p) => p.deviceId === 'DEV_ONLINE')?.online === true, 'clients parser: string ONLINE asal ONLINE bana');
+  ok(parsed.find((p) => p.deviceId === 'DEV_UNKNOWN')?.online === undefined, 'clients parser: missing status unknown rakha, false nahi');
+  ok(parsed.find((p) => p.deviceId === 'DEV_OFFLINE')?.online === false, 'clients parser: string offline asal offline bana');
+  const counts = _countDeviceOnlineStates([
+    ...parsed,
+    { phone: '9876501099', deviceId: 'DEV_UNKNOWN', online: true },
+    { phone: '9876501098', deviceId: 'DEV_OFFLINE', online: undefined },
+  ]);
+  ok(counts.online === 2 && counts.unknown === 1 && counts.offline === 0 && counts.total === 3,
+    'device status counts: device-wise dedupe + true > unknown > false');
+}
 
 // ---------------------------------------------------------------------------
 console.log('_parseTs:');
@@ -340,6 +370,13 @@ console.log('freshEntriesFrom + preferOnline (pipeline helpers):');
 
   const ordered = preferOnline(fresh);
   ok(ordered[0].online === true && ordered[ordered.length - 1].online === false, 'online pehle, offline baad me');
+  const triStateOrdered = preferOnline([
+    { phone: '9876500203', online: false },
+    { phone: '9876500202', online: undefined },
+    { phone: '9876500201', online: true },
+  ]);
+  ok(triStateOrdered.map((e) => e.phone).join(',') === '9876500201,9876500202,9876500203',
+    'preferOnline: asal ONLINE → status-unknown → offline order');
 
   // 7-day extracted-number cooldown: 6 din pehle bheja number block,
   // exact 7 din guzarne ke baad hi dobara eligible.
@@ -654,6 +691,20 @@ ok(requestAutopilotStop('manual') === false, 'na chalne wale batch ko stop = fal
     'Firebase card current source + fallback progress dikhata hai');
   ok(poolExhaustedReasonText({ poolTotal: 0, processed: 0, poolSourcesTried: 56, poolSourcesTotal: 56 }).includes('Kisi enabled Firebase source se valid number nahi mila'),
     '0-processed summary jhootha “saare process ho gaye” nahi kehta');
+  ok('scanCandidateOnline' in snap && 'scanCandidateUnknown' in snap && 'scanCandidateOffline' in snap,
+    'snapshot: scanner candidate status counts maujood');
+  ok(formatScanCandidateStates({ scanCandidateOnline: 3, scanCandidateUnknown: 5, scanCandidateOffline: 7 }) === 'ONLINE 3 · status-unknown 5 · offline 7',
+    'scanner card: ONLINE/unknown/offline alag-alag dikhte hain');
+  ok(formatScanCandidateStates({}) === '', 'scanner card: koi candidate count na ho to khali text');
+  ok(noEvidenceWaitPassLimit({ hasNextSource: true }) === 1,
+    'dead source: agla Firebase ho to sirf 1 retry pass, phir rotate');
+  ok(noEvidenceWaitPassLimit({ hasNextSource: false }) === 40,
+    'dead source: aakhri/ekmatra source par lambi fresh-wait policy barqarar');
+  ok(poolExhaustedReasonText({
+    poolTotal: 693, processed: 0, poolSourcesTried: 56, poolSourcesTotal: 56,
+    scanCandidateOnline: 0, scanCandidateUnknown: 640, scanCandidateOffline: 0,
+  }).includes('SMS timestamp ya ONLINE saboot nahi mila'),
+    '0-processed dead scan: summary asal no-evidence wajah batati hai');
   ok(normalizeBatchConcurrency(99) === 10, 'parallel lanes max 10 par cap');
   ok(normalizeBatchConcurrency(0) === 1, 'parallel lanes min 1');
   ok(normalizeBatchConcurrency('x') === 10, 'parallel lanes invalid value par default 10');
@@ -1181,6 +1232,24 @@ console.log('parallel device scan (hot-queue) + pipeline precheck:');
       'ONLINE fallback: deadline ke baad baqi pool scan nahi hua');
     ok(r.onlineFallback === true && r.fresh.length === 2 && r.fresh.every((f) => f.onlineFallback && !f.lastActivityMs),
       'ONLINE fallback: SMS timestamp na hone par clients-online backups mile');
+  }
+
+  // Status-unknown ONLINE nahi hota: timestamp bhi na ho to scanner usay
+  // blind process nahi karega. Sirf pakka online=true fallback chalega.
+  {
+    const unknownOnly = await fbn.scanFreshDevices([
+      { phone: '9876503001', deviceId: 'UNK1', online: undefined },
+      { phone: '9876503002', deviceId: 'UNK2' },
+      { phone: '9876503003', deviceId: 'OFF1', online: false },
+    ], { windowMs: 10_000, onlineFallback: true, probe: async () => null });
+    ok(unknownOnly.fresh.length === 0 && unknownOnly.onlineFallback === false && unknownOnly.exhausted === true,
+      'ONLINE fallback: status-unknown/offline ko bina SMS timestamp blind process nahi');
+    const mixed = await fbn.scanFreshDevices([
+      { phone: '9876503011', deviceId: 'UNK9', online: undefined },
+      { phone: '9876503012', deviceId: 'ON9', online: true },
+    ], { windowMs: 10_000, onlineFallback: true, backupCount: 2, probe: async () => null });
+    ok(mixed.fresh.length === 1 && mixed.fresh[0].entry.deviceId === 'ON9',
+      'ONLINE fallback: mixed pool me sirf pakka ONLINE device select');
   }
 
   // scanFreshDevices — bilkul khali activity → fresh [] + exhausted

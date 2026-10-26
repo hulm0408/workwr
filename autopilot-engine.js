@@ -18,7 +18,7 @@
 //
 // Engine process-singleton hai: dono bots (main + autopilot) isi state ko dekhte hain.
 
-import { isFirebaseConfigured, firebaseSetupHintLines, listPoolNumbers, scanFreshDevices } from './firebase-numbers.js';
+import { isFirebaseConfigured, firebaseSetupHintLines, listPoolNumbers, scanFreshDevices, _countDeviceOnlineStates } from './firebase-numbers.js';
 import { applyActiveSource, applySourceForRun, listRunSources } from './firebase-sources.js';
 import { getSetting } from './bot-settings.js';
 import {
@@ -92,6 +92,24 @@ export function formatFirebaseSourceStatus(snapshot = {}) {
   return `${name}${progress}${errors ? ` · ${errors} source error` : ''}`;
 }
 
+export function formatScanCandidateStates(snapshot = {}) {
+  const online = Number(snapshot.scanCandidateOnline) || 0;
+  const unknown = Number(snapshot.scanCandidateUnknown) || 0;
+  const offline = Number(snapshot.scanCandidateOffline) || 0;
+  if (!(online + unknown + offline)) return '';
+  return `ONLINE ${online} · status-unknown ${unknown} · offline ${offline}`;
+}
+
+// Ek full pass me na SMS timestamp mile na pakka ONLINE fallback, to
+// usi mare hue source par 40 passes ghumana sirf waqt aur Firebase probes
+// jalata hai. Agla enabled source maujood ho to sirf ek 15s retry pass
+// kaafi hai; uske baad source badlo. Aakhri/ekmatra source par purani
+// lambi wait policy rehne do, kyunki wahan nayi device activity ka
+// intezaar hi wahid rasta hai.
+export function noEvidenceWaitPassLimit({ hasNextSource = false } = {}) {
+  return hasNextSource ? 1 : 40;
+}
+
 export function poolExhaustedReasonText(snapshot = {}) {
   const tried = Number(snapshot.poolSourcesTried) || 0;
   const total = Number(snapshot.poolSourcesTotal) || 0;
@@ -102,6 +120,12 @@ export function poolExhaustedReasonText(snapshot = {}) {
     return `🕳 Kisi enabled Firebase source se valid number nahi mila — ${sourcePart}. ACTIVE source khali/error ho to baaki enabled sources isi run me auto-try hote hain.`;
   }
   if ((Number(snapshot.processed) || 0) <= 0) {
+    const candidateStates = formatScanCandidateStates(snapshot);
+    const noLiveEvidence = (Number(snapshot.scanCandidateOnline) || 0) === 0 &&
+      ((Number(snapshot.scanCandidateUnknown) || 0) + (Number(snapshot.scanCandidateOffline) || 0)) > 0;
+    if (noLiveEvidence) {
+      return `🕳 Pool me numbers mile, lekin kisi candidate device par SMS timestamp ya ONLINE saboot nahi mila — ${sourcePart}${candidateStates ? ` · aakhri source: ${candidateStates}` : ''}.`;
+    }
     return `🕳 Pool me numbers mile, lekin koi fresh/usable candidate process ke liye nahi bacha — ${sourcePart} (cooldown/used/caps/device scan ke baad).`;
   }
   return `🕳 Saare enabled Firebase sources ke usable fresh numbers khatam ho gaye — ${sourcePart}.`;
@@ -171,6 +195,9 @@ const state = {
   scanBestActivityMs: 0,  // probed sample ki sabse taazi SMS activity (diagnostic)
   scanBestActivityAgeMs: 0, // scan ke waqt ki best SMS age (baad me khud na barhti rahe)
   scanFresh: 0,           // hot-queue me ready (fresh) devices
+  scanCandidateOnline: 0, // current pass candidates: pakke ONLINE devices
+  scanCandidateUnknown: 0,// current pass candidates: status maloom nahi
+  scanCandidateOffline: 0,// current pass candidates: pakke offline devices
 };
 
 export function getAutopilotSnapshot() {
@@ -231,6 +258,9 @@ export function getAutopilotSnapshot() {
     scanBestActivityMs: state.scanBestActivityMs || 0,
     scanBestActivityAgeMs: state.scanBestActivityAgeMs || 0,
     scanFresh: state.scanFresh || 0,
+    scanCandidateOnline: state.scanCandidateOnline || 0,
+    scanCandidateUnknown: state.scanCandidateUnknown || 0,
+    scanCandidateOffline: state.scanCandidateOffline || 0,
     lastError: state.lastError,
     history: state.history.slice(-40),
     freshAccounts: state.freshAccounts.slice(-100),
@@ -359,7 +389,7 @@ function statsLines() {
     field('🔥 Firebase', formatFirebaseSourceStatus(state)),
     field('Pool', formatPoolStatus(state)),
     (state.scanning || state.scanChecked)
-      ? field('🔎 Device scan', `pass ${state.scanPass || 1}: ${state.scanUniqueChecked || 0}/${state.scanTotalDevices || 0} unique check · total probes ${state.scanTotalProbes || state.scanChecked || 0} · window ≤${fmtDuration(state.scanWindowMs || 0)} · ${state.scanBestActivityMs ? `scan ke waqt best SMS ~${fmtDuration(state.scanBestActivityAgeMs || Math.max(0, Date.now() - state.scanBestActivityMs))} purani · ` : ''}${state.scanFresh || 0} fresh ready${state.scanning ? ' · scanning…' : ''}`)
+      ? field('🔎 Device scan', `pass ${state.scanPass || 1}: ${state.scanUniqueChecked || 0}/${state.scanTotalDevices || 0} unique check · total probes ${state.scanTotalProbes || state.scanChecked || 0} · window ≤${fmtDuration(state.scanWindowMs || 0)} · ${state.scanBestActivityMs ? `scan ke waqt best SMS ~${fmtDuration(state.scanBestActivityAgeMs || Math.max(0, Date.now() - state.scanBestActivityMs))} purani · ` : ''}${state.scanFresh || 0} fresh ready${formatScanCandidateStates(state) ? ` · candidates: ${formatScanCandidateStates(state)}` : ''}${state.scanning ? ' · scanning…' : ''}`)
       : '',
     state.activeNumbers?.length
       ? `📍 <b>Abhi ${state.activeNumbers.length} lane(s):</b>\n${state.activeNumbers.slice(0, 10).map((n) => `• <code>${esc(n.phone)}</code> · lane ${n.laneId || '?'} · ${esc(n.proxyLabel || 'direct')} (${fmtDuration(Date.now() - n.startedAt)})`).join('\n')}`
@@ -576,6 +606,7 @@ export async function startAutopilot(opts = {}) {
     scanning: false, scanChecked: 0, scanTotalProbes: 0,
     scanUniqueChecked: 0, scanTotalDevices: 0, scanPass: 1,
     scanWindowMs: Number(otpCfg.activeWindowMs) || 0, scanBestActivityMs: 0, scanBestActivityAgeMs: 0, scanFresh: 0,
+    scanCandidateOnline: 0, scanCandidateUnknown: 0, scanCandidateOffline: 0,
   });
   // Pichhli run kisi fatal par ruki ho to stale lane reservations nayi
   // run ki saari IPs ko block na kar dein.
@@ -1025,8 +1056,13 @@ export async function startAutopilot(opts = {}) {
         .filter((e) => !staleThisRun.has(e.phone))
         .filter((e) => !isEntryActive(e));
       if (!allowOffline) {
-        const onlineOnly = list.filter((e) => e.online !== false);
-        if (onlineOnly.length) list = onlineOnly;
+        // Pakka ONLINE device ho to pakke offline ko pehle side par rakho,
+        // lekin status-unknown ko ONLINE samajh kar offline devices ke
+        // SMS timestamps scan karne ka mauqa khatam mat karo. Koi pakka
+        // ONLINE na ho to unknown + offline sab timestamp scan me rahenge;
+        // bina timestamp ke sirf asal ONLINE fallback hi aage badhega.
+        const hasKnownOnline = list.some((e) => e.online === true);
+        if (hasKnownOnline) list = list.filter((e) => e.online !== false);
       }
       return list;
     };
@@ -1101,6 +1137,10 @@ export async function startAutopilot(opts = {}) {
     const refillHotQueue = async () => {
       if (!gateOn) return { fresh: [] };
       const allCandidates = pickFreshList().filter((e) => e.deviceId);
+      const candidateStates = _countDeviceOnlineStates(allCandidates);
+      state.scanCandidateOnline = candidateStates.online;
+      state.scanCandidateUnknown = candidateStates.unknown;
+      state.scanCandidateOffline = candidateStates.offline;
       const passDeviceIds = new Set(allCandidates.map((e) => e.deviceId));
       const candidates = allCandidates.filter((e) => !probedDevices.has(e.deviceId));
       const baseUniqueChecked = [...probedDevices].filter((id) => passDeviceIds.has(id)).length;
@@ -1161,14 +1201,15 @@ export async function startAutopilot(opts = {}) {
                 ? `› Ab tak sabse taazi SMS activity: ~${fmtDuration(now - state.scanBestActivityMs)} purani.`
                 : '› Ab tak kisi probed device ki SMS activity timestamp nahi mili.';
               const budgetLine = deviceScanBudgetMs > 0
-                ? `Quick scan max ${fmtDuration(deviceScanBudgetMs)} chalegi. Taaza SMS na mili to full ${state.scanTotalDevices} devices ka wait nahi hoga — probed sample ke sabse taaza / Firebase ONLINE device ko process karunga.`
+                ? `Quick scan budget ${fmtDuration(deviceScanBudgetMs)} hai. Probed sample me taaza SMS timestamp ya pakka ONLINE device mile to foran process hoga; bilkul saboot na mile to baaki devices isi pass me check honge, phir ek retry ke baad agla Firebase source try hoga.`
                 : 'Candidate milte hi scan ruk kar number process hoga; 12 ranked backups bhi queue me rahenge.';
               void push(progressCard(section('🔎 Zinda Devices Dhoondh Raha Hoon', [
                 `› Pass ${state.scanPass || 1}: <b>${state.scanUniqueChecked}/${state.scanTotalDevices}</b> unique devices check hue — base window me <b>${freshCount}</b> fresh; current ladder ≤${fmtDuration(state.scanWindowMs)}.`,
                 bestLine,
+                formatScanCandidateStates(state) ? `› Candidate devices: <b>${esc(formatScanCandidateStates(state))}</b>.` : '',
                 `› Total probes: ${state.scanTotalProbes} (repeated passes sameet — ye unique devices ki ginti nahi hai).`,
                 sub(budgetLine),
-              ].join('\n'))), stopRows());
+              ].filter(Boolean).join('\n'))), stopRows());
             }
           },
         });
@@ -1438,6 +1479,9 @@ export async function startAutopilot(opts = {}) {
       state.scanBestActivityMs = 0;
       state.scanBestActivityAgeMs = 0;
       state.scanFresh = 0;
+      state.scanCandidateOnline = 0;
+      state.scanCandidateUnknown = 0;
+      state.scanCandidateOffline = 0;
     };
     // Current source khatam/khali ho aur koi lane kisi number par active
     // na ho to batch band karne ke bajaye agla enabled Firebase lagao.
@@ -1538,15 +1582,21 @@ export async function startAutopilot(opts = {}) {
             if (await tryRotateRunSource(pool.length ? 'no-usable-fresh-candidate' : 'empty-pool')) continue;
             return { status: 'exhausted' };
           }
-          if (state.poolFresh > 0 && freshWaitRounds < 40) {
+          const hasNextRunSource = runSourceIndex >= 0 && runSourceIndex < runSources.length - 1;
+          const waitPassLimit = noEvidenceWaitPassLimit({ hasNextSource: hasNextRunSource });
+          if (state.poolFresh > 0 && freshWaitRounds < waitPassLimit) {
             const now = Date.now();
             if (now < freshWaitUntil) return { status: 'waiting', waitMs: Math.max(250, freshWaitUntil - now) };
             freshWaitRounds++;
+            const candidateStates = formatScanCandidateStates(state);
             await push(progressCard(section('🕐 Fresh Device Ka Wait', [
-              `› Pass ${state.scanPass || 1} ke <b>${state.scanUniqueChecked || 0}/${state.scanTotalDevices || 0}</b> unique devices me koi usable last-activity timestamp hi nahi mila.`,
-              `› Total probes: ${state.scanTotalProbes || state.scanChecked || 0} (repeated passes sameet). 15s ruk kar naya pass karunga (round ${freshWaitRounds}/40).`,
-              sub('Timestamp wala device hota to isi pass par window double karke use le liya jata — dobara scan sirf nayi activity ke intezaar ke liye hai.'),
-            ].join('\n'))), stopRows());
+              `› Pass ${state.scanPass || 1} ke <b>${state.scanUniqueChecked || 0}/${state.scanTotalDevices || 0}</b> unique devices me koi usable last-activity timestamp ya ONLINE fallback nahi mila.`,
+              candidateStates ? `› Candidate devices: <b>${esc(candidateStates)}</b>.` : '',
+              `› Total probes: ${state.scanTotalProbes || state.scanChecked || 0} (repeated passes sameet). 15s ruk kar ek naya pass karunga (round ${freshWaitRounds}/${waitPassLimit}).`,
+              sub(hasNextRunSource
+                ? 'Is retry pass me bhi saboot na mila to isi source par 40 passes nahi ghumunga — agla enabled Firebase source try hoga.'
+                : 'Timestamp wala device hota to isi pass par window double karke use le liya jata — dobara scan sirf nayi activity ke intezaar ke liye hai.'),
+            ].filter(Boolean).join('\n'))), stopRows());
             probedDevices.clear();
             staleThisRun.clear();
             state.scanPass = (state.scanPass || 1) + 1;
@@ -1557,7 +1607,7 @@ export async function startAutopilot(opts = {}) {
             freshWaitUntil = now + 15_000;
             return { status: 'waiting', waitMs: 15_000 };
           }
-          if (await tryRotateRunSource('device-scan-exhausted')) continue;
+          if (await tryRotateRunSource('SMS timestamp ya ONLINE device nahi mila')) continue;
           return { status: 'exhausted' };
         }
       }

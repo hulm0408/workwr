@@ -215,6 +215,54 @@ export function _parsePool(raw) {
 // ---------------------------------------------------------------------------
 // CLIENTS pool parser (asli structure — device profiles)
 // ---------------------------------------------------------------------------
+function onlineStateFromValue(value) {
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    if (value === 1) return true;
+    if (value === 0) return false;
+    return null;
+  }
+  if (typeof value !== 'string') return null;
+  const v = value.trim().toLowerCase();
+  if (['true', '1', 'online', 'active', 'connected', 'available', 'alive', 'on', 'yes', 'y'].includes(v)) return true;
+  if (['false', '0', 'offline', 'inactive', 'disconnected', 'unavailable', 'dead', 'off', 'no', 'n'].includes(v)) return false;
+  return null;
+}
+
+// Alag-alag panels device presence ko alag field/format me likhte hain:
+// status:true, status:"online", online:1, isOnline:"true" waghera. Pehle
+// sirf boolean true ko ONLINE mana jata tha; baaki sab zabardasti offline
+// ho jate thay, phir scanner ka ONLINE fallback bhi kabhi trigger nahi
+// hota tha. Unknown/missing status ko null rakho — woh "pakka offline"
+// nahi hai.
+export function _clientOnlineState(client) {
+  if (!client || typeof client !== 'object') return null;
+  const fields = ['online', 'isOnline', 'connected', 'isConnected', 'active', 'isActive', 'presence', 'status', 'state'];
+  for (const field of fields) {
+    if (!Object.prototype.hasOwnProperty.call(client, field)) continue;
+    const state = onlineStateFromValue(client[field]);
+    if (state !== null) return state;
+  }
+  return null;
+}
+
+export function _countDeviceOnlineStates(entries = []) {
+  const rankByDevice = new Map();
+  const rankOf = (entry) => entry?.online === true ? 2 : entry?.online === false ? 0 : 1;
+  for (const entry of entries || []) {
+    const key = String(entry?.deviceId || entry?.phone || '');
+    if (!key) continue;
+    rankByDevice.set(key, Math.max(rankByDevice.get(key) ?? -1, rankOf(entry)));
+  }
+  const counts = { online: 0, unknown: 0, offline: 0, total: rankByDevice.size };
+  for (const rank of rankByDevice.values()) {
+    if (rank === 2) counts.online++;
+    else if (rank === 0) counts.offline++;
+    else counts.unknown++;
+  }
+  return counts;
+}
+
 export function _parseClientsPool(raw) {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return [];
   const out = [];
@@ -223,7 +271,8 @@ export function _parseClientsPool(raw) {
   for (const [deviceId, c] of Object.entries(raw)) {
     if (!c || typeof c !== 'object') continue;
     const label = String(c.modelName || c.service_provider || '').trim();
-    const online = c.status === true;
+    const onlineState = _clientOnlineState(c);
+    const online = onlineState === null ? undefined : onlineState;
     const joined = String(c.joined || '').trim();
     const candidates = [c.mobNo, c.mobile, c.number, ...(Array.isArray(c.sims) ? c.sims.map((s) => s?.phoneNumber) : [])];
 
@@ -660,8 +709,11 @@ export async function scanFreshDevices(entries = [], opts = {}) {
   const rankedOnlineFallbackCandidates = () => {
     if (!onlineFallback) return [];
     const seenPhones = new Set();
+    // Sirf pakka ONLINE signal hi bina SMS timestamp ke aage badh sakta
+    // hai. Status-unknown device ko timestamp probe me rakho, lekin usay
+    // blind ONLINE samajh kar process mat karo.
     return probed
-      .filter((p) => p.entry?.online !== false)
+      .filter((p) => p.entry?.online === true)
       .sort((a, b) => (b.lastActivityMs || 0) - (a.lastActivityMs || 0))
       .filter((p) => {
         const phone = String(p.entry?.phone || '');

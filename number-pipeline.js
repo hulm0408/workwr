@@ -211,12 +211,15 @@ export function freshEntriesFrom(pool, opts = {}) {
   });
 }
 
-// Online devices pehle (unme hi OTP aayega), phir offline fallback.
+// Pakke ONLINE devices pehle, phir jinke status ka pata nahi, aur aakhir
+// me pakke offline. Pehle unknown bhi online wale hi bucket me ghul jata
+// tha; ab asal ONLINE saboot wale devices ko pehli tarjeeh milti hai.
 export function preferOnline(entries) {
-  const online = entries.filter((e) => e.online !== false);
+  const online = entries.filter((e) => e.online === true);
+  const unknown = entries.filter((e) => e.online !== true && e.online !== false);
   const offline = entries.filter((e) => e.online === false);
   const shuffle = (arr) => arr.slice().sort(() => Math.random() - 0.5);
-  return [...shuffle(online), ...shuffle(offline)];
+  return [...shuffle(online), ...shuffle(unknown), ...shuffle(offline)];
 }
 
 // ---------------------------------------------------------------------------

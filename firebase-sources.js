@@ -1,23 +1,31 @@
 // ===== 🔥 FIREBASE SOURCES — dynamic, bot UI se manage =====
 //
-// User ki AZADI: ek se zyada Firebase databases add karo, unhe enable/
-// disable karo, active switch karo — sab bot UI se (env nahi chhedni padti).
+// User ka rule: ek saath multiple Firebase databases add karo, aur jo
+// bhi source list me hai woh HAMESHA ACTIVE rahega — disable/switch-off
+// ka koi scene nahi. Source sirf Delete karne par hatega.
 //
 // Storage: data/db.json → db.firebaseSources = { activeId, list: [...] }
 //   source = { id, name, url, auth?, clientsPath?, messagesPath?,
 //              numbersPath?, smsPath?, otpPath?, enabled, addedAt }
 //
+// `enabled` field purani DB compatibility ke liye rakha hai, lekin ab
+// hamesha true normalize hota hai. `activeId` bhi sirf internal
+// first-try/reader order ke liye hai — iska matlab ye nahi ke baaki
+// sources inactive hain; listRunSources() har saved source ko batch ke
+// ACTIVE pool me rakhta hai.
+//
 // Default: agar list khali hai to env FIREBASE_DB_URL (ya vuvhbjbi default)
 // se ek "Default" source seed hota hai — pehla run bina setup ke chalta hai.
 //
-// applyActiveSource() — active source ko reader (firebase-numbers.js) par
-// set karta hai; batch/start se PEHLE aur switch/ADD ke TURANT baad call ho.
+// applyActiveSource() — first-try source ko reader (firebase-numbers.js)
+// par set karta hai; batch/start se PEHLE aur ADD ke baad call hota hai.
 
 import crypto from 'crypto';
 import { getDb, saveDb } from './store.js';
 import { setFirebaseSource, _firebaseErrorMessage } from './firebase-numbers.js';
 
 const DEFAULT_URL = 'https://vuvhbjbi-default-rtdb.firebaseio.com/';
+export const MAX_BULK_FIREBASE_SOURCES = 200;
 
 // Owner ke diye hue Firebase DBs — pehli baar is seed-version ke saath bot
 // chalne par ye sab Settings → Firebase Sources me auto-add ho jate hain.
@@ -86,6 +94,19 @@ function normalizeSourceUrl(url) {
   return String(url || '').trim().replace(/\/+$/, '').toLowerCase();
 }
 
+// Har saved source public roop me hamesha ACTIVE hai. `primary` sirf
+// batch/reader ka first-try order batata hai; baaki sources bhi utne hi
+// ACTIVE hote hain aur isi run ke fallback order me rehte hain.
+function decorateSource(source, state = {}) {
+  if (!source) return null;
+  return {
+    ...source,
+    enabled: true,
+    active: true,
+    primary: source.id === state.activeId,
+  };
+}
+
 function builtinSourceName(url) {
   try {
     return new URL(url).hostname
@@ -120,11 +141,19 @@ function persist(state) {
 }
 
 // Pehli baar list khali ho to env/default se seed + owner-ki built-in list
-// ek dafa merge karo. Active source nahi badalta — naye sources enabled
-// rehte hain aur user Settings se kisi ko bhi ACTIVE kar sakta hai.
+// ek dafa merge karo. Purani DB me koi source galti/purane UI se disabled
+// save ho gaya ho to use yahin ACTIVE normalize kar do — ab source sirf
+// Delete se hi hatega.
 export function ensureSeeded() {
   const state = loadState();
   let changed = false;
+
+  for (const source of state.list) {
+    if (source.enabled !== true) {
+      source.enabled = true;
+      changed = true;
+    }
+  }
 
   if (!state.list.length) {
     const url = String(process.env.FIREBASE_DB_URL || DEFAULT_URL).trim();
@@ -184,47 +213,63 @@ export function ensureSeeded() {
 
 export function listSources() {
   const state = ensureSeeded();
-  return state.list.map((s) => ({ ...s, active: s.id === state.activeId }));
+  return state.list.map((s) => decorateSource(s, state));
 }
 
-export function getActiveSource() {
+// Ye "akela active" nahi hai — saare sources ACTIVE hain. Ye helper sirf
+// wo ek source deta hai jo reader/batch sabse pehle try karega.
+export function getPrimarySource() {
   const state = ensureSeeded();
-  return state.list.find((s) => s.id === state.activeId && s.enabled)
-    || state.list.find((s) => s.enabled)
-    || null;
+  const source = state.list.find((s) => s.id === state.activeId) || state.list[0] || null;
+  return decorateSource(source, state);
+}
+
+// Backward-compatible alias: purane callers isi naam se first-try source
+// lete aaye hain.
+export function getActiveSource() {
+  return getPrimarySource();
 }
 
 export function getSource(id) {
   const state = ensureSeeded();
-  const src = state.list.find((s) => s.id === id) || null;
-  return src ? { ...src, active: src.id === state.activeId } : null;
+  return decorateSource(state.list.find((s) => s.id === id) || null, state);
 }
 
-// Batch ke liye source order: ACTIVE pehle, phir baaki enabled sources
-// usi list order me. Ek source khali/error/exhaust ho to engine isi order
-// se agla source try karta hai; duplicate URL par ek hi DB dobara load
-// nahi hota. Disabled sources kabhi fallback nahi bante.
+// Batch ke liye ACTIVE sources ka order: first-try source pehle, phir
+// baaki saare saved sources list order me. Purani/stale `enabled:false`
+// value kisi source ko bahar nahi karti — source sirf Delete se hatega.
+// Ek source khali/error/exhaust ho to engine isi order se agla ACTIVE
+// source try karta hai; duplicate URL par ek hi DB dobara load nahi hota.
 export function orderSourcesForRun(sources = [], activeId = '') {
-  const enabled = (Array.isArray(sources) ? sources : []).filter(
-    (s) => s && s.enabled !== false && String(s.url || '').trim()
+  const present = (Array.isArray(sources) ? sources : []).filter(
+    (s) => s && String(s.url || '').trim()
   );
-  const active = enabled.find((s) => s.id === activeId || s.active === true) || null;
-  const ordered = active
-    ? [active, ...enabled.filter((s) => s !== active)]
-    : enabled;
+  const primary = present.find((s) => s.id === activeId)
+    || present.find((s) => s.primary === true)
+    || present.find((s) => s.active === true)
+    || null;
+  const ordered = primary
+    ? [primary, ...present.filter((s) => s !== primary)]
+    : present;
   const seenUrls = new Set();
-  return ordered.filter((s) => {
-    const key = normalizeSourceUrl(s.url);
-    if (!key || seenUrls.has(key)) return false;
-    seenUrls.add(key);
-    return true;
-  });
+  return ordered
+    .filter((s) => {
+      const key = normalizeSourceUrl(s.url);
+      if (!key || seenUrls.has(key)) return false;
+      seenUrls.add(key);
+      return true;
+    })
+    .map((s) => ({
+      ...s,
+      enabled: true,
+      active: true,
+      primary: primary ? s === primary : Boolean(s.primary),
+    }));
 }
 
 export function listRunSources() {
   const state = ensureSeeded();
-  return orderSourcesForRun(state.list, state.activeId)
-    .map((s) => ({ ...s, active: s.id === state.activeId }));
+  return orderSourcesForRun(state.list, state.activeId);
 }
 
 function validateSourceInput({ name, url, auth, clientsPath, messagesPath, numbersPath, smsPath, otpPath }) {
@@ -248,6 +293,155 @@ function validateSourceInput({ name, url, auth, clientsPath, messagesPath, numbe
   };
 }
 
+// Ek hi Telegram message me multiple Firebase URLs qubool karo:
+//   • har line me ek URL
+//   • comma / semicolon / space se alag kai URLs
+//   • bare hostname (https:// khud lag jayega)
+//   • har URL ke saath optional auth: <url> | <DB_AUTH_secret>
+// Bullet/index/labels tolerate hote hain; jo tukda Firebase URL hi na
+// ho woh invalid me report hota hai taaki user ko saaf count mile.
+export function parseFirebaseSourceBulkInput(text = '') {
+  const hostRe = () => /(?:https?:\/\/)?(?:[a-z0-9-]+\.)+(?:firebaseio\.com|firebasedatabase\.app)(?=$|[\s\/|,;\)\]\}>"'\?#!]|\.(?=$|[\s,;\)\]\}>"']))/gi;
+  const segments = [];
+
+  for (const chunk of String(text || '').split(/[\r\n,;]+/)) {
+    if (!chunk.trim()) continue;
+    const matches = [...chunk.matchAll(hostRe())];
+    if (matches.length <= 1) {
+      segments.push(chunk);
+      continue;
+    }
+    matches.forEach((match, i) => {
+      segments.push(chunk.slice(match.index, matches[i + 1]?.index ?? chunk.length));
+    });
+  }
+
+  const entries = [];
+  const invalid = [];
+  for (const rawSegment of segments) {
+    const segment = String(rawSegment || '').trim();
+    if (!segment) continue;
+    const match = hostRe().exec(segment);
+    if (!match) {
+      // Invalid tukde ki report me pipe ke baad wala hissa kabhi mat rakho —
+      // woh DB auth secret ho sakta hai.
+      invalid.push({ input: segment.split('|')[0].trim().slice(0, 100), error: 'valid Firebase Realtime DB URL nahi mila' });
+      continue;
+    }
+
+    const rawUrl = match[0];
+    const url = (/^https?:\/\//i.test(rawUrl)
+      ? rawUrl.replace(/^http:\/\//i, 'https://')
+      : `https://${rawUrl}`).replace(/\/+$/, '');
+    const remainder = segment.slice(match.index + rawUrl.length);
+    const pipeIdx = remainder.indexOf('|');
+    let auth = '';
+    if (pipeIdx !== -1) {
+      auth = remainder.slice(pipeIdx + 1).trim()
+        .replace(/^auth\s*[:=]\s*/i, '')
+        .replace(/^["']|["']$/g, '')
+        .trim();
+    } else {
+      const queryAuth = remainder.match(/[?&]auth=([^&\s,;]+)/i);
+      if (queryAuth) {
+        try { auth = decodeURIComponent(queryAuth[1]); } catch { auth = queryAuth[1]; }
+      }
+    }
+    entries.push({ url, auth });
+  }
+
+  return { entries, invalid };
+}
+
+// Multiple sources ek hi baar me ACTIVE add karo. Existing/input
+// duplicates dobara nahi bante; invalid tukde report hote hain. Reader ka
+// first-try source tabhi badalta hai jab caller setFirstAsPrimary bole —
+// is se baaki sources inactive nahi hote, sab waisay hi ACTIVE rehte hain.
+export function addSourcesBulk(input, {
+  setFirstAsPrimary = false,
+  applyReader = true,
+} = {}) {
+  let parsed = { entries: [], invalid: [] };
+  if (typeof input === 'string') {
+    parsed = parseFirebaseSourceBulkInput(input);
+  } else if (Array.isArray(input)) {
+    for (const item of input) {
+      if (typeof item === 'string') {
+        const one = parseFirebaseSourceBulkInput(item);
+        parsed.entries.push(...one.entries);
+        parsed.invalid.push(...one.invalid);
+      } else if (item && typeof item === 'object') {
+        parsed.entries.push(item);
+      } else if (String(item || '').trim()) {
+        parsed.invalid.push({ input: String(item).slice(0, 100), error: 'valid Firebase source nahi hai' });
+      }
+    }
+  } else if (input && Array.isArray(input.entries)) {
+    parsed = {
+      entries: [...input.entries],
+      invalid: Array.isArray(input.invalid) ? [...input.invalid] : [],
+    };
+  } else if (String(input || '').trim()) {
+    parsed.invalid.push({ input: String(input).slice(0, 100), error: 'valid Firebase source nahi hai' });
+  }
+
+  const requested = parsed.entries.length + parsed.invalid.length;
+  const invalid = [...parsed.invalid];
+  const candidates = parsed.entries.slice(0, MAX_BULK_FIREBASE_SOURCES);
+  for (const extra of parsed.entries.slice(MAX_BULK_FIREBASE_SOURCES)) {
+    invalid.push({
+      input: String(extra?.url || '').slice(0, 100),
+      error: `ek baar me max ${MAX_BULK_FIREBASE_SOURCES} Firebase add ho sakte hain`,
+    });
+  }
+
+  const state = ensureSeeded();
+  const byUrl = new Map(state.list.map((s) => [normalizeSourceUrl(s.url), s]));
+  const addedRefs = [];
+  const duplicateRefs = [];
+  const addedAt = new Date().toISOString();
+
+  for (const candidate of candidates) {
+    const v = validateSourceInput(candidate || {});
+    if (!v.ok) {
+      invalid.push({ input: String(candidate?.url || '').slice(0, 100), error: v.error });
+      continue;
+    }
+    const key = normalizeSourceUrl(v.src.url);
+    const existing = byUrl.get(key);
+    if (existing) {
+      duplicateRefs.push(existing);
+      continue;
+    }
+    const src = {
+      id: newSourceId(state),
+      ...v.src,
+      enabled: true,
+      addedAt,
+    };
+    state.list.push(src);
+    byUrl.set(key, src);
+    addedRefs.push(src);
+  }
+
+  if (addedRefs.length && (setFirstAsPrimary || !state.list.some((s) => s.id === state.activeId))) {
+    state.activeId = addedRefs[0].id;
+  }
+  if (addedRefs.length) persist(state);
+  if (addedRefs.length && applyReader) applyActiveSource();
+
+  const finalState = ensureSeeded();
+  const byId = new Map(finalState.list.map((s) => [s.id, s]));
+  return {
+    ok: addedRefs.length > 0,
+    added: addedRefs.map((s) => decorateSource(byId.get(s.id) || s, finalState)),
+    duplicates: duplicateRefs.map((s) => decorateSource(byId.get(s.id) || s, finalState)),
+    invalid,
+    requested,
+    total: finalState.list.length,
+  };
+}
+
 export function addSource(input, { activate = true } = {}) {
   const v = validateSourceInput(input);
   if (!v.ok) return v;
@@ -262,10 +456,12 @@ export function addSource(input, { activate = true } = {}) {
     addedAt: new Date().toISOString(),
   };
   state.list.push(src);
+  // Legacy `activate` ka ab matlab sirf first-try banana hai; naya source
+  // har haal me ACTIVE add hota hai aur purane sources bhi ACTIVE rehte hain.
   if (activate || !getActiveSource()) state.activeId = src.id;
   persist(state);
   if (src.id === state.activeId) applyActiveSource(); // reader par turant apply
-  return { ok: true, source: { ...src, active: src.id === state.activeId } };
+  return { ok: true, source: decorateSource(src, state) };
 }
 
 export function removeSource(id) {
@@ -283,45 +479,49 @@ export function removeSource(id) {
   return { ok: true };
 }
 
+// Legacy naam barqarar hai, lekin ab ye kisi ek ko "akela active" nahi
+// banata — sirf batch/reader ke first-try order me use aage rakhta hai.
+// Saare saved Firebase pehle se ACTIVE hain.
 export function setActiveSource(id) {
   const state = ensureSeeded();
   const src = state.list.find((s) => s.id === id);
   if (!src) return { ok: false, error: 'Source nahi mila.' };
-  if (!src.enabled) return { ok: false, error: 'Source disabled hai — pehle enable karein.' };
+  src.enabled = true;
   state.activeId = id;
   persist(state);
   applyActiveSource();
-  return { ok: true, source: { ...src, active: true } };
+  return { ok: true, source: decorateSource(src, state) };
 }
 
+// Backward compatibility ke liye export rehne diya hai, lekin user ke
+// rule ke mutabiq ye kabhi disable nahi karega. Source hatana ho to
+// sirf removeSource()/Delete hi rasta hai.
 export function toggleSource(id) {
   const state = ensureSeeded();
   const src = state.list.find((s) => s.id === id);
   if (!src) return { ok: false, error: 'Source nahi mila.' };
-  if (src.enabled && src.id === state.activeId) {
-    const others = state.list.filter((s) => s.enabled && s.id !== id);
-    if (!others.length) return { ok: false, error: 'Kam se kam ek enabled source chahiye.' };
-  }
-  src.enabled = !src.enabled;
-  if (!src.enabled && src.id === state.activeId) {
-    const next = state.list.find((s) => s.enabled);
-    state.activeId = next ? next.id : '';
-  }
+  src.enabled = true;
   persist(state);
-  applyActiveSource();
-  return { ok: true, enabled: src.enabled };
+  return {
+    ok: true,
+    enabled: true,
+    active: true,
+    alwaysActive: true,
+    source: decorateSource(src, state),
+  };
 }
 
-// Active source ko reader par apply (boot par + switch par)
+// Saare sources ACTIVE hain; reader par ek waqt me sirf first-try/current
+// source lag sakta hai. Ye usi first-try ko apply karta hai (boot/ADD par).
 export function applyActiveSource() {
   const src = getActiveSource();
   setFirebaseSource(src); // null = env fallback
   return src;
 }
 
-// Batch ke andar fallback source ko reader par lagao — saved ACTIVE
-// setting nahi badalti. Run khatam hone par engine applyActiveSource()
-// se user ki asal choice restore kar deta hai.
+// Batch ke andar agle ACTIVE source ko reader par lagao — saved first-try
+// setting nahi badalti aur koi source inactive nahi hota. Run khatam hone
+// par engine applyActiveSource() se first-try choice restore kar deta hai.
 export function applySourceForRun(src) {
   setFirebaseSource(src || null);
   return src || null;

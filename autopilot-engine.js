@@ -198,10 +198,10 @@ export function poolExhaustedReasonText(snapshot = {}) {
   const tried = Number(snapshot.poolSourcesTried) || 0;
   const total = Number(snapshot.poolSourcesTotal) || 0;
   const sourcePart = total > 0
-    ? `${Math.min(Math.max(tried, 1), total)}/${total} enabled Firebase sources check hue`
+    ? `${Math.min(Math.max(tried, 1), total)}/${total} ACTIVE Firebase sources check hue`
     : 'Firebase source check hua';
   if ((Number(snapshot.poolTotal) || 0) <= 0) {
-    return `🕳 Kisi enabled Firebase source se valid number nahi mila — ${sourcePart}. ACTIVE source khali/error ho to baaki enabled sources isi run me auto-try hote hain.`;
+    return `🕳 Kisi ACTIVE Firebase source se valid number nahi mila — ${sourcePart}. Ek source khali/error ho to baaki ACTIVE sources isi run me auto-try hote hain.`;
   }
   if ((Number(snapshot.processed) || 0) <= 0) {
     const candidateStates = formatScanCandidateStates(snapshot);
@@ -212,7 +212,7 @@ export function poolExhaustedReasonText(snapshot = {}) {
     }
     return `🕳 Pool me numbers mile, lekin koi fresh/usable candidate process ke liye nahi bacha — ${sourcePart} (cooldown/used/caps/device scan ke baad).`;
   }
-  return `🕳 Saare enabled Firebase sources ke usable fresh numbers khatam ho gaye — ${sourcePart}.`;
+  return `🕳 Saare ACTIVE Firebase sources ke usable fresh numbers khatam ho gaye — ${sourcePart}.`;
 }
 
 // ---------------------------------------------------------------------------
@@ -917,9 +917,10 @@ export async function startAutopilot(opts = {}) {
       state.telegramConfigured = Boolean(telegramCfg?.configured);
       state.telegramMissing = [...(telegramCfg?.missing || telegramStatus.missing || [])];
     } else {
-      // Dynamic Firebase — saved ACTIVE pehle. Woh khali/error nikle to
-      // baaki enabled sources isi batch me khud try honge; user ko har DB
-      // alag se ACTIVE karke batch dobara chalane ki zaroorat nahi.
+      // Dynamic Firebase — saare saved sources ACTIVE pool me hain.
+      // First-try source pehle load hota hai; woh khali/error/exhaust ho
+      // to baaki ACTIVE sources isi batch me khud try honge. User ko kisi
+      // DB ko alag se enable/ACTIVE karne ki zaroorat nahi.
       try { runSources = listRunSources(); } catch { runSources = []; }
       state.poolSourcesTotal = runSources.length;
       if (runSources.length) {
@@ -972,7 +973,7 @@ export async function startAutopilot(opts = {}) {
         : `⚡ Parallel lanes: ${requestedConcurrency} tak — har lane alag number + alag IP legi.`,
       telegramMode
         ? '📨 Number + OTP dono Telegram Hermes se — Firebase fallback OFF; spare account/Hermes connection verify ho raha hai…'
-        : `🔥 Firebase: <b>${esc(state.poolSourceName || 'ACTIVE source')}</b> pehle${runSources.length > 1 ? ` — khali/error ho to baaki <b>${runSources.length - 1} enabled</b> sources isi batch me auto-try honge.` : ''}`,
+        : `🔥 Firebase: <b>${runSources.length}/${runSources.length} ACTIVE</b> sources is batch ke pool me hain — <b>${esc(state.poolSourceName || 'first-try source')}</b> pehle${runSources.length > 1 ? `, khali/error/exhaust par baaki <b>${runSources.length - 1} ACTIVE</b> sources isi batch me auto-try honge.` : '.'}`,
       telegramMode
         ? '🔍 Hermes FIND NUMBER / NEW NUMBER card verify karoonga; Firebase pool load aur device scan skip rahenge.'
         : '📋 Saath hi pool load + zinda devices ki parallel scan chal rahi hai…',
@@ -1185,7 +1186,7 @@ export async function startAutopilot(opts = {}) {
 
       if (!sawSuccessfulLoad && lastSourceError) {
         throw new Error(
-          `Kisi bhi enabled Firebase source se pool load nahi hua (${triedRunSourceKeys.size}/${runSources.length} check). Last error: ${lastSourceError}`
+          `Kisi bhi ACTIVE Firebase source se pool load nahi hua (${triedRunSourceKeys.size}/${runSources.length} check). Last error: ${lastSourceError}`
         );
       }
       // Kam az kam ek source safalta se load hua, magar kahin usable
@@ -2000,7 +2001,7 @@ export async function startAutopilot(opts = {}) {
               candidateStates ? `› Candidate devices: <b>${esc(candidateStates)}</b>.` : '',
               `› Total probes: ${state.scanTotalProbes || state.scanChecked || 0} (repeated passes sameet). 15s ruk kar ek naya pass karunga (round ${freshWaitRounds}/${waitPassLimit}).`,
               sub(hasNextRunSource
-                ? 'Is retry pass me bhi saboot na mila to isi source par 40 passes nahi ghumunga — agla enabled Firebase source try hoga.'
+                ? 'Is retry pass me bhi saboot na mila to isi source par 40 passes nahi ghumunga — agla ACTIVE Firebase source try hoga.'
                 : 'Timestamp wala device hota to isi pass par window double karke use le liya jata — dobara scan sirf nayi activity ke intezaar ke liye hai.'),
             ].filter(Boolean).join('\n'))), stopRows());
             probedDevices.clear();

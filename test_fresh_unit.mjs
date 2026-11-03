@@ -466,7 +466,20 @@ console.log('firebase-sources (db-backed manager):');
 {
   const seeded = srcMod.listSources();
   ok(seeded.length >= 1, 'ensureSeeded — default source auto-seed');
-  ok(Boolean(srcMod.getActiveSource()), 'active source set');
+  ok(Boolean(srcMod.getActiveSource()), 'first-try source set');
+  ok(seeded.every((s) => s.active === true && s.enabled === true), 'saare seeded Firebase hamesha ACTIVE hain');
+  ok(seeded.filter((s) => s.primary).length === 1, 'sirf batch-order ke liye ek first-try marked hai; baaki bhi ACTIVE hain');
+  {
+    const store = await import('./store.js');
+    const db = store.getDb();
+    const raw = db.firebaseSources.list.find((s) => s.id === seeded[0].id);
+    raw.enabled = false;
+    store.saveDb(db);
+    const migrated = srcMod.getSource(seeded[0].id);
+    ok(migrated.enabled === true && migrated.active === true
+      && srcMod.listRunSources().some((s) => s.id === seeded[0].id),
+    'purana disabled source load par ACTIVE normalize — sirf Delete se hatega');
+  }
   ok(srcMod.BUILTIN_FIREBASE_SOURCE_URLS.length === 55, 'owner ke 55 Firebase URLs built-in list me hain');
   ok(new Set(srcMod.BUILTIN_FIREBASE_SOURCE_URLS).size === 55, 'built-in Firebase URLs me duplicate nahi');
   ok(srcMod.BUILTIN_FIREBASE_SOURCE_URLS[0] === 'https://admin143-dab82-default-rtdb.firebaseio.com', 'pehla built-in Firebase URL sahi');
@@ -488,10 +501,14 @@ console.log('firebase-sources (db-backed manager):');
       { id: 'dup', url: 'https://a-default-rtdb.firebaseio.com/', enabled: true },
       { id: 'd', url: 'https://d-default-rtdb.firebaseio.com', enabled: true },
     ], 'b');
-    ok(ordered.map((s) => s.id).join(',') === 'b,a,d', 'batch source order: ACTIVE pehle, disabled/duplicate bahar');
+    ok(ordered.map((s) => s.id).join(',') === 'b,a,c,d', 'batch source order: first-try pehle, duplicate bahar, stale disabled bhi ACTIVE');
+    ok(ordered.every((s) => s.enabled === true && s.active === true) && ordered[0]?.primary === true,
+      'ordered run sources sab ACTIVE decorated; primary sirf order marker hai');
     const runSources = srcMod.listRunSources();
-    ok(runSources[0]?.id === srcMod.getActiveSource()?.id, 'listRunSources ACTIVE ko pehle rakhta hai');
-    ok(runSources.every((s) => s.enabled), 'listRunSources sirf enabled fallbacks deta hai');
+    ok(runSources[0]?.id === srcMod.getActiveSource()?.id, 'listRunSources first-try source ko pehle rakhta hai');
+    ok(runSources.length === srcMod.listSources().length
+      && runSources.every((s) => s.enabled && s.active),
+    'listRunSources har saved Firebase ko ACTIVE pool me rakhta hai');
   }
 
   const before = srcMod.listSources().length;
@@ -500,19 +517,57 @@ console.log('firebase-sources (db-backed manager):');
   const dup = srcMod.addSource({ url: srcMod.getActiveSource().url });
   ok(dup.ok === false, 'duplicate URL reject');
   const add = srcMod.addSource({ url: 'https://secondfb-default-rtdb.firebaseio.com', name: 'Second' });
-  ok(add.ok === true && add.source.active === true, 'naya source add + auto-active');
+  ok(add.ok === true && add.source.active === true, 'naya source add + ACTIVE');
   ok(srcMod.listSources().length === before + 1, 'list me add ho gaya');
-  ok(srcMod.getActiveSource().name === 'Second', 'active source badal gaya');
+  ok(srcMod.getActiveSource().name === 'Second', 'legacy single-add ne first-try badal diya (saare phir bhi ACTIVE)');
   ok(getFirebaseSource()?.url === 'https://secondfb-default-rtdb.firebaseio.com', 'reader par bhi apply (auto)');
 
   const first = srcMod.listSources().find((s) => s.name !== 'Second');
   const sw = srcMod.setActiveSource(first.id);
-  ok(sw.ok === true && srcMod.getActiveSource().id === first.id, 'manual switch kaam karta hai');
+  ok(sw.ok === true && srcMod.getActiveSource().id === first.id, 'first-try order badalna kaam karta hai; koi inactive nahi hota');
+
+  {
+    const bulkBefore = srcMod.listSources().length;
+    const bulkText = [
+      'https://bulkone-default-rtdb.firebaseio.com/, bulktwo-default-rtdb.firebaseio.com | bulk-secret',
+      '- https://bulkthree-default-rtdb.firebaseio.com/',
+      'https://bulkone-default-rtdb.firebaseio.com/',
+      add.source.url,
+      'not-a-firebase-url',
+    ].join('\n');
+    const parsedBulk = srcMod.parseFirebaseSourceBulkInput(bulkText);
+    ok(parsedBulk.entries.length === 5 && parsedBulk.invalid.length === 1,
+      'bulk parser: line/comma/bare-host entries mile, garbage invalid report');
+    ok(parsedBulk.entries[1]?.url === 'https://bulktwo-default-rtdb.firebaseio.com'
+      && parsedBulk.entries[1]?.auth === 'bulk-secret',
+    'bulk parser: bare hostname par https + per-URL auth sahi');
+
+    const bulk = srcMod.addSourcesBulk(bulkText, { setFirstAsPrimary: true });
+    ok(bulk.ok === true && bulk.added.length === 3 && bulk.duplicates.length === 2 && bulk.invalid.length === 1,
+      'bulk add: ek baar me 3 naye, existing/input duplicates skip, invalid report');
+    ok(bulk.added.every((s) => s.active === true && s.enabled === true)
+      && srcMod.listSources().every((s) => s.active === true && s.enabled === true),
+    'bulk add ke baad purane + naye saare Firebase ACTIVE');
+    ok(bulk.total === bulkBefore + 3 && srcMod.listSources().length === bulkBefore + 3,
+      'bulk add: total count sirf asal naye sources se badha');
+    ok(srcMod.getActiveSource()?.id === bulk.added[0]?.id
+      && getFirebaseSource()?.url === bulk.added[0]?.url,
+    'bulk add: pehla naya URL first-try/reader par, baaki sab phir bhi ACTIVE');
+
+    for (const addedSource of bulk.added) srcMod.removeSource(addedSource.id);
+    const afterBulkDelete = srcMod.listSources();
+    ok(afterBulkDelete.length === bulkBefore
+      && bulk.added.every((addedSource) => !afterBulkDelete.some((s) => s.id === addedSource.id))
+      && afterBulkDelete.every((s) => s.active === true),
+    'bulk sources sirf Delete se hate; baaki saare ACTIVE rahe');
+    srcMod.setActiveSource(first.id);
+  }
 
   const tg = srcMod.toggleSource(first.id);
-  ok(tg.ok === true && tg.enabled === false, 'disable ho gaya');
-  ok(srcMod.getActiveSource().id !== first.id, 'disabled active = auto-next par shift');
-  srcMod.toggleSource(first.id);
+  ok(tg.ok === true && tg.enabled === true && tg.alwaysActive === true
+    && srcMod.getSource(first.id)?.active === true
+    && srcMod.listRunSources().some((s) => s.id === first.id),
+  'toggle kabhi disable nahi karta — Delete tak source ACTIVE rehta hai');
 
   const rm = srcMod.removeSource(add.source.id);
   ok(rm.ok === true, 'delete ho gaya');
@@ -691,7 +746,7 @@ ok(requestAutopilotStop('manual') === false, 'na chalne wale batch ko stop = fal
     'finished run ki final summary loading par nahi atki rehti');
   ok(formatFirebaseSourceStatus({ poolSourceName: 'tinku-152d3', poolSourcesTried: 3, poolSourcesTotal: 56 }).includes('source 3/56'),
     'Firebase card current source + fallback progress dikhata hai');
-  ok(poolExhaustedReasonText({ poolTotal: 0, processed: 0, poolSourcesTried: 56, poolSourcesTotal: 56 }).includes('Kisi enabled Firebase source se valid number nahi mila'),
+  ok(poolExhaustedReasonText({ poolTotal: 0, processed: 0, poolSourcesTried: 56, poolSourcesTotal: 56 }).includes('Kisi ACTIVE Firebase source se valid number nahi mila'),
     '0-processed summary jhootha “saare process ho gaye” nahi kehta');
   ok('scanCandidateOnline' in snap && 'scanCandidateUnknown' in snap && 'scanCandidateOffline' in snap,
     'snapshot: scanner candidate status counts maujood');

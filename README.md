@@ -157,13 +157,17 @@ persistent disk** (`/app/data`) set hai — yahi sahi combo hai:
 `/start` → **⚙️ Settings**:
 
 - **🔥 Firebase Sources** — default DB ke saath owner ke **55 Firebase DB**
-  pehle se seed milte hain; iske alawa bhi multiple DB add/remove/enable/disable/
-  switch, sab bot UI se. Badi list 10-per-page pagination me dikhti hai. Har
-  manual add par **auto-verify** (reachable + top keys). Batch pehle **ACTIVE**
-  source use karta hai; woh khali, error/deactivated ya exhaust ho to baaki
-  **enabled** sources isi run me ek-ek karke auto-try hote hain. Numbers + OTP
-  current run-source se hi aate hain, aur source tabhi badalta hai jab koi
-  number active na ho.
+  pehle se seed milte hain. Add Firebase me ab ek hi message me multiple
+  URLs bhej sakte ho — har line me ek ya comma se alag; bare hostname aur
+  har URL ke saath optional `| <DB_AUTH>` bhi chalega. Duplicate skip aur
+  invalid entries ka count turant dikhega. **Har added Firebase hamesha
+  ACTIVE rehta hai; disable/switch-off nahi hota — sirf Delete se hatega.**
+  Ek source add ho to auto-verify hota hai; bulk add me bot verify ke
+  intezaar me nahi atkega, har source detail card se Verify ho sakta hai.
+  Batch first-try (⭐) source se shuru hota hai; woh khali,
+  error/deactivated ya exhaust ho to baaki saare **ACTIVE** sources isi
+  run me ek-ek karke auto-try hote hain. Numbers + OTP current run-source
+  se hi aate hain, aur source tabhi badalta hai jab koi number active na ho.
 - **🎯 Target** — presets (10/50/100/200/500) ya custom number text me likho
 - **⏱ Max time** — 15m se 480m tak
 - **🚦 Gap** — do numbers ke beech 0s–60s
@@ -185,7 +189,7 @@ Sab `data/db.json` me save hota hai — restart ke baad bhi yaad rehta hai.
   jati hai; status missing/unknown ho to usay zabardasti offline ya ONLINE
   nahi mana jata — woh sirf SMS timestamp se hi aage badh sakta hai. Ek full
   pass + ek retry pass me na timestamp mile na pakka ONLINE device, aur agla
-  enabled Firebase maujood ho, to bot usi dead source par 40 passes nahi
+  ACTIVE Firebase maujood ho, to bot usi dead source par 40 passes nahi
   ghumata — agla source try karta hai. 40-pass fresh-wait sirf aakhri/ekmatra
   source ke liye hai. Ye zaroori hai kyunki last incoming SMS asal heartbeat
   nahi — zinda device ko bhi ghanton/dinon SMS nahi aata.
@@ -326,7 +330,7 @@ chalta rehta hai; temporary error par number failed nahi gina jata.
 | `autopilot-engine.js` | **Parallel batch lanes** — distinct IPs/devices, target/time, lane-local rotate/defer, live-card |
 | `number-pipeline.js` | EK number ka poora lifecycle (saare scenarios) |
 | `firebase-numbers.js` | Firebase reader — pool + OTP inbox + **dynamic source override** |
-| `firebase-sources.js` | **Multiple Firebase sources** — add/switch/verify (db-backed) |
+| `firebase-sources.js` | **Multiple Firebase sources** — bulk add/verify; sab Delete tak ACTIVE (db-backed) |
 | `bot-settings.js` | **Batch knobs** — target/parallel lanes/time/gap (UI se, validated + clamped) |
 | `proxy-pool.js` | **Proxy pool** — lane reservations, IP rotation, per-proxy WAF token + cooldown |
 | `swiggy-bridge.js` | Swiggy automation + WAF token injection + **lane-local proxy routing** |
@@ -380,7 +384,7 @@ padh/sakta hai. Number pool + OTP inbox dono public hain. Rules lagwa lena
 | Console `409 Conflict` | Isi token se bot ki doosri copy chal rahi hai (purana terminal/server, ya leak hua token). Purani copy band karo; token revoke karke naya lo |
 | Bot chalta hai, batch har number par `security_challenge`/403 | WAF token nahi ban raha — aksar **Chrome nahi mila**. `/diag` dekho; Chrome install karo ya `PUPPETEER_EXECUTABLE_PATH` do. Proxies add karne se bhi bachta hai |
 | `/start` par "Sirf owner ke liye" | Tumhari Telegram ID allow nahi. Message me dikhi ID `.env` ke `OWNER_IDS=` me daalo, restart karo |
-| Batch chala lekin `pool-exhausted`/0 numbers | Card ki **🔥 Firebase** + **Pool** lines dekho: kitne enabled sources check hue aur current source par kitne valid numbers mile. ACTIVE khali/error ho to baaki enabled sources auto-try hote hain; sab par 0 aaye to `clients/` paths/data check karo ya bekaar/deactivated DBs disable karo. `/diag` ACTIVE source ka alag test dikhata hai |
+| Batch chala lekin `pool-exhausted`/0 numbers | Card ki **🔥 Firebase** + **Pool** lines dekho: kitne ACTIVE sources check hue aur current source par kitne valid numbers mile. Ek source khali/error ho to baaki ACTIVE sources auto-try hote hain; sab par 0 aaye to `clients/` paths/data check karo. Bekaar/deactivated DB ko pool se hatana ho to use **Delete** karo — disable option ab nahi hai. `/diag` first-try source ka test dikhata hai |
 | OTP hi nahi aata (`failed_otp_miss`) | Device offline hai ya SMS forwarder band. Online devices wala pool use karo (⚙️ Settings → 📴 Offline OFF rakho jab tak pakka na ho) |
 | Bot beech me chup-chaap band ho jata tha | Fix ho gaya — ab handler errors par bot nahi marta (`bot.catch` + guards). Phir bhi band ho to console ka aakhri error dekho |
 | `Chrome ❌ nahi mila` (server/Render par) | Free cloud par Chrome hota hi nahi. Local PC/VPS par chalao jahan Chrome ho, ya build me Chromium install karke `PUPPETEER_EXECUTABLE_PATH` do |

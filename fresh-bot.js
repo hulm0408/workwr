@@ -14,7 +14,7 @@
 //      STOP dabane par ruk jata hai
 //
 // ⚙️ SETTINGS — user ki azadi (env chhedni ki zaroorat nahi):
-//   • 🔥 Firebase Sources — multiple DB add/remove/enable/switch (bot UI se)
+//   • 🔥 Firebase Sources — multiple DB ek saath add; sab Delete tak ACTIVE
 //   • 🎯 Target / ⏱ Max time / 🚦 Gap / ⏳ OTP wait — sab yahin se
 //
 // Setup (sirf 2 cheezein):
@@ -267,8 +267,7 @@ function activeSourceLine() {
     const src = sources.getActiveSource();
     if (!src) return field('🔥 Firebase', '— (koi source nahi)');
     const list = sources.listSources();
-    const enabledCount = list.filter((s) => s.enabled).length;
-    return field('🔥 Firebase', `${esc(src.name)}  ·  ${enabledCount} enabled source${enabledCount === 1 ? '' : 's'} (batch me auto-fallback)`);
+    return field('🔥 Firebase', `${esc(src.name)} first-try  ·  ${list.length} ACTIVE source${list.length === 1 ? '' : 's'} (sab batch me auto-try)`);
   } catch {
     return field('🔥 Firebase', '—');
   }
@@ -489,11 +488,11 @@ function sourcesCard(requestedPage = 0) {
   const page = Math.min(Math.max(0, Number(requestedPage) || 0), totalPages - 1);
   const start = page * SOURCES_PER_PAGE;
   const pageItems = list.slice(start, start + SOURCES_PER_PAGE);
-  const active = list.find((s) => s.active);
+  const primary = list.find((s) => s.primary);
 
   const rows = pageItems.map((s) => [
     {
-      text: `${s.active ? '✅' : (s.enabled ? '▫️' : '🚫')} ${s.name}${s.active ? ' (ACTIVE)' : ''}`,
+      text: `✅ ${s.name} (ACTIVE)${s.primary ? ' ⭐' : ''}`,
       callback_data: `ap_src_${s.id}`,
     },
   ]);
@@ -504,23 +503,25 @@ function sourcesCard(requestedPage = 0) {
     if (page < totalPages - 1) nav.push({ text: 'Next ▶️', callback_data: `ap_sources_p${page + 1}` });
     rows.push(nav);
   }
-  rows.push([{ text: '➕ Add Firebase', callback_data: 'ap_src_add', style: 'success' }]);
+  rows.push([{ text: '➕ Add Firebase (Bulk)', callback_data: 'ap_src_add', style: 'success' }]);
   rows.push([{ text: '↩️ Settings', callback_data: 'ap_settings', style: 'primary' }]);
 
   return {
     text: section('🔥 Firebase Sources', [
-      `Aap jitne chahein Firebase DB add kar sakte hain — batch pehle`,
-      `<b>ACTIVE</b> source use karega. Woh khali, error ya exhaust ho to`,
-      `baaki <b>enabled</b> sources isi batch me ek-ek karke auto-try honge.`,
+      `<b>Saare added Firebase hamesha ACTIVE hain</b> — disable/switch-off`,
+      `nahi hota. Koi source sirf <b>Delete</b> karne par hi hatega.`,
+      `Batch ek waqt me ek DB ko current rakhta hai taaki number ka OTP`,
+      `usi DB se mile; woh khali/error/exhaust ho to agli <b>ACTIVE</b> DB`,
+      `isi batch me auto-try hoti hai.`,
       ``,
-      `Total: <b>${list.length}</b> sources · Page <b>${page + 1}/${totalPages}</b>`,
-      active ? `ACTIVE: <b>${esc(active.name)}</b>` : 'ACTIVE: —',
+      `Total: <b>${list.length} ACTIVE</b> sources · Page <b>${page + 1}/${totalPages}</b>`,
+      primary ? `⭐ First-try: <b>${esc(primary.name)}</b> (baaki sab bhi ACTIVE)` : '⭐ First-try: —',
       ``,
       ...pageItems.map((s, i) =>
-        `${start + i + 1}. ${s.active ? '✅' : (s.enabled ? '▫️' : '🚫')} <b>${esc(s.name)}</b> — <code>${esc(s.url.replace('https://', ''))}</code>${s.auth ? ' 🔑' : ''}`
+        `${start + i + 1}. ✅ <b>${esc(s.name)}</b> (ACTIVE)${s.primary ? ' ⭐' : ''} — <code>${esc(s.url.replace('https://', ''))}</code>${s.auth ? ' 🔑' : ''}`
       ),
       ``,
-      sub('Source tap karke: switch / verify / enable-disable / delete. Badi list ke liye Prev/Next use karein.'),
+      sub('Source tap karke: first-try / verify / delete. Disable option nahi — har added Firebase ACTIVE rehta hai.'),
     ].join('\n')),
     rows,
   };
@@ -534,15 +535,13 @@ function sourceDetailCard(srcId) {
       `URL: <code>${esc(s.url)}</code>`,
       s.auth ? 'Auth: 🔑 set hai' : 'Auth: nahi (open rules)',
       `Paths: clients=<code>${esc(s.clientsPath)}</code> · messages=<code>${esc(s.messagesPath)}</code>`,
-      `Status: ${s.enabled ? '▫️ enabled' : '🚫 disabled'}${s.active ? ' · <b>ACTIVE</b>' : ''}`,
+      `Status: ✅ <b>ACTIVE</b> — Delete tak hamesha active rahega`,
+      s.primary ? '⭐ Batch is source ko sabse pehle try karega (baaki sab bhi ACTIVE hain).' : 'Batch order me ye source bhi ACTIVE pool me shamil hai.',
       ``,
       sub('Verify = test ki DB reachable hai (shallow root read).'),
     ].join('\n')),
     rows: [
-      [
-        { text: '✅ Use this', callback_data: `ap_src_use_${s.id}`, style: 'success' },
-        { text: s.enabled ? '🚫 Disable' : '▫️ Enable', callback_data: `ap_src_toggle_${s.id}` },
-      ],
+      ...(s.primary ? [] : [[{ text: '⭐ Pehle Try Karo', callback_data: `ap_src_use_${s.id}`, style: 'success' }]]),
       [{ text: '🧪 Verify', callback_data: `ap_src_verify_${s.id}` }],
       [{ text: '🗑 Delete', callback_data: `ap_src_del_${s.id}`, style: 'danger' }],
       [{ text: '↩️ Sources', callback_data: `ap_sources_p${sourcePageFor(s.id)}`, style: 'primary' }],
@@ -913,16 +912,16 @@ async function diagCard() {
         const deviceStates = _countDeviceOnlineStates(pool);
         const fallbackCount = Math.max(0, sources.listRunSources().length - 1);
         lines.push(field('📱 Number pool', pool.length
-          ? `✅ ACTIVE source: ${pool.length} numbers · devices: ONLINE ${deviceStates.online} · status-unknown ${deviceStates.unknown} · offline ${deviceStates.offline}`
-          : `⚠️ ACTIVE source: 0 numbers mile — clients/ node khali ya paths galat${fallbackCount ? `; batch me baaki ${fallbackCount} enabled source(s) auto-try honge` : ''}`));
+          ? `✅ First-try ACTIVE source: ${pool.length} numbers · devices: ONLINE ${deviceStates.online} · status-unknown ${deviceStates.unknown} · offline ${deviceStates.offline}`
+          : `⚠️ First-try ACTIVE source: 0 numbers mile — clients/ node khali ya paths galat${fallbackCount ? `; batch me baaki ${fallbackCount} ACTIVE source(s) auto-try honge` : ''}`));
       }
     } catch (e) {
       let fallbackNote = '';
       try {
         const fallbackCount = Math.max(0, sources.listRunSources().length - 1);
-        if (fallbackCount) fallbackNote = ` · batch me baaki ${fallbackCount} enabled source(s) auto-try honge`;
+        if (fallbackCount) fallbackNote = ` · batch me baaki ${fallbackCount} ACTIVE source(s) auto-try honge`;
       } catch {}
-      lines.push(field('📱 Number pool', `❌ ACTIVE source: ${esc(String(e?.message || e).slice(0, 140))}${fallbackNote}`));
+      lines.push(field('📱 Number pool', `❌ First-try ACTIVE source: ${esc(String(e?.message || e).slice(0, 140))}${fallbackNote}`));
     }
     // Device last-seen gate
     {
@@ -1497,17 +1496,24 @@ bot.action(/^ap_src_use_([a-f0-9-]{1,10})$/, async (ctx) => {
   if (!(await gate(ctx))) return;
   if (await blockSourceChangeWhileRunning(ctx)) return;
   const r = sources.setActiveSource(ctx.match[1]);
-  await ctx.answerCbQuery(r.ok ? '✅ Active source badal diya.' : `❌ ${r.error}`, !r.ok && { show_alert: true }).catch(() => {});
+  await ctx.answerCbQuery(
+    r.ok ? '⭐ First-try set — saare Firebase ACTIVE hi rahenge.' : `❌ ${r.error}`,
+    !r.ok && { show_alert: true }
+  ).catch(() => {});
   const { text, rows } = r.ok ? sourcesCard(sourcePageFor(ctx.match[1])) : sourceDetailCard(ctx.match[1]);
   await editOrSend(ctx, text, rows);
 });
 
+// Purane keyboards me Disable button ho sakta hai. Naye rule me ye kabhi
+// source ko off nahi karega — hatana ho to sirf Delete.
 bot.action(/^ap_src_toggle_([a-f0-9-]{1,10})$/, async (ctx) => {
   if (!(await gate(ctx))) return;
-  if (await blockSourceChangeWhileRunning(ctx)) return;
   const r = sources.toggleSource(ctx.match[1]);
-  await ctx.answerCbQuery(r.ok ? (r.enabled ? '▫️ Enabled' : '🚫 Disabled') : `❌ ${r.error}`, !r.ok && { show_alert: true }).catch(() => {});
-  const { text, rows } = sourcesCard(sourcePageFor(ctx.match[1]));
+  await ctx.answerCbQuery(
+    r.ok ? '✅ Ye Firebase hamesha ACTIVE rahega — hatana ho to Delete karein.' : `❌ ${r.error}`,
+    { show_alert: true }
+  ).catch(() => {});
+  const { text, rows } = sourceDetailCard(ctx.match[1]);
   await editOrSend(ctx, text, rows);
 });
 
@@ -1542,20 +1548,25 @@ bot.action(/^ap_src_del_(.{1,10})$/, async (ctx) => {
   await editOrSend(ctx, text, rows);
 });
 
-// ➕ Add Firebase — bot URL (aur chahein to auth) text me maangta hai
+// ➕ Add Firebase — ek ya bahut saare URLs ek hi message me.
+// Har add hote hi ACTIVE ho jayega aur Delete tak ACTIVE rahega.
 bot.action('ap_src_add', async (ctx) => {
   if (!(await gate(ctx))) return;
   if (await blockSourceChangeWhileRunning(ctx)) return;
   await ctx.answerCbQuery().catch(() => {});
   pending.set(String(ctx.from.id), { action: 'add_source' });
-  await editOrSend(ctx, section('➕ Add Firebase', [
-    `Ab <b>URL bhejo</b> (Realtime Database URL):`,
-    `<code>https://xxxx-default-rtdb.firebaseio.com/</code>`,
+  await editOrSend(ctx, section('➕ Add Firebase — Bulk Bhi Chalega', [
+    `Ab <b>ek ya bahut saare Firebase URL ek saath bhejo</b> — har line me ek,`,
+    `ya comma se alag karke:`,
+    `<code>https://one-default-rtdb.firebaseio.com/</code>`,
+    `<code>https://two-default-rtdb.firebaseio.com/</code>`,
+    `<code>https://three-default-rtdb.firebaseio.com/</code>`,
     ``,
-    `Auth lage to pipe ke saath:`,
+    `Kisi URL ko auth lage to usi line par pipe ke saath:`,
     `<code>&lt;url&gt; | &lt;DB_AUTH_secret&gt;</code>`,
     ``,
-    sub('Cancel karne ke liye /start dabao.'),
+    `✅ Add hote hi <b>saare ACTIVE</b> ho jayenge aur Delete tak ACTIVE rahenge.`,
+    sub('Duplicate URLs khud skip ho jayenge. Cancel ke liye /start dabao.'),
   ].join('\n')), [[{ text: '↩️ Cancel', callback_data: 'ap_sources', style: 'primary' }]]);
 });
 
@@ -2052,26 +2063,52 @@ bot.on('text', async (ctx) => {
 
   if (st.action === 'add_source') {
     pending.delete(uid);
-    const [urlPart, authPart] = txt.split('|').map((x) => x.trim());
     const batchRunning = isAutopilotRunning();
-    const r = sources.addSource(
-      { url: urlPart, auth: authPart || '' },
-      { activate: !batchRunning }
-    );
-    if (!r.ok) {
-      await ctx.reply(`❌ ${r.error}`).catch(() => {});
-      return;
+    const r = sources.addSourcesBulk(txt, {
+      // Manual add ki purani aadat: naye group ka pehla URL first-try bane.
+      // Is se baaki sources inactive nahi hote — sab ACTIVE pool me rehte hain.
+      setFirstAsPrimary: !batchRunning,
+      applyReader: !batchRunning,
+    });
+
+    const lines = [];
+    if (r.added.length) {
+      lines.push(`✅ <b>${r.added.length} Firebase add ho gaye — sab ACTIVE.</b>`);
+      lines.push(...r.added.slice(0, 8).map((s) => `• <b>${esc(s.name)}</b> — <code>${esc(s.url.replace('https://', ''))}</code>`));
+      if (r.added.length > 8) lines.push(`• …aur <b>${r.added.length - 8}</b> Firebase`);
     }
-    if (!batchRunning) sources.applyActiveSource();
-    const v = await sources.verifySource(r.source.id);
-    const lines = [
-      `✅ <b>${esc(r.source.name)}</b> add ho gaya${r.source.active ? ' aur <b>ACTIVE</b>' : ''}.`,
-      ...(batchRunning ? ['⏳ Batch chal raha hai — ye source current OTP flow disturb kiye bina agle batch se lagega.'] : []),
-      v.ok
+    if (r.duplicates.length) {
+      lines.push(`↻ <b>${r.duplicates.length}</b> duplicate skip — woh pehle se ACTIVE thay.`);
+    }
+    if (r.invalid.length) {
+      lines.push(`⚠️ <b>${r.invalid.length}</b> entry add nahi hui:`);
+      lines.push(...r.invalid.slice(0, 3).map((x) => `• ${esc(x.error)}${x.input ? ` — <code>${esc(String(x.input).slice(0, 70))}</code>` : ''}`));
+      if (r.invalid.length > 3) lines.push(`• …aur ${r.invalid.length - 3} invalid entries`);
+    }
+    if (!r.added.length && !r.duplicates.length && !r.invalid.length) {
+      lines.push('❌ Koi Firebase URL nahi mila. Ek URL per line ya comma se alag karke bhejo.');
+    }
+    lines.push(`🔥 Total ab: <b>${r.total} ACTIVE Firebase</b> — Delete karne tak sab active rahenge.`);
+    if (batchRunning && r.added.length) {
+      lines.push('⏳ Batch chal raha hai — naye Firebase saved ACTIVE hain, lekin current OTP flow disturb kiye bina agle batch ke ACTIVE pool me aayenge.');
+    }
+
+    // Ek hi naya source ho to purani tarah turant verify bhi kar do. Bulk
+    // me 50+ DBs ko ek-ek test karne se bot be-wajah atak sakta hai; woh
+    // sab ACTIVE save ho chuke hain aur detail card se Verify ho sakte hain.
+    if (r.added.length === 1) {
+      const v = await sources.verifySource(r.added[0].id);
+      lines.push(v.ok
         ? `🧪 Verify: reachable in ${v.ms}ms${v.topKeys?.length ? ` · keys: <code>${esc(v.topKeys.join(', '))}</code>` : ''}`
-        : `⚠️ Verify fail: ${esc(v.error)} — URL/auth check kar le, tab bhi use kar sakte ho.`,
-    ];
-    await ctx.reply(section('🔥 Firebase Source Added', lines.join('\n')), kb([[{ text: '↩️ Sources', callback_data: 'ap_sources', style: 'primary' }]])).catch(() => {});
+        : `⚠️ Verify fail: ${esc(v.error)} — source phir bhi ACTIVE save hai; URL/auth check kar sakte ho.`);
+    } else if (r.added.length > 1) {
+      lines.push('🧪 Bulk auto-verify skip kiya taaki add turant complete ho — kisi source ko tap karke Verify kar sakte ho.');
+    }
+
+    await ctx.reply(
+      section(r.added.length ? '🔥 Firebase Sources Added' : '🔥 Firebase Add Result', lines.join('\n')),
+      kb([[{ text: '↩️ Sources', callback_data: 'ap_sources', style: 'primary' }]])
+    ).catch(() => {});
     return;
   }
 

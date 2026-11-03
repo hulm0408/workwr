@@ -17,5 +17,15 @@ test-data/
 data/*.tmp
 data/db.json.corrupt-*
 data/bot.lock
+data/db.json
 *.log
 accounts.json
+
+# Telegram spare-account login secrets — session = full account access.
+# Add Telegram Account bot ke andar ye files 0600 permissions se banata hai;
+# inhe git/GitHub/chat me kabhi mat bhejo.
+data/telegram.session
+data/telegram-api.json
+*.session
+telegram.session
+telegram-api.json

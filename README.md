@@ -53,6 +53,53 @@ npm start           # = node fresh-bot.js
 Telegram me bot kholo → `/start` → **▶️ START BATCH** → phone chhod do.
 Wapas aa kar **📊 STATUS** dabao, ya khatam hone par summary khud aa jayega.
 
+## 📨 Telegram Hermes mode (Add Telegram Account)
+
+Owner ka selected source ab **Telegram-only @HermeshuOTPROBOT** hai. Setup
+bot ke andar hi hota hai:
+
+1. Bot ki **private chat** me **⚙️ Settings → 👤 Add Telegram Account**
+   dabao.
+2. Agar API ID/hash env me saved nahi hain, bot
+   `my.telegram.org → API development tools` wali spare-account API app ki
+   details ek-ek karke maangega.
+3. Phir **spare/faltu Telegram account** ka phone number, Telegram login
+   code, aur 2FA ON ho to password lagega. Har sensitive input message ko
+   bot milte hi delete karne ki koshish karta hai; **session kabhi chat me
+   nahi dikhayi jaati**.
+4. Login success par Hermes mode apne aap ON ho jata hai aur bot
+   @HermeshuOTPROBOT ka connection test karta hai. Manual test ke liye
+   **⚙️ Settings → 🧪 Test Hermes** bhi hai; account hatana ho to
+   **🗑 Remove Telegram** (confirmation ke baad session clear hoti hai).
+
+Batch is mode me ye karta hai: Hermes par **FIND NUMBER** → mile hue number
+par Swiggy OTP → **REFRESH** karte hue default **20 second** wait (⚙️
+Settings me 20/30/45/60/90s presets; env
+`TELEGRAM_OTP_TIMEOUT_MS`) → OTP mile to wahi purana verify/register/delete/
+fresh process → OTP na mile to **NEW NUMBER** aur agla number. Refresh ka gap
+default **2.5s** hai (Settings ya `TELEGRAM_OTP_REFRESH_MS`). Firebase
+fallback is mode me bilkul use nahi hota. Ek spare account ki ek hi Hermeshu
+chat serialized state hoti hai, isliye Telegram mode safety ke liye
+**1 lane** par rehta hai; Firebase mode ki 10-lane behavior unchanged hai.
+
+Session/API files `data/telegram.session` aur `data/telegram-api.json`
+me `0600` permissions se rehti hain aur gitignore me hain. Render free disk
+restart/redeploy par mit sakti hai — durable setup ke liye local
+`npm run telegram:login` ke baad session ko Render Secret env
+`TELEGRAM_SESSION` me rakhna behtar hai. Session = full spare-account
+access; use GitHub/chat/screenshot me kabhi mat bhejo, aur main account
+login mat karo.
+
+Fresh signup ka email ab number ke **first 5 digits +
+`Rahul@gmail.com`** hota hai (misal: `9876543210` →
+`98765Rahul@gmail.com`, bina spaces). Agar Swiggy us exact email ko
+duplicate bole, tabhi numbered fallback use hota hai taaki signup atak na
+jaye. Account fresh finalize hone par ek complete random delivery address
+bhi local account record/session JSON me save hoti hai (`address` +
+`addressDetails`). Repository me Swiggy ke remote address-create payload
+ka verified contract nahi hai, isliye bot guessed remote address-save ka
+claim nahi karta.
+
 ## ☁️ Render par host karo (24×7, PC band phir bhi bot on)
 
 Repo me sab ready hai: **`Dockerfile`** (Chrome ke saath) + **`render.yaml`**

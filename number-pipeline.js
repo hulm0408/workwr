@@ -39,6 +39,11 @@ import {
 } from './firebase-numbers.js';
 import { esc, section, sub, field } from './rich-text.js';
 import { normalizeIndianMobileNumber } from './phone-utils.js';
+import {
+  snapshotTelegramOtpState,
+  waitForTelegramOtpCode,
+  discardCurrentTelegramNumber,
+} from './telegram-otp-source.js';
 
 // ---------------------------------------------------------------------------
 // Ledger (db.json → premiumFlow.used) + fresh-selection helpers
@@ -193,6 +198,7 @@ export function markLedger(phone, status, extra = {}) {
 }
 
 export async function markPoolStatus(entry, status) {
+  if (entry?.noPatch || entry?.source === 'telegram' || entry?.otpProvider === 'telegram') return;
   try {
     await markPoolNumberStatus(entry, status);
   } catch (e) {
@@ -222,6 +228,15 @@ export function preferOnline(entries) {
   return [...shuffle(online), ...shuffle(unknown), ...shuffle(offline)];
 }
 
+export function isTelegramOtpEntry(entry = null, otpCfg = {}) {
+  const entrySource = String(entry?.otpProvider || entry?.source || '').trim().toLowerCase();
+  if (['telegram', 'hermes', 'hermeshu', 'telegram-hermes'].includes(entrySource)) return true;
+  if (entry?.telegramBotUsername || String(entry?.deviceId || '').startsWith('hermes:')) return true;
+  const cfgSource = String(otpCfg?.numberSource || otpCfg?.source || '').trim().toLowerCase();
+  if (['telegram', 'hermes', 'hermeshu', 'telegram-hermes'].includes(cfgSource)) return true;
+  return otpCfg?.telegramOtpMode === true;
+}
+
 // ---------------------------------------------------------------------------
 // OTP → verify (+ ek baar retry) ka shared round
 // ---------------------------------------------------------------------------
@@ -235,12 +250,15 @@ async function grabAndVerifyRound({
   waitText,
   retryText,
   shouldAbort,
+  waitOtp = null,
+  sourceLabel = 'Firebase SMS inbox',
 }) {
   const aborted = () => Boolean(shouldAbort && shouldAbort());
+  const waitOtpCode = typeof waitOtp === 'function' ? waitOtp : waitForOtpCode;
 
   if (report && waitText) await report(waitText);
 
-  const otp1 = await waitForOtpCode(phone, { ...waitCfg, excludeIds: seen, deviceIds, shouldAbort });
+  const otp1 = await waitOtpCode(phone, { ...waitCfg, excludeIds: seen, deviceIds, shouldAbort });
   if (!otp1?.code) {
     if (otp1?.aborted) return { status: 'aborted', stage: 'otp-wait' };
     // Khali reason = card/console par "failed_otp_miss |" ke baad kuch nahi
@@ -248,7 +266,7 @@ async function grabAndVerifyRound({
     return {
       status: 'miss',
       reason: otp1?.error
-        || `OTP ${Math.max(1, Math.round((Number(waitCfg.timeoutMs) || 90_000) / 1000))}s window me Firebase SMS inbox me nahi mila (device par SMS forward hua hi nahi ya abhi tak nahi aaya)`,
+        || `OTP ${Math.max(1, Math.round((Number(waitCfg.timeoutMs) || 90_000) / 1000))}s window me ${sourceLabel} me nahi mila (SMS abhi tak show/forward nahi hua)`,
     };
   }
 
@@ -267,10 +285,13 @@ async function grabAndVerifyRound({
   if (!v?.success && !v?.code && !aborted()) {
     if (report && retryText) await report(retryText);
     const seen2 = {
+      ...(seen || {}),
       ids: new Set([...(seen?.ids || []), otp1.idKey].filter(Boolean)),
       codes: new Set([...(seen?.codes || []), otp1.code].filter(Boolean)),
+      code: otp1.code,
+      smsTimeMs: Number(otp1.ts || seen?.smsTimeMs || 0) || 0,
     };
-    const otp2 = await waitForOtpCode(phone, {
+    const otp2 = await waitOtpCode(phone, {
       ...waitCfg,
       timeoutMs: Math.min(Number(waitCfg.timeoutMs ?? 90_000), 60_000),
       excludeIds: seen2,
@@ -345,6 +366,7 @@ export async function processSingleNumber({
 }) {
   const phone = entry?.phone;
   if (!phone) return { ok: false, kind: 'failed_bad_entry', phone: '', reason: 'Entry me phone nahi hai' };
+  const telegramMode = isTelegramOtpEntry(entry, otpCfg);
 
   // 7-day extracted-number cooldown — selection ke ilawa yahan bhi hard
   // gate hai. Pehle retry-later queue ki purani entry ledger check bypass
@@ -356,6 +378,7 @@ export async function processSingleNumber({
       const until = cooldown.cooldownUntilMs
         ? new Date(cooldown.cooldownUntilMs).toISOString()
         : 'unknown (purani success entry me timestamp nahi)';
+      if (telegramMode) discardCurrentTelegramNumber(phone);
       return {
         ok: false,
         kind: 'deferred_number_cooldown',
@@ -368,16 +391,43 @@ export async function processSingleNumber({
     }
   }
 
-  const deviceIds = entry?.deviceId ? [entry.deviceId] : null;
+  const deviceIds = !telegramMode && entry?.deviceId ? [entry.deviceId] : null;
   const say = async (text) => { if (report) { try { await report(text); } catch {} } };
   const aborted = () => Boolean(shouldAbort && shouldAbort());
+  const telegramBotLabel = `@${String(entry?.telegramBotUsername || 'HermeshuOTPROBOT').replace(/^@+/, '')}`;
+  const sourceLabel = telegramMode ? telegramBotLabel : 'Firebase SMS inbox';
 
+  const telegramTimeoutMs = Number(otpCfg.telegramOtpTimeoutMs ?? otpCfg.hermesOtpTimeoutMs ?? 20_000);
+  const telegramRefreshMs = Number(otpCfg.telegramOtpRefreshMs ?? otpCfg.hermesOtpRefreshMs ?? 2_500);
+  // Telegram mode me Hermes-specific values hi authoritative hain.
+  // Autopilot ka generic Firebase config (90s timeout, 3s wait, 1.5s poll)
+  // agar saath aa jaye to bhi Hermes flow 20s / 0s / Refresh interval se
+  // hi chalega — warna "20 second me New Number" wala rule toot jata hai.
+  const resolvedTimeoutMs = Number(telegramMode ? telegramTimeoutMs : (otpCfg.timeoutMs ?? 90_000));
   const waitCfg = {
-    waitMs: Number(otpCfg.waitMs ?? 3_000),
-    timeoutMs: Number(otpCfg.timeoutMs ?? 90_000),
-    pollMs: Number(otpCfg.pollMs ?? 1_500),
-    acceptAnyAfterMs: Number(otpCfg.acceptAnyAfterMs ?? 15_000),
+    waitMs: Number(telegramMode ? (otpCfg.telegramWaitMs ?? otpCfg.hermesWaitMs ?? 0) : (otpCfg.waitMs ?? 3_000)),
+    timeoutMs: resolvedTimeoutMs,
+    pollMs: Number(telegramMode ? telegramRefreshMs : (otpCfg.pollMs ?? 1_500)),
+    refreshMs: telegramRefreshMs,
+    acceptAnyAfterMs: Number(
+      telegramMode
+        ? (otpCfg.telegramAcceptAnyAfterMs ?? otpCfg.hermesAcceptAnyAfterMs ?? Math.min(15_000, Math.floor((resolvedTimeoutMs || 20_000) * 0.75)))
+        : (otpCfg.acceptAnyAfterMs ?? 15_000)
+    ),
   };
+  const snapshotOtp = () => telegramMode
+    ? snapshotTelegramOtpState(phone)
+    : snapshotSeenOtpState(phone, { deviceIds });
+  const waitOtp = (targetPhone, cfg) => telegramMode
+    ? waitForTelegramOtpCode(targetPhone, cfg)
+    : waitForOtpCode(targetPhone, cfg);
+  const otpWaitSeconds = Math.max(1, Math.round((waitCfg.timeoutMs || 0) / 1000));
+  const waitLine = telegramMode
+    ? `⏳ OTP bhej diya — <b>${esc(telegramBotLabel)}</b> me Refresh dabate hue ${otpWaitSeconds}s tak naya OTP check kar raha hoon.`
+    : '⏳ OTP bhej diya — Firebase inbox live poll kar raha hoon (jaise hi SMS forward hoga, code mil jayega).';
+  const pollLine = telegramMode
+    ? `Hermes card par Refresh dabate hue naya OTP check kar raha hoon (${otpWaitSeconds}s)…`
+    : 'Firebase SMS inbox live poll kar raha hoon…';
 
   const mapVerify = (r, failKind) => {
     if (r.status === 'waf_cooldown') return { ok: false, kind: 'waf_cooldown', phone, cooldownMs: r.cooldownMs, reason: r.reason };
@@ -400,7 +450,7 @@ export async function processSingleNumber({
     // Scanner ne agar device ko Firebase clients ke ONLINE status par
     // explicitly chuna hai, to use last incoming SMS ki age par dobara
     // mat roko. SMS na aana device ke band honay ka saboot nahi hai.
-    const skipLastSeenGate = Boolean(otpCfg.skipLastSeenGate);
+    const skipLastSeenGate = telegramMode || Boolean(otpCfg.skipLastSeenGate);
     if (deviceIds?.length && activeWindowMs > 0 && !skipLastSeenGate) {
       let lastActivityMs = null;
       // Engine ka parallel scan pehle hi ye device probe kar chuka hai to
@@ -448,7 +498,7 @@ export async function processSingleNumber({
     }
 
     // ---- Step 1: Swiggy OTP bhejo (purana/naya Swiggy khud detect karta hai) ----
-    const seen1 = await snapshotSeenOtpState(phone, { deviceIds });
+    const seen1 = await snapshotOtp();
 
     const db = getDb();
     const existingKey = findAccountKeyByPhone(db.config?.accounts || {}, phone) || '';
@@ -472,7 +522,7 @@ export async function processSingleNumber({
             ? '→ Number Swiggy par pehle se nahi hai — seedha naya account banega.'
             : '→ Purana account mila: login → Settings → Delete Account → phir fresh registration.',
           '',
-          sub('⏳ OTP bhej diya — Firebase inbox live poll kar raha hoon (jaise hi SMS forward hoga, code mil jayega).'),
+          sub(waitLine),
         ].join('\n')
       )
     );
@@ -481,13 +531,16 @@ export async function processSingleNumber({
     // ---- Step 2: OTP lana + verify (new = yahin done; old = aage delete) ----
     const round1 = await grabAndVerifyRound({
       userId, phone, deviceIds, seen: seen1, waitCfg, report: say, shouldAbort,
+      waitOtp, sourceLabel,
       waitText: section('⏳ OTP Wait — Step 1/3', [
         `📱 <b>Number:</b> <code>${esc(phone)}</code>`,
-        sub('Firebase SMS inbox live poll kar raha hoon…'),
+        sub(pollLine),
       ].join('\n')),
       retryText: section('↻ Verify Retry', [
         `📱 <b>Number:</b> <code>${esc(phone)}</code>`,
-        sub('Pehla OTP verify nahi hua — inbox me ek nayi entry ka wait (max 60s).'),
+        sub(telegramMode
+          ? `Pehla OTP verify nahi hua — Hermes card par ek aur naye OTP ka wait (${otpWaitSeconds}s).`
+          : 'Pehla OTP verify nahi hua — inbox me ek nayi entry ka wait (max 60s).'),
       ].join('\n')),
     });
     if (round1.status !== 'ok') return mapVerify(round1, 'failed_otp_miss');
@@ -514,7 +567,7 @@ export async function processSingleNumber({
     ].join('\n')));
     if (aborted()) return { ok: false, kind: 'aborted', phone, stage: 'before-delete-request' };
 
-    const seen2 = await snapshotSeenOtpState(phone, { deviceIds });
+    const seen2 = await snapshotOtp();
     const delReq = await requestSwiggyDeleteOtpViaBridge(userId, phone, loginAcc.accountKey, loginAcc.name || null);
     if (!delReq?.success) {
       if (delReq?.code === 'SWIGGY_WAF_COOLDOWN') return { ok: false, kind: 'waf_cooldown', phone, cooldownMs: Number(delReq?.cooldownMs) || 60_000, reason: delReq?.message || '' };
@@ -530,7 +583,7 @@ export async function processSingleNumber({
       };
     }
 
-    const otpD = await waitForOtpCode(phone, { ...waitCfg, excludeIds: seen2, deviceIds, shouldAbort });
+    const otpD = await waitOtp(phone, { ...waitCfg, excludeIds: seen2, deviceIds, shouldAbort });
     if (!otpD?.code) {
       if (otpD?.aborted) return { ok: false, kind: 'aborted', phone, stage: 'delete-otp-wait' };
       if (markUsed) {
@@ -567,7 +620,7 @@ export async function processSingleNumber({
       sub('Swiggy account delete + bot DB purge done — ab fresh OTP bhej raha hoon…'),
     ].join('\n')));
 
-    const seen3 = await snapshotSeenOtpState(phone, { deviceIds });
+    const seen3 = await snapshotOtp();
     const otpReq2 = await requestSwiggyOtpViaBridge(userId, phone, '', null);
     if (!otpReq2?.success) {
       return _classifyOtpSendFailure(otpReq2, phone, {
@@ -578,13 +631,18 @@ export async function processSingleNumber({
 
     const round3 = await grabAndVerifyRound({
       userId, phone, deviceIds, seen: seen3, waitCfg, report: say, shouldAbort,
+      waitOtp, sourceLabel,
       waitText: section('⏳ Fresh OTP Wait — Step 3/3', [
         `📱 <b>Number:</b> <code>${esc(phone)}</code>`,
-        sub('Fresh registration OTP — inbox live poll kar raha hoon…'),
+        sub(telegramMode
+          ? `Fresh registration OTP — Hermes card par Refresh dabate hue naya OTP check kar raha hoon (${otpWaitSeconds}s)…`
+          : 'Fresh registration OTP — inbox live poll kar raha hoon…'),
       ].join('\n')),
       retryText: section('↻ Fresh Verify Retry', [
         `📱 <b>Number:</b> <code>${esc(phone)}</code>`,
-        sub('Pehla verify nahi hua — ek aur naye OTP ka wait (max 60s).'),
+        sub(telegramMode
+          ? `Pehla verify nahi hua — Hermes card par ek aur naye OTP ka wait (${otpWaitSeconds}s).`
+          : 'Pehla verify nahi hua — ek aur naye OTP ka wait (max 60s).'),
       ].join('\n')),
     });
     if (round3.status !== 'ok') return mapVerify(round3, 'failed_fresh_otp_miss');
@@ -602,5 +660,7 @@ export async function processSingleNumber({
   } catch (err) {
     console.error('[Pipeline]', err?.stack || err?.message);
     return { ok: false, kind: 'failed_exception', phone, reason: String(err?.message || err) };
+  } finally {
+    if (telegramMode) discardCurrentTelegramNumber(phone);
   }
 }

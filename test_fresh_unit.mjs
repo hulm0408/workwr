@@ -1564,4 +1564,100 @@ console.log('🌐 free proxies auto-fetch (ProxyScrape parse/rank/probe/refresh)
   if (!before.enabled) pp.setPoolEnabled(false);
 }
 
+// ---------------------------------------------------------------------------
+console.log('telegram Hermes source + Add Telegram Account primitives:');
+{
+  const tg = await import('./telegram-otp-source.js');
+  const engine = await import('./autopilot-engine.js');
+  const bridge = await import('./swiggy-bridge.js');
+  const store = await import('./store.js');
+
+  tg._resetTelegramOtpSourceForTests();
+
+  // Visible Hermeshu labels: FIND strict hai; SEARCH/ACTIVE ko FIND nahi
+  // samjha jayega, warna bot galat screen par ja sakta hai.
+  ok(tg.telegramButtonRole('FIND NUMBER') === 'find', 'Hermes FIND NUMBER → find');
+  ok(tg.telegramButtonRole('🔍 FIND NUMBER') === 'find', 'emoji ke saath FIND NUMBER → find');
+  ok(tg.telegramButtonRole('SEARCH NUMBER') === '', 'Hermes SEARCH NUMBER FIND nahi hai');
+  ok(tg.telegramButtonRole('ACTIVE NUMBERS') === '', 'Hermes ACTIVE NUMBERS FIND nahi hai');
+  ok(tg.telegramButtonRole('NEW NUMBER') === 'new', 'Hermes NEW NUMBER → new');
+  ok(tg.telegramButtonRole('REFRESH') === 'refresh', 'Hermes REFRESH → refresh');
+
+  const welcomeOnly = [
+    'WELCOME TO Hermes',
+    'FIND NUMBER • SEARCH NUMBER • ACTIVE NUMBERS',
+  ].join('\n');
+  ok(tg.parseTelegramNumberCard(welcomeOnly) === null, 'welcome card bina phone ke number card nahi banta');
+
+  const cardText = [
+    'YOUR NUMBER: +91 98765 43210',
+    'STATUS: ACTIVE',
+    'DEVICE: DEVICE-TEST-1',
+    'LAST SMS: [NEWSWI-GY] OTP: 123456',
+    '01/01/2026 | 10:15 AM',
+  ].join('\n');
+  const parsedCard = tg.parseTelegramNumberCard(cardText);
+  ok(parsedCard?.phone === '9876543210', 'Hermes number card se 10-digit phone parsed');
+  ok(parsedCard?.status === 'ACTIVE', 'Hermes card STATUS ACTIVE parsed');
+  ok(parsedCard?.device === 'DEVICE-TEST-1', 'Hermes card device parsed');
+  ok(parsedCard?.sender === 'NEWSWI-GY' && parsedCard?.code === '123456', 'Hermes LAST SMS sender + OTP parsed');
+  ok(tg.extractTelegramOtpFromText('SENDER: VM-SWIGGY\nYour OTP is 654321') === '654321', 'SENDER label wale Hermes text se OTP');
+
+  ok(tg.normalizeTelegramLoginPhone('98765 43210') === '+919876543210', 'in-bot login: Indian 10-digit → +91');
+  ok(tg.normalizeTelegramLoginPhone('+1 202 555 0101') === '+12025550101', 'in-bot login: country-code phone preserved');
+  ok(tg.normalizeTelegramLoginPhone('12345') === '', 'in-bot login: invalid short phone reject');
+
+  const noTelegramEnv = {
+    TELEGRAM_SESSION_FILE: '/tmp/workwr-missing-telegram.session',
+    TELEGRAM_API_CREDENTIALS_FILE: '/tmp/workwr-missing-telegram-api.json',
+  };
+  const missingStatus = tg.getTelegramOtpStatus(noTelegramEnv);
+  ok(missingStatus.configured === false && missingStatus.sessionPresent === false, 'Telegram setup missing → status not configured');
+  ok(['TELEGRAM_API_ID', 'TELEGRAM_API_HASH', 'TELEGRAM_SESSION'].every((k) => missingStatus.missing.includes(k)), 'Telegram status missing keys saaf batata hai');
+  ok(tg.telegramOtpSetupHintLines(noTelegramEnv).join('\n').includes('Add Telegram Account'), 'setup hint Add Telegram Account flow batata hai');
+  ok(tg.resolveNumberSourceMode({ env: { NUMBER_SOURCE: 'telegram' }, telegramSetting: false }) === 'telegram', 'NUMBER_SOURCE=telegram → Telegram only');
+  ok(tg.resolveNumberSourceMode({ env: { NUMBER_SOURCE: 'firebase' }, telegramSetting: true }) === 'firebase', 'NUMBER_SOURCE=firebase env force respect');
+  ok(engine.resolveAutopilotNumberSource({ env: { NUMBER_SOURCE: 'telegram' } }) === 'telegram', 'Autopilot source resolver Telegram env');
+  ok(engine.effectiveAutopilotLanes({ sourceMode: 'telegram', requested: 10, proxyEnabled: true, enabledProxyCount: 20 }) === 1, 'ek Hermes chat → Telegram mode hamesha 1 lane');
+  ok(engine.effectiveAutopilotLanes({ sourceMode: 'firebase', requested: 10, proxyEnabled: true, enabledProxyCount: 9 }) === 10, 'Firebase mode ki 10-lane behavior unchanged');
+  ok(engine.formatNumberSourceStatus({ sourceMode: 'telegram', telegramBotUsername: 'HermeshuOTPROBOT', telegramConfigured: true }).includes('@HermeshuOTPROBOT'), 'source status Hermes bot dikhata hai');
+
+  // Fresh-ID email rule: first five digits + exact Rahul@gmail.com.
+  ok(bridge.generateFreshSwiggyEmail('9876543210') === '98765Rahul@gmail.com', 'fresh email: 9876543210 → 98765Rahul@gmail.com');
+  ok(bridge.generateFreshSwiggyEmail('+91 98765 43210') === '98765Rahul@gmail.com', 'fresh email: +91 input ke first five mobile digits');
+  ok(bridge.generateFreshSwiggyEmail('9876543210', { attempt: 1 }) === '98765Rahul1@gmail.com', 'fresh email duplicate par sirf numbered fallback');
+  ok(!bridge.generateFreshSwiggyEmail('9876543210').includes(' '), 'fresh email me spaces nahi');
+
+  // Deterministic random function se complete generated address.
+  const randomAddress = bridge.generateRandomSwiggyAddress('9876543210', 'Rahul Kumar', () => 0.42);
+  ok(randomAddress.mobile === '9876543210' && randomAddress.phone === '9876543210', 'random address me account phone saved');
+  ok(Boolean(randomAddress.address && randomAddress.city && randomAddress.pincode && randomAddress.landmark), 'random address complete fields ke saath banta hai');
+  ok(bridge.formatSwiggyAddress(randomAddress) === randomAddress.address, 'random address format helper string return karta hai');
+  ok(randomAddress.source === 'generated-local', 'random address source honestly generated-local marked hai');
+
+  // Saved account se /session fallback export me email/address survive kare.
+  store.updateAccount('TEST_TELEGRAM_FRESH_EXPORT', {
+    name: 'Telegram Fresh Test',
+    swiggyName: 'Rahul Kumar',
+    botTag: 'tag-telegram-fresh',
+    email: bridge.generateFreshSwiggyEmail('9876543210'),
+    address: randomAddress.address,
+    addressDetails: randomAddress,
+    phone: '9876543210',
+    customerId: 'CUSTTG1',
+    token: 'TOKENTG1',
+    tid: 'TIDTG1',
+    sid: 'SIDTG1',
+    deviceId: 'DEVTG1',
+    cookies: 'tid=TIDTG1; _sid=SIDTG1; _device_id=DEVTG1; token=TOKENTG1',
+    isLoggedIn: true,
+    savedAt: '2026-11-03T00:00:00.000Z',
+  });
+  const sessionExport = store.getSessionExportJson('TEST_TELEGRAM_FRESH_EXPORT', null);
+  ok(sessionExport?.email === '98765Rahul@gmail.com', 'session fallback export me fresh email included');
+  ok(sessionExport?.address === randomAddress.address && sessionExport?.addressDetails?.pincode === randomAddress.pincode, 'session fallback export me random address included');
+  const fullExport = store.exportSessionJson('TEST_TELEGRAM_FRESH_EXPORT');
+  ok(fullExport?.email === '98765Rahul@gmail.com' && fullExport?.address === randomAddress.address, 'full session export me email + address included');
+}
+
 console.log(`\n✅ ALL PASSED — ${passed} checks`);

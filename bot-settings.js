@@ -16,6 +16,9 @@ const SPECS = {
   otpWaitMs:         { min: 0,    max: 60000, dflt: 3000, label: 'OTP poll shuru karne se pehle wait (ms)' },
   otpTimeoutMs:      { min: 5000, max: 300000, dflt: 90000, label: 'OTP poll budget (ms)' },
   allowOffline:      { bool: true, dflt: false, label: 'Offline devices bhi try karein' },
+  telegramOtpMode:   { bool: true, dflt: false, label: '📨 Telegram Hermes mode (number + OTP Telegram bot se)' },
+  telegramOtpTimeoutMs: { min: 5000, max: 180000, dflt: 20000, label: 'Hermes OTP Refresh budget (ms)' },
+  telegramOtpRefreshMs: { min: 1000, max: 15000, dflt: 2500, label: 'Hermes Refresh interval (ms)' },
 };
 
 const ENV_MAP = {
@@ -27,6 +30,9 @@ const ENV_MAP = {
   otpWaitMs: 'PREMIUM_OTP_WAIT_MS',
   otpTimeoutMs: 'PREMIUM_OTP_TIMEOUT_MS',
   allowOffline: 'PREMIUM_ALLOW_OFFLINE_DEVICES',
+  telegramOtpMode: 'PREMIUM_TELEGRAM_OTP_MODE',
+  telegramOtpTimeoutMs: 'TELEGRAM_OTP_TIMEOUT_MS',
+  telegramOtpRefreshMs: 'TELEGRAM_OTP_REFRESH_MS',
 };
 
 function load() {
@@ -42,8 +48,10 @@ export function getSetting(key) {
   const s = load();
   if (spec.bool) {
     if (typeof s[key] === 'boolean') return s[key];
-    const envVal = String(process.env[ENV_MAP[key]] || '').trim();
-    return envVal === '1' ? true : spec.dflt;
+    const envVal = String(process.env[ENV_MAP[key]] || '').trim().toLowerCase();
+    if (['1', 'true', 'yes', 'on'].includes(envVal)) return true;
+    if (['0', 'false', 'no', 'off'].includes(envVal)) return false;
+    return spec.dflt;
   }
   if (Number.isFinite(s[key])) return s[key];
   const envVal = Number(process.env[ENV_MAP[key]]);
@@ -90,8 +98,8 @@ export function settingsSpecs() {
 
 export function fmtSetting(key) {
   const v = getSetting(key);
-  if (key === 'allowOffline') return v ? 'ON' : 'OFF';
-  if (key === 'gapMs' || key === 'backoffMs' || key === 'otpWaitMs' || key === 'otpTimeoutMs') {
+  if (key === 'allowOffline' || key === 'telegramOtpMode') return v ? 'ON' : 'OFF';
+  if (key === 'gapMs' || key === 'backoffMs' || key === 'otpWaitMs' || key === 'otpTimeoutMs' || key === 'telegramOtpTimeoutMs' || key === 'telegramOtpRefreshMs') {
     return v >= 60000 ? `${Math.round(v / 60000)} min` : `${Math.round(v / 1000)}s`;
   }
   return String(v);

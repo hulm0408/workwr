@@ -364,11 +364,100 @@ export function sanitizeSwiggyName(name) {
   return cleaned;
 }
 
-function generateUniqueSwiggyEmail(phone, name) {
-  const prefix = String(name || 'rahul').toLowerCase().replace(/[^a-z]/g, '').slice(0, 8) || 'rahul';
-  const last4 = String(phone || '').slice(-4) || '1000';
-  const rand = Math.floor(1000 + Math.random() * 9000);
-  return `${prefix}${last4}.${rand}@gmail.com`;
+// User ka fresh-ID rule: number ke FIRST 5 digits + exact
+// "Rahul@gmail.com". Example: 9876543210 → 98765Rahul@gmail.com.
+// Country-code wala input mile to pehle uska 10-digit Indian mobile nikalo,
+// taaki "+91" ke digits first-five me na aa jayein.
+export function freshSwiggyEmailPhoneDigits(phone) {
+  const digits = String(phone || '').replace(/\D/g, '');
+  if (digits.length > 10) return digits.slice(-10);
+  return digits;
+}
+
+export function generateFreshSwiggyEmail(phone, { attempt = 0 } = {}) {
+  const mobile = freshSwiggyEmailPhoneDigits(phone) || '0000000000';
+  const firstFive = mobile.padEnd(5, '0').slice(0, 5);
+  const retry = Math.max(0, Math.floor(Number(attempt) || 0));
+  // Primary attempt hamesha exact requested format hai. Swiggy agar wohi
+  // email kisi purane account se duplicate bole, tabhi numbered fallback
+  // use hoga — warna signup hamesha ek hi taken email par atka rahega.
+  return `${firstFive}Rahul${retry > 0 ? String(retry) : ''}@gmail.com`;
+}
+
+function generateUniqueSwiggyEmail(phone, _name, attempt = 0) {
+  return generateFreshSwiggyEmail(phone, { attempt });
+}
+
+const RANDOM_SWIGGY_ADDRESS_AREAS = [
+  { area: 'Hazratganj', city: 'Lucknow', state: 'Uttar Pradesh', pincode: '226001', lat: 26.8500, lng: 80.9462, landmark: 'Near GPO' },
+  { area: 'Aliganj', city: 'Lucknow', state: 'Uttar Pradesh', pincode: '226024', lat: 26.8998, lng: 80.9431, landmark: 'Near Aliganj Market' },
+  { area: 'Indira Nagar', city: 'Lucknow', state: 'Uttar Pradesh', pincode: '226016', lat: 26.8702, lng: 80.9955, landmark: 'Near Bhootnath Market' },
+  { area: 'Rajajipuram', city: 'Lucknow', state: 'Uttar Pradesh', pincode: '226017', lat: 26.8455, lng: 80.8704, landmark: 'Near Rajajipuram Market' },
+  { area: 'Aminabad', city: 'Lucknow', state: 'Uttar Pradesh', pincode: '226018', lat: 26.8439, lng: 80.9228, landmark: 'Near Aminabad Market' },
+  { area: 'Jankipuram', city: 'Lucknow', state: 'Uttar Pradesh', pincode: '226021', lat: 26.9124, lng: 80.9443, landmark: 'Near Sahara States' },
+  { area: 'Gomti Nagar', city: 'Lucknow', state: 'Uttar Pradesh', pincode: '226010', lat: 26.8569, lng: 81.0025, landmark: 'Near Patrakarpuram' },
+  { area: 'Alambagh', city: 'Lucknow', state: 'Uttar Pradesh', pincode: '226005', lat: 26.8135, lng: 80.9122, landmark: 'Near Alambagh Bus Stand' },
+];
+
+const RANDOM_SWIGGY_ADDRESS_STREETS = [
+  'Main Road', 'Station Road', 'MG Road', 'Ring Road', 'Market Road',
+  'College Road', 'Temple Street', 'Park Street', 'Civil Lines Road', 'Nagar Road',
+];
+
+function pickRandomAddressItem(items, random) {
+  const n = Number(random());
+  const frac = Number.isFinite(n) ? Math.min(0.999999, Math.max(0, n)) : 0;
+  return items[Math.floor(frac * items.length)];
+}
+
+export function formatSwiggyAddress(address) {
+  if (!address) return '';
+  if (typeof address === 'string') return address.trim();
+  if (typeof address.address === 'string' && address.address.trim()) return address.address.trim();
+  return [
+    address.flatNo || address.houseNo || '',
+    address.street || '',
+    address.area || '',
+    address.landmark || '',
+    address.city || '',
+    address.state || '',
+    address.pincode ? `- ${address.pincode}` : '',
+  ].filter(Boolean).join(', ').replace(/\s+-\s+/g, ' - ').trim();
+}
+
+// Fresh account ke saath local vault/export me ek complete random delivery
+// address save karne ke liye. Ye generated profile data hai; Swiggy ke remote
+// address-create payload ka verified contract repo me nahi hai, isliye bot
+// koi guessed "address added remotely" claim nahi karta.
+export function generateRandomSwiggyAddress(phone, name = 'Rahul Kumar', random = Math.random) {
+  const where = pickRandomAddressItem(RANDOM_SWIGGY_ADDRESS_AREAS, random);
+  const street = pickRandomAddressItem(RANDOM_SWIGGY_ADDRESS_STREETS, random);
+  const houseNo = 11 + Math.floor(Math.min(0.999999, Math.max(0, Number(random()) || 0)) * 780);
+  const block = String.fromCharCode(65 + Math.floor(Math.min(0.999999, Math.max(0, Number(random()) || 0)) * 12));
+  const jitter = () => Number((((Number(random()) || 0) - 0.5) * 0.006).toFixed(6));
+  const flatNo = `House No. ${block}-${houseNo}`;
+  const mobile = freshSwiggyEmailPhoneDigits(phone);
+  const address = `${flatNo}, ${street}, ${where.area}, ${where.landmark}, ${where.city}, ${where.state} - ${where.pincode}`;
+  return {
+    name: sanitizeSwiggyName(name),
+    mobile,
+    phone: mobile,
+    address,
+    flatNo,
+    houseNo: flatNo,
+    street,
+    landmark: where.landmark,
+    area: where.area,
+    city: where.city,
+    state: where.state,
+    pincode: where.pincode,
+    annotation: 'HOME',
+    addressType: 'HOME',
+    addressCategory: 'dropoff',
+    lat: Number((where.lat + jitter()).toFixed(6)),
+    lng: Number((where.lng + jitter()).toFixed(6)),
+    source: 'generated-local',
+  };
 }
 
 // Helper to check if cookies or account contain a verified logged-in user
@@ -1935,7 +2024,7 @@ export async function requestSwiggyOtpViaBridge(userId, phone, targetAcc = '', t
         const initMsgLower = `${signupInitResult.data?.statusMessage || ''} ${signupInitResult.data?.message || ''} ${signupInitResult.rawText || ''}`.toLowerCase();
         // If generated email collided with an archived record, regenerate once and retry cleanly
         if (signupInitResult.status === 200 && signupInitResult.data?.statusCode !== 0 && /email.*exist|email.*already|duplicate.*email|invalid.*email/i.test(initMsgLower)) {
-          signupEmail = generateUniqueSwiggyEmail(cleanPhone, `${signupName}x`);
+          signupEmail = generateFreshSwiggyEmail(cleanPhone, { attempt: 1 });
           signupInitResult = await postSwiggyAuthJson(session, 'https://www.swiggy.com/dapi/auth/signup', {
             mobile: cleanPhone,
             name: signupName,
@@ -2643,11 +2732,28 @@ async function finalizeAuthenticatedSwiggyAccount(userId, session, authResult, {
     : getNextAutoUserName();
   const finalName = rawSlot || cleanActual || getNextAutoUserName();
 
+  // Fresh/new-signup record kabhi email/address ke bina save na ho.
+  // Existing login par Swiggy/profile ka email mile to wahi rakho; fresh
+  // signup par requested first-five email fallback bhi hamesha available hai.
+  const finalEmail = String(resolvedEmail || '').trim()
+    || (wasNewSignup ? generateFreshSwiggyEmail(phone) : '');
+  session.signupEmail = finalEmail || session.signupEmail || '';
+  const generatedAddressDetails = wasNewSignup
+    ? (session.generatedAddressDetails || generateRandomSwiggyAddress(phone, cleanActual || session.signupName || finalName))
+    : null;
+  if (generatedAddressDetails) session.generatedAddressDetails = generatedAddressDetails;
+  const generatedAddress = generatedAddressDetails ? formatSwiggyAddress(generatedAddressDetails) : '';
+
   const savedData = {
     name: finalName,
     swiggyName: cleanActual || '',
     botTag: rawSlot,
-    email: resolvedEmail,
+    email: finalEmail,
+    ...(generatedAddress ? {
+      address: generatedAddress,
+      addressDetails: generatedAddressDetails,
+      deliveryAddress: generatedAddressDetails,
+    } : {}),
     phone,
     mobile: phone,
     customerId,
@@ -2676,6 +2782,11 @@ async function finalizeAuthenticatedSwiggyAccount(userId, session, authResult, {
     name: finalName,
     swiggyName: cleanActual || '',
     botTag: rawSlot,
+    email: finalEmail,
+    ...(generatedAddress ? {
+      address: generatedAddress,
+      addressDetails: generatedAddressDetails,
+    } : {}),
     mobile: phone,
     phone,
     customerId,
@@ -2694,6 +2805,11 @@ async function finalizeAuthenticatedSwiggyAccount(userId, session, authResult, {
     name: finalName,
     swiggyName: cleanActual || '',
     botTag: rawSlot,
+    email: finalEmail,
+    ...(generatedAddress ? {
+      address: generatedAddress,
+      addressDetails: generatedAddressDetails,
+    } : {}),
     accountKey: finalSavedKey,
     phone,
     customerId: customerId || 'Verified',
@@ -2799,7 +2915,7 @@ export async function verifySwiggyOtpViaBridge(userId, otp) {
 
       const sLower = `${signupResult?.data?.statusMessage || ''} ${signupResult?.data?.message || ''} ${signupResult?.rawText || ''}`.toLowerCase();
       if (signupResult?.status === 200 && signupResult?.data?.statusCode !== 0 && /email.*exist|email.*already|duplicate.*email/i.test(sLower)) {
-        signupEmail = generateUniqueSwiggyEmail(phone, `${signupName}z`);
+        signupEmail = generateFreshSwiggyEmail(phone, { attempt: 1 });
         session.signupEmail = signupEmail;
         signupResult = await postSwiggyAuthJson(session, 'https://www.swiggy.com/dapi/auth/signup', {
           mobile: phone,
@@ -2897,7 +3013,7 @@ export async function signupSwiggyViaBridge(userId, enteredName, enteredEmail = 
 
     const sLower = `${signupResult?.data?.statusMessage || ''} ${signupResult?.data?.message || ''} ${signupResult?.rawText || ''}`.toLowerCase();
     if (!enteredEmail && signupResult?.status === 200 && signupResult?.data?.statusCode !== 0 && /email.*exist|email.*already|duplicate.*email/i.test(sLower)) {
-      signupEmail = generateUniqueSwiggyEmail(phone, `${cleanName}r`);
+      signupEmail = generateFreshSwiggyEmail(phone, { attempt: 1 });
       session.signupEmail = signupEmail;
       signupResult = await postSwiggyAuthJson(session, 'https://www.swiggy.com/dapi/auth/signup', {
         mobile: phone,

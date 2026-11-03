@@ -643,8 +643,10 @@ console.log('proxy-pool (IP rotation — "rukna hi na pare"):');
   ok(detail.wafHits === 1 && !detail.tokenReady, 'WAF hit: count + jala token clear');
   const d = px.pickProxy({ excludeIds: [] });
   ok(d && d.id !== a.id, 'cooldown wala proxy pick nahi hua');
-  ok(px.proxySummary().usableCount === 1 && px.proxySummary().wafCoolingCount >= 1,
-    'summary: ON ke bajaye asal usable/cooling proxy count');
+  ok(px.proxySummary().usableCount === 0 && px.proxySummary().wafCoolingCount >= 1,
+    'summary: ON ke bajaye asal usable/cooling proxy count (solve-cooling last-resort ko backup nahi ginta)');
+  ok(px.usableProxyCount() === px.proxySummary().usableCount,
+    'usableProxyCount: refill decision asal backup count par — sirf enabled total par nahi');
 
   // Error / success streak
   px.markProxyError(b.id);
@@ -950,11 +952,15 @@ console.log('Swiggy temporary 5xx/network — number FAILED nahi, retry queue:')
   ok(pipe._classifyOtpSendFailure({ success: true }, '9812345670') === null,
     'pipeline: successful OTP send par failure classification null');
 
-  ok(engine.transientSwiggyRetryWaitMs(1) === 20_000
-    && engine.transientSwiggyRetryWaitMs(2) === 45_000
-    && engine.transientSwiggyRetryWaitMs(3) === 60_000
-    && engine.transientSwiggyRetryWaitMs(99) === 60_000,
-  'engine: transient cool-off ladder 20s→45s→60s cap');
+  ok(engine.transientSwiggyRetryWaitMs(1) === 15_000
+    && engine.transientSwiggyRetryWaitMs(2) === 30_000
+    && engine.transientSwiggyRetryWaitMs(3) === 45_000
+    && engine.transientSwiggyRetryWaitMs(99) === 45_000,
+  'engine: transient cool-off ladder 15s→30s→45s cap');
+  ok(engine.rateLimitRecoveryWaitMs(1, 10 * 60_000) === 15_000
+    && engine.rateLimitRecoveryWaitMs(2, 10 * 60_000) === 30_000
+    && engine.fastRouteRecoveryCapMs(10 * 60_000) === 15_000,
+  'engine: rate-limit/WAF pehli recovery max 15s (number queue me fasa nahi)');
   const snap = engine.getAutopilotSnapshot();
   ok(Number.isFinite(snap.serverErrors) && Number.isFinite(snap.transientStrikes),
     'engine snapshot: serverErrors/transientStrikes counters maujood');
@@ -1365,13 +1371,14 @@ console.log('WAF challenge survival (jala token invalidate + batch-marta-nahi la
   wafPool.clearCooldown();
   ok(wafPool.cooldownRemainingMs() === 0, 'clearCooldown reset karta hai');
 
-  // Engine wait ladder: 30s → 60s → 120s → 240s; pool cooldown lamba ho to wahi (5 min cap)
-  ok(engine.wafChallengeWaitMs(1, 0) === 30_000, 'ladder strike1 = 30s (pehle seedha 1-3 min tha)');
-  ok(engine.wafChallengeWaitMs(2, 0) === 60_000 && engine.wafChallengeWaitMs(3, 0) === 120_000, 'ladder strike2/3 = 60s/120s');
-  ok(engine.wafChallengeWaitMs(9, 0) === 240_000, 'ladder cap 240s (strike chahe kitne bhi)');
-  ok(engine.wafChallengeWaitMs(1, 4 * 60_000) === 4 * 60_000, 'pool cooldown lamba ho to wahi jeet');
-  ok(engine.wafChallengeWaitMs(1, 30 * 60_000) === 5 * 60_000, 'ek saath max 5 min (batch zinda rahe)');
-  ok(engine.wafChallengeWaitMs(0, 0) === 30_000, 'strikes 0/invalid → pehla step (30s)');
+  // Engine wait ladder: 5s → 10s → 15s cap; pool cooldown chahe lamba
+  // bole, route recovery 15s se upar number ko queue me nahi latkati.
+  ok(engine.wafChallengeWaitMs(1, 0) === 5_000, 'ladder strike1 = 5s (fast route recovery)');
+  ok(engine.wafChallengeWaitMs(2, 0) === 10_000 && engine.wafChallengeWaitMs(3, 0) === 15_000, 'ladder strike2/3 = 10s/15s');
+  ok(engine.wafChallengeWaitMs(9, 0) === 15_000, 'ladder cap 15s (strike chahe kitne bhi)');
+  ok(engine.wafChallengeWaitMs(1, 4 * 60_000) === 15_000, 'lamba pool cooldown bhi 15s par cap');
+  ok(engine.wafChallengeWaitMs(1, 30 * 60_000) === 15_000, 'ek saath max 15s (batch consistent rahe)');
+  ok(engine.wafChallengeWaitMs(0, 0) === 5_000, 'strikes 0/invalid → pehla step (5s)');
 }
 
 // ---------------------------------------------------------------------------
@@ -1549,7 +1556,7 @@ console.log('🌐 free proxies auto-fetch (ProxyScrape parse/rank/probe/refresh)
   const autos3 = pp.listProxies().filter((p) => p.auto);
   ok(r3.added === 1 && autos3.length === 1 && autos3[0].id === keepId && autos3[0].quality === 'challenged',
     'refresh v2: ek source + sirf WAF-ready proxy par bhi pool me entry');
-  ok(r3.sourcesOk >= 1 && r3.sourcesTotal >= 10 && r3.candidates >= 2 && r3.stats?.challenged === 1,
+  ok(r3.sourcesOk >= 1 && r3.sourcesTotal >= 15 && r3.candidates >= 2 && r3.stats?.challenged === 1,
     'refresh v2: source/candidate/tier diagnostics wapas');
 
   // Kill switch — env 0 par auto band
@@ -1628,12 +1635,56 @@ console.log('telegram Hermes source + Add Telegram Account primitives:');
   ok(bridge.generateFreshSwiggyEmail('9876543210', { attempt: 1 }) === '98765Rahul1@gmail.com', 'fresh email duplicate par sirf numbered fallback');
   ok(!bridge.generateFreshSwiggyEmail('9876543210').includes(' '), 'fresh email me spaces nahi');
 
-  // Deterministic random function se complete generated address.
+  // Deterministic random function se Maharashtra ka complete address.
   const randomAddress = bridge.generateRandomSwiggyAddress('9876543210', 'Rahul Kumar', () => 0.42);
   ok(randomAddress.mobile === '9876543210' && randomAddress.phone === '9876543210', 'random address me account phone saved');
   ok(Boolean(randomAddress.address && randomAddress.city && randomAddress.pincode && randomAddress.landmark), 'random address complete fields ke saath banta hai');
   ok(bridge.formatSwiggyAddress(randomAddress) === randomAddress.address, 'random address format helper string return karta hai');
-  ok(randomAddress.source === 'generated-local', 'random address source honestly generated-local marked hai');
+  ok(randomAddress.state === 'Maharashtra' && randomAddress.source === 'generated-maharashtra', 'random address Maharashtra ka hai — user ke Lucknow/UP ka nahi');
+  ok(['Mumbai', 'Pune', 'Nagpur', 'Nashik', 'Thane', 'Chhatrapati Sambhajinagar', 'Kolhapur', 'Solapur'].includes(randomAddress.city), 'random address city Maharashtra cities me se koi ek hai');
+  ok(randomAddress.fullAddress === randomAddress.address && randomAddress.postalCode === randomAddress.pincode
+    && randomAddress.latitude === randomAddress.lat && randomAddress.longitude === randomAddress.lng, 'random address remote-create fields (fullAddress/postalCode/lat-lng) rakhta hai');
+
+  // Swiggy CAS create payload + pakka addressId par hi remote success.
+  const casPayload = bridge.buildSwiggyCreateAddressPayload(randomAddress, { customerId: 'CUSTTG1' });
+  ok(casPayload?.entityCtx?.id === 'CUSTTG1' && casPayload?.entityCtx?.type === 'ENTITY_TYPE_CUSTOMER'
+    && casPayload?.requestCtx?.clientCtx?.clientId === 'android-consumer-app'
+    && casPayload?.address?.city === randomAddress.city
+    && casPayload?.address?.location?.lat === randomAddress.lat
+    && casPayload?.address?.addressCategory?.[0] === 'ADDRESS_CATEGORY_HOME', 'CAS payload: customer + Maharashtra address + coords + HOME sahi map');
+  ok(bridge.buildSwiggyCreateAddressPayload(randomAddress, {}) === null, 'CAS payload: customerId ke bina blind create nahi');
+  ok(bridge.parseSwiggyCreateAddressResponse(200, { id: 'ADDR-77' }).ok === true
+    && bridge.parseSwiggyCreateAddressResponse(200, { data: { addressId: 'ADDR-78' } }).addressId === 'ADDR-78'
+    && bridge.parseSwiggyCreateAddressResponse(200, { statusCode: 0 }).ok === false
+    && bridge.parseSwiggyCreateAddressResponse(403, { id: 'X' }).ok === false, 'CAS response: success sirf HTTP 2xx + pakka addressId par');
+
+  const addressSession = {
+    phone: '9876543210',
+    cookieMap: new Map([['tid', 'TIDTG1'], ['_sid', 'SIDTG1'], ['token', 'TOKENTG1'], ['_device_id', 'DEVTG1']]),
+    deviceProfile: { deviceId: 'DEVTG1', swuid: 'DEVTG1', osVersion: '14' },
+  };
+  let remoteCalls = 0;
+  const remoteAdded = await bridge.addSwiggyAddressViaBridgeSession(addressSession, randomAddress, {
+    customerId: 'CUSTTG1',
+    urls: ['https://example.test/addresses/v1'],
+    fetchImpl: async (_url, opts) => {
+      remoteCalls++;
+      const sent = JSON.parse(opts.body);
+      ok(sent?.address?.city === randomAddress.city && sent?.entityCtx?.id === 'CUSTTG1', 'remote address POST body me wahi Maharashtra address jata hai');
+      return { status: 200, headers: new Headers(), text: async () => JSON.stringify({ id: 'ADDR-REMOTE-1' }) };
+    },
+  });
+  ok(remoteAdded.ok && remoteAdded.addressId === 'ADDR-REMOTE-1' && remoteCalls === 1, 'remote address: addressId mile to added success');
+  let forbiddenCalls = 0;
+  const remoteForbidden = await bridge.addSwiggyAddressViaBridgeSession(addressSession, randomAddress, {
+    customerId: 'CUSTTG1',
+    urls: ['https://example.test/a', 'https://example.test/b'],
+    fetchImpl: async () => {
+      forbiddenCalls++;
+      return { status: 403, headers: new Headers(), text: async () => JSON.stringify({ error: { message: 'denied' } }) };
+    },
+  });
+  ok(!remoteForbidden.ok && forbiddenCalls === 1, 'remote address: 403 par dusra blind POST nahi (duplicate bacha)');
 
   // Saved account se /session fallback export me email/address survive kare.
   store.updateAccount('TEST_TELEGRAM_FRESH_EXPORT', {
@@ -1655,7 +1706,8 @@ console.log('telegram Hermes source + Add Telegram Account primitives:');
   });
   const sessionExport = store.getSessionExportJson('TEST_TELEGRAM_FRESH_EXPORT', null);
   ok(sessionExport?.email === '98765Rahul@gmail.com', 'session fallback export me fresh email included');
-  ok(sessionExport?.address === randomAddress.address && sessionExport?.addressDetails?.pincode === randomAddress.pincode, 'session fallback export me random address included');
+  ok(sessionExport?.address === randomAddress.address && sessionExport?.addressDetails?.pincode === randomAddress.pincode
+    && sessionExport?.remoteAddressStatus === 'pending', 'session fallback export me random Maharashtra address + remote status included');
   const fullExport = store.exportSessionJson('TEST_TELEGRAM_FRESH_EXPORT');
   ok(fullExport?.email === '98765Rahul@gmail.com' && fullExport?.address === randomAddress.address, 'full session export me email + address included');
 }

@@ -94,11 +94,15 @@ Fresh signup ka email ab number ke **first 5 digits +
 `Rahul@gmail.com`** hota hai (misal: `9876543210` →
 `98765Rahul@gmail.com`, bina spaces). Agar Swiggy us exact email ko
 duplicate bole, tabhi numbered fallback use hota hai taaki signup atak na
-jaye. Account fresh finalize hone par ek complete random delivery address
-bhi local account record/session JSON me save hoti hai (`address` +
-`addressDetails`). Repository me Swiggy ke remote address-create payload
-ka verified contract nahi hai, isliye bot guessed remote address-save ka
-claim nahi karta.
+jaye. Account fresh finalize hone par **Maharashtra** ki random city
+(Mumbai/Pune/Nagpur/Nashik/Thane/Chhatrapati Sambhajinagar/Kolhapur/
+Solapur) ka complete delivery address banta hai — owner ka Lucknow/UP
+address bilkul use nahi hota. Bot usi authenticated fresh session se
+Swiggy central-address-service (`addresses/v1`) par address asal account
+me add karne ki koshish karta hai; JSON me `remoteAddressStatus` =
+`added` + `remoteAddressId` sirf tab dikhega jab Swiggy response me pakka
+address ID aaye. Remote create fail ho to fresh session fail nahi hota,
+lekin status honestly `failed` rahega aur address local record me bachega.
 
 ## ☁️ Render par host karo (24×7, PC band phir bhi bot on)
 
@@ -257,12 +261,16 @@ Jo 403 challenge pehle poora batch maar deta tha, ab uska tod:
    — limit lanes ke hisaab se scale hoti hai taaki pehli parallel wave hi
    batch ko premature band na kar de; ek processed response bhi aa jaye
    to storm ginti reset ho jati hai.
-4. **Solver route-locked + time-boxed** — har proxy ka solve alag route key
-   par hota hai (ek IP ka token doosri IP par leak nahi), ek solve zyada se
-   zyada ~25–35s leta hai, aur jis proxy par solve fail ho wo 10 min side
-   par rehti hai taaki har number par wahi lamba solver na ghume.
-5. **WAF cooldown** (circuit-breaker) active ho to request bheji hi nahi
-   jaati — cooldown khatam hote hi khud aage badhta hai.
+4. **Solver route-locked + 15s time-boxed** — har proxy ka solve alag route
+   key par hota hai (ek IP ka token doosri IP par leak nahi), ek solve
+   zyada se zyada **15 second** leta hai, aur jis proxy par solve fail ho
+   wo 90s side par rehti hai. WAF-hit proxy ki quarantine ab sirf 60–120s
+   hai (pehle 3–10 minute), isliye bada pool asal me usable rehta hai.
+5. **15-second route recovery** — engine WAF wait 5s→10s→**15s cap** hai;
+   pehla direct rate-limit bhi max 15s rukta hai, dusra 30s. Global WAF
+   circuit-breaker bhi ab 15s/30s/60s hai. Matlab garam IP par number
+   minutes tak queue me nahi fasa rehta — route badli, fresh proxies
+   background me refill aur kaam aage.
 
 ## 🔀 Proxies — "rukna hi na pare" ka asli tod (IP rotation)
 
@@ -273,16 +281,18 @@ ko nahi. Ek IP par lagatar request = flagged IP = 403 = wait.
 jitne chahein add karo (ek saath comma me bhi):
 
 - `host:port` · `http://user:pass@host:port` · `socks5://host:port`
-- **🌐 Free Proxies Lao (auto)** — proxy card se ek tap: bot kai public free
-  lists (ProxyScrape API + uske GitHub shards, monosans, jetkai aur
-  Proxifly-India) ko parallel fetch karke candidates merge karta hai, phir
-  har proxy ko generic HTTPS ke baad **seedha Swiggy par test** karta hai.
+- **🌐 Free Proxies Lao (auto)** — proxy card se ek tap: bot ab **18 public
+  free sources** (ProxyScrape, Proxifly global/India, monosans, jetkai,
+  TheSpeedX, hookzof, clarketm aur roosterkid) ko parallel fetch karke
+  candidates merge karta hai, phir har proxy ko generic HTTPS ke baad
+  **seedha Swiggy par test** karta hai. Target ab **30 usable backups** hai.
   Clean proxies pehle aati hain; jo Swiggy tak pohanchti hai lekin WAF
   challenge deti hai use 🛡 fallback tier me rakha jata hai kyunki browser
   usi IP ka `aws-waf-token` solve kar sakta hai. Card par sources/candidates/
-  checked/clean/challenged diagnostics bhi dikhte hain. Batch start par
-  requested parallel lanes se kam enabled proxies hon to ye **khud bhi
-  ho sakta hai** (OFF karna ho:
+  checked/clean/challenged diagnostics bhi dikhte hain. Batch start/mid-run
+  par refill ka faisla sirf enabled ginti nahi, **asal usable** (cooling/
+  errored excluded) ginti par hota hai — isliye “10 ON” ka matlab agar
+  sirf 2 asal usable hon to bot phir se nayi proxies laata hai (OFF karna ho:
   proxy card par 🌐 Free Auto toggle, ya env `PREMIUM_AUTO_FREE_PROXIES=0`).
   Apni list URLs: `PREMIUM_PROXY_SOURCES=url1,url2` — ye baki sources ke
   saath merge hongi. Free proxies marne par refresh me khud replace ho jati
@@ -295,7 +305,7 @@ jitne chahein add karo (ek saath comma me bhi):
 - **WAF/rate-limit/temporary 5xx hit = TURANT doosri proxy** — number
   failed count kiye baghair defer karke aage badhta hai, baad me **isi run
   me** ek aur mauqa milta hai (per number combined infra attempts max 2).
-  Lagatar 3 temporary errors par 60s ka short cool-off lagta hai.
+  Temporary errors ka cool-off bhi chhota hai: 15s→30s→45s cap.
 - **`aws-waf-token` IP-bound** hota hai → har proxy ka **apna token** +
   apna WAF/solve-failure state (proxy-pool.js me per-proxy). Challenge par
   usi route ka token burn ho jata hai; ek session ke beech silent IP-switch

@@ -1619,7 +1619,7 @@ bot.action('ap_px_free', async (ctx) => {
   let progressPromise = Promise.resolve();
   try {
     const r = await proxyPool.refreshFreeProxies({
-      want: 10,
+      want: 30,
       onProgress: ({ checked = 0, clean = 0, challenged = 0, total = 0 } = {}) => {
         const now = Date.now();
         if (finished || now - lastProgressAt < 10_000) return;
@@ -1629,7 +1629,7 @@ bot.action('ap_px_free', async (ctx) => {
           `✅ Clean mili: <b>${clean}</b>`,
           `🛡 Swiggy-reachable (WAF challenge): <b>${challenged}</b>`,
           '',
-          sub('Clean 10 milte hi ruk jaunga; warna deadline tak best fallback bhi jama karunga.'),
+          sub('Clean 30 milte hi ruk jaunga; warna deadline tak best fallback bhi jama karunga.'),
         ].join('\n')), backRows).catch(() => {});
       },
     });

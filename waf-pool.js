@@ -29,8 +29,12 @@ import { getDb, saveDb } from './store.js';
 const TOKEN_TTL_MS = 30 * 60 * 1000;            // pehle 2h tha — token asal me beech me hi mar jata hai aur bot wahi jala token har request me bhejta rehta tha (challenge par challenge). 30m par fresh solve sasta padta hai.
 const ESCALATION_WINDOW_MS = 30 * 60 * 1000;    // hits within 30 min escalate
 const STREAK_RESET_MS = 60 * 60 * 1000;         // 60 min clean → streak back to 0
-const HIT_DEBOUNCE_MS = 120 * 1000;             // a scan's burst of 403s = ONE incident
-const COOLDOWNS_MS = [3 * 60 * 1000, 5 * 60 * 1000, 10 * 60 * 1000];
+const HIT_DEBOUNCE_MS = 20 * 1000;              // a scan's burst of 403s = ONE incident
+// Fast recovery: pehle 3/5/10 min ka global cooldown ek garam direct IP
+// par poora batch slow kar deta tha. Ab pehla retry 15s me hoga; lagatar
+// asal hits par hi 30s/60s tak badhega. Proxy mode me IP rotation is se
+// pehle hi recovery kar deti hai.
+const COOLDOWNS_MS = [15 * 1000, 30 * 1000, 60 * 1000];
 
 const state = {
   token: '',

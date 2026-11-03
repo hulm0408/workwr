@@ -392,15 +392,34 @@ export function requestAutopilotStop(reason = 'manual') {
   return true;
 }
 
-// Security challenge ke baad IP ko kitna thanda hone dein — ladder 30s →
-// 60s → 120s → 240s (lagatar strikes par). waf-pool ka circuit-breaker
-// cooldown usse lamba ho to wahi jeet (warna agla number seedha pool
-// cooldown khayega), lekin 5 min se zyada ek saath nahi (batch zinda rahe).
+// User ka fast-recovery rule: rate-limit/WAF par number minuteon queue me
+// na fase — pehli recovery koshish 15 second ke andar nayi IP/token se ho.
+export const FAST_ROUTE_RECOVERY_MS = 15_000;
+export const FREE_PROXY_TARGET_COUNT = 30;
+
+export function fastRouteRecoveryCapMs(requestedMs, fallbackMs = FAST_ROUTE_RECOVERY_MS) {
+  const n = Number(requestedMs);
+  const base = Number.isFinite(n) && n >= 0 ? n : (Number(fallbackMs) || FAST_ROUTE_RECOVERY_MS);
+  return Math.max(0, Math.min(base, FAST_ROUTE_RECOVERY_MS));
+}
+
+export function rateLimitRecoveryWaitMs(consecutiveStrikes = 1, configuredBackoffMs = 0) {
+  const strikes = Math.max(1, Number(consecutiveStrikes) || 1);
+  const fastLadder = strikes <= 1 ? FAST_ROUTE_RECOVERY_MS : 30_000;
+  const configured = Number(configuredBackoffMs) || fastLadder;
+  // Configured backoff kitna bhi lamba ho, pehli do recoveries fast hongi;
+  // third strike par engine pehle ki tarah run ko rok sakta hai.
+  return Math.min(configured, fastLadder);
+}
+
+// Security challenge ke baad IP ko sirf chhota sa saans do, phir nayi
+// IP/token se retry. Purani 30s→240s ladder ek hi Hermes lane ko 4 minute
+// rok deti thi aur result slow/inconsistent lagta tha.
 export function wafChallengeWaitMs(consecutiveStrikes, poolCooldownMs = 0) {
-  const ladder = [30_000, 60_000, 120_000, 240_000];
+  const ladder = [5_000, 10_000, FAST_ROUTE_RECOVERY_MS, FAST_ROUTE_RECOVERY_MS];
   const idx = Math.min(Math.max(1, Number(consecutiveStrikes) || 1), ladder.length) - 1;
-  const poolPart = Math.min(Math.max(0, Number(poolCooldownMs) || 0), 5 * 60_000);
-  return Math.min(Math.max(ladder[idx], poolPart), 5 * 60_000);
+  const poolPart = fastRouteRecoveryCapMs(poolCooldownMs, 0);
+  return Math.min(Math.max(ladder[idx], poolPart), FAST_ROUTE_RECOVERY_MS);
 }
 
 // Swiggy/proxy temporary 5xx ya network error par cool-off ladder. Proxy
@@ -408,7 +427,7 @@ export function wafChallengeWaitMs(consecutiveStrikes, poolCooldownMs = 0) {
 // ye wait sirf direct/no-next-proxy ya 3+ lagatar transient errors par
 // istemal hota hai taaki asal Swiggy outage me poora pool churn na ho.
 export function transientSwiggyRetryWaitMs(consecutiveStrikes) {
-  const ladder = [20_000, 45_000, 60_000, 60_000];
+  const ladder = [FAST_ROUTE_RECOVERY_MS, 30_000, 45_000, 45_000];
   const idx = Math.min(Math.max(1, Number(consecutiveStrikes) || 1), ladder.length) - 1;
   return ladder[idx];
 }
@@ -987,7 +1006,13 @@ export async function startAutopilot(opts = {}) {
     // behavior, koi rukawat nahi.
     const freePromise = (async () => {
       try {
-        const r = await proxyPool.ensureFreeProxies({ min: requestedConcurrency, want: Math.max(10, requestedConcurrency) });
+        const r = await proxyPool.ensureFreeProxies({
+          // Telegram me lane 1 hai, phir bhi WAF/rate-limit se bachne ke
+          // liye sequential backup IPs chahiye. Sirf lane-count ginna pool
+          // ko 1-10 par rok kar result slow kar deta tha.
+          min: Math.max(12, requestedConcurrency),
+          want: FREE_PROXY_TARGET_COUNT,
+        });
         if (r && !r.skipped) {
           console.log(r.added
             ? `[Autopilot] 🌐 Free proxies: ${r.candidates || 0} candidates me se ${r.checked} parkhin, ${r.added} rakhin (clean ${r.clean || 0}, WAF-ready ${r.challenged || 0}) — IP rotation ON.`
@@ -1200,7 +1225,7 @@ export async function startAutopilot(opts = {}) {
           state.routeMode = 'direct';
         }
         wafPool.loadFromDb?.();
-        wafTok = await getLiveSwiggyWafToken(false, { solveBudgetMs: 25_000 });
+        wafTok = await getLiveSwiggyWafToken(false, { solveBudgetMs: FAST_ROUTE_RECOVERY_MS });
         console.log(wafTok ? '[Autopilot] WAF token ready (warm start).' : '[Autopilot] WAF token nahi mila (Chromium?) — raw mode me chalega.');
       } catch (e) {
         console.warn('[Autopilot] WAF warm-up skipped:', e?.message);
@@ -1648,21 +1673,23 @@ export async function startAutopilot(opts = {}) {
     // 🌐 Mid-run proxy refill — "rukna hi na pare". Jab saare IPs cooling
     // ho jate hain to lanes seedha DIRECT (flagged Render IP) par chali jaati
     // thin jahan WAF challenge guaranteed tha → 4 strikes par run khatam.
-    // Ab all-cooling par background me free pool se naye IPs test karke
-    // laya jata hai (max ek baar har 3 min) aur lanes us tak wait karti hain.
+    // Ab usable backups lane-count se kam hon to background me free pool
+    // se naye IPs test karke laya jata hai (max ek baar har 60s).
     let lastProxyRefillAt = 0;
     let refillInFlight = false;
     const maybeRefillFreeProxies = () => {
       if (refillInFlight || !proxyPool.isEnabled()) return;
       const now = Date.now();
-      if (now - lastProxyRefillAt < 3 * 60_000) return;
+      if (now - lastProxyRefillAt < 60_000) return;
       lastProxyRefillAt = now;
       refillInFlight = true;
       (async () => {
         try {
           const before = proxyPool.proxySummary();
-          if ((before.usableCount || 0) > 0 || (before.reservedCount || 0) > 0) return;
-          const r = await proxyPool.refreshFreeProxies({ want: 10 });
+          // Pool poori tarah marne ka wait mat karo — usable backups
+          // lane-count se kam hon to peeche refill shuru kar do.
+          if ((before.usableCount || 0) >= Math.max(2, laneCount || 1)) return;
+          const r = await proxyPool.refreshFreeProxies({ want: FREE_PROXY_TARGET_COUNT });
           const after = proxyPool.proxySummary();
           console.log(`[Autopilot] 🌐 Sab IPs cooling the — refill: ${r?.checked || 0} check → ${r?.added || 0} nayi (usable ab ${after.usableCount || 0}/${after.enabledCount || 0}).`);
           if ((after.usableCount || 0) > 0) notifyRouteChanged();
@@ -1695,14 +1722,15 @@ export async function startAutopilot(opts = {}) {
         // Proxy pool hai par abhi koi pick-layak nahi (sab cooling ya lanes me
         // reserved). DIRECT fallback = flagged IP par challenge jala kar strike
         // barhana, isliye pehle naye IP ka intezaar: free refill background me
-        // chalu, cooldown khatam hote hi lane khud age badhegi. Sirf tab hi
-        // direct lo jab tak (90s) kuch na mila — rukna bhi nahi hai.
+        // chalu, cooldown khatam hote hi lane khud age badhegi. 15s se
+        // zyada route ka wait nahi — phir direct ko ek tez mauqa milega aur
+        // peeche refill chalti rahegi.
         const s = proxyPool.proxySummary();
         if ((s.enabledCount || 0) > 0) {
           if (!lane.routeWaitSince) lane.routeWaitSince = Date.now();
           maybeRefillFreeProxies();
-          if (Date.now() - lane.routeWaitSince < 90_000) return false;
-          console.log(`[Autopilot] Lane ${lane.id}: 90s me koi free IP nahi mili — direct fallback le raha hai.`);
+          if (Date.now() - lane.routeWaitSince < FAST_ROUTE_RECOVERY_MS) return false;
+          console.log(`[Autopilot] Lane ${lane.id}: 15s me koi free IP nahi mili — direct fallback le raha hai.`);
         }
       }
       lane.routeWaitSince = 0;
@@ -1748,7 +1776,7 @@ export async function startAutopilot(opts = {}) {
       try {
         return await runWithBridgeProxy(
           lane.proxy || null,
-          () => getLiveSwiggyWafToken(force, { solveBudgetMs: 25_000 }),
+          () => getLiveSwiggyWafToken(force, { solveBudgetMs: FAST_ROUTE_RECOVERY_MS }),
           { owner: lane.owner, releaseOnExit: false }
         );
       } catch { return ''; }
@@ -2325,12 +2353,15 @@ export async function startAutopilot(opts = {}) {
           }
         }
 
-        // Direct mode (koi proxy nahi) — thoda ruk kar aage, warna poora IP
-        // hi flagged ho jayega. 2 strikes se zyada = band.
+        // Direct mode (koi proxy nahi) — fast recovery: pehla retry 15s,
+        // doosra 30s. Number minuteon queue me nahi fasega. 3 strikes = band.
         if (state.rateStrikes >= 3) { requestRunEnd('rate_limited'); break; }
-        const backoff = Math.min(backoffMs, 5 * 60_000); // max 5 min (pehle 15)
-        await push(progressCard(section('🚦 Swiggy Rate Limit — Short Backoff', [
-          `› Sirf lane ${lane.id} ${Math.round(backoff / 60000)} min rukegi (strike ${state.rateStrikes}/3); baaki lanes chalti rahengi.`,
+        const backoff = rateLimitRecoveryWaitMs(state.rateStrikes, backoffMs);
+        void proxyPool.ensureFreeProxies?.({ min: 12, want: FREE_PROXY_TARGET_COUNT }).then((r) => {
+          if (r?.added) ps = proxyPool.proxySummary();
+        }).catch(() => {});
+        await push(progressCard(section('🚦 Swiggy Rate Limit — 15s Fast Recovery', [
+          `› Sirf lane ${lane.id} ~${Math.max(1, Math.round(backoff / 1000))}s ruk kar nayi IP/token se aage badhegi (strike ${state.rateStrikes}/3); baaki lanes chalti rahengi.`,
           sub('⚠️ Proxies add karne se ye wait bhi hat jayegi (⚙️ Settings → 🔀 Proxies).'),
         ].join('\n'))), stopRows());
         await sleep(backoff, () => state.stopRequested);
@@ -2348,11 +2379,13 @@ export async function startAutopilot(opts = {}) {
         const wafInfra = recordInfraAttempt(res.phone);
         if (res.phone && wafInfra.willRetry && !telegramMode) deferNumber(entry, 'waf_cooldown');
 
-        // Pool ke cooldown ka ahtaram karo lekin ek saath max 5 min — uske
-        // baad token naya solve karke phir dekho (IP beech me thandi hogi).
-        const cdMs = Math.min(Number(res.cooldownMs) || 120_000, 5 * 60_000);
-        await push(progressCard(section('🛡 WAF Cooling — Short Wait', [
-          `› Swiggy ki WAF abhi lane ${lane.id} ki IP ko thanda hone de rahi hai — ~${Math.max(1, Math.round(cdMs / 60000))} min ruk kar aage badhunga; baaki lanes chalti rahengi.`,
+        // Fast recovery: ek wait kabhi 15s se zyada nahi. Uske baad nayi
+        // IP/token se asal retry hoga; purani 5-minute neend result ko
+        // slow aur inconsistent banati thi.
+        const cdMs = fastRouteRecoveryCapMs(res.cooldownMs, FAST_ROUTE_RECOVERY_MS);
+        maybeRefillFreeProxies();
+        await push(progressCard(section('🛡 WAF Cooling — 15s Fast Recovery', [
+          `› Swiggy ki WAF abhi lane ${lane.id} ki IP ko garam bol rahi hai — sirf ~${Math.max(1, Math.round(cdMs / 1000))}s me nayi IP/token try hogi; baaki lanes chalti rahengi.`,
           telegramMode
             ? `› Hermes current number consumed hai — retry queue me nahi jayega; batch zinda hai, agla number NEW NUMBER se aayega.`
             : wafInfra.willRetry
@@ -2366,7 +2399,7 @@ export async function startAutopilot(opts = {}) {
         if (!rotated) {
           // Koi proxy free nahi bachi (free wali jaldi marti hain) — background
           // me nayi free proxies le aao, batch ko roke baghair.
-          void proxyPool.refreshFreeProxies({ want: 10 }).then((r) => {
+          void proxyPool.refreshFreeProxies({ want: FREE_PROXY_TARGET_COUNT }).then((r) => {
             if (r?.added) { ps = proxyPool.proxySummary(); console.log(`[Autopilot] 🌐 ${r.added} free proxies aa gayin (clean ${r.keptClean || 0}, WAF-ready ${r.keptChallenged || 0}).`); }
           }).catch(() => {});
         }
@@ -2411,7 +2444,7 @@ export async function startAutopilot(opts = {}) {
           if (currentId) {
             try {
               const info = proxyPool.listProxies().find((p) => p.id === currentId);
-              if (!info || !info.cooldownLeftMs) proxyPool.markProxyWafHit(currentId, 10 * 60_000);
+              if (!info || !info.cooldownLeftMs) proxyPool.markProxyWafHit(currentId, 120_000);
             } catch {}
           }
         } else {
@@ -2432,7 +2465,7 @@ export async function startAutopilot(opts = {}) {
           state.directChallenges = 0;
           state.proxyRotations = (state.proxyRotations || 0) + 1; // asal IP switch hua hai
           // Direct try hota rahe, peeche nayi free proxies bhi parkh lo.
-          void proxyPool.refreshFreeProxies({ want: Math.max(10, requestedConcurrency) }).then((r) => {
+          void proxyPool.refreshFreeProxies({ want: FREE_PROXY_TARGET_COUNT }).then((r) => {
             if (r?.added) {
               ps = proxyPool.proxySummary();
               console.log(`[Autopilot] 🌐 Direct fallback ke peeche ${r.added} free proxies refresh.`);
@@ -2507,16 +2540,19 @@ export async function startAutopilot(opts = {}) {
         // token banana bekar hota hai: solver visit bhi challenge kha sakti hai.
         const poolCd = (() => { try { return wafPool.cooldownRemainingMs?.() || 0; } catch { return 0; } })();
         const waitMs = wafChallengeWaitMs(state.wafStrikes, poolCd);
-        await push(progressCard(section('🛡 Swiggy Security Check — IP Cool-Down', [
+        await push(progressCard(section('🛡 Swiggy Security Check — 15s Fast Recovery', [
           `› Lane ${lane.id} ko challenge mila — direct IP abhi garam hai.`,
-          `› Sirf ye lane ~${Math.max(1, Math.round(waitMs / 60000))} min ruk kar naya WAF token banayegi; baaki lanes chalti rahengi. ${numberRetryLine}`,
+          `› Sirf ye lane max ~15s me fresh WAF token ke saath wapas ayegi; baaki lanes chalti rahengi. ${numberRetryLine}`,
           sub(ps.enabled
             ? 'Ek aur direct challenge par best proxy route dobara try hogi.'
             : 'Batch nahi rukega. Ek success milte hi ye ginti reset ho jati hai.'),
         ].join('\n'))), stopRows());
+        // Wait aur 15s-cap wala token solve saath chalao — warna 15+15
+        // hokar recovery phir slow ho jayegi.
+        const fastSolvePromise = solveLaneToken(lane, true);
         await sleep(waitMs, () => state.stopRequested);
         if (state.stopRequested) { endReason = state.stopReason || 'manual'; break; }
-        await solveLaneToken(lane, true);
+        await fastSolvePromise;
         state.consecutiveFails = 0;
         lane.consecutiveFails = 0;
         continue; // thandi IP + fresh token → agla number

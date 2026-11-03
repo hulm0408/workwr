@@ -327,7 +327,7 @@ export function markProxyWafHit(id, cooldownMs = 60_000) {
 // Chromium is proxy par aws-waf-token nahi bana paya — kuch der is route ko
 // solver ke liye side par rakho. Warna har rotate/OTP par wahi 30-90s ka
 // full solver chal kar batch ko sust kar deta hai.
-export function markProxyWafSolveFailure(id, cooldownMs = 10 * 60_000) {
+export function markProxyWafSolveFailure(id, cooldownMs = 90_000) {
   if (!id) return;
   const rt = runtimeFor(id);
   rt.wafSolveFailedUntil = Date.now() + (Number(cooldownMs) || 0);
@@ -510,8 +510,20 @@ const FREE_PROXY_SOURCES_DEFAULT = [
   'https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt',
   'https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-http.txt',
   'https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-socks5.txt',
-  // Proxifly ka SIRF India subset (poori all-list bahut badi hai).
+  // Proxifly: India subset + global protocol shards. Sirf IN subset aksar
+  // 5-10 par ruk jata tha; user ko Indian IP lazmi nahi, isliye global
+  // shards se backup IPs ka pool bada rehta hai (ranking IN ko pehle rakhti hai).
   'https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/countries/IN/data.json',
+  'https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/http/data.json',
+  'https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/socks5/data.json',
+  // Aur maintained public lists — koi source down/404 ho to fetch layer
+  // use chup-chaap skip kar deta hai, baaki sources se pool banta rehta hai.
+  'https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt',
+  'https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt',
+  'https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt',
+  'https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt',
+  'https://raw.githubusercontent.com/roosterkid/openproxylist/main/HTTPS_RAW.txt',
+  'https://raw.githubusercontent.com/roosterkid/openproxylist/main/SOCKS5_RAW.txt',
 ];
 
 export function freeProxiesEnabled() {
@@ -881,8 +893,10 @@ let _freeRefreshPromise = null;
 // Purani auto entries pehle re-verify hongi (zinda hain to wahi id/token
 // continuity ke saath reh jayengi). Manual proxies untouched.
 export async function refreshFreeProxies({
-  want = 8, concurrency = 24, timeoutMs = 8000, maxProbe = 320,
-  deadlineMs = 75_000,
+  // Zyada backup IPs = ek IP garam hone par turant agli. Probe tez aur
+  // wide hai, lekin deadline hard hai taaki refresh khud result slow na kare.
+  want = 24, concurrency = 32, timeoutMs = 6000, maxProbe = 520,
+  deadlineMs = 60_000,
   fetchImpl = null, check = null, onProgress = null,
 } = {}) {
   if (_freeRefreshPromise) return _freeRefreshPromise;
@@ -985,22 +999,44 @@ export async function refreshFreeProxies({
   return _freeRefreshPromise;
 }
 
-// Batch shuru hone se pehle: enabled proxies kam hon to free wali khud le aao.
+// Asal me abhi pick honay ke qabil proxies. Enabled hona kaafi nahi:
+// WAF/solve cooldown ya lagatar errors wali route result ko slow karti hai,
+// isliye batch-start ka faisla isi usable count par hoga.
+export function usableProxyCount(now = Date.now()) {
+  try {
+    const state = ensureSeeded();
+    return state.list.filter((p) => {
+      const rt = runtime.get(p.id) || {};
+      return p.enabled &&
+        !proxyReservations.has(p.id) &&
+        !((Number(rt.cooldownUntil) || 0) > now) &&
+        !((Number(rt.wafSolveFailedUntil) || 0) > now && !hasFreshProxyToken(rt)) &&
+        (Number(rt.consecutiveErrors) || 0) < 3;
+    }).length;
+  } catch { return 0; }
+}
+
+// Batch shuru hone se pehle: USABLE proxies kam hon to free wali khud le aao.
 // Kabhi throw nahi karta — fail ho to purana direct-mode hi chalega.
-export async function ensureFreeProxies({ min = 1, want = 8 } = {}) {
+export async function ensureFreeProxies({ min = 1, want = 24 } = {}) {
   try {
     const state = ensureSeeded();
     const enabledCount = state.list.filter((p) => p.enabled).length;
-    if (!freeProxiesEnabled()) return { skipped: true, reason: 'disabled', count: enabledCount };
-    if (enabledCount >= min && state.enabled) return { skipped: true, reason: 'enough', count: enabledCount };
-    // 1-2 proxies hain aur refresh abhi taza hai to har batch par dobara
-    // lambi probing karke OTP window zaya na karo.
+    const usableCount = usableProxyCount();
+    if (!freeProxiesEnabled()) return { skipped: true, reason: 'disabled', count: enabledCount, usableCount };
+    if (usableCount >= min && state.enabled) return { skipped: true, reason: 'enough', count: enabledCount, usableCount };
+    // Recent-refresh throttle SIRF tab — jab usable backup asal me bachay
+    // hon. Pehle 10 enabled dikhte thay lekin 8 cooling hotay thay, phir
+    // bhi "recent" bolkar refresh skip ho jata tha aur batch ek garam IP
+    // par phans kar slow ho jata tha.
     const lastRefreshMs = state.autoFreeAt ? Date.parse(state.autoFreeAt) : 0;
-    if (enabledCount > 0 && state.enabled && lastRefreshMs && Date.now() - lastRefreshMs < 30 * 60_000) {
-      return { skipped: true, reason: 'recent', count: enabledCount };
+    const recentEnoughFloor = Math.max(3, Math.ceil(Math.max(1, min) / 2));
+    if (usableCount >= recentEnoughFloor && state.enabled && lastRefreshMs && Date.now() - lastRefreshMs < 10 * 60_000) {
+      return { skipped: true, reason: 'recent', count: enabledCount, usableCount };
     }
     const r = await refreshFreeProxies({ want });
-    const now = ensureSeeded().list.filter((p) => p.enabled).length;
+    const after = ensureSeeded();
+    const nowEnabled = after.list.filter((p) => p.enabled).length;
     return {
       skipped: false,
       added: r.added || 0,
@@ -1008,11 +1044,12 @@ export async function ensureFreeProxies({ min = 1, want = 8 } = {}) {
       clean: r.clean || 0,
       challenged: r.challenged || 0,
       candidates: r.candidates || 0,
-      count: now,
+      count: nowEnabled,
+      usableCount: usableProxyCount(),
     };
   } catch (e) {
     console.warn('[ProxyPool] ensureFreeProxies:', e?.message);
-    return { skipped: true, reason: 'error', count: 0 };
+    return { skipped: true, reason: 'error', count: 0, usableCount: 0 };
   }
 }
 
@@ -1036,14 +1073,9 @@ export function proxySummary() {
   }).length;
   // "ON" hona aur asal me pick honay ke qabil hona alag baatein hain.
   // Card pehle 10 ON dikha deta tha jab unme se aksar WAF/solve cooldown
-  // me hotay thay — usableCount picker ke base filter se match karta hai.
-  const usableCount = state.list.filter((p) => {
-    const rt = runtime.get(p.id) || {};
-    return p.enabled &&
-      !proxyReservations.has(p.id) &&
-      !((Number(rt.cooldownUntil) || 0) > now) &&
-      (Number(rt.consecutiveErrors) || 0) < 3;
-  }).length;
+  // me hotay thay — summary aur refill ek hi strict usable definition
+  // use karen, taaki UI kabhi jhoothi backup ginti na dikhaye.
+  const usableCount = usableProxyCount(now);
   const reservedCount = state.list.filter((p) => proxyReservations.has(p.id)).length;
   return {
     enabled: Boolean(state.enabled),

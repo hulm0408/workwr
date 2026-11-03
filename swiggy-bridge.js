@@ -388,20 +388,28 @@ function generateUniqueSwiggyEmail(phone, _name, attempt = 0) {
   return generateFreshSwiggyEmail(phone, { attempt });
 }
 
+// User ka rule: address owner ke Lucknow/UP ka nahi — Maharashtra ki kisi
+// bhi city ka random address. Coordinates area ke aas-paas ke hain taaki
+// Swiggy ka address-service use serviceable locality ke roop me pehchane.
 const RANDOM_SWIGGY_ADDRESS_AREAS = [
-  { area: 'Hazratganj', city: 'Lucknow', state: 'Uttar Pradesh', pincode: '226001', lat: 26.8500, lng: 80.9462, landmark: 'Near GPO' },
-  { area: 'Aliganj', city: 'Lucknow', state: 'Uttar Pradesh', pincode: '226024', lat: 26.8998, lng: 80.9431, landmark: 'Near Aliganj Market' },
-  { area: 'Indira Nagar', city: 'Lucknow', state: 'Uttar Pradesh', pincode: '226016', lat: 26.8702, lng: 80.9955, landmark: 'Near Bhootnath Market' },
-  { area: 'Rajajipuram', city: 'Lucknow', state: 'Uttar Pradesh', pincode: '226017', lat: 26.8455, lng: 80.8704, landmark: 'Near Rajajipuram Market' },
-  { area: 'Aminabad', city: 'Lucknow', state: 'Uttar Pradesh', pincode: '226018', lat: 26.8439, lng: 80.9228, landmark: 'Near Aminabad Market' },
-  { area: 'Jankipuram', city: 'Lucknow', state: 'Uttar Pradesh', pincode: '226021', lat: 26.9124, lng: 80.9443, landmark: 'Near Sahara States' },
-  { area: 'Gomti Nagar', city: 'Lucknow', state: 'Uttar Pradesh', pincode: '226010', lat: 26.8569, lng: 81.0025, landmark: 'Near Patrakarpuram' },
-  { area: 'Alambagh', city: 'Lucknow', state: 'Uttar Pradesh', pincode: '226005', lat: 26.8135, lng: 80.9122, landmark: 'Near Alambagh Bus Stand' },
+  { area: 'Andheri West', city: 'Mumbai', state: 'Maharashtra', pincode: '400053', lat: 19.1363, lng: 72.8277, landmark: 'Near Azad Nagar Metro Station' },
+  { area: 'Bandra West', city: 'Mumbai', state: 'Maharashtra', pincode: '400050', lat: 19.0600, lng: 72.8360, landmark: 'Near Linking Road' },
+  { area: 'Powai', city: 'Mumbai', state: 'Maharashtra', pincode: '400076', lat: 19.1197, lng: 72.9051, landmark: 'Near Powai Lake' },
+  { area: 'Koregaon Park', city: 'Pune', state: 'Maharashtra', pincode: '411001', lat: 18.5362, lng: 73.8939, landmark: 'Near German Bakery' },
+  { area: 'Hinjewadi Phase 1', city: 'Pune', state: 'Maharashtra', pincode: '411057', lat: 18.5912, lng: 73.7389, landmark: 'Near Infosys Circle' },
+  { area: 'Kothrud', city: 'Pune', state: 'Maharashtra', pincode: '411038', lat: 18.5074, lng: 73.8077, landmark: 'Near MIT College' },
+  { area: 'Sitabuldi', city: 'Nagpur', state: 'Maharashtra', pincode: '440012', lat: 21.1425, lng: 79.0800, landmark: 'Near Variety Square' },
+  { area: 'Dwarka', city: 'Nashik', state: 'Maharashtra', pincode: '422011', lat: 19.9975, lng: 73.7898, landmark: 'Near Dwarka Circle' },
+  { area: 'Ghodbunder Road', city: 'Thane', state: 'Maharashtra', pincode: '400615', lat: 19.2597, lng: 72.9750, landmark: 'Near Kasarvadavali' },
+  { area: 'CIDCO', city: 'Chhatrapati Sambhajinagar', state: 'Maharashtra', pincode: '431003', lat: 19.8738, lng: 75.3370, landmark: 'Near CIDCO Bus Stand' },
+  { area: 'Shahupuri', city: 'Kolhapur', state: 'Maharashtra', pincode: '416001', lat: 16.7100, lng: 74.2430, landmark: 'Near Shahupuri Market' },
+  { area: 'Hotgi Road', city: 'Solapur', state: 'Maharashtra', pincode: '413003', lat: 17.6480, lng: 75.9150, landmark: 'Near Solapur Railway Station' },
 ];
 
 const RANDOM_SWIGGY_ADDRESS_STREETS = [
   'Main Road', 'Station Road', 'MG Road', 'Ring Road', 'Market Road',
-  'College Road', 'Temple Street', 'Park Street', 'Civil Lines Road', 'Nagar Road',
+  'College Road', 'Linking Road', 'FC Road', 'Baner Road', 'Nagar Road',
+  'Central Avenue Road', 'Gangapur Road',
 ];
 
 function pickRandomAddressItem(items, random) {
@@ -425,39 +433,201 @@ export function formatSwiggyAddress(address) {
   ].filter(Boolean).join(', ').replace(/\s+-\s+/g, ' - ').trim();
 }
 
-// Fresh account ke saath local vault/export me ek complete random delivery
-// address save karne ke liye. Ye generated profile data hai; Swiggy ke remote
-// address-create payload ka verified contract repo me nahi hai, isliye bot
-// koi guessed "address added remotely" claim nahi karta.
+// Fresh account ke liye Maharashtra ka complete random delivery address.
+// Fields is tarah rakhe hain ke wahi object local export, Swiggy CAS
+// (central-address-service) create payload aur official MCP create_address
+// shape teeno me map ho jaye.
 export function generateRandomSwiggyAddress(phone, name = 'Rahul Kumar', random = Math.random) {
   const where = pickRandomAddressItem(RANDOM_SWIGGY_ADDRESS_AREAS, random);
   const street = pickRandomAddressItem(RANDOM_SWIGGY_ADDRESS_STREETS, random);
   const houseNo = 11 + Math.floor(Math.min(0.999999, Math.max(0, Number(random()) || 0)) * 780);
   const block = String.fromCharCode(65 + Math.floor(Math.min(0.999999, Math.max(0, Number(random()) || 0)) * 12));
+  const floor = 1 + Math.floor(Math.min(0.999999, Math.max(0, Number(random()) || 0)) * 12);
   const jitter = () => Number((((Number(random()) || 0) - 0.5) * 0.006).toFixed(6));
-  const flatNo = `House No. ${block}-${houseNo}`;
+  const flatNo = `Flat ${block}-${houseNo}, Floor ${floor}`;
+  const addressLine2 = `${street}, ${where.area}`;
   const mobile = freshSwiggyEmailPhoneDigits(phone);
-  const address = `${flatNo}, ${street}, ${where.area}, ${where.landmark}, ${where.city}, ${where.state} - ${where.pincode}`;
+  const address = `${flatNo}, ${addressLine2}, ${where.landmark}, ${where.city}, ${where.state} - ${where.pincode}`;
+  const lat = Number((where.lat + jitter()).toFixed(6));
+  const lng = Number((where.lng + jitter()).toFixed(6));
   return {
     name: sanitizeSwiggyName(name),
     mobile,
     phone: mobile,
     address,
+    fullAddress: address,
+    addressLine: flatNo,
+    addressLine2,
     flatNo,
     houseNo: flatNo,
     street,
     landmark: where.landmark,
     area: where.area,
+    locality: where.area,
     city: where.city,
     state: where.state,
     pincode: where.pincode,
-    annotation: 'HOME',
+    postalCode: where.pincode,
+    annotation: 'Home',
     addressType: 'HOME',
-    addressCategory: 'dropoff',
-    lat: Number((where.lat + jitter()).toFixed(6)),
-    lng: Number((where.lng + jitter()).toFixed(6)),
-    source: 'generated-local',
+    addressCategory: 'HOME',
+    lat,
+    lng,
+    latitude: lat,
+    longitude: lng,
+    source: 'generated-maharashtra',
+    remoteAddressStatus: 'pending',
   };
+}
+
+// Swiggy Android ke central-address-service ka CreateAddressRequest
+// (proto-JSON shape): entityCtx = customer, requestCtx = Swiggy India +
+// android-consumer-app, address = formattedAddress/addressLine/... .
+export function buildSwiggyCreateAddressPayload(addressDetails = {}, { customerId = '' } = {}) {
+  const a = addressDetails || {};
+  const entityId = String(customerId || a.customerId || '').trim();
+  if (!entityId) return null;
+  const formattedAddress = formatSwiggyAddress(a);
+  if (!formattedAddress) return null;
+  const lat = Number(a.lat ?? a.latitude);
+  const lng = Number(a.lng ?? a.longitude);
+  return {
+    entityCtx: { id: entityId, type: 'ENTITY_TYPE_CUSTOMER' },
+    requestCtx: {
+      marketPlaceId: 'MARKET_PLACE_ID_SWIGGY_IN',
+      clientCtx: { clientId: 'android-consumer-app', source: 'PROFILE' },
+    },
+    address: {
+      formattedAddress,
+      addressLine: String(a.addressLine || a.flatNo || a.houseNo || '').trim(),
+      addressLine2: String(a.addressLine2 || [a.street, a.area || a.locality].filter(Boolean).join(', ')).trim(),
+      landmark: String(a.landmark || '').trim(),
+      city: String(a.city || '').trim(),
+      locality: String(a.locality || a.area || '').trim(),
+      ...(Number.isFinite(lat) && Number.isFinite(lng) ? { location: { lat, lng } } : {}),
+      instructions: '',
+      contactName: sanitizeSwiggyName(a.name || 'Rahul Kumar'),
+      phone: freshSwiggyEmailPhoneDigits(a.mobile || a.phone || ''),
+      voiceDirectionsS3Uri: '',
+      marketPlaceId: 'MARKET_PLACE_ID_SWIGGY_IN',
+      addressCategory: ['ADDRESS_CATEGORY_HOME'],
+      tags: ['Home'],
+    },
+  };
+}
+
+function findSwiggyAddressId(value, depth = 0) {
+  if (!value || depth > 5) return '';
+  if (typeof value === 'string' || typeof value === 'number') return '';
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const id = findSwiggyAddressId(item, depth + 1);
+      if (id) return id;
+    }
+    return '';
+  }
+  const direct = value.addressId ?? value.address_id ?? value.id;
+  if (direct !== undefined && direct !== null && String(direct).trim() && String(direct).trim() !== '0') {
+    return String(direct).trim();
+  }
+  for (const key of ['data', 'address', 'enrichedAddress', 'result', 'response']) {
+    const id = findSwiggyAddressId(value[key], depth + 1);
+    if (id) return id;
+  }
+  return '';
+}
+
+export function parseSwiggyCreateAddressResponse(status, data = null, rawText = '') {
+  const httpOk = Number(status) >= 200 && Number(status) < 300;
+  const rpcError = data?.error?.message || data?.error?.status || (typeof data?.error === 'string' ? data.error : '');
+  const swiggyCode = data?.statusCode;
+  const swiggyOk = swiggyCode === undefined || swiggyCode === null || Number(swiggyCode) === 0;
+  const addressId = findSwiggyAddressId(data);
+  const ok = Boolean(httpOk && swiggyOk && !rpcError && addressId);
+  return {
+    ok,
+    addressId,
+    status: Number(status) || 0,
+    message: String(
+      rpcError || data?.statusMessage || data?.message ||
+      (ok ? 'Address added in Swiggy account' : (rawText || '').slice(0, 160))
+    ).trim(),
+  };
+}
+
+export const SWIGGY_ADDRESS_CREATE_URLS = [
+  'https://www.swiggy.com/mapi/addresses/v1',
+  'https://www.swiggy.com/dapi/addresses/v1',
+];
+
+// Fresh account banne ke baad address ko ASAL Swiggy account me add karne
+// ki koshish. Endpoint Android central-address-service ka `addresses/v1`
+// hai; success sirf tab mana jata hai jab response me addressId aaye.
+// Fail ho to fresh session ko fail nahi karte — address local record me
+// rahega aur status `remoteAddressStatus` me saaf dikhega.
+export async function addSwiggyAddressViaBridgeSession(session, addressDetails, {
+  customerId = '',
+  timeoutMs = 8_000,
+  fetchImpl = null,
+  urls = null,
+} = {}) {
+  if (!session?.cookieMap || typeof session.cookieMap.get !== 'function') {
+    return { ok: false, addressId: '', status: 0, message: 'Swiggy session missing hai — remote address add skip' };
+  }
+  const payload = buildSwiggyCreateAddressPayload(addressDetails, { customerId });
+  if (!payload) {
+    return { ok: false, addressId: '', status: 0, message: 'customerId/address missing hai — remote address add skip' };
+  }
+
+  const tokenVal = session.cookieMap.get('token') || '';
+  const tidVal = session.cookieMap.get('tid') || '';
+  const sidVal = session.cookieMap.get('_sid') || '';
+  const doFetch = fetchImpl || fetchSwiggy;
+  const candidates = Array.isArray(urls) && urls.length
+    ? urls
+    : (String(process.env.SWIGGY_ADDRESS_CREATE_URL || '').trim()
+      ? [String(process.env.SWIGGY_ADDRESS_CREATE_URL).trim()]
+      : SWIGGY_ADDRESS_CREATE_URLS);
+
+  let last = { ok: false, addressId: '', status: 0, message: 'address endpoint se jawab nahi aaya' };
+  for (const url of candidates) {
+    try {
+      const res = await doFetch(url, {
+        method: 'POST',
+        headers: buildAuthRequestHeaders(session, {
+          referer: 'https://www.swiggy.com/my-account',
+          useAndroidUa: true,
+          extra: {
+            'Accept': 'application/json',
+            'Content-Type': 'application/json',
+            'x-client-id': 'android-consumer-app',
+            ...(tokenVal ? { token: tokenVal } : {}),
+            ...(tidVal ? { tid: tidVal } : {}),
+            ...(sidVal ? { sid: sidVal } : {}),
+          },
+        }),
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(Math.max(2_000, Number(timeoutMs) || 8_000)),
+      });
+      try { applySetCookiesToMap(session.cookieMap, getResponseSetCookies(res)); } catch {}
+      const rawText = typeof res?.text === 'function' ? await res.text().catch(() => '') : '';
+      let data = null;
+      try { data = rawText ? JSON.parse(rawText) : null; } catch {}
+      if (!data && typeof res?.json === 'function' && !rawText) {
+        data = await res.json().catch(() => null);
+      }
+      const parsed = parseSwiggyCreateAddressResponse(res?.status, data, rawText);
+      last = { ...parsed, url };
+      if (parsed.ok) return last;
+      // Sirf route-missing par agli candidate try karo. Auth/validation/WAF
+      // par dobara POST karna duplicate address bana sakta hai.
+      if (![404, 405].includes(Number(res?.status))) break;
+    } catch (e) {
+      last = { ok: false, addressId: '', status: 0, url, message: String(e?.message || e).slice(0, 180) };
+      break;
+    }
+  }
+  return last;
 }
 
 // Helper to check if cookies or account contain a verified logged-in user
@@ -1157,10 +1327,10 @@ function createSwiggyHttpAuthSession(phone, targetAcc = '', targetAccName = null
   cookieMap.set('swuid', deviceProfile.swuid);
   cookieMap.set('_is_logged_in', '0');
   cookieMap.set('userLocation', encodeURIComponent(JSON.stringify({
-    lat: '26.8467',
-    lng: '80.9462',
-    address: 'Lucknow, Uttar Pradesh, India',
-    area: 'Lucknow',
+    lat: '19.0760',
+    lng: '72.8777',
+    address: 'Mumbai, Maharashtra, India',
+    area: 'Mumbai',
     id: ''
   })));
   return {
@@ -1440,12 +1610,12 @@ async function postSwiggyAuthJson(session, endpointUrl, payload = {}, { timeoutM
     if (getBridgeProxy()?.id) {
       // Is proxy ko "hot" mark karo (thodi der ke liye side par), phir
       // turant doosri proxy par retry.
-      try { proxyPool.markProxyWafHit(getBridgeProxy().id, 3 * 60_000); } catch {}
+      try { proxyPool.markProxyWafHit(getBridgeProxy().id, 60_000); } catch {}
       const nextProxy = proxyPool.pickProxy({ excludeIds: [getBridgeProxy().id] });
       if (nextProxy) {
         setBridgeProxy(nextProxy);
         session.wafToken = ''; // nayi IP = naya token chahiye
-        try { session.wafToken = await getLiveSwiggyWafToken(false, { solveBudgetMs: 25_000 }); } catch {}
+        try { session.wafToken = await getLiveSwiggyWafToken(false, { solveBudgetMs: 15_000 }); } catch {}
         await bootstrapSwiggyAuthJar(session, { forceFresh: true });
         out = await sendOnce(session.transportMode === 'android');
       } else {
@@ -1511,7 +1681,7 @@ async function postSwiggyAuthJson(session, endpointUrl, payload = {}, { timeoutM
         if (c?.name && c?.value && c.name !== 'aws-waf-token') session.cookieMap.set(c.name, c.value);
       }
       if (getBridgeProxy()?.id && isAwsWafChallengeResponse(browserOut?.status, browserOut?.rawText, browserOut?.headers)) {
-        try { proxyPool.markProxyWafHit(getBridgeProxy().id, 10 * 60_000); } catch {}
+        try { proxyPool.markProxyWafHit(getBridgeProxy().id, 120_000); } catch {}
       }
       return browserOut;
     }).catch(() => null);
@@ -1522,7 +1692,7 @@ async function postSwiggyAuthJson(session, endpointUrl, payload = {}, { timeoutM
   // Pehle sirf pehli challenged proxy mark hoti thi — recovery wali doosri
   // proxy agar phir challenge de to wo pool me "clean" reh kar dobara ghumti thi.
   if (getBridgeProxy()?.id && isAwsWafChallengeResponse(out?.status, out?.rawText, out?.headers)) {
-    try { proxyPool.markProxyWafHit(getBridgeProxy().id, 10 * 60_000); } catch {}
+    try { proxyPool.markProxyWafHit(getBridgeProxy().id, 120_000); } catch {}
   }
 
   return out;
@@ -1605,7 +1775,7 @@ export async function prewarmBrowser() {
 // Universal cached / live AWS WAF token provider for both swiggy-bridge and swiggy-cart.
 // Doosra argument solver ka time budget hai — proxy screening me full
 // 80-90s solver har route par chalana batch ko maar deta tha.
-export async function getLiveSwiggyWafToken(forceRefresh = false, { solveBudgetMs = 35_000 } = {}) {
+export async function getLiveSwiggyWafToken(forceRefresh = false, { solveBudgetMs = 15_000 } = {}) {
   const now = Date.now();
   const routeProxy = getBridgeProxy() || null;
 
@@ -1675,7 +1845,7 @@ export async function getLiveSwiggyWafToken(forceRefresh = false, { solveBudgetM
 // maanga gaya tha, beech me active bridge route badal bhi jaye to token
 // galat IP par nahi chipkega. Coalescing bhi per-route hai.
 // Time budget hard cap hai — pehle ek fail solve 80-90s kha sakta tha.
-async function solveWafTokenOnce(forceRefresh = false, routeProxy = getBridgeProxy(), { solveBudgetMs = 35_000 } = {}) {
+async function solveWafTokenOnce(forceRefresh = false, routeProxy = getBridgeProxy(), { solveBudgetMs = 15_000 } = {}) {
   const routeKey = _wafSolveRouteKey(routeProxy);
   const existing = wafSolvePromises.get(routeKey);
   if (existing) return existing;
@@ -1692,7 +1862,7 @@ async function solveWafTokenOnce(forceRefresh = false, routeProxy = getBridgePro
   const solvePromise = (async () => {
     await previousSolve.catch(() => '');
     const startedAt = Date.now();
-    const budgetMs = Math.max(8_000, Number(solveBudgetMs) || 35_000);
+    const budgetMs = Math.min(15_000, Math.max(8_000, Number(solveBudgetMs) || 15_000));
     const deadline = startedAt + budgetMs;
     const remaining = () => Math.max(0, deadline - Date.now());
     let browser = null;
@@ -2341,7 +2511,7 @@ export async function requestSwiggyDeleteOtpViaBridge(userId, phone, targetAcc =
     // Direct mode = circuit-breaker + naya token + EK clean retry.
     if (isAwsWafChallengeResponse(checkOut.status, checkOut.rawText, checkOut.headers)) {
       if (getBridgeProxy()?.id) {
-        try { proxyPool.markProxyWafHit(getBridgeProxy().id, 3 * 60_000); } catch {}
+        try { proxyPool.markProxyWafHit(getBridgeProxy().id, 60_000); } catch {}
         const nextProxy = proxyPool.pickProxy({ excludeIds: [getBridgeProxy().id] });
         if (nextProxy) {
           setBridgeProxy(nextProxy);
@@ -2724,14 +2894,6 @@ async function finalizeAuthenticatedSwiggyAccount(userId, session, authResult, {
     ]);
   } catch {}
 
-  // Auto label offer-lock ke await ke BAAD lo. Parallel lanes me do
-  // finalizes ek saath aayein to dono await se pehle same "User N" nahi
-  // uthayengi; yahan se updateAccount tak koi await nahi hai.
-  const rawSlot = requestedAccountLabel && !/^user\s*\d+$/i.test(requestedAccountLabel)
-    ? requestedAccountLabel
-    : getNextAutoUserName();
-  const finalName = rawSlot || cleanActual || getNextAutoUserName();
-
   // Fresh/new-signup record kabhi email/address ke bina save na ho.
   // Existing login par Swiggy/profile ka email mile to wahi rakho; fresh
   // signup par requested first-five email fallback bhi hamesha available hai.
@@ -2739,10 +2901,44 @@ async function finalizeAuthenticatedSwiggyAccount(userId, session, authResult, {
     || (wasNewSignup ? generateFreshSwiggyEmail(phone) : '');
   session.signupEmail = finalEmail || session.signupEmail || '';
   const generatedAddressDetails = wasNewSignup
-    ? (session.generatedAddressDetails || generateRandomSwiggyAddress(phone, cleanActual || session.signupName || finalName))
+    ? (session.generatedAddressDetails?.state === 'Maharashtra'
+      ? session.generatedAddressDetails
+      : generateRandomSwiggyAddress(phone, cleanActual || session.signupName || 'Rahul Kumar'))
     : null;
   if (generatedAddressDetails) session.generatedAddressDetails = generatedAddressDetails;
+
+  // User ka rule: address sirf local JSON me nahi — asal Swiggy account
+  // me bhi add ho. Fresh finalize par authenticated session se CAS
+  // create call hogi; pakka addressId mile tabhi status `added` hoga.
+  // Ye await auto-label se PEHLE hai taaki parallel finalizes duplicate
+  // "User N" na uthayein.
+  let remoteAddressResult = null;
+  if (generatedAddressDetails && customerId) {
+    try {
+      remoteAddressResult = await addSwiggyAddressViaBridgeSession(
+        session,
+        generatedAddressDetails,
+        { customerId, timeoutMs: 6_000 }
+      );
+      generatedAddressDetails.remoteAddressStatus = remoteAddressResult.ok ? 'added' : 'failed';
+      if (remoteAddressResult.addressId) generatedAddressDetails.remoteAddressId = remoteAddressResult.addressId;
+      if (remoteAddressResult.message) generatedAddressDetails.remoteAddressMessage = remoteAddressResult.message;
+      console.log(`[SwiggyBridge] Fresh account Maharashtra address remote ${remoteAddressResult.ok ? `added (id ${remoteAddressResult.addressId})` : `failed: ${remoteAddressResult.message || remoteAddressResult.status}`}`);
+    } catch (e) {
+      generatedAddressDetails.remoteAddressStatus = 'failed';
+      generatedAddressDetails.remoteAddressMessage = String(e?.message || e).slice(0, 180);
+      console.warn('[SwiggyBridge] Remote address add failed:', generatedAddressDetails.remoteAddressMessage);
+    }
+  }
   const generatedAddress = generatedAddressDetails ? formatSwiggyAddress(generatedAddressDetails) : '';
+
+  // Auto label saare awaits ke BAAD lo. Parallel lanes me do finalizes ek
+  // saath aayein to dono await se pehle same "User N" nahi uthayengi;
+  // yahan se updateAccount tak koi await nahi hai.
+  const rawSlot = requestedAccountLabel && !/^user\s*\d+$/i.test(requestedAccountLabel)
+    ? requestedAccountLabel
+    : getNextAutoUserName();
+  const finalName = rawSlot || cleanActual || getNextAutoUserName();
 
   const savedData = {
     name: finalName,
@@ -2753,6 +2949,8 @@ async function finalizeAuthenticatedSwiggyAccount(userId, session, authResult, {
       address: generatedAddress,
       addressDetails: generatedAddressDetails,
       deliveryAddress: generatedAddressDetails,
+      remoteAddressStatus: generatedAddressDetails.remoteAddressStatus || 'pending',
+      ...(generatedAddressDetails.remoteAddressId ? { remoteAddressId: generatedAddressDetails.remoteAddressId } : {}),
     } : {}),
     phone,
     mobile: phone,
@@ -2786,6 +2984,8 @@ async function finalizeAuthenticatedSwiggyAccount(userId, session, authResult, {
     ...(generatedAddress ? {
       address: generatedAddress,
       addressDetails: generatedAddressDetails,
+      remoteAddressStatus: generatedAddressDetails.remoteAddressStatus || 'pending',
+      ...(generatedAddressDetails.remoteAddressId ? { remoteAddressId: generatedAddressDetails.remoteAddressId } : {}),
     } : {}),
     mobile: phone,
     phone,
@@ -2809,6 +3009,8 @@ async function finalizeAuthenticatedSwiggyAccount(userId, session, authResult, {
     ...(generatedAddress ? {
       address: generatedAddress,
       addressDetails: generatedAddressDetails,
+      remoteAddressStatus: generatedAddressDetails.remoteAddressStatus || 'pending',
+      ...(generatedAddressDetails.remoteAddressId ? { remoteAddressId: generatedAddressDetails.remoteAddressId } : {}),
     } : {}),
     accountKey: finalSavedKey,
     phone,

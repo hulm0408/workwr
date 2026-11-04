@@ -243,7 +243,26 @@ function extractPhone(text = '') {
     const phone = extractPhoneFromSegment(line);
     if (phone) return phone;
   }
-  return extractPhoneFromSegment(normalized);
+  // Poori text wale fallback me bhi ID wali lines hata do. Screenshot wale
+  // welcome card par `ID: 7458637854` khud valid 10-digit mobile jaisa hai;
+  // use Hermes number samajhna claim ko galat phone par le ja sakta tha.
+  const withoutIdLines = lines
+    .filter((line) => !/^\s*(?:telegram\s*)?id\b/i.test(searchText(line)))
+    .join('\n');
+  return extractPhoneFromSegment(withoutIdLines);
+}
+
+function extractTelegramCardPhone(text = '') {
+  const lines = normalizeTelegramFancyText(text).split(/\r?\n/);
+  for (const line of lines) {
+    const normalizedLine = searchText(line);
+    if (!/\b(number|mobile|phone)\b/.test(normalizedLine)) continue;
+    if (/\b(find|search|active numbers|live indian numbers)\b/.test(normalizedLine)) continue;
+    const afterLabel = line.includes(':') ? line.slice(line.indexOf(':') + 1) : line;
+    const phone = extractPhoneFromSegment(afterLabel) || extractPhoneFromSegment(line);
+    if (phone) return phone;
+  }
+  return null;
 }
 
 function labelledValue(text, label) {
@@ -303,7 +322,20 @@ function parseHermesText(text = '') {
 
 export function parseTelegramNumberCard(text = '') {
   const parsed = parseHermesText(text);
-  return parsed.phone ? parsed : null;
+  // Number card ke liye sirf explicit NUMBER/MOBILE/PHONE label wala phone
+  // chalega. Welcome card ki Telegram ID ya koi aur 10-digit number ko
+  // Hermes ka current number nahi mana jayega.
+  const phone = extractTelegramCardPhone(text);
+  if (!phone) return null;
+  const signature = parsed.code
+    ? [parsed.sender, parsed.code, parsed.smsTimeMs || parsed.rawTime, phone].join('|')
+    : '';
+  return {
+    ...parsed,
+    phone,
+    signature,
+    lastSms: parsed.lastSms ? { ...parsed.lastSms, signature } : null,
+  };
 }
 
 export function parseTelegramOtpText(text = '') {
@@ -313,6 +345,63 @@ export function parseTelegramOtpText(text = '') {
 
 export function extractTelegramOtpFromText(text = '') {
   return parseHermesText(text).code || '';
+}
+
+// Hermes ki sirf SABSE LATEST button-screen hi asal current screen hai.
+// Purani number-card par chipka NEW NUMBER ya purani welcome par chipka
+// FIND NUMBER stale hai — use click karna hi 4-minute wale claim-stuck ki
+// ek asal wajah thi. Is selector ka rule bilkul owner ke instruction jaisa
+// hai: latest screen par NEW ho to NEW, warna FIND. Latest screen par koi
+// claim button na ho to purani screens me bilkul nahi ghusenge.
+export function _selectHermesLatestScreenAction(screens = [], {
+  mode = 'claim',
+  phone = '',
+} = {}) {
+  const wantedPhone = String(phone || '').replace(/\D/g, '').slice(-10);
+  for (let screenIndex = 0; screenIndex < (Array.isArray(screens) ? screens.length : 0); screenIndex++) {
+    const screen = screens[screenIndex] || {};
+    const rawButtons = Array.isArray(screen.buttons) ? screen.buttons : [];
+    const buttons = rawButtons.map((button) => String(
+      typeof button === 'string' ? button : button?.text || button?.button?.text || ''
+    )).filter(Boolean);
+    if (!buttons.length) continue;
+
+    const roles = buttons.map((text, index) => String(
+      screen.buttonRoles?.[index] || telegramButtonRole(text) || ''
+    ));
+    const card = parseTelegramNumberCard(screen.text || screen.message || '');
+    const base = {
+      screenIndex,
+      buttons,
+      roles,
+      cardPhone: card?.phone || '',
+      role: '',
+      buttonIndex: -1,
+      buttonText: '',
+      reason: 'no-matching-button-on-latest-screen',
+    };
+
+    if (mode === 'refresh') {
+      if (wantedPhone && base.cardPhone && base.cardPhone !== wantedPhone) {
+        return { ...base, reason: 'latest-screen-different-number' };
+      }
+      const buttonIndex = roles.indexOf('refresh');
+      return buttonIndex >= 0
+        ? { ...base, role: 'refresh', buttonIndex, buttonText: buttons[buttonIndex], reason: 'latest-screen' }
+        : base;
+    }
+
+    const newIndex = roles.indexOf('new');
+    if (newIndex >= 0) {
+      return { ...base, role: 'new', buttonIndex: newIndex, buttonText: buttons[newIndex], reason: 'latest-screen-new' };
+    }
+    const findIndex = roles.indexOf('find');
+    if (findIndex >= 0) {
+      return { ...base, role: 'find', buttonIndex: findIndex, buttonText: buttons[findIndex], reason: 'latest-screen-find' };
+    }
+    return base;
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -337,6 +426,11 @@ const providerState = {
   lastError: '',
   lastActionAt: 0,
   lastCheckedAt: 0,
+  lastScreenButtons: [],
+  lastClickedButton: '',
+  lastClickedRole: '',
+  lastCallbackMessage: '',
+  claimPhase: '',
 };
 
 export function isTelegramLoginInProgress() {
@@ -561,12 +655,16 @@ function buttonText(button) {
 
 async function getMessageButtons(message) {
   let rows;
-  try {
-    rows = typeof message?.getButtons === 'function'
-      ? await message.getButtons()
-      : message?.buttons;
-  } catch {
-    try { rows = message?.buttons; } catch {}
+  // Teleproto ke sync `buttons` getter se pehle dekho. Har purani message
+  // par async getButtons()/reload ghumana claim ko bekaar slow karta tha;
+  // asal action bhi sirf latest screen par hi lena hai.
+  try { rows = message?.buttons; } catch {}
+  if (!rows) {
+    try {
+      rows = typeof message?.getButtons === 'function'
+        ? await message.getButtons()
+        : null;
+    } catch {}
   }
   if (!rows) rows = message?._buttons || (message?._buttonsFlat ? [message._buttonsFlat] : []);
   if (!Array.isArray(rows)) return [];
@@ -590,21 +688,95 @@ function buttonMatchesRole(button, role, config) {
   return telegramButtonRole(text) === role;
 }
 
-async function clickButtonUnlocked(role, { phone = '' } = {}) {
-  const { config } = await ensureClientUnlocked();
-  const messages = await fetchIncomingUnlocked(12);
-  for (const message of messages) {
-    const card = parseTelegramNumberCard(messageText(message));
-    if (phone && card?.phone && card.phone !== phone) continue;
-    const buttons = await getMessageButtons(message);
-    const button = buttons.find((candidate) => buttonMatchesRole(candidate, role, config));
-    if (!button) continue;
-    await button.click({});
-    providerState.lastActionAt = Date.now();
-    providerState.lastError = '';
-    return { ok: true, messageId: messageId(message), buttonText: buttonText(button) };
+function roleForHermesButton(button, config) {
+  for (const role of ['refresh', 'new', 'find']) {
+    if (buttonMatchesRole(button, role, config)) return role;
   }
-  return { ok: false };
+  return '';
+}
+
+async function latestHermesScreenUnlocked(limit = 6) {
+  const { config } = await ensureClientUnlocked();
+  const messages = await fetchIncomingUnlocked(limit);
+  for (const message of messages) {
+    const buttons = await getMessageButtons(message);
+    const entries = buttons
+      .map((button) => ({
+        button,
+        text: buttonText(button),
+        role: roleForHermesButton(button, config),
+      }))
+      .filter((entry) => entry.text);
+    if (!entries.length) continue;
+
+    const text = messageText(message);
+    const screen = {
+      message,
+      text,
+      entries,
+      buttons: entries.map((entry) => entry.text),
+      buttonRoles: entries.map((entry) => entry.role),
+      card: parseTelegramNumberCard(text),
+    };
+    providerState.lastScreenButtons = [...screen.buttons];
+    return screen;
+  }
+  providerState.lastScreenButtons = [];
+  return null;
+}
+
+async function clickLatestHermesButtonUnlocked({ mode = 'claim', phone = '' } = {}) {
+  const screen = await latestHermesScreenUnlocked(6);
+  if (!screen) {
+    providerState.claimPhase = 'no-latest-screen';
+    return { ok: false, reason: 'no-latest-screen', screenButtons: [] };
+  }
+
+  const action = _selectHermesLatestScreenAction([screen], { mode, phone });
+  providerState.claimPhase = action?.role
+    ? `click-${action.role}`
+    : (action?.reason || 'no-button-on-latest-screen');
+  if (!action?.role || action.buttonIndex < 0) {
+    console.log(`[Hermes] Latest screen par ${mode} button nahi mila. Buttons: ${screen.buttons.join(' | ') || 'none'}`);
+    return {
+      ok: false,
+      reason: action?.reason || 'no-button-on-latest-screen',
+      messageId: messageId(screen.message),
+      screenButtons: [...screen.buttons],
+      cardPhone: screen.card?.phone || '',
+    };
+  }
+
+  const entry = screen.entries[action.buttonIndex];
+  const answer = await entry.button.click({});
+  const callbackMessage = String(answer?.message || '').trim().slice(0, 180);
+  providerState.lastActionAt = Date.now();
+  providerState.lastError = '';
+  providerState.lastClickedButton = entry.text;
+  providerState.lastClickedRole = action.role;
+  providerState.lastCallbackMessage = callbackMessage;
+  providerState.claimPhase = `clicked-${action.role}`;
+  console.log(
+    `[Hermes] Latest screen button click: ${entry.text} (${action.role})` +
+    `${callbackMessage ? ` — callback: ${callbackMessage}` : ''}`
+  );
+  return {
+    ok: true,
+    role: action.role,
+    messageId: messageId(screen.message),
+    buttonText: entry.text,
+    screenButtons: [...screen.buttons],
+    cardPhone: screen.card?.phone || '',
+    callbackMessage,
+    callbackAlert: Boolean(answer?.alert),
+  };
+}
+
+async function clickButtonUnlocked(role, { phone = '' } = {}) {
+  return clickLatestHermesButtonUnlocked({
+    mode: role === 'refresh' ? 'refresh' : 'claim',
+    phone,
+  });
 }
 
 async function sendStartUnlocked() {
@@ -652,25 +824,83 @@ async function obtainCardUnlocked({
   timeoutMs = 20_000,
   shouldAbort = null,
 } = {}) {
-  const before = await fetchIncomingUnlocked(12);
-  const baselineSignatures = new Set(before.map(messageSignature));
+  const totalMs = Math.max(3_000, Number(timeoutMs) || 20_000);
+  const deadline = Date.now() + totalMs;
+  const remainingMs = () => Math.max(0, deadline - Date.now());
+  const currentSignatures = async () => new Set(
+    (await fetchIncomingUnlocked(6)).map(messageSignature)
+  );
 
-  let clicked = await clickButtonUnlocked(forceNew ? 'new' : 'find');
-  if (!clicked.ok && forceNew) clicked = await clickButtonUnlocked('find');
-  if (!clicked.ok) {
-    await sendStartUnlocked();
-    await sleepInterruptibly(1_000, shouldAbort);
-    clicked = await clickButtonUnlocked(forceNew ? 'new' : 'find');
-    if (!clicked.ok && forceNew) clicked = await clickButtonUnlocked('find');
+  if (!forceNew) {
+    const existing = await latestNumberCardUnlocked(excludePhones);
+    if (existing) return existing;
   }
 
-  const fresh = await waitForNumberCardUnlocked({
-    baselineSignatures,
-    excludePhones,
-    timeoutMs,
-    shouldAbort,
-  });
-  if (fresh) return fresh;
+  let baselineSignatures = await currentSignatures();
+  const freshSinceBaseline = async () => {
+    const latest = await latestNumberCardUnlocked(excludePhones);
+    return latest && !baselineSignatures.has(latest.signature) ? latest : null;
+  };
+  let sentStart = false;
+
+  // Ek hi claim ke andar max 3 action cycles. Pehli click ka jawab 5s me
+  // na aaye to poora 20s andhere me nahi jalega: latest screen dobara
+  // padhkar sahi button, ya ek baar /start se welcome reset karke FIND.
+  for (let cycle = 0; cycle < 3 && remainingMs() > 500; cycle++) {
+    if (typeof shouldAbort === 'function' && shouldAbort()) return null;
+    providerState.claimPhase = `latest-screen-cycle-${cycle + 1}`;
+    const clicked = await clickLatestHermesButtonUnlocked({ mode: 'claim' });
+
+    if (!clicked.ok) {
+      if (sentStart || remainingMs() <= 1_500) break;
+      sentStart = true;
+      providerState.claimPhase = 'send-start';
+      await sendStartUnlocked();
+      await sleepInterruptibly(Math.min(900, remainingMs()), shouldAbort);
+      const lateFresh = await freshSinceBaseline();
+      if (lateFresh) return lateFresh;
+      baselineSignatures = await currentSignatures();
+      continue;
+    }
+
+    const waitMs = cycle === 2
+      ? remainingMs()
+      : Math.min(5_000, remainingMs());
+    const fresh = await waitForNumberCardUnlocked({
+      baselineSignatures,
+      excludePhones,
+      timeoutMs: waitMs,
+      shouldAbort,
+    });
+    if (fresh) return fresh;
+    if ((typeof shouldAbort === 'function' && shouldAbort()) || remainingMs() <= 500) return null;
+
+    // Hermes ka jawab 5s wali pehli wait ke thik baad bhi aa sakta hai.
+    // Baseline reset ya /start se pehle use pakdo, warna asal card chhup
+    // jayega aur bot use NEW karke bekaar me agla number le lega.
+    const lateFresh = await freshSinceBaseline();
+    if (lateFresh) return lateFresh;
+
+    baselineSignatures = await currentSignatures();
+    const latestAny = await latestNumberCardUnlocked(new Set());
+    if (latestAny?.card?.phone && excludePhones.has(latestAny.card.phone)) {
+      // Hermes ne consumed/rejected number hi dikhaya hai — agle cycle me
+      // usi latest card ka NEW NUMBER turant chalega, timeout nahi jalega.
+      providerState.claimPhase = 'excluded-card-new-number';
+      continue;
+    }
+
+    if (!sentStart && cycle === 0 && remainingMs() > 2_000) {
+      sentStart = true;
+      providerState.claimPhase = 'no-response-send-start';
+      await sendStartUnlocked();
+      await sleepInterruptibly(Math.min(900, remainingMs()), shouldAbort);
+      const lateFreshAfterStart = await freshSinceBaseline();
+      if (lateFreshAfterStart) return lateFreshAfterStart;
+      baselineSignatures = await currentSignatures();
+    }
+  }
+
   if (!forceNew) return latestNumberCardUnlocked(excludePhones);
   return null;
 }
@@ -713,7 +943,16 @@ export async function getNextTelegramNumber(opts = {}) {
         shouldAbort,
       });
       if (!result) {
-        throw new Error(`@${config.botUsername} se number card nahi mila (Find/New button ya bot response check karo)`);
+        const screenButtons = providerState.lastScreenButtons?.length
+          ? providerState.lastScreenButtons.join(' | ')
+          : 'none';
+        const clicked = providerState.lastClickedButton
+          ? `last click ${providerState.lastClickedButton}`
+          : 'koi click nahi ho paya';
+        const callback = providerState.lastCallbackMessage
+          ? `; callback: ${providerState.lastCallbackMessage}`
+          : '';
+        throw new Error(`@${config.botUsername} se number card nahi mila (latest screen: ${screenButtons}; ${clicked}${callback})`);
       }
       const entry = entryFromCard(result, config);
       lastEntry = entry;
@@ -938,6 +1177,11 @@ export function getTelegramOtpStatus(env = process.env) {
     lastError: providerState.lastError,
     lastActionAt: providerState.lastActionAt,
     lastCheckedAt: providerState.lastCheckedAt,
+    lastScreenButtons: [...(providerState.lastScreenButtons || [])],
+    lastClickedButton: providerState.lastClickedButton || '',
+    lastClickedRole: providerState.lastClickedRole || '',
+    lastCallbackMessage: providerState.lastCallbackMessage || '',
+    claimPhase: providerState.claimPhase || '',
   };
 }
 
@@ -1270,5 +1514,10 @@ export function _resetTelegramOtpSourceForTests() {
     lastError: '',
     lastActionAt: 0,
     lastCheckedAt: 0,
+    lastScreenButtons: [],
+    lastClickedButton: '',
+    lastClickedRole: '',
+    lastCallbackMessage: '',
+    claimPhase: '',
   });
 }

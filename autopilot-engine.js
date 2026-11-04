@@ -319,6 +319,13 @@ const state = {
 };
 
 export function getAutopilotSnapshot() {
+  // Hermes claim ke beech engine state aksar purana hota hai (worker ek
+  // await par hota hai). Status ke waqt provider ki taazi screen/click
+  // jaankari lo taaki card par asal NEW/FIND click saaf dikhe.
+  let telegramLive = {};
+  if (state.running && state.sourceMode === 'telegram') {
+    try { telegramLive = getTelegramOtpStatus() || {}; } catch {}
+  }
   return {
     running: state.running,
     stopRequested: state.stopRequested,
@@ -377,6 +384,12 @@ export function getAutopilotSnapshot() {
     telegramRejected: state.telegramRejected || 0,
     telegramInfraRetries: state.telegramInfraRetries || 0,
     telegramClaimRetries: state.telegramClaimRetries || 0,
+    telegramScreenButtons: [...(telegramLive.lastScreenButtons || [])],
+    telegramLastClickedButton: telegramLive.lastClickedButton || '',
+    telegramLastClickedRole: telegramLive.lastClickedRole || '',
+    telegramCallbackMessage: telegramLive.lastCallbackMessage || '',
+    telegramClaimPhase: telegramLive.claimPhase || '',
+    telegramLastActionAt: Number(telegramLive.lastActionAt) || 0,
     workerRecoveries: state.workerRecoveries || 0,
     addressAdded: state.addressAdded || 0,
     addressFailed: state.addressFailed || 0,
@@ -723,6 +736,39 @@ function compactStepInfo(snap = {}, stageText = '') {
     now = 'Number process ho raha hai';
   } else if (title) {
     now = truncateUiText(title.replace(/^[^\p{L}\p{N}]+/u, ''), 54);
+  }
+
+  // Hermes claim ke beech generic "New number le raha hoon" kaafi nahi hai.
+  // Provider ki taazi latest-screen/click state ho to wahi ek line me dikhao;
+  // route/WAF wala asal stage isse override nahi hoga.
+  if (
+    telegram && step === 'NEW'
+    && !snap.current?.phone && !(snap.activeNumbers || []).length
+    && !/route ready|waf|token|security|proxy|direct ip|rate limit/.test(text)
+  ) {
+    const claimPhase = String(snap.telegramClaimPhase || '').toLowerCase();
+    const clickedButton = truncateUiText(
+      String(snap.telegramLastClickedButton || '').replace(/^[^\p{L}\p{N}]+/u, ''),
+      24
+    );
+    const actionAgeMs = Number(snap.telegramLastActionAt) > 0
+      ? Date.now() - Number(snap.telegramLastActionAt)
+      : Number.POSITIVE_INFINITY;
+    if (/no-matching-button|no-button|no-latest-screen/.test(claimPhase)) {
+      now = 'Latest Hermes screen par NEW/FIND nahi mila';
+    } else if (/latest-screen-different-number/.test(claimPhase)) {
+      now = 'Latest Hermes card alag number ka hai';
+    } else if (/send-start/.test(claimPhase)) {
+      now = '/start bhej kar FIND screen la raha hoon';
+    } else if (/excluded-card/.test(claimPhase)) {
+      now = 'Consumed card mila — NEW NUMBER lunga';
+    } else if (/latest-screen-cycle/.test(claimPhase)) {
+      now = 'Latest Hermes screen dobara padh raha hoon';
+    } else if (clickedButton && (/clicked|click-|wait/.test(claimPhase) || actionAgeMs < 45_000)) {
+      now = `${clickedButton} click — number card ka wait`;
+    } else if (/connect/.test(claimPhase)) {
+      now = 'Hermes connect ho raha hai';
+    }
   }
 
   const flow = telegram
@@ -1286,6 +1332,18 @@ export async function startAutopilot(opts = {}) {
         return r;
       } catch { return null; }
     })();
+    // Hermes single-lane hai: 30 backup proxies probe hone tak pehla
+    // NEW/FIND click rokna hi 4-minute wale NEW-stuck ki ek wajah tha.
+    // Free probing background me jaari rahegi, lekin start/warm-up sirf
+    // 12s tak uska wait karega (agar pehle se usable route hai to bilkul
+    // nahi). Firebase ki 10-lane route ginti ke liye purana full wait hai.
+    const freeStartWaitMs = telegramMode && !(Number(ps.usableCount) > 0) ? 12_000 : 0;
+    const freeStartPromise = freeStartWaitMs > 0
+      ? Promise.race([
+          freePromise,
+          sleep(freeStartWaitMs, () => state.stopRequested).then(() => null),
+        ])
+      : freePromise;
 
     // Pool load (bada node — ek baar, zarurat par refresh). YE WAF warm-up ke
     // SAATH parallel chalega — pehle dono ek-ke-peeche-ek the isliye pehla
@@ -1488,7 +1546,7 @@ export async function startAutopilot(opts = {}) {
       try {
         // PEHLE proxy final karo (free auto-fetch khatam hone do), PHIR token
         // solve karo — aws-waf-token IP-bound hai, galat IP ka token bekar hai.
-        await freePromise;
+        await freeStartPromise;
         ps = proxyPool.proxySummary();
         if (ps.enabled) {
           const chosen = rotateProxy();
@@ -2099,6 +2157,10 @@ export async function startAutopilot(opts = {}) {
     // aur bridge ke paas apni Android/browser recovery bhi hai.
     const prepareLaneRouteBeforeClaim = async (lane) => {
       if (!telegramMode) return true;
+      // Hermes startup ab free-proxy probing ke poora khatam hone ka wait
+      // nahi karta; background me nayi routes aayein to agli claim se
+      // pehle summary taaza kar lo, warna ps purana OFF snapshot reh jayega.
+      try { ps = proxyPool.proxySummary(); } catch {}
       const attemptedRoutes = new Set();
       let notified = false;
       const notifyPreparing = async (routeLabel) => {
@@ -2502,7 +2564,7 @@ export async function startAutopilot(opts = {}) {
     // Distinct routes tay hone ke baad asal lane count final karo. Free
     // auto-fetch pool/scan ke parallel chal raha tha; uske baghair lanes
     // ko pata hi nahi chalta kitni alag IPs asal me available hain.
-    await freePromise;
+    await freeStartPromise;
     ps = proxyPool.proxySummary();
     laneCount = effectiveAutopilotLanes({
       sourceMode,

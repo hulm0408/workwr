@@ -8,8 +8,14 @@
    - 🆕 **Naya number** → register + session JSON save
    - ♻️ **Purana number** → login → **Delete Account** flow → delete success par purge → **usi number se fresh registration**
    - ⚠️ **Delete block** (charges / active order / Swiggy Money / other) → **SKIP**, aage badhta hai
-   - 🚦 **Rate limit / WAF / security / temporary network** → fast route recovery + retry; batch aam taur par force-stop nahi hota · ⏹ **STOP** → current safe point par rukta hai
-4. Target (default **100 fresh sessions**) ya max time (default **120 min**) tak apne aap chalta rehta — live card ab ek hi compact mono flow dikhata hai (`NEW › OTP › REFRESH › VERIFY › ADDR › FRESH`), current number, progress, elapsed time, source lock, short error/next step aur verified-address count ke saath. Lambi pool/scan diagnostics live card me repeat nahi hoti.
+   - ⚡ **OTP send/miss/verify/delete-OTP ek baar fail** → wahi number isi run ke liye khatam; dusra OTP try nahi, seedha agla number
+   - 🚦 **Rate limit / WAF / security / temporary network** → fast route recovery ke baad agla naya number; batch aam taur par force-stop nahi hota
+4. Target (default **100 fresh sessions**) ya max time (default **120 min**) tak apne aap chalta rehta — live card ab ek hi compact mono flow dikhata hai (`NEW › OTP › REFRESH › VERIFY › ADDR › FRESH`), current number, progress, elapsed time, source lock, SKIP/OTP-fail counters, short error/next step aur verified-address count ke saath. Lambi pool/scan diagnostics live card me repeat nahi hoti.
+
+Running card par **⏭ SKIP NUMBER** aur **⏹ STOP BATCH** alag-alag hain.
+SKIP sirf current number ko chhodta hai — batch nahi rukti, agli claim turant
+naye number ki hoti hai. STOP poore batch ko current safe point par rokta
+hai.
 
 > Ek run me source **locked** rehta hai: Hermes ON ho to numbers + OTP sirf @HermeshuOTPROBOT se aate hain aur Firebase bilkul try nahi hota; Firebase mode deliberately select ho tabhi saved ACTIVE Firebase sources use hotay hain.
 
@@ -72,17 +78,21 @@ bot ke andar hi hota hai:
    **⚙️ Settings → 🧪 Test Hermes** bhi hai; account hatana ho to
    **🗑 Remove Telegram** (confirmation ke baad session clear hoti hai).
 
-Batch is mode me ye simple flow karta hai: pehle lane ki proxy/direct route
-aur WAF token ready → Hermes par **NEW NUMBER** (sirf bilkul nayi chat me NEW
-button na mile tab bootstrap ke liye FIND) → mile hue number par Swiggy OTP →
-**REFRESH** karte hue default **20 second** wait (⚙️ Settings me
-20/30/45/60/90s presets; env `TELEGRAM_OTP_TIMEOUT_MS`) → OTP mile to wahi
-purana verify/register/delete/fresh process → OTP na mile to agla **NEW
-NUMBER**. Agar pehle OTP-send stage par hi WAF/rate/5xx/network jaisa infra
-failure aaye, to Hermes ka current number consume nahi hota: wahi number ready
-route par ek capped retry leta hai (combined infra attempts max 2), uske baad
-hi NEW NUMBER chalega. Refresh ka gap default **2.5s** hai (Settings ya
-`TELEGRAM_OTP_REFRESH_MS`).
+Batch is mode me ye simple one-shot flow karta hai: pehle lane ki
+proxy/direct route aur WAF token ready → Hermes par **NEW NUMBER** (sirf
+bilkul nayi chat me NEW button na mile tab bootstrap ke liye FIND) → mile
+hue number par Swiggy OTP → **REFRESH** karte hue default **20 second**
+wait (⚙️ Settings me 20/30/45/60/90s presets; env
+`TELEGRAM_OTP_TIMEOUT_MS`) → OTP mile to ek hi verification round me
+verify/register/delete/fresh process. OTP send, miss, verify ya delete-OTP
+me se koi bhi failure **ek baar** aate hi woh number isi run ke liye
+consumed ho jata hai: dusra code/verify, deferred queue, Hermes current
+preserve ya same-number reclaim bilkul nahi; route recovery sirf agle
+**NEW NUMBER** ke liye hoti hai. Owner ko number bekaar lage to live card
+par **⏭ SKIP NUMBER** dabate hi sirf woh number khatam hota hai aur batch
+bina bekaar gap naye number par jati hai. Hermes me fail/skip ke baad
+configured 6s+ ki neend bhi nahi lagti (fresh success par max 1s). Refresh
+gap default **2.5s** hai (Settings ya `TELEGRAM_OTP_REFRESH_MS`).
 
 Bot ke andar **Hermes mode ON** ho to wahi is run ka locked source hai —
 Render par purana `NUMBER_SOURCE=firebase` reh jaye tab bhi Hermes batch
@@ -116,14 +126,23 @@ owner ka Lucknow/UP address bilkul use nahi hota, aur candidate apne aap
 success nahi mana jata. Bot pehle authenticated session se Swiggy ki saved
 address list (`POST /dapi/address/all`) check karta hai; wahi address pehle
 se saved ho to duplicate nahi banata. Warna woh asal authenticated
-**`/web-cart-add-address`** page kholkar Maharashtra pin/geolocation ke saath
-**Address + Door / Flat No. + Landmark + Home → SAVE ADDRESS & PROCEED** karta
-hai. Success tabhi hai jab create response ya saved-address list se pakka
-remote address ID verify ho jaye.
+**`/web-cart-add-address`** page kholkar Maharashtra pin/geolocation ke
+saath **Address + Door / Flat No. + Landmark + Home → SAVE ADDRESS &
+PROCEED** karta hai. Page ko pehle `form-ready`, `map-gate`,
+`login-required`, `security-challenge`, `redirected` ya `loading` me
+classify kiya jata hai; checkout ke proven input names `building`/`house`
+aur `landmark` ko pehli tarjeeh milti hai, frames/shadow roots bhi check
+hote hain, aur map/Proceed gate ko asal gate action se paar karne ki
+koshish hoti hai. Failure me purana vague `fields=0` ki jagah short exact
+page-state wajah aati hai. Success tabhi hai jab create response ya
+saved-address list se pakka remote address ID verify ho jaye.
 
-Browser page submit hi na kar paye tabhi purana central-address-service
-(`addresses/v1`) CAS fallback chalega. SAVE ho chuka ho lekin verification
-uncertain ho to duplicate rokne ke liye dusra CAS POST nahi hota. JSON/account
+CAS (`addresses/v1`) fallback ab default me guessed web URLs par blind
+POST **nahi** karta — sirf caller ke explicit URL ya
+`SWIGGY_ADDRESS_CREATE_URL` configure ho tab. HTML/WAF response aaye to
+raw `<!doctype html>…` kabhi user ko nahi dikhaya jata; sirf short
+sanitized wajah aati hai. SAVE ho chuka ho lekin verification uncertain
+ho to duplicate rokne ke liye dusra CAS POST nahi hota. JSON/account
 record me address, `remoteAddressStatus=added` aur `remoteAddressId` sirf
 verified remote record par aayenge. Remote Add Address fail ho to fresh JSON
 phir bhi turant bhej diya jayega, lekin usme generated/fake address data nahi

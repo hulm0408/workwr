@@ -965,7 +965,7 @@ console.log('isUnregisteredSwiggyAuthResponse (failed_otp_send wala bug):');
 }
 
 // ---------------------------------------------------------------------------
-console.log('Swiggy temporary 5xx/network — number FAILED nahi, retry queue:');
+console.log('Swiggy temporary 5xx/network — one-shot OTP number consumed, retry sirf next number:');
 {
   const bridge = await import('./swiggy-bridge.js');
   const pipe = await import('./number-pipeline.js');
@@ -995,8 +995,15 @@ console.log('Swiggy temporary 5xx/network — number FAILED nahi, retry queue:')
     retryable: true,
     message: serverErr.message,
   }, '6306779573');
-  ok(c1.kind === 'deferred_swiggy_transient' && c1.retryable === true && c1.httpStatus === 500 && c1.stage === 'otp_send',
-    'pipeline: HTTP 500 → deferred_swiggy_transient (failed_otp_send nahi)');
+  ok(c1.kind === 'deferred_swiggy_transient'
+    && c1.retryable === false
+    && c1.routeRetryable === true
+    && c1.otpFailure === true
+    && c1.otpAttemptConsumed === true
+    && c1.otpAttempts === 1
+    && c1.httpStatus === 500
+    && c1.stage === 'otp_send',
+    'pipeline: HTTP 500 par route recover hoga, number one-shot consumed hai');
 
   const c2 = pipe._classifyOtpSendFailure({
     success: false,
@@ -1005,8 +1012,13 @@ console.log('Swiggy temporary 5xx/network — number FAILED nahi, retry queue:')
     retryable: true,
     message: systemErr.message,
   }, '6306779573', { failKind: 'failed_fresh_otp_send', stage: 'fresh_otp_send' });
-  ok(c2.kind === 'deferred_swiggy_transient' && c2.stage === 'fresh_otp_send',
-    'pipeline: network/system error bhi transient retry outcome');
+  ok(c2.kind === 'deferred_swiggy_transient'
+    && c2.retryable === false
+    && c2.routeRetryable === true
+    && c2.otpFailure === true
+    && c2.otpAttemptConsumed === true
+    && c2.stage === 'fresh_otp_send',
+    'pipeline: network/system error par bhi wahi number dobara OTP nahi lega');
 
   const c3 = pipe._classifyOtpSendFailure({
     success: false,
@@ -1017,9 +1029,14 @@ console.log('Swiggy temporary 5xx/network — number FAILED nahi, retry queue:')
   }, '12345');
   ok(c3.kind === 'failed_otp_send', 'pipeline: invalid mobile transient nahi — asli failed_otp_send');
 
-  ok(pipe._classifyOtpSendFailure({ success: false, code: 'SWIGGY_RATE_LIMIT', message: 'limit' }, '9812345670').kind === 'rate_limited'
-    && pipe._classifyOtpSendFailure({ success: false, code: 'SWIGGY_SECURITY_CHALLENGE', message: 'waf' }, '9812345670').kind === 'security_challenge',
-  'pipeline: rate-limit/security apne purane infra outcomes par hi');
+  const rateOneShot = pipe._classifyOtpSendFailure({ success: false, code: 'SWIGGY_RATE_LIMIT', message: 'limit' }, '9812345670');
+  const securityOneShot = pipe._classifyOtpSendFailure({ success: false, code: 'SWIGGY_SECURITY_CHALLENGE', message: 'waf' }, '9812345670');
+  ok(
+    rateOneShot.kind === 'rate_limited'
+    && rateOneShot.otpAttemptConsumed === true
+    && securityOneShot.kind === 'security_challenge'
+    && securityOneShot.otpAttemptConsumed === true,
+  'pipeline: rate/security route recovery karegi, lekin ye number run me dubara nahi');
   ok(pipe._classifyOtpSendFailure({ success: true }, '9812345670') === null,
     'pipeline: successful OTP send par failure classification null');
 
@@ -1034,10 +1051,10 @@ console.log('Swiggy temporary 5xx/network — number FAILED nahi, retry queue:')
   'engine: rate-limit/WAF pehli recovery max 15s (number queue me fasa nahi)');
   ok(engine.telegramInfraRetryDecision({
     telegramMode: true, willRetry: true, phone: '9876543210', stage: 'otp_send',
-  }) === true, 'Hermes: pehle OTP-send infra fail par current number capped retry ke liye safe');
+  }) === false, 'Hermes: OTP-send fail par same-number retry hamesha OFF');
   ok(engine.telegramInfraRetryDecision({
     telegramMode: true, willRetry: true, phone: '9876543210', stage: 'fresh_otp_send',
-  }) === true, 'Hermes: fresh OTP-send infra fail par bhi current number safe');
+  }) === false, 'Hermes: fresh OTP-send fail par bhi next NEW NUMBER');
   ok(engine.telegramInfraRetryDecision({
     telegramMode: true, willRetry: true, phone: '9876543210', stage: 'verify',
   }) === false
@@ -1065,9 +1082,30 @@ console.log('Swiggy temporary 5xx/network — number FAILED nahi, retry queue:')
       routeState: { tokenReady: false },
     }).rawFallback === true,
   'route gate: challenged ko token solve, clean ko solve ke baad raw fallback mauqa');
+  ok(
+    engine.isOneShotOtpFailureResult({ ok: false, kind: 'failed_verify', stage: 'otp_verify' }) === true
+    && engine.isOneShotOtpFailureResult({ ok: false, kind: 'failed_otp_miss', stage: 'otp_wait' }) === true
+    && engine.isOneShotOtpFailureResult({ ok: false, kind: 'deferred_swiggy_transient', stage: 'otp_send' }) === true
+    && engine.isOneShotOtpFailureResult({ ok: false, kind: 'manual_skip', stage: 'manual_skip' }) === false
+    && engine.isOneShotOtpFailureResult({ ok: true, kind: 'fresh_new', stage: 'otp_send' }) === false,
+    'engine: OTP send/wait/verify failures one-shot consumed; manual/fresh alag'
+  );
+  ok(
+    engine.nextNumberGapMs({ telegramMode: true, outcome: 'failed', configuredGapMs: 6_000 }) === 0
+    && engine.nextNumberGapMs({ telegramMode: true, outcome: 'manual_skip', configuredGapMs: 6_000 }) === 0
+    && engine.nextNumberGapMs({ telegramMode: true, outcome: 'ok', configuredGapMs: 6_000 }) === 1_000
+    && engine.nextNumberGapMs({ telegramMode: false, outcome: 'failed', configuredGapMs: 6_000 }) === 6_000,
+    'engine: Hermes me fail/skip ke baad 6s gap nahi; success max 1s'
+  );
   const snap = engine.getAutopilotSnapshot();
-  ok(Number.isFinite(snap.serverErrors) && Number.isFinite(snap.transientStrikes) && Number.isFinite(snap.telegramInfraRetries),
-    'engine snapshot: serverErrors/transientStrikes/Hermes infra-retry counters maujood');
+  ok(
+    Number.isFinite(snap.serverErrors)
+    && Number.isFinite(snap.transientStrikes)
+    && Number.isFinite(snap.telegramInfraRetries)
+    && Number.isFinite(snap.manualSkips)
+    && Number.isFinite(snap.otpFailures)
+    && typeof snap.skipRequested === 'boolean',
+    'engine snapshot: recovery + SKIP + one-shot OTP counters maujood');
 }
 
 // ---------------------------------------------------------------------------
@@ -1860,20 +1898,49 @@ console.log('telegram Hermes source + Add Telegram Account primitives:');
   // Browser Add Address UI ka mocked page flow: pehle saved list khali,
   // form fill + SAVE, phir saved list me wahi address real ID ke saath.
   {
-    let evaluateCalls = 0;
     let visitedUrl = '';
+    let saveClicked = false;
     const cookiesSet = [];
+    const formSnapshot = {
+      url: 'https://www.swiggy.com/web-cart-add-address',
+      title: 'Add Address',
+      readyState: 'complete',
+      bodyText: 'Delivery address Address Door / Flat No. Landmark Home SAVE ADDRESS & PROCEED',
+      fields: [
+        { tag: 'input', type: 'text', name: 'building', label: 'door flat', visible: true, disabled: false },
+        { tag: 'input', type: 'text', name: 'landmark', label: 'landmark', visible: true, disabled: false },
+      ],
+      buttons: [{ text: 'Home', visible: true }, { text: 'SAVE ADDRESS & PROCEED', visible: true }],
+    };
     const mockPage = {
-      setViewport: async () => {}, setGeolocation: async () => {},
+      setViewport: async () => {}, setGeolocation: async () => {}, setUserAgent: async () => {},
       setCookie: async (cookie) => { cookiesSet.push(cookie); },
-      cookies: async () => [], on: () => {}, off: () => {},
+      cookies: async () => [], on: () => {}, off: () => {}, frames: () => [],
       goto: async (url) => { visitedUrl = url; },
-      evaluate: async () => {
-        evaluateCalls++;
-        if (evaluateCalls === 1) return { status: 200, data: { statusCode: 0, data: { addresses: [] } } };
-        if (evaluateCalls === 2) return { ok: true, filled: { address: true, flatNo: true, landmark: true }, fields: 3 };
-        if (evaluateCalls === 3) return true;
-        return { status: 200, data: { statusCode: 0, data: { addresses: [savedRemoteAddress] } } };
+      evaluate: async (fn, arg) => {
+        const fnName = typeof fn === 'function' ? fn.name : String(fn || '');
+        if (fnName === 'swiggyAddressSnapshotInBrowser') return formSnapshot;
+        if (fnName === 'swiggyAddressFillInBrowser') {
+          return {
+            ok: true,
+            filled: { address: false, flatNo: true, landmark: true },
+            fields: 2,
+            addressStatic: true,
+            selected: { address: '', flatNo: 'input:building', landmark: 'input:landmark' },
+            saveDisabled: false,
+            url: formSnapshot.url,
+          };
+        }
+        if (fnName === 'swiggyAddressClickTextInBrowser') {
+          const isSave = Array.isArray(arg) && arg.some((text) => String(text).includes('save address'));
+          if (isSave) saveClicked = true;
+          return { clicked: isSave, text: isSave ? 'save address & proceed' : '' };
+        }
+        return {
+          status: 200,
+          data: { statusCode: 0, data: { addresses: saveClicked ? [savedRemoteAddress] : [] } },
+          rawText: '{}',
+        };
       },
     };
     const uiAdded = await bridge.addSwiggyAddressViaWebUi(addressSession, randomAddress, {
@@ -1881,7 +1948,22 @@ console.log('telegram Hermes source + Add Telegram Account primitives:');
       timeoutMs: 12_000,
     });
     ok(uiAdded.ok && uiAdded.addressId === 'ADDR-SAVED-9' && uiAdded.verifiedAddress?.source === 'swiggy-saved-address', 'asal Add Address UI flow SAVE ke baad saved list se verify karta hai');
-    ok(visitedUrl.includes('/web-cart-add-address') && visitedUrl.includes(`lat=${randomAddress.lat}`) && cookiesSet.some((c) => c.name === '_is_logged_in'), 'Add Address UI authenticated cookies + Maharashtra pin ke saath page kholta hai');
+    ok(saveClicked && visitedUrl.includes('/web-cart-add-address') && visitedUrl.includes(`lat=${randomAddress.lat}`) && cookiesSet.some((c) => c.name === '_is_logged_in'), 'Add Address UI authenticated cookies + Maharashtra pin ke saath page kholta hai');
+    ok(
+      bridge.classifySwiggyAddressPageState(formSnapshot, { status: 200 }) === 'form-ready'
+      && bridge.classifySwiggyAddressPageState({ url: formSnapshot.url, bodyText: 'Drag map to choose location Proceed', buttons: [{ text: 'Proceed' }], fields: [] }) === 'map-gate'
+      && bridge.classifySwiggyAddressPageState({ url: formSnapshot.url, bodyText: 'Security check Verify you are human', buttons: [], fields: [] }) === 'security-challenge'
+      && bridge.classifySwiggyAddressPageState({ url: 'https://www.swiggy.com/', bodyText: 'Login Existing account', buttons: [], fields: [] }) === 'redirected',
+      'Add Address page states form/map/security/redirect ko alag pehchanti hai'
+    );
+    const sanitizedHtml = bridge.sanitizeSwiggyAddressFailureMessage('<!doctype html><html><body>WAF challenge secret</body></html>');
+    ok(
+      bridge._isHtmlSwiggyResponseText('<!doctype html><html></html>') === true
+      && sanitizedHtml.includes('HTML/WAF page')
+      && !sanitizedHtml.includes('<!doctype')
+      && !sanitizedHtml.includes('secret'),
+      'Add Address/CAS HTML response raw markup ke roop me user ko nahi dikhta'
+    );
   }
 
   // Orchestration order: saved list → browser UI → sirf non-submit UI
@@ -1923,6 +2005,34 @@ console.log('telegram Hermes source + Add Telegram Account primitives:');
       browserAddImpl: async () => ({ ok: false, addressId: '', submitAttempted: true, uncertain: true, message: 'SAVE verify nahi hua' }),
     });
     ok(!uncertainUi.ok && uncertainUi.submitAttempted === true && casCalls === 0, 'address orchestration: UI SAVE uncertain ho to duplicate rokne ke liye CAS POST nahi');
+
+    const oldCreateUrl = process.env.SWIGGY_ADDRESS_CREATE_URL;
+    delete process.env.SWIGGY_ADDRESS_CREATE_URL;
+    casCalls = 0;
+    try {
+      const noBlindCas = await bridge.addSwiggyAddressToAccount(addressSession, randomAddress, {
+        customerId: 'CUSTTG1',
+        fetchImpl: async (url) => {
+          if (String(url).includes('/dapi/address/all')) return jsonResponse({ statusCode: 0, data: { addresses: [] } });
+          casCalls++;
+          return jsonResponse({ id: 'ADDR-SHOULD-NOT-POST' });
+        },
+        browserAddImpl: async () => ({
+          ok: false,
+          addressId: '',
+          submitAttempted: false,
+          pageState: 'form-not-found',
+          message: 'Add Address form ready nahi hua (state=form-not-found, fields=0)',
+        }),
+      });
+      ok(
+        !noBlindCas.ok && casCalls === 0 && !/<\s*!?doctype/i.test(noBlindCas.message || ''),
+        'address orchestration: explicit CAS URL na ho to guessed endpoint par HTML wala blind POST nahi'
+      );
+    } finally {
+      if (oldCreateUrl === undefined) delete process.env.SWIGGY_ADDRESS_CREATE_URL;
+      else process.env.SWIGGY_ADDRESS_CREATE_URL = oldCreateUrl;
+    }
   }
 
   // Saved account se /session fallback export me email/address survive kare.
@@ -1975,6 +2085,46 @@ console.log('telegram Hermes source + Add Telegram Account primitives:');
     && verifiedExport?.remoteAddressId === 'ADDR-SAVED-9', 'verified remote address + real ID session export me included');
   const verifiedFullExport = store.exportSessionJson('TEST_TELEGRAM_FRESH_EXPORT');
   ok(verifiedFullExport?.addressDetails?.remoteAddressId === 'ADDR-SAVED-9', 'full export me sirf verified Swiggy address ID aata hai');
+}
+
+// ---------------------------------------------------------------------------
+console.log('manual SKIP current number — owner control + one-shot outcome:');
+{
+  const pipe = await import('./number-pipeline.js');
+  const engine = await import('./autopilot-engine.js');
+  const fs = await import('node:fs/promises');
+  const freshBotSource = await fs.readFile(new URL('./fresh-bot.js', import.meta.url), 'utf8');
+  const engineSource = await fs.readFile(new URL('./autopilot-engine.js', import.meta.url), 'utf8');
+
+  const skipped = await pipe.processSingleNumber({
+    userId: 'manual-skip-test',
+    entry: { phone: '9812345670', source: 'telegram', otpProvider: 'telegram' },
+    otpCfg: { numberSource: 'telegram' },
+    shouldSkip: () => true,
+    markUsed: false,
+  });
+  ok(
+    skipped.kind === 'manual_skip' && skipped.manualSkip === true && !skipped.ok,
+    'pipeline: shouldSkip pehle checkpoint par manual_skip deta hai'
+  );
+  ok(
+    engine.isOneShotOtpFailureResult(skipped) === false,
+    'manual SKIP ko OTP-failure nahi gina jata; alag SKIP counter hai'
+  );
+  ok(
+    freshBotSource.includes('requestAutopilotSkipCurrent')
+    && freshBotSource.includes("callback_data: 'ap_skip_current'")
+    && freshBotSource.includes("bot.action('ap_skip_current', skipCurrentNumber)")
+    && freshBotSource.includes("bot.action('prem_batch_skip_current', skipCurrentNumber)")
+    && engineSource.includes("callback_data: 'prem_batch_skip_current'"),
+    'Fresh Bot + engine live keyboards dono me SKIP NUMBER functional wiring hai'
+  );
+  ok(
+    engineSource.includes('otpFailedThisRun')
+    && engineSource.includes('manualSkippedThisRun')
+    && !engineSource.includes('pendingTelegramRetry'),
+    'engine: OTP-failed/manual-skipped numbers run-consumed hain, pending same-number retry nahi'
+  );
 }
 
 console.log(`\n✅ ALL PASSED — ${passed} checks`);

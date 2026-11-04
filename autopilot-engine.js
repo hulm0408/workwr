@@ -250,6 +250,13 @@ const state = {
   staleSkips: 0,          // last-seen window se bahar wale devices (OTP bheje baghair skip)
   failed: 0,
   aborted: 0,
+  manualSkips: 0,         // owner ke ⏭ SKIP se khatam hue current numbers
+  manualSkipRequests: 0,  // SKIP button ki accepted requests (race me outcome se pehle)
+  otpFailures: 0,         // one-shot OTP rule se isi run me consumed numbers
+  skipRequestedPhone: '',
+  skipRequestedLaneId: 0,
+  skipRequestedAt: 0,
+  lastSkippedPhone: '',
   rateStrikes: 0,
   wafStrikes: 0,
   wafCooldowns: 0,
@@ -333,6 +340,14 @@ export function getAutopilotSnapshot() {
     failed: state.failed,
     staleSkips: state.staleSkips || 0,
     aborted: state.aborted,
+    manualSkips: state.manualSkips || 0,
+    manualSkipRequests: state.manualSkipRequests || 0,
+    otpFailures: state.otpFailures || 0,
+    skipRequested: Boolean(state.skipRequestedPhone),
+    skipRequestedPhone: state.skipRequestedPhone || '',
+    skipRequestedLaneId: state.skipRequestedLaneId || 0,
+    skipRequestedAt: state.skipRequestedAt || 0,
+    lastSkippedPhone: state.lastSkippedPhone || '',
     rateStrikes: state.rateStrikes,
     wafStrikes: state.wafStrikes,
     wafCooldowns: state.wafCooldowns,
@@ -410,6 +425,82 @@ export function requestAutopilotStop(reason = 'manual') {
   return true;
 }
 
+// ⏭ Owner ka current-number SKIP. Ye poora batch nahi rokta: sirf live
+// card par dikh raha pehla active number cooperative checkpoints par
+// khatam hoga, phir wahi lane NEW NUMBER legi.
+export function requestAutopilotSkipCurrent(reason = 'manual') {
+  if (!state.running) return { ok: false, reason: 'not-running', phone: '' };
+  if (state.stopRequested) return { ok: false, reason: 'batch-stopping', phone: '' };
+  const active = Array.isArray(state.activeNumbers) ? state.activeNumbers.filter(Boolean) : [];
+  const current = active[0] || state.current || null;
+  const phone = String(current?.phone || state.telegramCurrentPhone || '').replace(/\D/g, '').slice(-10);
+  if (!phone) return { ok: false, reason: 'no-current-number', phone: '' };
+  if (state.skipRequestedPhone === phone) {
+    return { ok: true, already: true, reason, phone, laneId: Number(current?.laneId || state.skipRequestedLaneId || 0) };
+  }
+  state.skipRequestedPhone = phone;
+  state.skipRequestedLaneId = Number(current?.laneId || 0);
+  state.skipRequestedAt = Date.now();
+  state.manualSkipRequests = (state.manualSkipRequests || 0) + 1;
+  return { ok: true, already: false, reason, phone, laneId: state.skipRequestedLaneId };
+}
+
+export function isAutopilotSkipRequested(phone = '') {
+  const clean = String(phone || '').replace(/\D/g, '').slice(-10);
+  return Boolean(clean && state.skipRequestedPhone === clean);
+}
+
+function clearAutopilotSkipRequest(phone = '') {
+  const clean = String(phone || '').replace(/\D/g, '').slice(-10);
+  if (clean && state.skipRequestedPhone !== clean) return false;
+  state.skipRequestedPhone = '';
+  state.skipRequestedLaneId = 0;
+  state.skipRequestedAt = 0;
+  return true;
+}
+
+// OTP se juda koi bhi failure is number ko isi run ke liye khatam kar
+// deta hai. Route/WAF recovery iske baad bhi chalegi, lekin sirf agle
+// NEW number ke liye — pending/deferred same-number retry nahi hoga.
+export function isOneShotOtpFailureResult(res = {}) {
+  if (!res || res.ok || res.success === true) return false;
+  if (res.otpFailure === true || res.otpAttemptConsumed === true) return true;
+  const kind = String(res.kind || '');
+  if ([
+    'failed_otp_send',
+    'failed_fresh_otp_send',
+    'failed_otp_miss',
+    'failed_fresh_otp_miss',
+    'failed_otp_timeout',
+    'failed_otp_verify',
+    'failed_verify',
+    'deferred_delete_otp_miss',
+  ].includes(kind)) return true;
+  const stage = String(res.stage || '');
+  return [
+    'otp_send',
+    'fresh_otp_send',
+    'delete_otp_send',
+    'otp_wait',
+    'otp_wait',
+    'verify',
+    'otp_verify',
+    'delete_otp_wait',
+    'delete_otp_verify',
+  ].includes(stage);
+}
+
+export function nextNumberGapMs({
+  telegramMode = false,
+  outcome = '',
+  configuredGapMs = 6_000,
+} = {}) {
+  const configured = Math.max(0, Number(configuredGapMs) || 0);
+  if (outcome === 'manual_skip') return 0;
+  if (telegramMode) return outcome === 'ok' ? Math.min(configured, 1_000) : 0;
+  return configured;
+}
+
 // User ka fast-recovery rule: rate-limit/WAF par number minuteon queue me
 // na fase — pehli recovery koshish 15 second ke andar nayi IP/token se ho.
 export const FAST_ROUTE_RECOVERY_MS = 15_000;
@@ -450,21 +541,12 @@ export function transientSwiggyRetryWaitMs(consecutiveStrikes) {
   return ladder[idx];
 }
 
-// Telegram/Hermes mode me current card NEW NUMBER click honay tak wahi
-// rehta hai. Agar pehle OTP-send stage par hi proxy/Swiggy infra fail ho
-// jaye (OTP dispatch confirm hi nahi hua), to current number ko kha kar
-// agla Hermes number claim karna regression tha: card par claimed badhta
-// rehta, processed 0. Ek capped retry ke liye wahi current entry rakho.
-// Verify/delete jaise aage ke stages yahan nahi aate — aadha process
-// dobara chalana duplicate OTP/delete ambiguity bana sakta hai.
-export function telegramInfraRetryDecision({
-  telegramMode = false,
-  willRetry = false,
-  phone = '',
-  stage = '',
-} = {}) {
-  if (!telegramMode || !willRetry || !String(phone || '').trim()) return false;
-  return ['otp_send', 'fresh_otp_send'].includes(String(stage || ''));
+// Backward-compatible export, lekin latest owner rule isay supersede kar
+// chuka hai: Hermes number par OTP-send/miss/verify failure ek baar aate
+// hi woh number isi run ke liye khatam. Route recovery ke baad seedha
+// NEW NUMBER hoga — pending same-number retry kabhi nahi.
+export function telegramInfraRetryDecision(_opts = {}) {
+  return false;
 }
 
 // Naya number claim karne se pehle route ki haalat. Tokenless +
@@ -591,7 +673,13 @@ function compactStepInfo(snap = {}, stageText = '') {
   let step = telegram ? 'NEW' : 'POOL';
   let now = telegram ? 'New number le raha hoon' : 'Number select ho raha hai';
 
-  if (/address/.test(text)) {
+  if (/number skip|manual_skip|current number skip|skip ho raha/.test(text)) {
+    step = telegram ? 'NEW' : 'POOL';
+    now = 'Current number SKIP ho gaya';
+  } else if (/otp fail|failed_otp|failed_verify|one shot otp|one-shot otp/.test(text)) {
+    step = telegram ? 'NEW' : 'POOL';
+    now = 'OTP fail — ye number khatam';
+  } else if (/address/.test(text)) {
     step = 'ADDR';
     now = 'Swiggy me address add ho raha hai';
   } else if (/route ready|waf|token|security|proxy|direct ip|rate limit/.test(text)) {
@@ -659,14 +747,22 @@ function compactStepInfo(snap = {}, stageText = '') {
         ADDR: 'Address verify hote hi JSON aayega',
         FRESH: 'JSON isi chat me bhej diya hai',
       };
-  const errorish = /error|retry|waf|security|rate|temporary|fail|claim/.test(text);
+  const manualSkip = /number skip|manual_skip|current number skip|skip ho raha/.test(text);
+  const oneShotOtp = /otp fail|failed_otp|failed_verify|one shot otp|one-shot otp/.test(text);
+  const errorish = !manualSkip && /error|retry|waf|security|rate|temporary|fail|claim/.test(text);
   return {
     title,
     detail,
     step,
     now,
     flowText,
-    next: errorish ? 'Route badal kar khud retry hoga — STOP nahi hoga' : nextByStep[step],
+    next: manualSkip
+      ? 'Batch chalega — NEW NUMBER aayega'
+      : oneShotOtp
+        ? 'Ye number khatam — route ready karke NEW NUMBER aayega'
+        : errorish
+          ? 'Route recovery hoga — STOP nahi hoga'
+          : nextByStep[step],
     errorish,
   };
 }
@@ -717,7 +813,9 @@ export function formatCompactAutopilotCard(snap = state, { stageText = '', final
     waf_stuck: 'WAF rukawat',
     circuit_breaker: 'Lagatar failures par safety stop',
   }[s.stopReason] || (s.stopReason ? `Stop: ${s.stopReason}` : 'Batch complete');
-  const now = final ? reason : info.now;
+  const skipRequested = !final && Boolean(s.skipRequestedPhone && s.skipRequestedPhone === currentPhone);
+  const now = final ? reason : (skipRequested ? 'Current number SKIP ho raha hai' : info.now);
+  const next = skipRequested ? 'Safe checkpoint par ruk kar NEW NUMBER aayega' : info.next;
   const title = final ? '🏁 BATCH KHATAM' : '🟢 LIVE';
   const lines = [
     mono(info.flowText),
@@ -726,10 +824,10 @@ export function formatCompactAutopilotCard(snap = state, { stageText = '', final
     progressBar(fresh, target),
     `📱 ${mono(phoneText)} · ⏱ ${mono(fmtDuration(compactElapsedMs(s)))}${s.sourceMode !== 'telegram' && (s.concurrency || 1) > 1 ? ` · ⚡ ${mono(`${Number(s.activeWorkers) || active.length}/${Number(s.concurrency) || 1}`)}` : ''}`,
     compactSourceLine(s),
-    `✅ ${mono(`FRESH ${fresh}`)} · ⚙ ${mono(`DONE ${Number(s.processed) || 0}`)} · × ${mono(`FAIL ${Number(s.failed) || 0}`)}${retries ? ` · ↻ ${mono(`RETRY ${retries}`)}` : ''}${fresh ? ` · 🏠 ${mono(`ADDR ${Number(s.addressAdded) || 0}/${fresh}`)}` : ''}`,
+    `✅ ${mono(`FRESH ${fresh}`)} · ⚙ ${mono(`DONE ${Number(s.processed) || 0}`)} · × ${mono(`FAIL ${Number(s.failed) || 0}`)}${retries ? ` · ↻ ${mono(`RETRY ${retries}`)}` : ''}${Number(s.manualSkips) ? ` · ⏭ ${mono(`SKIP ${Number(s.manualSkips) || 0}`)}` : ''}${fresh ? ` · 🏠 ${mono(`ADDR ${Number(s.addressAdded) || 0}/${fresh}`)}` : ''}`,
     final
       ? (fresh ? sub('Fresh JSON chat me bhej diye hain.') : sub('Is run me fresh session nahi bana.'))
-      : `<b>Next:</b> ${esc(info.next)}`,
+      : `<b>Next:</b> ${esc(next)}`,
     (final || info.errorish) && s.lastError ? `⚠ ${mono(truncateUiText(s.lastError, 76))}` : '',
   ];
   if (final && Array.isArray(s.freshAccounts) && s.freshAccounts.length) {
@@ -769,7 +867,10 @@ function summaryCard() {
 
 function stopRows() {
   return [
-    [{ text: '⏹ STOP BATCH', callback_data: 'prem_batch_stop', style: 'danger' }],
+    [
+      { text: '⏭ SKIP NUMBER', callback_data: 'prem_batch_skip_current', style: 'primary' },
+      { text: '⏹ STOP BATCH', callback_data: 'prem_batch_stop', style: 'danger' },
+    ],
     [{ text: '📊 Status', callback_data: 'prem_batch_status' }, { text: '⌂ Main Menu', callback_data: 'boss_panel_home' }],
   ];
 }
@@ -927,6 +1028,8 @@ export async function startAutopilot(opts = {}) {
     concurrency: requestedConcurrency, requestedConcurrency, activeWorkers: 0,
     processed: 0, fresh: 0, freshNew: 0, freshAfterDelete: 0,
     skipped: 0, deferred: 0, cooldownSkips: 0, staleSkips: 0, failed: 0, aborted: 0,
+    manualSkips: 0, manualSkipRequests: 0, otpFailures: 0,
+    skipRequestedPhone: '', skipRequestedLaneId: 0, skipRequestedAt: 0, lastSkippedPhone: '',
     rateStrikes: 0, wafStrikes: 0, wafCooldowns: 0, serverErrors: 0, transientStrikes: 0,
     consecutiveFails: 0, proxyRotations: 0,
     routeMode: 'direct', proxyChallenges: 0, directChallenges: 0, deferredQueue: 0,
@@ -990,8 +1093,22 @@ export async function startAutopilot(opts = {}) {
   };
 
   const tally = (res) => {
-    // WAF cooldown = number bilkul untouched (sirf wait hui) — count me mat lo,
-    // warna summary jhootha dikhega.
+    // Owner ka manual SKIP na fresh hai, na fail, na DONE. Alag counter +
+    // history me record hoga aur batch agle number par chalega.
+    if (res.kind === 'manual_skip') {
+      state.manualSkips = (state.manualSkips || 0) + 1;
+      state.lastSkippedPhone = res.phone || state.lastSkippedPhone || '';
+      state.history.push({ phone: res.phone, kind: res.kind, reason: res.reason || 'manual skip', at: new Date().toISOString() });
+      if (state.history.length > 200) state.history.splice(0, state.history.length - 200);
+      return 'manual_skip';
+    }
+    if (isOneShotOtpFailureResult(res)) {
+      state.otpFailures = (state.otpFailures || 0) + 1;
+    }
+
+    // WAF cooldown OTP confirm hone se pehle aaya — processed/fail me
+    // mat lo, warna summary jhootha dikhega. Phone phir bhi post-tally
+    // one-shot consumed hoga, taaki chaalu batch isi par waqt na jalaye.
     if (res.kind === 'waf_cooldown') return 'waf_cooldown';
 
     // 7-day extracted-number cooldown — number pehle hi extract/send ho
@@ -1009,16 +1126,14 @@ export async function startAutopilot(opts = {}) {
       return 'device_stale';
     }
 
-    // Security challenge — request WAF par hi ruk gayi, number bilkul
-    // untouched hai (na OTP gaya, na kuch burn hua). Processed/fail me
-    // gina jata tha to stats jhoothe padte the; engine isko alag handle
-    // karta hai (number defer + IP cooldown + naya token).
+    // Security challenge — request WAF par hi ruk gayi. Processed/fail
+    // me gina jata tha to stats jhoothe padte the; engine isko alag
+    // handle karta hai (number one-shot consumed + IP cooldown/token).
     if (res.kind === 'security_challenge') return 'security_challenge';
 
     // Swiggy/proxy temporary 5xx ya network error — OTP confirm hi nahi
-    // hua, isliye number processed/failed NAHI gina jayega. Engine use
-    // retry queue me rakh kar proxy rotate karega. (Pehle ye
-    // `failed_otp_send` ban kar number ko kha jata tha.)
+    // hua, isliye number processed/failed NAHI gina jayega. Engine proxy
+    // rotate karke agla NEW number lega; ye phone retry queue me nahi.
     if (res.kind === 'deferred_swiggy_transient') {
       state.serverErrors = (state.serverErrors || 0) + 1;
       state.transientStrikes = (state.transientStrikes || 0) + 1;
@@ -1426,6 +1541,9 @@ export async function startAutopilot(opts = {}) {
     const retryLater = []; // { entry, attempts, why }
     const deferNumber = (entry, why) => {
       if (!entry?.phone) return;
+      // One-shot OTP / manual SKIP wala phone kisi bhi branch se retry
+      // queue me wapas nahi jayega.
+      try { if (phoneConsumedThisRun(entry.phone)) return; } catch {}
       if (retryLater.some((r) => r.entry.phone === entry.phone)) return;
       retryLater.push({ entry, attempts: 0, why });
       state.deferredQueue = retryLater.length;
@@ -1505,6 +1623,13 @@ export async function startAutopilot(opts = {}) {
     // Is run me extract/send ho chuke numbers — ledger ke ilawa in-memory
     // hard stop, taaki koi purani hot/retry queue entry inhe dobara na uthaye.
     const extractedThisRun = new Set();
+    // One-shot OTP + owner SKIP: ye phones is run me kisi queue/claim se
+    // dobara nahi uthenge. Route recovery sirf agle NEW number ke liye hai.
+    const otpFailedThisRun = new Set();
+    const manualSkippedThisRun = new Set();
+    const phoneConsumedThisRun = (phone) => Boolean(
+      phone && (otpFailedThisRun.has(phone) || manualSkippedThisRun.has(phone))
+    );
     // WAF/security/rate-limit/transient jaise infra outcomes par bhi ek hi
     // number ko is run me max 2 attempts. Pehle har category ka alag (ya
     // bilkul nahi) cap tha, isliye ek number WAF storm me baar-baar ghoom
@@ -1516,7 +1641,7 @@ export async function startAutopilot(opts = {}) {
       if (!phone) return { attempt: 0, willRetry: false };
       const attempt = (infraAttemptsThisRun.get(phone) || 0) + 1;
       infraAttemptsThisRun.set(phone, attempt);
-      const willRetry = attempt < 2;
+      const willRetry = attempt < 2 && !phoneConsumedThisRun(phone);
       if (!willRetry) {
         infraCappedThisRun.add(phone);
         removeRetryLaterPhone(phone);
@@ -1534,6 +1659,7 @@ export async function startAutopilot(opts = {}) {
         .filter(underTransientCap)
         .filter(underInfraCap)
         .filter((e) => !extractedThisRun.has(e.phone))
+        .filter((e) => !phoneConsumedThisRun(e.phone))
         .filter((e) => !staleThisRun.has(e.phone))
         .filter((e) => !isEntryActive(e));
       if (!allowOffline) {
@@ -1568,6 +1694,7 @@ export async function startAutopilot(opts = {}) {
         if (
           staleThisRun.has(entry.phone) ||
           extractedThisRun.has(entry.phone) ||
+          phoneConsumedThisRun(entry.phone) ||
           !underFailCap(entry) ||
           !underTransientCap(entry) ||
           !underInfraCap(entry)
@@ -1603,6 +1730,7 @@ export async function startAutopilot(opts = {}) {
         if (
           staleThisRun.has(entry.phone) ||
           extractedThisRun.has(entry.phone) ||
+          phoneConsumedThisRun(entry.phone) ||
           !underFailCap(entry) ||
           !underTransientCap(entry) ||
           !underInfraCap(entry) ||
@@ -1978,9 +2106,9 @@ export async function startAutopilot(opts = {}) {
         if (notified || (lane.routePrepNoticeAt && now - lane.routePrepNoticeAt < 30_000)) return;
         notified = true;
         lane.routePrepNoticeAt = now;
-        await push(progressCard(section('🛡 Route Ready Kar Raha Hoon — Hermes Number Safe Hai', [
+        await push(progressCard(section('🛡 Route Ready — Phir NEW NUMBER', [
           `› Lane ${lane.id} ki route <code>${esc(routeLabel || 'direct')}</code> par WAF token solve ho raha hai.`,
-          '› Is dauran <b>naya Hermes number claim nahi hoga</b> — pehle IP/token ready, phir FIND/NEW NUMBER.',
+          '› Pehle IP/token ready hoga, phir <b>NEW NUMBER</b> claim hoga — purana OTP-failed number dobara nahi chalega.',
           sub('Token jaldi mil jaye to solve turant khatam ho jayega; clean route par fast solve, challenged/direct route par reliable budget 45s tak hai.'),
         ].join('\n'))), stopRows());
       };
@@ -2010,8 +2138,8 @@ export async function startAutopilot(opts = {}) {
             if (next) continue;
           }
           // Direct-only / koi proxy free nahi: bridge ki raw + Android /
-          // browser recovery ko ek mauqa do. Send-stage infra fail par wahi
-          // Hermes current number capped retry me safe rahega.
+          // browser recovery ko ek mauqa do. OTP fail par ye number
+          // one-shot consumed hoga aur recovery agle NEW ke liye hogi.
           return true;
         }
 
@@ -2167,6 +2295,8 @@ export async function startAutopilot(opts = {}) {
           ...telegramClaimedThisRun,
           ...telegramRejectedThisRun,
           ...extractedThisRun,
+          ...otpFailedThisRun,
+          ...manualSkippedThisRun,
           ...staleThisRun,
           ...infraCappedThisRun,
           ...activePhones,
@@ -2179,6 +2309,7 @@ export async function startAutopilot(opts = {}) {
             && !telegramClaimedThisRun.has(phone)
             && !telegramRejectedThisRun.has(phone)
             && !extractedThisRun.has(phone)
+            && !phoneConsumedThisRun(phone)
             && !staleThisRun.has(phone)
             && underFailCap(entry)
             && underTransientCap(entry)
@@ -2392,7 +2523,6 @@ export async function startAutopilot(opts = {}) {
       directChallenges: 0,
       consecutiveFails: 0,
       currentEntry: null,
-      pendingTelegramRetry: null,
       routePrepNoticeAt: 0,
       rawRouteOkKey: '',
     }));
@@ -2461,26 +2591,9 @@ export async function startAutopilot(opts = {}) {
             continue;
           }
 
-          let claim;
-          if (telegramMode && lane.pendingTelegramRetry?.entry) {
-            const retryPicked = lane.pendingTelegramRetry;
-            if (!claimPickedEntry(retryPicked.entry)) {
-              await sleep(250, () => state.stopRequested);
-              continue;
-            }
-            lane.pendingTelegramRetry = null;
-            state.telegramCurrentPhone = retryPicked.entry.phone;
-            claim = {
-              status: 'picked',
-              picked: {
-                ...retryPicked,
-                checkedAt: Date.now(),
-                telegramInfraRetry: true,
-              },
-            };
-          } else {
-            claim = await claimNextPick();
-          }
+          // One-shot OTP rule: pichhla Hermes number kabhi pending retry
+          // se wapas nahi aayega. Har asal claim NEW NUMBER se hoga.
+          const claim = await claimNextPick();
           if (claim.status === 'target') { requestRunEnd('target'); break; }
           if (claim.status === 'stopped') break;
           if (claim.status === 'waiting') {
@@ -2507,6 +2620,24 @@ export async function startAutopilot(opts = {}) {
       // warna success ke baad wahi stale retry number ko dobara utha sakti thi.
       removeRetryLaterPhone(entry.phone);
       setLaneCurrent(lane, entry);
+      // Route-prep/gap ke dauran pichhle number par laga stale SKIP
+      // naye current number ki card/state ko confuse na kare. Kisi aur
+      // lane ka asal active target ho to use bilkul mat chhuo.
+      if (
+        state.skipRequestedPhone
+        && state.skipRequestedPhone !== entry.phone
+        && !activePhones.has(state.skipRequestedPhone)
+      ) {
+        clearAutopilotSkipRequest(state.skipRequestedPhone);
+      }
+      const manualSkipResult = () => ({
+        ok: false,
+        kind: 'manual_skip',
+        phone: entry.phone,
+        stage: 'engine',
+        manualSkip: true,
+        reason: 'Owner ne current number SKIP kar diya',
+      });
 
       // Card par foran saaf dikhao ke scan ruk chuka hai aur asal number
       // process ho raha hai. Warna WAF warm-up / OTP wait ke dauran purana
@@ -2516,24 +2647,19 @@ export async function startAutopilot(opts = {}) {
           ? Math.max(0, Date.now() - Number(picked.lastActivityMs))
           : null;
         await push(progressCard(section(
-          picked.telegramInfraRetry
-            ? '↻ Hermes Current Number — Ready Route Par Retry'
-            : '📟 Device Mil Gaya — Number Process Shuru',
+          '📟 Device Mil Gaya — Number Process Shuru',
           [
             `📱 <b>Number:</b> <code>${esc(entry.phone)}</code> · lane ${lane.id} · ${esc(lane.proxy?.label || 'direct')}`,
-            picked.telegramInfraRetry
-              ? '› Pichhle send-stage infra failure par naya Hermes number claim nahi kiya — wahi current number ab tayyar route par dobara process ho raha hai.'
-              : picked.onlineFallback
-                ? '› Quick scan me taaza SMS activity nahi mili — Firebase <b>clients me ONLINE</b> dikh raha device liya hai. Full pool scan ka wait nahi kiya.'
-                : `› Device ki last SMS activity ~${fmtDuration(pickedAgeMs || 0)} purani · ladder ≤${fmtDuration(Math.max(Number(otpCfg.activeWindowMs) || 0, Number(picked.windowMs) || 0))} · queue me ${hotQueue.length} backup(s).`,
-            sub(picked.telegramInfraRetry
-              ? 'Ye capped infra retry hai; asal OTP/processed outcome aate hi agla number chalega.'
-              : 'Is lane par ab WAF/OTP flow chalega; baaki lanes apna kaam jaari rakhengi. Processed count result aate hi badhega.'),
+            picked.onlineFallback
+              ? '› Quick scan me taaza SMS activity nahi mili — Firebase <b>clients me ONLINE</b> dikh raha device liya hai. Full pool scan ka wait nahi kiya.'
+              : `› Device ki last SMS activity ~${fmtDuration(pickedAgeMs || 0)} purani · ladder ≤${fmtDuration(Math.max(Number(otpCfg.activeWindowMs) || 0, Number(picked.windowMs) || 0))} · queue me ${hotQueue.length} backup(s).`,
+            sub('Is lane par ab WAF/OTP flow chalega; baaki lanes apna kaam jaari rakhengi. Processed count result aate hi badhega.'),
           ].join('\n'))), stopRows());
       }
 
-      // WAF warm-up background me chal raha tha — pehla OTP iske baghair na jaye
-      await ensureWarm();
+      // WAF warm-up background me chal raha tha — pehla OTP iske baghair na jaye.
+      // Owner ne isi beech SKIP kar diya ho to warm-up ka wait bhi mat karo.
+      if (!isAutopilotSkipRequested(entry.phone)) await ensureWarm();
 
       // Scan se aaye number ka prechecked last-seen pipeline ko dedo — wahi
       // device dobara fetch nahi hoga. Agar ye device base window miss ke
@@ -2560,23 +2686,32 @@ export async function startAutopilot(opts = {}) {
         proxyId: lane.proxy?.id || '',
       };
       let finalProxy = lane.proxy || null;
-      const res = await runWithBridgeProxy(lane.proxy || null, async () => {
-        try {
-          return await processSingleNumber({
-            userId: lane.userId,
-            entry,
-            otpCfg: numCfg,
-            shouldAbort: () => state.stopRequested,
-            report: async (text) => { await push(progressCard(text), stopRows()); },
-          });
-        } finally {
-          finalProxy = getBridgeProxy();
-        }
-      }, {
-        owner: lane.owner,
-        releaseOnExit: false,
-        wafTokenMode: laneCount > 1 && lane.proxy?.id ? 'defer-until-challenge' : '',
-      });
+      const rawRes = isAutopilotSkipRequested(entry.phone)
+        ? manualSkipResult()
+        : await runWithBridgeProxy(lane.proxy || null, async () => {
+          try {
+            return await processSingleNumber({
+              userId: lane.userId,
+              entry,
+              otpCfg: numCfg,
+              shouldAbort: () => state.stopRequested || isAutopilotSkipRequested(entry.phone),
+              shouldSkip: () => isAutopilotSkipRequested(entry.phone),
+              report: async (text) => { await push(progressCard(text), stopRows()); },
+            });
+          } finally {
+            finalProxy = getBridgeProxy();
+          }
+        }, {
+          owner: lane.owner,
+          releaseOnExit: false,
+          wafTokenMode: laneCount > 1 && lane.proxy?.id ? 'defer-until-challenge' : '',
+        });
+      // SKIP kisi lambay bridge step ke bilkul aakhir me aaya ho tab bhi
+      // tally se pehle manual outcome hi jeetega — ye number fresh count
+      // ya instant JSON me nahi jayega.
+      const res = isAutopilotSkipRequested(entry.phone) && !state.stopRequested
+        ? manualSkipResult()
+        : rawRes;
       syncLaneRouteAfterProcess(lane, finalProxy);
       const finalProxyId = finalProxy?.id || '';
 
@@ -2606,28 +2741,21 @@ export async function startAutopilot(opts = {}) {
       if (outcome === 'failed' && res.phone) {
         failedAttemptsThisRun.set(res.phone, (failedAttemptsThisRun.get(res.phone) || 0) + 1);
       }
-      // Send-stage infra failure par Hermes ka current card abhi bhi wahi
-      // number dikha raha hota hai (NEW NUMBER abhi click nahi hua). Use
-      // lane ke pending retry me rakho — agli iteration provider se naya
-      // number claim kiye baghair wahi entry ready route par process hogi.
-      const preserveTelegramCurrentForRetry = (willRetry) => {
-        const shouldPreserve = telegramInfraRetryDecision({
-          telegramMode,
-          willRetry,
-          phone: entry?.phone || res?.phone || '',
-          stage: res?.stage || '',
-        });
-        if (!shouldPreserve) return false;
-        lane.pendingTelegramRetry = {
-          ...picked,
-          entry,
-          checkedAt: Date.now(),
-          telegramInfraRetry: true,
-        };
-        state.telegramCurrentPhone = entry.phone;
-        state.telegramInfraRetries = (state.telegramInfraRetries || 0) + 1;
-        return true;
-      };
+      // One-shot OTP / manual SKIP: is phone ko isi run ki har queue aur
+      // claim filter se consumed kar do. Neeche wali route recovery ab
+      // sirf agle NEW number ke liye hai.
+      const oneShotOtpFailure = isOneShotOtpFailureResult(res);
+      if (oneShotOtpFailure && res.phone) {
+        otpFailedThisRun.add(res.phone);
+        if (telegramMode) telegramRejectedThisRun.add(res.phone);
+        purgeQueuedPhone(res.phone);
+      }
+      if (outcome === 'manual_skip' && res.phone) {
+        manualSkippedThisRun.add(res.phone);
+        if (telegramMode) telegramRejectedThisRun.add(res.phone);
+        purgeQueuedPhone(res.phone);
+      }
+      if (telegramMode) state.telegramRejected = telegramRejectedThisRun.size;
       // Console visibility — exact failure reason (Telegram card ke alawa),
       // taaki WAF/rate-limit/verify/OTP-miss ka farq turant dikhe logs me.
       if (!res.ok) {
@@ -2640,13 +2768,17 @@ export async function startAutopilot(opts = {}) {
           section(
             res.ok
               ? '✅ Number Done'
-              : res.kind === 'skipped_delete_blocked'
-                ? '⚠️ Skipped'
-                : res.kind === 'aborted'
-                  ? '⏹ Aborted'
-                  : res.kind === 'deferred_swiggy_transient'
-                    ? '↻ Temporary Swiggy Error — Retry Later'
-                    : '× Result',
+              : res.kind === 'manual_skip'
+                ? '⏭ Number SKIP'
+                : oneShotOtpFailure
+                  ? '⚡ OTP Fail — New Number'
+                  : res.kind === 'skipped_delete_blocked'
+                    ? '⚠️ Skipped'
+                    : res.kind === 'aborted'
+                      ? '⏹ Aborted'
+                      : res.kind === 'deferred_swiggy_transient'
+                        ? '↻ Temporary Swiggy Error — Route Recovery'
+                        : '× Result',
             [
             `📱 <b>Number:</b> <code>${esc(res.phone)}</code> · lane ${lane.id} · ${esc(lane.proxy?.label || 'direct')}`,
             `› <b>Outcome:</b> <code>${esc(res.kind)}</code>`,
@@ -2656,8 +2788,14 @@ export async function startAutopilot(opts = {}) {
       }
 
       // Engine-level reactions — "rukna hi na pare":
-      //   rate-limit/WAF → TURANT proxy badal (nayi IP) + number defer kar
-      //   (baad me isi run me dobara). Sirf tab ruk jab saare proxies side par.
+      //   rate-limit/WAF → TURANT proxy badal (nayi IP), lekin OTP-failed
+      //   number defer nahi hoga. Sirf tab ruk jab saare proxies side par.
+
+      // Owner SKIP: sirf ye number khatam, batch bina gap agle number par.
+      if (outcome === 'manual_skip') {
+        clearAutopilotSkipRequest(res.phone || entry.phone);
+        continue;
+      }
 
       // 7-day cooldown — ye number pehle extract/send ho chuka hai. Queue
       // ki iski har copy saaf karke bina gap agla number lo.
@@ -2676,17 +2814,14 @@ export async function startAutopilot(opts = {}) {
         continue;
       }
 
-      // Swiggy/proxy temporary 5xx ya network error — number ki galti
-      // nahi. Number isi run ki retry queue me (max 2 attempts), proxy
-      // turant rotate, aur agar lagatar 3 hon to asal outage samajh kar
-      // short cool-off. Pehle ye seedha Failed count hota tha aur proxy
-      // 4 generic fails se pehle badalti hi nahi thi.
+      // Swiggy/proxy temporary 5xx ya network error par route turant
+      // rotate hogi, lekin OTP-stage failure wala number one-shot rule
+      // se isi run me khatam hai — recovery agle NEW number ke liye hai.
       if (outcome === 'swiggy_transient') {
         const attempt = (transientAttemptsThisRun.get(res.phone) || 0) + 1;
         if (res.phone) transientAttemptsThisRun.set(res.phone, attempt);
         const infra = recordInfraAttempt(res.phone);
-        const willRetry = Boolean(res.phone && attempt < 2 && infra.willRetry);
-        const telegramRetryPreserved = preserveTelegramCurrentForRetry(willRetry);
+        const willRetry = Boolean(res.phone && attempt < 2 && infra.willRetry && !oneShotOtpFailure);
         if (willRetry && !telegramMode) deferNumber(entry, 'swiggy_transient');
         if (finalProxyId) {
           try { proxyPool.markProxyTransientFailure(finalProxyId, 60_000); } catch {}
@@ -2699,23 +2834,17 @@ export async function startAutopilot(opts = {}) {
 
         const needsCoolOff = !next || (state.transientStrikes || 0) >= 3;
         const waitMs = needsCoolOff ? transientSwiggyRetryWaitMs(state.transientStrikes) : 0;
-        await push(progressCard(section('↻ Temporary Error — Number Safe Hai', [
-          `› ${res.httpStatus ? `HTTP ${res.httpStatus}` : 'Network/5xx'} temporary error — ye number <b>FAILED count nahi</b> hua.`,
+        await push(progressCard(section('↻ Temporary Error — Route Recovery', [
+          `› ${res.httpStatus ? `HTTP ${res.httpStatus}` : 'Network/5xx'} temporary error — ye number <b>one-shot OTP rule</b> se khatam hai.`,
           telegramMode
-            ? (telegramRetryPreserved
-              ? `› Hermes current number <b>safe rakha hai</b> — naya number claim nahi hoga; wahi number ready route par ek capped retry lega (attempt ${attempt}/2).`
-              : `› Is Hermes number ke capped infra attempts khatam — ab agla number FIND NUMBER/NEW NUMBER se aayega.`)
-            : willRetry
-              ? `› Number retry queue me daal diya (attempt ${attempt}/2) — isi run me dobara ayega.`
-              : `› Is number ke is run ke 2 temporary attempts ho gaye — ledger/pool me failed mark nahi kiya, agli run me mil sakta hai.`,
+            ? '› Route ready karke seedha NEW NUMBER aayega — isi number par dusra try nahi hoga.'
+            : '› Route recovery ke baad agla naya number aayega — isi number par dusra OTP try nahi hoga.',
           next
             ? `› Proxy rotate kar diya: <code>${esc(next.label)}</code> (rotation #${state.proxyRotations})`
             : `› Doosri proxy available nahi — isi IP par cool-off ke baad aage badhunga.`,
           waitMs
             ? `› Lagatar ${state.transientStrikes} temporary errors — sirf lane ${lane.id} ${Math.round(waitMs / 1000)}s cool-off legi, baaki lanes chalti rahengi.`
-            : (telegramRetryPreserved
-              ? `› Nayi IP par turant wahi Hermes current number retry hoga — batch nahi rukega.`
-              : `› Nayi IP par turant agla number — batch nahi rukega.`),
+            : '› Nayi IP par turant agla number — batch nahi rukega.',
         ].join('\n'))), stopRows());
 
         if (waitMs) {
@@ -2733,11 +2862,10 @@ export async function startAutopilot(opts = {}) {
       if (outcome === 'rate_limited') {
         // NOTE: rateStrikes tally() me already badhta hai — yahan dobara ++
         // karne se 3-strike wali limit 2 hits par hi band ho jati thi.
-        // Number defer — isi run me aakhir me dobara try hoga (is run ke
-        // combined infra attempts max 2; us ke baad ye phone side par).
+        // OTP failure wala number defer nahi hoga; nayi IP sirf agle
+        // NEW number ke liye ready ki jayegi.
         const rateInfra = recordInfraAttempt(res.phone);
-        const telegramRetryPreserved = preserveTelegramCurrentForRetry(Boolean(res.phone && rateInfra.willRetry));
-        if (res.phone && rateInfra.willRetry && !telegramMode) deferNumber(entry, 'rate_limited');
+        if (res.phone && rateInfra.willRetry && !oneShotOtpFailure && !telegramMode) deferNumber(entry, 'rate_limited');
 
         if (ps.enabled) {
           const before = finalProxyId;
@@ -2746,12 +2874,8 @@ export async function startAutopilot(opts = {}) {
             await push(progressCard(section('🔀 Rate Limit — Proxy Rotate (zero wait)', [
               `› IP ko limit lagi — nayi IP (proxy) le liya: <code>${esc(next.label)}</code>`,
               telegramMode
-                ? (telegramRetryPreserved
-                  ? `› Hermes current number safe hai — naya claim nahi hoga; wahi number nayi IP par capped retry lega.`
-                  : `› Is Hermes number ke capped infra attempts khatam — agla number NEW NUMBER se aayega.`)
-                : rateInfra.willRetry
-                  ? `› Number defer kiya — baad me isi run me ek aur mauqa milega.`
-                  : `› Is number ke is run ke 2 infra attempts ho gaye — ab ye is run me dobara nahi uthega.`,
+                ? '› Ye Hermes number one-shot OTP rule se khatam — agla number NEW NUMBER se aayega.'
+                : '› Ye number one-shot OTP rule se khatam — nayi IP par agla naya number aayega.',
               `› Strike ${state.rateStrikes} — lane ${lane.id} nayi IP par, baaki lanes unaffected.`,
             ].join('\n'))), stopRows());
             state.consecutiveFails = 0;
@@ -2795,8 +2919,7 @@ export async function startAutopilot(opts = {}) {
           state.workerRecoveries = (state.workerRecoveries || 0) + 1;
         }
         const wafInfra = recordInfraAttempt(res.phone);
-        const telegramRetryPreserved = preserveTelegramCurrentForRetry(Boolean(res.phone && wafInfra.willRetry));
-        if (res.phone && wafInfra.willRetry && !telegramMode) deferNumber(entry, 'waf_cooldown');
+        if (res.phone && wafInfra.willRetry && !oneShotOtpFailure && !telegramMode) deferNumber(entry, 'waf_cooldown');
 
         // Fast recovery: ek wait kabhi 15s se zyada nahi. Uske baad nayi
         // IP/token se asal retry hoga; purani 5-minute neend result ko
@@ -2806,12 +2929,8 @@ export async function startAutopilot(opts = {}) {
         await push(progressCard(section('🛡 WAF Cooling — 15s Fast Recovery', [
           `› Swiggy ki WAF abhi lane ${lane.id} ki IP ko garam bol rahi hai — sirf ~${Math.max(1, Math.round(cdMs / 1000))}s me nayi IP/token try hogi; baaki lanes chalti rahengi.`,
           telegramMode
-            ? (telegramRetryPreserved
-              ? `› Hermes current number safe hai — naya claim nahi hoga; wahi number nayi IP/token par capped retry lega. Batch zinda hai.`
-              : `› Is Hermes number ke capped infra attempts khatam — batch zinda hai, agla number NEW NUMBER se aayega.`)
-            : wafInfra.willRetry
-              ? `› Number defer ho chuka hai (isi run me ek aur mauqa milega). Batch zinda hai.`
-              : `› Is number ke is run ke 2 infra attempts ho gaye — ab ye is run me dobara nahi uthega. Batch zinda hai.`,
+            ? '› Ye Hermes number one-shot OTP rule se khatam — batch zinda hai, agla number NEW NUMBER se aayega.'
+            : '› Ye number one-shot OTP rule se khatam — batch zinda hai, route recovery ke baad naya number aayega.',
           sub('Proxies add karoge to ye wait ghat kar seconds me aa jayegi (nayi IP = turant aage).'),
         ].join('\n'))), stopRows());
         await sleep(cdMs, () => state.stopRequested);
@@ -2829,8 +2948,8 @@ export async function startAutopilot(opts = {}) {
         continue;
       }
 
-      // Security challenge (403) — batch NAHI marta. Number defer, IP ko
-      // thanda hone do, naya token lo aur aage badho. Ek success par strikes
+      // Security challenge (403) — batch NAHI marta. OTP-failed number
+      // khatam karke IP ko thanda hone do, naya token lo aur aage badho. Ek success par strikes
       // reset (tally me) — isliye milawat wali run kabhi is par nahi rukti.
       // Sirf bahut lagatar (bina ek bhi processed outcome ke) challenges
       // par roko. Parallel lanes me limit lane-count ke hisaab se scale
@@ -2840,15 +2959,10 @@ export async function startAutopilot(opts = {}) {
         state.wafStrikes++;
         state.lastError = `security challenge ×${state.wafStrikes}`;
         const securityInfra = recordInfraAttempt(res.phone);
-        const telegramRetryPreserved = preserveTelegramCurrentForRetry(Boolean(res.phone && securityInfra.willRetry));
-        if (res.phone && securityInfra.willRetry && !telegramMode) deferNumber(entry, 'security_challenge');
+        if (res.phone && securityInfra.willRetry && !oneShotOtpFailure && !telegramMode) deferNumber(entry, 'security_challenge');
         const numberRetryLine = telegramMode
-          ? (telegramRetryPreserved
-            ? 'Hermes current number safe hai — naya claim nahi hoga; wahi number ready route par capped retry lega.'
-            : 'Is Hermes number ke capped infra attempts khatam — agla number NEW NUMBER se aayega.')
-          : securityInfra.willRetry
-            ? 'Number defer hai — isi run me ek aur mauqa milega, failed mark nahi hua.'
-            : 'Is number ke is run ke 2 infra attempts ho gaye — failed mark nahi hua, lekin ab ye is run me dobara nahi uthega.';
+          ? 'Ye Hermes number one-shot OTP rule se khatam — route ready karke NEW NUMBER aayega.'
+          : 'Ye number one-shot OTP rule se khatam — route recovery ke baad naya number aayega.';
         if (state.wafStrikes >= securityStormLimit) {
           if (!telegramMode) { requestRunEnd('security_challenge'); break; }
           // Hermes lane ke liye security storm bhi recovery checkpoint hai;
@@ -2953,7 +3067,7 @@ export async function startAutopilot(opts = {}) {
             await solveLaneToken(lane, false);
             state.consecutiveFails = 0;
             lane.consecutiveFails = 0;
-            continue; // agla number nayi IP par (ye wala baad me dobara)
+            continue; // agla NEW number nayi IP par; ye phone consumed hai
           }
 
           // Pehle yahan purani garam proxy hi chipki rehti thi aur code
@@ -3010,13 +3124,27 @@ export async function startAutopilot(opts = {}) {
         }
       }
 
-      // Gap between numbers — ab per-lane/per-IP hai, global nahi. Ek lane
-      // ke gap ke dauran baaki 9 lanes OTP/process jaari rakhengi.
+      // Gap between numbers — per-lane/per-IP hai, global nahi. Hermes
+      // single-lane me OTP fail ke baad 6-9s ki fuzool neend speed marti
+      // thi: wahan sirf success par max 1s, baaki outcomes par zero gap.
       if (state.fresh < target && !state.stopRequested) {
-        const jitter = Math.floor(Math.random() * 3_000);
-        await sleep(gapMs + jitter, () => state.stopRequested);
+        const baseGapMs = nextNumberGapMs({
+          telegramMode,
+          outcome,
+          configuredGapMs: gapMs,
+        });
+        const jitter = telegramMode ? 0 : Math.floor(Math.random() * 3_000);
+        if (baseGapMs + jitter > 0) {
+          await sleep(baseGapMs + jitter, () => state.stopRequested);
+        }
       }
           } finally {
+            const endingPhone = lane.currentEntry?.phone || '';
+            if (endingPhone && isAutopilotSkipRequested(endingPhone)) {
+              manualSkippedThisRun.add(endingPhone);
+              purgeQueuedPhone(endingPhone);
+              clearAutopilotSkipRequest(endingPhone);
+            }
             setLaneCurrent(lane, null);
             if (lane.currentEntry) releaseClaimedEntry(lane.currentEntry);
             lane.currentEntry = null;

@@ -30,6 +30,7 @@ import {
   verifyAndDeleteSwiggyAccountViaBridge,
   signupSwiggyViaBridge,
   setSwiggyBridgeSessionProgressReporter,
+  setSwiggyBridgeSessionAbortChecker,
 } from './swiggy-bridge.js';
 import {
   snapshotSeenOtpState,
@@ -239,8 +240,12 @@ export function isTelegramOtpEntry(entry = null, otpCfg = {}) {
 }
 
 // ---------------------------------------------------------------------------
-// OTP → verify (+ ek baar retry) ka shared round
+// OTP → verify ka ONE-SHOT shared round
 // ---------------------------------------------------------------------------
+// Latest owner rule: ek number par OTP miss/verify failure ek baar ho jaye
+// to dusra code, dusra verify ya same-number retry bilkul nahi. Engine
+// route recovery karke seedha NEW NUMBER lega. Signup completion isi ek
+// OTP ke saath wala registration step hai — ye dusra OTP try nahi hai.
 async function grabAndVerifyRound({
   userId,
   phone,
@@ -249,76 +254,72 @@ async function grabAndVerifyRound({
   waitCfg,
   report,
   waitText,
-  retryText,
   shouldAbort,
+  shouldSkip = null,
   waitOtp = null,
   sourceLabel = 'Firebase SMS inbox',
 }) {
-  const aborted = () => Boolean(shouldAbort && shouldAbort());
+  const skipRequested = () => {
+    try { return Boolean(shouldSkip?.()); } catch { return false; }
+  };
+  const aborted = () => Boolean(skipRequested() || (shouldAbort && shouldAbort()));
+  const abortStatus = (stage) => ({
+    status: skipRequested() ? 'manual_skip' : 'aborted',
+    stage,
+    manualSkip: skipRequested(),
+  });
   const waitOtpCode = typeof waitOtp === 'function' ? waitOtp : waitForOtpCode;
 
+  if (aborted()) return abortStatus('otp-wait');
   if (report && waitText) await report(waitText);
+  if (aborted()) return abortStatus('otp-wait');
 
-  const otp1 = await waitOtpCode(phone, { ...waitCfg, excludeIds: seen, deviceIds, shouldAbort });
+  const otp1 = await waitOtpCode(phone, { ...waitCfg, excludeIds: seen, deviceIds, shouldAbort: aborted });
   if (!otp1?.code) {
-    if (otp1?.aborted) return { status: 'aborted', stage: 'otp-wait' };
+    if (otp1?.aborted || aborted()) return abortStatus('otp-wait');
     // Khali reason = card/console par "failed_otp_miss |" ke baad kuch nahi
     // dikhta tha. waitForOtpCode ka error nahi to bhi window ka bata do.
     return {
       status: 'miss',
+      stage: 'otp_wait',
+      otpFailure: true,
+      otpAttemptConsumed: true,
+      otpAttempts: 1,
       reason: otp1?.error
         || `OTP ${Math.max(1, Math.round((Number(waitCfg.timeoutMs) || 90_000) / 1000))}s window me ${sourceLabel} me nahi mila (SMS abhi tak show/forward nahi hua)`,
     };
   }
 
+  if (aborted()) return abortStatus('before-verify');
   const verifyOnce = async (code) => {
     let v = await verifySwiggyOtpViaBridge(userId, code);
-    if (!v?.success && (v?.isNewUser || v?.needsSignup)) {
+    if (!v?.success && !v?.aborted && (v?.isNewUser || v?.needsSignup)) {
       v = await signupSwiggyViaBridge(userId, getNextAutoUserName());
     }
     return v;
   };
 
-  let v = await verifyOnce(otp1.code);
+  const v = await verifyOnce(otp1.code);
+  if (skipRequested() || v?.aborted || v?.code === 'ABORTED') return abortStatus('verify');
+  if (v?.success) return { status: 'ok', account: v, otpAttempts: 1 };
 
-  // Retry: verify fail hua to ek baar aur naya OTP dhundo (galat service ka code
-  // ya late-arriving Swiggy code dono isi se bachte hain).
-  if (!v?.success && !v?.code && !aborted()) {
-    if (report && retryText) await report(retryText);
-    const seen2 = {
-      ...(seen || {}),
-      ids: new Set([...(seen?.ids || []), otp1.idKey].filter(Boolean)),
-      codes: new Set([...(seen?.codes || []), otp1.code].filter(Boolean)),
-      code: otp1.code,
-      smsTimeMs: Number(otp1.ts || seen?.smsTimeMs || 0) || 0,
-    };
-    const otp2 = await waitOtpCode(phone, {
-      ...waitCfg,
-      timeoutMs: Math.min(Number(waitCfg.timeoutMs ?? 90_000), 60_000),
-      excludeIds: seen2,
-      deviceIds,
-      shouldAbort,
-    });
-    if (otp2?.aborted) return { status: 'aborted', stage: 'otp-retry-wait' };
-    if (otp2?.code) {
-      const v2 = await verifyOnce(otp2.code);
-      v = v2?.success ? v2 : (v2 || v);
-    }
-  }
-
-  if (v?.success) return { status: 'ok', account: v };
-  if (v?.code === 'SWIGGY_WAF_COOLDOWN') return { status: 'waf_cooldown', reason: v?.message || '', cooldownMs: Number(v?.cooldownMs) || 60_000 };
-  if (v?.code === 'SWIGGY_RATE_LIMIT') return { status: 'rate_limited', reason: v?.message || '' };
-  if (v?.code === 'SWIGGY_SECURITY_CHALLENGE') return { status: 'security_challenge', reason: v?.message || '' };
-  if (aborted()) return { status: 'aborted', stage: 'verify' };
-  return { status: 'failed', reason: v?.message || '', swiggyText: v?.swiggyStatus || '' };
+  const failure = {
+    stage: 'otp_verify',
+    otpFailure: true,
+    otpAttemptConsumed: true,
+    otpAttempts: 1,
+  };
+  if (v?.code === 'SWIGGY_WAF_COOLDOWN') return { ...failure, status: 'waf_cooldown', reason: v?.message || '', cooldownMs: Number(v?.cooldownMs) || 60_000 };
+  if (v?.code === 'SWIGGY_RATE_LIMIT') return { ...failure, status: 'rate_limited', reason: v?.message || '' };
+  if (v?.code === 'SWIGGY_SECURITY_CHALLENGE') return { ...failure, status: 'security_challenge', reason: v?.message || '' };
+  if (aborted()) return abortStatus('verify');
+  return { ...failure, status: 'failed', reason: v?.message || '', swiggyText: v?.swiggyStatus || '' };
 }
 
-// OTP-send failures ko engine ke samajhne wali shakl do. Khaas taur par
-// Swiggy/proxy ke temporary 5xx ya network errors number ki galti NAHI hain:
-// pehle ye sab `failed_otp_send` ban kar processed+failed count ho jate the
-// aur number retry queue me bhi nahi jata tha. Ab ye alag transient outcome
-// hai — engine number ko safe rakh kar proxy rotate + isi run me retry karega.
+// OTP-send failures ko engine ke samajhne wali shakl do. Route/WAF/5xx
+// ki recovery engine karega, lekin latest one-shot rule ke tehat ye
+// number isi run me dobara nahi uthega — recovery sirf agle NEW number
+// ke liye hai. Isi liye har send failure `otpFailure` consumed hai.
 export function _classifyOtpSendFailure(otpReq, phone, {
   failKind = 'failed_otp_send',
   stage = 'otp_send',
@@ -334,6 +335,9 @@ export function _classifyOtpSendFailure(otpReq, phone, {
     httpStatus: httpStatus || undefined,
     stage,
     reason,
+    otpFailure: true,
+    otpAttemptConsumed: true,
+    otpAttempts: 1,
   };
 
   if (code === 'SWIGGY_WAF_COOLDOWN') {
@@ -348,7 +352,7 @@ export function _classifyOtpSendFailure(otpReq, phone, {
     code === 'NO_RESPONSE' ||
     (otpReq.retryable === true && httpStatus >= 500);
   if (isTransient) {
-    return { ...base, kind: 'deferred_swiggy_transient', retryable: true };
+    return { ...base, kind: 'deferred_swiggy_transient', retryable: false, routeRetryable: true };
   }
 
   return { ...base, kind: failKind };
@@ -363,6 +367,7 @@ export async function processSingleNumber({
   report = null,            // async (text) => {} — stage cards (caller buttons lagata hai)
   otpCfg = {},
   shouldAbort = null,
+  shouldSkip = null,
   markUsed = true,
 }) {
   const phone = entry?.phone;
@@ -394,7 +399,22 @@ export async function processSingleNumber({
 
   const deviceIds = !telegramMode && entry?.deviceId ? [entry.deviceId] : null;
   const say = async (text) => { if (report) { try { await report(text); } catch {} } };
-  const aborted = () => Boolean(shouldAbort && shouldAbort());
+  const skipRequested = () => {
+    try { return Boolean(shouldSkip?.()); } catch { return false; }
+  };
+  const aborted = () => Boolean(skipRequested() || (shouldAbort && shouldAbort()));
+  const abortResult = (stage) => ({
+    ok: false,
+    kind: skipRequested() ? 'manual_skip' : 'aborted',
+    phone,
+    stage,
+    manualSkip: skipRequested(),
+    reason: skipRequested() ? 'Owner ne current number SKIP kar diya' : '',
+  });
+  const registerBridgeSessionHooks = () => {
+    try { setSwiggyBridgeSessionProgressReporter(userId, say); } catch {}
+    try { setSwiggyBridgeSessionAbortChecker(userId, skipRequested); } catch {}
+  };
   const telegramBotLabel = `@${String(entry?.telegramBotUsername || 'HermeshuOTPROBOT').replace(/^@+/, '')}`;
   const sourceLabel = telegramMode ? telegramBotLabel : 'Firebase SMS inbox';
 
@@ -419,9 +439,21 @@ export async function processSingleNumber({
   const snapshotOtp = () => telegramMode
     ? snapshotTelegramOtpState(phone)
     : snapshotSeenOtpState(phone, { deviceIds });
-  const waitOtp = (targetPhone, cfg) => telegramMode
-    ? waitForTelegramOtpCode(targetPhone, cfg)
-    : waitForOtpCode(targetPhone, cfg);
+  const waitOtp = (targetPhone, cfg = {}) => {
+    // Engine aksar STOP+SKIP combined callback bhejta hai, lekin pipeline
+    // khud bhi dono ko hamesha combine rakhegi — warna shouldSkip akela
+    // dene par delete-OTP wait SKIP ke bawjood poori window jala sakti thi.
+    const callerAbort = cfg.shouldAbort;
+    const combinedCfg = {
+      ...cfg,
+      shouldAbort: () => {
+        try { return Boolean(aborted() || callerAbort?.()); } catch { return aborted(); }
+      },
+    };
+    return telegramMode
+      ? waitForTelegramOtpCode(targetPhone, combinedCfg)
+      : waitForOtpCode(targetPhone, combinedCfg);
+  };
   const otpWaitSeconds = Math.max(1, Math.round((waitCfg.timeoutMs || 0) / 1000));
   const waitLine = telegramMode
     ? `⏳ OTP bhej diya — <b>${esc(telegramBotLabel)}</b> me Refresh dabate hue ${otpWaitSeconds}s tak naya OTP check kar raha hoon.`
@@ -431,15 +463,27 @@ export async function processSingleNumber({
     : 'Firebase SMS inbox live poll kar raha hoon…';
 
   const mapVerify = (r, failKind) => {
-    if (r.status === 'waf_cooldown') return { ok: false, kind: 'waf_cooldown', phone, cooldownMs: r.cooldownMs, reason: r.reason };
-    if (r.status === 'rate_limited') return { ok: false, kind: 'rate_limited', phone, reason: r.reason };
-    if (r.status === 'security_challenge') return { ok: false, kind: 'security_challenge', phone, reason: r.reason };
-    if (r.status === 'aborted') return { ok: false, kind: 'aborted', phone, stage: r.stage };
-    if (r.status === 'miss') return { ok: false, kind: failKind, phone, reason: r.reason };
-    return { ok: false, kind: 'failed_verify', phone, reason: r.reason, swiggyText: r.swiggyText };
+    if (r.status === 'manual_skip' || skipRequested()) return abortResult(r.stage || 'otp_verify');
+    const failure = {
+      ok: false,
+      phone,
+      stage: r.stage || 'otp_verify',
+      reason: r.reason || '',
+      otpFailure: true,
+      otpAttemptConsumed: true,
+      otpAttempts: 1,
+    };
+    if (r.status === 'waf_cooldown') return { ...failure, kind: 'waf_cooldown', cooldownMs: r.cooldownMs };
+    if (r.status === 'rate_limited') return { ...failure, kind: 'rate_limited' };
+    if (r.status === 'security_challenge') return { ...failure, kind: 'security_challenge' };
+    if (r.status === 'aborted') return abortResult(r.stage || 'otp_verify');
+    if (r.status === 'miss') return { ...failure, kind: failKind };
+    return { ...failure, kind: 'failed_verify', swiggyText: r.swiggyText };
   };
 
   try {
+    if (aborted()) return abortResult('before-process');
+
     // ---- Step 0: DEVICE LAST-SEEN GATE ----
     // Andhere me random number try karne ka koi faida nahi — OTP sirf usi
     // device ko jayega jiski last activity (taaza forwarded message) window
@@ -498,22 +542,25 @@ export async function processSingleNumber({
       }
     }
 
+    if (aborted()) return abortResult('before-otp-send');
+
     // ---- Step 1: Swiggy OTP bhejo (purana/naya Swiggy khud detect karta hai) ----
     const seen1 = await snapshotOtp();
+    if (aborted()) return abortResult('before-otp-send');
 
     const db = getDb();
     const existingKey = findAccountKeyByPhone(db.config?.accounts || {}, phone) || '';
     const existingName = existingKey ? (db.config.accounts[existingKey]?.name || existingKey) : null;
 
     const otpReq = await requestSwiggyOtpViaBridge(userId, phone, existingKey, existingName);
+    registerBridgeSessionHooks();
+    if (aborted()) return abortResult('otp_send');
     if (!otpReq?.success) {
       return _classifyOtpSendFailure(otpReq, phone, {
         failKind: 'failed_otp_send',
         stage: 'otp_send',
       });
     }
-
-    try { setSwiggyBridgeSessionProgressReporter(userId, say); } catch {}
     const isNew = Boolean(otpReq.isNewUser);
     await say(
       section(
@@ -528,25 +575,20 @@ export async function processSingleNumber({
         ].join('\n')
       )
     );
-    if (aborted()) return { ok: false, kind: 'aborted', phone, stage: 'after-send' };
+    if (aborted()) return abortResult('after-send');
 
     // ---- Step 2: OTP lana + verify (new = yahin done; old = aage delete) ----
     const round1 = await grabAndVerifyRound({
-      userId, phone, deviceIds, seen: seen1, waitCfg, report: say, shouldAbort,
+      userId, phone, deviceIds, seen: seen1, waitCfg, report: say, shouldAbort, shouldSkip,
       waitOtp, sourceLabel,
       waitText: section('⏳ OTP Wait — Step 1/3', [
         `📱 <b>Number:</b> <code>${esc(phone)}</code>`,
         sub(pollLine),
       ].join('\n')),
-      retryText: section('↻ Verify Retry', [
-        `📱 <b>Number:</b> <code>${esc(phone)}</code>`,
-        sub(telegramMode
-          ? `Pehla OTP verify nahi hua — Hermes card par ek aur naye OTP ka wait (${otpWaitSeconds}s).`
-          : 'Pehla OTP verify nahi hua — inbox me ek nayi entry ka wait (max 60s).'),
-      ].join('\n')),
     });
     if (round1.status !== 'ok') return mapVerify(round1, 'failed_otp_miss');
 
+    if (aborted()) return abortResult('after-verify');
     const loginAcc = round1.account;
     syncCloudVaultNow(getDb()).catch(() => {});
 
@@ -567,14 +609,17 @@ export async function processSingleNumber({
       `📱 <b>Number:</b> <code>${esc(phone)}</code>`,
       sub('Login ho gaya — ab Settings → Delete Account ka OTP bhej raha hoon…'),
     ].join('\n')));
-    if (aborted()) return { ok: false, kind: 'aborted', phone, stage: 'before-delete-request' };
+    if (aborted()) return abortResult('before-delete-request');
 
     const seen2 = await snapshotOtp();
+    if (aborted()) return abortResult('before-delete-request');
     const delReq = await requestSwiggyDeleteOtpViaBridge(userId, phone, loginAcc.accountKey, loginAcc.name || null);
+    if (aborted()) return abortResult('delete_otp_send');
     if (!delReq?.success) {
-      if (delReq?.code === 'SWIGGY_WAF_COOLDOWN') return { ok: false, kind: 'waf_cooldown', phone, cooldownMs: Number(delReq?.cooldownMs) || 60_000, reason: delReq?.message || '' };
-      if (delReq?.code === 'SWIGGY_RATE_LIMIT') return { ok: false, kind: 'rate_limited', phone, reason: delReq?.message || '' };
-      if (delReq?.code === 'SWIGGY_SECURITY_CHALLENGE') return { ok: false, kind: 'security_challenge', phone, reason: delReq?.message || '' };
+      const otpFlags = { stage: 'delete_otp_send', otpFailure: true, otpAttemptConsumed: true, otpAttempts: 1 };
+      if (delReq?.code === 'SWIGGY_WAF_COOLDOWN') return { ok: false, kind: 'waf_cooldown', phone, cooldownMs: Number(delReq?.cooldownMs) || 60_000, reason: delReq?.message || '', ...otpFlags };
+      if (delReq?.code === 'SWIGGY_RATE_LIMIT') return { ok: false, kind: 'rate_limited', phone, reason: delReq?.message || '', ...otpFlags };
+      if (delReq?.code === 'SWIGGY_SECURITY_CHALLENGE') return { ok: false, kind: 'security_challenge', phone, reason: delReq?.message || '', ...otpFlags };
       if (markUsed) {
         markLedger(phone, 'skipped', { reason: String(delReq?.message || ''), accountKey: loginAcc.accountKey });
         await markPoolStatus(entry, 'skipped');
@@ -582,25 +627,30 @@ export async function processSingleNumber({
       return {
         ok: false, kind: 'skipped_delete_blocked', phone,
         reason: String(delReq?.message || 'Delete possible nahi'), accountKey: loginAcc.accountKey, account: loginAcc,
+        ...otpFlags,
       };
     }
 
     const otpD = await waitOtp(phone, { ...waitCfg, excludeIds: seen2, deviceIds, shouldAbort });
     if (!otpD?.code) {
-      if (otpD?.aborted) return { ok: false, kind: 'aborted', phone, stage: 'delete-otp-wait' };
+      if (otpD?.aborted || aborted()) return abortResult('delete_otp_wait');
       if (markUsed) {
         markLedger(phone, 'deferred', { reason: 'delete OTP not received', accountKey: loginAcc.accountKey });
       }
       return {
         ok: false, kind: 'deferred_delete_otp_miss', phone,
+        stage: 'delete_otp_wait', otpFailure: true, otpAttemptConsumed: true, otpAttempts: 1,
         reason: otpD?.error || 'Delete OTP window me nahi mila', accountKey: loginAcc.accountKey, account: loginAcc,
       };
     }
+    if (aborted()) return abortResult('before-delete-verify');
 
     const delRes = await verifyAndDeleteSwiggyAccountViaBridge(userId, otpD.code, loginAcc.accountKey);
+    if (aborted()) return abortResult('delete_otp_verify');
     if (!delRes?.success) {
-      if (delRes?.code === 'SWIGGY_RATE_LIMIT') return { ok: false, kind: 'rate_limited', phone, reason: delRes?.message || '' };
-      if (delRes?.code === 'SWIGGY_SECURITY_CHALLENGE') return { ok: false, kind: 'security_challenge', phone, reason: delRes?.message || '' };
+      const otpFlags = { stage: 'delete_otp_verify', otpFailure: true, otpAttemptConsumed: true, otpAttempts: 1 };
+      if (delRes?.code === 'SWIGGY_RATE_LIMIT') return { ok: false, kind: 'rate_limited', phone, reason: delRes?.message || '', ...otpFlags };
+      if (delRes?.code === 'SWIGGY_SECURITY_CHALLENGE') return { ok: false, kind: 'security_challenge', phone, reason: delRes?.message || '', ...otpFlags };
       if (markUsed) {
         markLedger(phone, 'skipped', { reason: String(delRes?.message || ''), accountKey: loginAcc.accountKey });
         await markPoolStatus(entry, 'skipped');
@@ -608,13 +658,14 @@ export async function processSingleNumber({
       return {
         ok: false, kind: 'skipped_delete_blocked', phone,
         reason: String(delRes?.message || 'Delete blocked'), accountKey: loginAcc.accountKey, account: loginAcc,
+        ...otpFlags,
       };
     }
 
     // Swiggy se delete OK → bot DB + vault se purge (tabhi fresh login milega)
     deleteAccount(loginAcc.accountKey, { purgeVault: true });
     syncCloudVaultNow(getDb()).catch(() => {});
-    if (aborted()) return { ok: false, kind: 'aborted', phone, stage: 'after-delete' };
+    if (aborted()) return abortResult('after-delete');
 
     // ---- Step 3/3: usi number se FRESH registration ----
     await say(section('✅ Step 3/3 — Delete Ho Gaya — Fresh Registration', [
@@ -622,8 +673,12 @@ export async function processSingleNumber({
       sub('Swiggy account delete + bot DB purge done — ab fresh OTP bhej raha hoon…'),
     ].join('\n')));
 
+    if (aborted()) return abortResult('before-fresh-otp-send');
     const seen3 = await snapshotOtp();
+    if (aborted()) return abortResult('before-fresh-otp-send');
     const otpReq2 = await requestSwiggyOtpViaBridge(userId, phone, '', null);
+    registerBridgeSessionHooks();
+    if (aborted()) return abortResult('fresh_otp_send');
     if (!otpReq2?.success) {
       return _classifyOtpSendFailure(otpReq2, phone, {
         failKind: 'failed_fresh_otp_send',
@@ -631,9 +686,8 @@ export async function processSingleNumber({
       });
     }
 
-    try { setSwiggyBridgeSessionProgressReporter(userId, say); } catch {}
     const round3 = await grabAndVerifyRound({
-      userId, phone, deviceIds, seen: seen3, waitCfg, report: say, shouldAbort,
+      userId, phone, deviceIds, seen: seen3, waitCfg, report: say, shouldAbort, shouldSkip,
       waitOtp, sourceLabel,
       waitText: section('⏳ Fresh OTP Wait — Step 3/3', [
         `📱 <b>Number:</b> <code>${esc(phone)}</code>`,
@@ -641,15 +695,10 @@ export async function processSingleNumber({
           ? `Fresh registration OTP — Hermes card par Refresh dabate hue naya OTP check kar raha hoon (${otpWaitSeconds}s)…`
           : 'Fresh registration OTP — inbox live poll kar raha hoon…'),
       ].join('\n')),
-      retryText: section('↻ Fresh Verify Retry', [
-        `📱 <b>Number:</b> <code>${esc(phone)}</code>`,
-        sub(telegramMode
-          ? `Pehla verify nahi hua — Hermes card par ek aur naye OTP ka wait (${otpWaitSeconds}s).`
-          : 'Pehla verify nahi hua — ek aur naye OTP ka wait (max 60s).'),
-      ].join('\n')),
     });
     if (round3.status !== 'ok') return mapVerify(round3, 'failed_fresh_otp_miss');
 
+    if (aborted()) return abortResult('after-fresh-verify');
     const freshAcc = round3.account;
     syncCloudVaultNow(getDb()).catch(() => {});
     if (markUsed) {
@@ -661,6 +710,7 @@ export async function processSingleNumber({
       accountKey: freshAcc.accountKey, account: freshAcc,
     };
   } catch (err) {
+    if (aborted()) return abortResult('exception');
     console.error('[Pipeline]', err?.stack || err?.message);
     return { ok: false, kind: 'failed_exception', phone, reason: String(err?.message || err) };
   } finally {

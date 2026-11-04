@@ -251,6 +251,12 @@ function normalizedTelegramSnapshot(snap = {}) {
     telegramCurrentPhone: snap.telegramCurrentPhone || snap.current?.phone || status.currentPhone || '',
     telegramClaimed: Number(snap.telegramClaimed) || 0,
     telegramRejected: Number(snap.telegramRejected) || 0,
+    telegramScreenButtons: [...(snap.telegramScreenButtons?.length ? snap.telegramScreenButtons : (status.lastScreenButtons || []))],
+    telegramLastClickedButton: snap.telegramLastClickedButton || status.lastClickedButton || '',
+    telegramLastClickedRole: snap.telegramLastClickedRole || status.lastClickedRole || '',
+    telegramCallbackMessage: snap.telegramCallbackMessage || status.lastCallbackMessage || '',
+    telegramClaimPhase: snap.telegramClaimPhase || status.claimPhase || '',
+    telegramLastActionAt: Number(snap.telegramLastActionAt || status.lastActionAt) || 0,
   };
 }
 

@@ -1493,6 +1493,7 @@ console.log('WAF challenge survival (jala token invalidate + batch-marta-nahi la
 {
   const wafPool = await import('./waf-pool.js');
   const engine = await import('./autopilot-engine.js');
+  const bridge = await import('./swiggy-bridge.js');
   const fakeToken = 't'.repeat(80);
 
   // Seed → mile; invalidate → gayab (challenge ke baad jala token reuse na ho)
@@ -1512,6 +1513,8 @@ console.log('WAF challenge survival (jala token invalidate + batch-marta-nahi la
   ok(wafPool.cooldownRemainingMs() > 0, 'markWafHit par circuit-breaker cooldown laga');
   wafPool.clearCooldown();
   ok(wafPool.cooldownRemainingMs() === 0, 'clearCooldown reset karta hai');
+  ok(bridge.DIRECT_WAF_SOLVE_FAILURE_COOLDOWN_MS === 60_000 && bridge._directWafSolveCooldownLeftMs() === 0,
+    'direct WAF solver failure par short cooldown hai — har claim par 45s dobara nahi jalega');
 
   // Engine wait ladder: 5s → 10s → 15s cap; pool cooldown chahe lamba
   // bole, route recovery 15s se upar number ko queue me nahi latkati.
@@ -1750,9 +1753,21 @@ console.log('telegram Hermes source + Add Telegram Account primitives:');
     freshAccounts: [{ phone: '9876543210', accountKey: 'AK1' }],
   }, { final: true });
   ok(compactFinal.includes('BATCH KHATAM') && compactFinal.includes('Aapne STOP kiya') && compactFinal.includes('Fresh JSON chat me'), 'compact final card asal stop reason + JSON note deta hai');
+  const compactHermesClaim = engine.formatCompactAutopilotCard({
+    sourceMode: 'telegram', running: true, target: 100, fresh: 0, processed: 0,
+    elapsedMs: 12_000, telegramClaimPhase: 'clicked-new',
+    telegramLastClickedButton: '🗳 NEW NUMBER', telegramLastActionAt: Date.now(),
+    telegramScreenButtons: ['🗳 NEW NUMBER', '✅ REFRESH'],
+  }, { stageText: rich.section('📨 Hermes Number Claim', 'Hermes se new number claim ho raha hai') });
+  ok(compactHermesClaim.includes('[NEW]') && compactHermesClaim.includes('NEW NUMBER click — number card ka wait'),
+    'compact live card Hermes ka asal latest-screen click dikhata hai');
   const recoverySnapshot = engine.getAutopilotSnapshot();
   ok(recoverySnapshot.telegramClaimRetries === 0 && recoverySnapshot.workerRecoveries === 0
     && recoverySnapshot.addressAdded === 0 && recoverySnapshot.addressFailed === 0, 'snapshot: claim-retry/worker-recovery/address counters maujood');
+  ok(Array.isArray(recoverySnapshot.telegramScreenButtons)
+    && recoverySnapshot.telegramLastClickedButton === ''
+    && recoverySnapshot.telegramClaimPhase === '',
+    'snapshot: Hermes latest-screen/click diagnostics fields maujood');
 
   // Visible Hermeshu labels: FIND strict hai; SEARCH/ACTIVE ko FIND nahi
   // samjha jayega, warna bot galat screen par ja sakta hai.
@@ -1782,6 +1797,46 @@ console.log('telegram Hermes source + Add Telegram Account primitives:');
   ok(parsedCard?.device === 'DEVICE-TEST-1', 'Hermes card device parsed');
   ok(parsedCard?.sender === 'NEWSWI-GY' && parsedCard?.code === '123456', 'Hermes LAST SMS sender + OTP parsed');
   ok(tg.extractTelegramOtpFromText('SENDER: VM-SWIGGY\nYour OTP is 654321') === '654321', 'SENDER label wale Hermes text se OTP');
+  ok(tg.parseTelegramNumberCard('WELCOME TO Hermes\nNAME: RAHUL\nID: 7458637854\nFIND NUMBER') === null,
+    'welcome card ki Telegram ID ko Hermes mobile number nahi mana jata');
+
+  // Owner ka exact click rule sirf CURRENT/latest button-screen par hai:
+  // NEW NUMBER ho to NEW, warna FIND NUMBER. Purani screens stale hain.
+  const latestWelcomeOldCard = tg._selectHermesLatestScreenAction([
+    { text: 'WELCOME TO Hermes', buttons: ['FIND NUMBER', 'HELP'] },
+    { text: cardText, buttons: ['NEW NUMBER', 'REFRESH'] },
+  ]);
+  ok(latestWelcomeOldCard?.role === 'find' && latestWelcomeOldCard.screenIndex === 0,
+    'latest welcome screen par FIND hi click hoga — purane card ka NEW stale hai');
+  const latestCardOldWelcome = tg._selectHermesLatestScreenAction([
+    { text: cardText, buttons: ['NEW NUMBER', 'REFRESH'] },
+    { text: 'WELCOME TO Hermes', buttons: ['FIND NUMBER'] },
+  ]);
+  ok(latestCardOldWelcome?.role === 'new' && latestCardOldWelcome.screenIndex === 0,
+    'latest number card par NEW NUMBER ko FIND se pehle priority');
+  const latestNoClaimButton = tg._selectHermesLatestScreenAction([
+    { text: 'Hermes HELP', buttons: ['HELP', 'BACK'] },
+    { text: cardText, buttons: ['NEW NUMBER', 'REFRESH'] },
+  ]);
+  ok(latestNoClaimButton?.role === '' && latestNoClaimButton.reason === 'no-matching-button-on-latest-screen',
+    'latest screen par NEW/FIND na ho to purani screen ka button click nahi hota');
+  const buttonlessThenWelcome = tg._selectHermesLatestScreenAction([
+    { text: 'Hermes notice', buttons: [] },
+    { text: 'WELCOME TO Hermes', buttons: ['FIND NUMBER'] },
+  ]);
+  ok(buttonlessThenWelcome?.role === 'find' && buttonlessThenWelcome.screenIndex === 1,
+    'buttonless notice ke baad pehli asal button-screen hi current mani jati hai');
+  const refreshDifferentLatest = tg._selectHermesLatestScreenAction([
+    { text: 'YOUR NUMBER: +91 91234 56780', buttons: ['NEW NUMBER', 'REFRESH'] },
+    { text: cardText, buttons: ['NEW NUMBER', 'REFRESH'] },
+  ], { mode: 'refresh', phone: '9876543210' });
+  ok(refreshDifferentLatest?.role === '' && refreshDifferentLatest.reason === 'latest-screen-different-number',
+    'REFRESH stale purane card par nahi — latest different number par rukta hai');
+  const refreshMatchingLatest = tg._selectHermesLatestScreenAction([
+    { text: cardText, buttons: ['NEW NUMBER', 'REFRESH'] },
+  ], { mode: 'refresh', phone: '9876543210' });
+  ok(refreshMatchingLatest?.role === 'refresh' && refreshMatchingLatest.cardPhone === '9876543210',
+    'REFRESH sirf latest matching number card par click hota hai');
 
   ok(tg.normalizeTelegramLoginPhone('98765 43210') === '+919876543210', 'in-bot login: Indian 10-digit → +91');
   ok(tg.normalizeTelegramLoginPhone('+1 202 555 0101') === '+12025550101', 'in-bot login: country-code phone preserved');
@@ -1964,6 +2019,84 @@ console.log('telegram Hermes source + Add Telegram Account primitives:');
       && !sanitizedHtml.includes('secret'),
       'Add Address/CAS HTML response raw markup ke roop me user ko nahi dikhta'
     );
+  }
+
+  // Live wala map-gate case: pehla DOM Proceed click bekaar ho to bot wahi
+  // atka nahi rahega — dusri baari asal coordinates par physical click, phir
+  // form. Success phir bhi saved list ke real ID se hi verify hoga.
+  {
+    let physicalGateClicks = 0;
+    let gateDomClicks = 0;
+    let mapGateSaveClicked = false;
+    const mapSnapshot = {
+      url: 'https://www.swiggy.com/web-cart-add-address',
+      title: 'Add Address',
+      readyState: 'complete',
+      bodyText: 'Delivery address Drag map to choose location Proceed',
+      fields: [],
+      buttons: [{ text: 'Proceed', visible: true, disabled: false, tag: 'a', x: 640, y: 820, width: 220, height: 48 }],
+    };
+    const openedFormSnapshot = {
+      url: mapSnapshot.url,
+      title: 'Add Address',
+      readyState: 'complete',
+      bodyText: 'Delivery address Address Door / Flat No. Landmark Home SAVE ADDRESS & PROCEED',
+      fields: [
+        { tag: 'input', type: 'text', name: 'building', label: 'door flat', visible: true, disabled: false },
+        { tag: 'input', type: 'text', name: 'landmark', label: 'landmark', visible: true, disabled: false },
+      ],
+      buttons: [{ text: 'Home', visible: true }, { text: 'SAVE ADDRESS & PROCEED', visible: true }],
+    };
+    const mapGatePage = {
+      setViewport: async () => {}, setGeolocation: async () => {}, setUserAgent: async () => {},
+      setCookie: async () => {}, cookies: async () => [], on: () => {}, off: () => {}, frames: () => [],
+      goto: async () => {},
+      viewport: () => ({ width: 1280, height: 900 }),
+      mouse: {
+        click: async (x, y) => {
+          if (x === 640 && y === 820) physicalGateClicks++;
+        },
+        move: async () => {}, down: async () => {}, up: async () => {},
+      },
+      evaluate: async (fn, arg) => {
+        const fnName = typeof fn === 'function' ? fn.name : String(fn || '');
+        if (fnName === 'swiggyAddressSnapshotInBrowser') return physicalGateClicks ? openedFormSnapshot : mapSnapshot;
+        if (fnName === 'swiggyAddressFillInBrowser') {
+          return {
+            ok: true,
+            filled: { address: false, flatNo: true, landmark: true },
+            fields: 2,
+            addressStatic: true,
+            selected: { address: '', flatNo: 'input:building', landmark: 'input:landmark' },
+            saveDisabled: false,
+            url: openedFormSnapshot.url,
+          };
+        }
+        if (fnName === 'swiggyAddressClickTextInBrowser') {
+          const patterns = Array.isArray(arg) ? arg.map(String) : [];
+          const isSave = patterns.some((text) => text.includes('save address'));
+          if (isSave) {
+            mapGateSaveClicked = true;
+            return { clicked: true, text: 'save address & proceed', tag: 'a', x: 640, y: 840 };
+          }
+          gateDomClicks++;
+          return { clicked: true, text: 'proceed', tag: 'a', x: 640, y: 820 };
+        }
+        return {
+          status: 200,
+          data: { statusCode: 0, data: { addresses: mapGateSaveClicked ? [savedRemoteAddress] : [] } },
+          rawText: '{}',
+        };
+      },
+    };
+    const mapGateAdded = await bridge.addSwiggyAddressViaWebUi(addressSession, randomAddress, {
+      pageFactory: async () => ({ page: mapGatePage, owned: false }),
+      timeoutMs: 15_000,
+    });
+    ok(mapGateAdded.ok && mapGateAdded.addressId === 'ADDR-SAVED-9',
+      'Add Address map gate DOM click fail ke baad physical Proceed click se asal form tak pahunchta hai');
+    ok(gateDomClicks === 1 && physicalGateClicks === 1 && mapGateSaveClicked,
+      'Add Address gate: DOM click ke baad physical fallback ek-ek baari, double activation nahi');
   }
 
   // Orchestration order: saved list → browser UI → sirf non-submit UI

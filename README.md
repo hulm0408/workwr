@@ -79,8 +79,9 @@ bot ke andar hi hota hai:
    **🗑 Remove Telegram** (confirmation ke baad session clear hoti hai).
 
 Batch is mode me ye simple one-shot flow karta hai: pehle lane ki
-proxy/direct route aur WAF token ready → Hermes par **NEW NUMBER** (sirf
-bilkul nayi chat me NEW button na mile tab bootstrap ke liye FIND) → mile
+proxy/direct route aur WAF token ready → Hermes ki **sabse latest
+button-screen** par **NEW NUMBER ho to NEW NUMBER, warna FIND NUMBER**
+(purani Hermes screens ke stale buttons kabhi click nahi hote) → mile
 hue number par Swiggy OTP → **REFRESH** karte hue default **20 second**
 wait (⚙️ Settings me 20/30/45/60/90s presets; env
 `TELEGRAM_OTP_TIMEOUT_MS`) → OTP mile to ek hi verification round me
@@ -93,6 +94,9 @@ par **⏭ SKIP NUMBER** dabate hi sirf woh number khatam hota hai aur batch
 bina bekaar gap naye number par jati hai. Hermes me fail/skip ke baad
 configured 6s+ ki neend bhi nahi lagti (fresh success par max 1s). Refresh
 gap default **2.5s** hai (Settings ya `TELEGRAM_OTP_REFRESH_MS`).
+Hermes startup par free-proxy probing background me chalti rehti hai,
+lekin pehla claim uske liye zyada se zyada **12s** rukega; live card par
+asal clicked **NEW/FIND** button ya latest-screen ki exact rukawat dikhegi.
 
 Bot ke andar **Hermes mode ON** ho to wahi is run ka locked source hai —
 Render par purana `NUMBER_SOURCE=firebase` reh jaye tab bhi Hermes batch
@@ -132,9 +136,11 @@ PROCEED** karta hai. Page ko pehle `form-ready`, `map-gate`,
 `login-required`, `security-challenge`, `redirected` ya `loading` me
 classify kiya jata hai; checkout ke proven input names `building`/`house`
 aur `landmark` ko pehli tarjeeh milti hai, frames/shadow roots bhi check
-hote hain, aur map/Proceed gate ko asal gate action se paar karne ki
-koshish hoti hai. Failure me purana vague `fields=0` ki jagah short exact
-page-state wajah aati hai. Success tabhi hai jab create response ya
+hote hain, aur map/Proceed gate par pehle asal interactive control par
+**ek hi** click, phir zarurat par physical coordinate click, halka map
+drag aur **Add New / Delivery Address** drawer action try hota hai.
+Failure me short exact page-state ke saath `fields=visible/total` aur
+disabled button bhi saaf dikhta hai. Success tabhi hai jab create response ya
 saved-address list se pakka remote address ID verify ho jaye.
 
 CAS (`addresses/v1`) fallback ab default me guessed web URLs par blind

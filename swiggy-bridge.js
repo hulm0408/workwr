@@ -275,6 +275,7 @@ let isPrewarming = false;
 let prewarmedAt = 0;
 let latestSharedWafToken = '';
 let latestSharedWafAt = 0;
+let directWafSolveFailedUntil = 0;
 // Route-keyed solver locks. PEHLA BUG: ek hi global promise tha — proxy B
 // ke liye token maangne wala proxy A par chal raha solver join karke A ka
 // IP-bound token B par chipka deta tha, phir challenge pakka tha.
@@ -320,6 +321,11 @@ const AUTH_PAGE_EVALUATE_TIMEOUT_MS = 9000;
 export const WAF_SOLVE_FAST_BUDGET_MS = 15_000;
 export const WAF_SOLVE_RELIABLE_BUDGET_MS = 45_000;
 export const WAF_SOLVE_MAX_BUDGET_MS = 60_000;
+export const DIRECT_WAF_SOLVE_FAILURE_COOLDOWN_MS = 60_000;
+
+export function _directWafSolveCooldownLeftMs(now = Date.now()) {
+  return Math.max(0, directWafSolveFailedUntil - now);
+}
 
 export function normalizeWafSolveBudgetMs(value, fallbackMs = WAF_SOLVE_RELIABLE_BUDGET_MS) {
   const base = Number(value);
@@ -1020,6 +1026,10 @@ function swiggyAddressSnapshotInBrowser() {
       visible,
       disabled: Boolean(el.disabled || el.getAttribute?.('aria-disabled') === 'true'),
       readOnly: Boolean(el.readOnly),
+      x: rect ? Math.round(rect.left + rect.width / 2) : 0,
+      y: rect ? Math.round(rect.top + rect.height / 2) : 0,
+      width: rect ? Math.round(rect.width) : 0,
+      height: rect ? Math.round(rect.height) : 0,
     };
   };
   const fields = collect('input, textarea, [contenteditable="true"], [role="textbox"]')
@@ -1028,7 +1038,16 @@ function swiggyAddressSnapshotInBrowser() {
   const buttons = collect('button, a, [role="button"]')
     .map((el) => {
       const d = describe(el);
-      return { text: norm(el.textContent || el.getAttribute?.('aria-label') || '').slice(0, 80), visible: d.visible, disabled: d.disabled };
+      return {
+        text: norm(el.textContent || el.getAttribute?.('aria-label') || '').slice(0, 80),
+        visible: d.visible,
+        disabled: d.disabled,
+        tag: d.tag,
+        x: d.x,
+        y: d.y,
+        width: d.width,
+        height: d.height,
+      };
     })
     .filter((button) => button.text);
   return {
@@ -1208,28 +1227,105 @@ function swiggyAddressClickTextInBrowser(patterns) {
     return Boolean(el && rect && rect.width > 0 && rect.height > 0 && style?.display !== 'none' && style?.visibility !== 'hidden');
   };
   const wanted = (Array.isArray(patterns) ? patterns : []).map(norm).filter(Boolean);
-  const candidates = collect('button, a, [role="button"], div, span')
-    .map((el) => ({ el, text: norm(el.textContent || el.getAttribute?.('aria-label') || '') }))
-    .filter(({ el, text }) => visible(el) && !el.disabled && text && wanted.some((pattern) => text === pattern || text.includes(pattern)))
+  const interactiveSelector = 'button, a, [role="button"], [tabindex]';
+  const rectOf = (el) => {
+    try { return el?.getBoundingClientRect?.() || null; } catch { return null; }
+  };
+  const styleOf = (el) => {
+    try { return window.getComputedStyle(el); } catch { return null; }
+  };
+  const isDisabled = (el) => {
+    if (!el) return true;
+    const style = styleOf(el);
+    const className = typeof el.className === 'string' ? el.className : String(el.getAttribute?.('class') || '');
+    return Boolean(
+      el.disabled
+      || el.getAttribute?.('aria-disabled') === 'true'
+      || style?.pointerEvents === 'none'
+      || /(^|[\s_-])(disabled|inactive)([\s_-]|$)/i.test(className)
+    );
+  };
+  const targetScore = (el) => {
+    if (!el) return 9;
+    const tag = String(el.tagName || '').toLowerCase();
+    if (tag === 'button' || tag === 'a' || el.getAttribute?.('role') === 'button') return 0;
+    if (el.hasAttribute?.('tabindex') || styleOf(el)?.cursor === 'pointer') return 1;
+    return 2;
+  };
+  const resolveTarget = (el) => {
+    if (!el) return null;
+    if ((el.matches?.(interactiveSelector) || styleOf(el)?.cursor === 'pointer') && visible(el) && !isDisabled(el)) return el;
+    let descendants = [];
+    try { descendants = [...el.querySelectorAll(interactiveSelector)]; } catch {}
+    descendants = descendants
+      .filter((child) => visible(child) && !isDisabled(child))
+      .sort((a, b) => {
+        const ar = rectOf(a); const br = rectOf(b);
+        return ((ar?.width || 0) * (ar?.height || 0)) - ((br?.width || 0) * (br?.height || 0));
+      });
+    if (descendants[0]) return descendants[0];
+    const ancestor = el.closest?.(interactiveSelector);
+    if (ancestor && visible(ancestor) && !isDisabled(ancestor)) return ancestor;
+    return isDisabled(el) ? null : el;
+  };
+  const candidates = collect('button, a, [role="button"], [tabindex], div, span')
+    .map((el) => ({
+      el,
+      text: norm(el.textContent || el.getAttribute?.('aria-label') || ''),
+    }))
+    // Pehle sirf wanted text wale chand elements rakho; Google Map ke
+    // saikdon divs par descendant-resolve chalana click ko slow kar dega.
+    .filter(({ el, text }) => visible(el) && text && wanted.some((pattern) => text === pattern || text.includes(pattern)))
+    .map(({ el, text }) => {
+      const target = resolveTarget(el);
+      const targetText = norm(target?.textContent || target?.getAttribute?.('aria-label') || text);
+      const rect = rectOf(target);
+      return { el, text, target, targetText, area: rect ? rect.width * rect.height : Number.MAX_SAFE_INTEGER };
+    })
+    .filter(({ target }) => Boolean(target))
     .sort((a, b) => {
       const aExact = wanted.some((pattern) => a.text === pattern) ? 0 : 1;
       const bExact = wanted.some((pattern) => b.text === pattern) ? 0 : 1;
-      return (aExact - bExact) || (a.text.length - b.text.length);
+      const patternRank = (text) => {
+        const index = wanted.findIndex((pattern) => text === pattern || text.includes(pattern));
+        return index >= 0 ? index : 99;
+      };
+      return (aExact - bExact)
+        || (patternRank(a.text) - patternRank(b.text))
+        || (targetScore(a.target) - targetScore(b.target))
+        || (a.targetText.length - b.targetText.length)
+        || (a.area - b.area)
+        || (a.text.length - b.text.length);
     });
   const found = candidates[0];
-  if (!found) return { clicked: false, text: '' };
-  const target = found.el.closest?.('button, a, [role="button"]') || found.el;
+  if (!found?.target) return { clicked: false, text: '' };
+  const target = found.target;
+  const rectBefore = rectOf(target);
+  const point = {
+    x: rectBefore ? Math.round(rectBefore.left + rectBefore.width / 2) : 0,
+    y: rectBefore ? Math.round(rectBefore.top + rectBefore.height / 2) : 0,
+    width: rectBefore ? Math.round(rectBefore.width) : 0,
+    height: rectBefore ? Math.round(rectBefore.height) : 0,
+  };
   try {
     target.scrollIntoView?.({ block: 'center' });
-    for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
-      const EventCtor = type.startsWith('pointer') && typeof PointerEvent === 'function' ? PointerEvent : MouseEvent;
-      target.dispatchEvent(new EventCtor(type, { bubbles: true, cancelable: true, view: window }));
+    target.focus?.({ preventScroll: true });
+    const rectAfterScroll = rectOf(target);
+    if (rectAfterScroll) {
+      point.x = Math.round(rectAfterScroll.left + rectAfterScroll.width / 2);
+      point.y = Math.round(rectAfterScroll.top + rectAfterScroll.height / 2);
+      point.width = Math.round(rectAfterScroll.width);
+      point.height = Math.round(rectAfterScroll.height);
     }
+    // Exactly ONE activation. Synthetic pointer/mouse sequence + native
+    // click pehle Proceed/SAVE ko do baar fire kar sakta tha; agar native
+    // click kisi custom div par na ho to sirf ek MouseEvent bhejo.
     if (typeof target.click === 'function') target.click();
+    else target.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
   } catch {
-    try { target.click?.(); } catch { return { clicked: false, text: found.text }; }
+    return { clicked: false, text: found.text, tag: String(target.tagName || '').toLowerCase(), ...point };
   }
-  return { clicked: true, text: found.text };
+  return { clicked: true, text: found.text, tag: String(target.tagName || '').toLowerCase(), ...point };
 }
 
 async function fetchSavedAddressesInSwiggyPage(page) {
@@ -1277,7 +1373,10 @@ function summarizeSwiggyAddressSnapshot(snapshot = {}) {
     visible: field?.visible !== false,
   }));
   const buttons = (Array.isArray(snapshot?.buttons) ? snapshot.buttons : [])
-    .map((button) => String(typeof button === 'string' ? button : button?.text || '').trim())
+    .map((button) => {
+      const text = String(typeof button === 'string' ? button : button?.text || '').trim();
+      return button && typeof button === 'object' && button.disabled && text ? `${text}(disabled)` : text;
+    })
     .filter(Boolean)
     .slice(0, 6);
   let path = '';
@@ -1287,14 +1386,16 @@ function summarizeSwiggyAddressSnapshot(snapshot = {}) {
 
 function swiggyAddressPageFailureMessage(state, snapshot = {}) {
   const summary = summarizeSwiggyAddressSnapshot(snapshot);
-  const fieldCount = Array.isArray(snapshot?.fields) ? snapshot.fields.filter((field) => field?.visible !== false && !field?.disabled).length : 0;
-  const buttons = summary.buttons.slice(0, 3).join('|') || 'none';
+  const allFields = Array.isArray(snapshot?.fields) ? snapshot.fields : [];
+  const fieldCount = allFields.filter((field) => field?.visible !== false && !field?.disabled).length;
+  const fieldSummary = `${fieldCount}/${allFields.length}`;
+  const buttons = summary.buttons.slice(0, 5).join('|') || 'none';
   if (state === 'login-required') return 'Add Address page par login session recognize nahi hua (state=login-required)';
   if (state === 'security-challenge') return 'Add Address page security check par atka hai (state=security-challenge)';
   if (state === 'redirected') return `Add Address page redirect ho gaya (state=redirected, path=${summary.path || 'unknown'})`;
-  if (state === 'map-gate') return `Add Address map/Proceed gate se aage nahi badha (fields=${fieldCount}, buttons=${buttons})`;
-  if (state === 'loading') return `Add Address page time par load nahi hua (fields=${fieldCount})`;
-  return `Add Address form ready nahi hua (state=${state || 'unknown'}, fields=${fieldCount}, buttons=${buttons})`;
+  if (state === 'map-gate') return `Add Address map/Proceed gate se aage nahi badha (fields=${fieldSummary}, buttons=${buttons})`;
+  if (state === 'loading') return `Add Address page time par load nahi hua (fields=${fieldSummary})`;
+  return `Add Address form ready nahi hua (state=${state || 'unknown'}, fields=${fieldSummary}, buttons=${buttons})`;
 }
 
 // Asal Swiggy "Add Address" web page par jaakar form bharna. Desktop web
@@ -1509,8 +1610,10 @@ export async function addSwiggyAddressViaWebUi(session, addressDetails, {
           ? Math.min(9_000, Math.max(3_500, remaining() - 11_000))
           : Math.min(7_000, Math.max(3_000, remaining() - 8_000));
         const phaseDeadline = Date.now() + phaseBudgetMs;
-        let clickedGate = false;
-        let tappedMap = false;
+        let gateClickAttempts = 0;
+        let gateClickUnavailable = false;
+        let mapGestureDone = false;
+        let lastGatePoint = null;
         let terminalChecks = 0;
 
         while (Date.now() < phaseDeadline && remaining() > 6_500) {
@@ -1538,28 +1641,83 @@ export async function addSwiggyAddressViaWebUi(session, addressDetails, {
             continue;
           }
 
-          if (!clickedGate && ['map-gate', 'form-not-found'].includes(lastState)) {
+          if (gateClickAttempts < 4 && ['map-gate', 'form-not-found'].includes(lastState)) {
+            const snapshotButton = (Array.isArray(lastSnapshot?.buttons) ? lastSnapshot.buttons : [])
+              .find((button) => button?.visible !== false && !button?.disabled
+                && /proceed|enter complete address|confirm location|save delivery address|use current location|add new address/i.test(String(button?.text || ''))
+                && Number(button?.x) > 0 && Number(button?.y) > 0);
+            if (snapshotButton && gateClickAttempts < 2) lastGatePoint = { x: Number(snapshotButton.x), y: Number(snapshotButton.y) };
+            let mainFrame = null;
+            try { mainFrame = typeof page.mainFrame === 'function' ? page.mainFrame() : null; } catch {}
+            const targetIsMainPage = fillTarget === page || (mainFrame && fillTarget === mainFrame);
+            let viewportForPoint = phase.viewport;
+            try { viewportForPoint = typeof page.viewport === 'function' ? page.viewport() : viewportForPoint; } catch {}
+            const pointInViewport = Boolean(
+              lastGatePoint
+              && lastGatePoint.x > 0 && lastGatePoint.y > 0
+              && lastGatePoint.x < (Number(viewportForPoint?.width) || phase.viewport.width)
+              && lastGatePoint.y < (Number(viewportForPoint?.height) || phase.viewport.height)
+            );
+            const usePhysicalClick = gateClickAttempts % 2 === 1 && targetIsMainPage && pointInViewport;
+            if (usePhysicalClick) {
+              let physicalClicked = false;
+              try {
+                if (typeof page.mouse?.click === 'function') {
+                  await page.mouse.click(lastGatePoint.x, lastGatePoint.y, { delay: 40 });
+                  physicalClicked = true;
+                } else if (typeof page.touchscreen?.tap === 'function') {
+                  await page.touchscreen.tap(lastGatePoint.x, lastGatePoint.y);
+                  physicalClicked = true;
+                }
+              } catch {}
+              if (physicalClicked) {
+                gateClickAttempts++;
+                await waitInterruptibly(900);
+                continue;
+              }
+            }
+            const gatePatterns = gateClickAttempts >= 2
+              ? ['enter complete address', 'add new address', 'add new', 'save delivery address', 'delivery address', 'add address', 'confirm location', 'proceed', 'use current location']
+              : ['confirm location', 'proceed', 'enter complete address', 'save delivery address', 'use current location', 'add new address', 'add new'];
             const gate = await fillTarget.evaluate(
               swiggyAddressClickTextInBrowser,
-              ['proceed', 'enter complete address', 'confirm location', 'save delivery address', 'use current location', 'add new address']
+              gatePatterns
             ).catch(() => ({ clicked: false }));
-            clickedGate = Boolean(gate?.clicked);
-            if (clickedGate) {
+            if (Number(gate?.x) > 0 && Number(gate?.y) > 0) lastGatePoint = { x: Number(gate.x), y: Number(gate.y) };
+            if (gate?.clicked) {
+              gateClickAttempts++;
               await waitInterruptibly(900);
               continue;
             }
+            // Proceed disabled/missing ho to click counter 0 par atka rahega;
+            // pehle map ko jagao, phir reverse-geocode ke baad click dobara do.
+            gateClickUnavailable = true;
           }
 
-          if (!tappedMap && lastState === 'map-gate') {
-            tappedMap = true;
+          if (!mapGestureDone && (gateClickAttempts >= 2 || gateClickUnavailable) && lastState === 'map-gate') {
+            mapGestureDone = true;
+            gateClickUnavailable = false;
             try {
               const viewport = typeof page.viewport === 'function' ? page.viewport() : phase.viewport;
-              const x = Math.round((Number(viewport?.width) || phase.viewport.width) / 2);
-              const y = Math.round((Number(viewport?.height) || phase.viewport.height) / 2);
-              if (typeof page.touchscreen?.tap === 'function') await page.touchscreen.tap(x, y);
-              else if (typeof page.mouse?.click === 'function') await page.mouse.click(x, y);
+              const width = Number(viewport?.width) || phase.viewport.width;
+              const height = Number(viewport?.height) || phase.viewport.height;
+              const x = Math.round(width / 2);
+              const y = Math.round(height * 0.42);
+              // Map ka sirf center tap aksar koi state-change nahi karta.
+              // Halka drag Google Map ko center_changed / reverse-geocode
+              // ki taraf dhakelta hai; uske baad Proceed phir try hoga.
+              if (typeof page.mouse?.move === 'function' && typeof page.mouse?.down === 'function' && typeof page.mouse?.up === 'function') {
+                await page.mouse.move(x, y, { steps: 4 });
+                await page.mouse.down();
+                await page.mouse.move(Math.min(width - 8, x + 36), Math.min(height - 8, y + 24), { steps: 12 });
+                await page.mouse.up();
+              } else if (typeof page.touchscreen?.tap === 'function') {
+                await page.touchscreen.tap(x, y);
+              } else if (typeof page.mouse?.click === 'function') {
+                await page.mouse.click(x, y);
+              }
             } catch {}
-            await waitInterruptibly(700);
+            await waitInterruptibly(900);
             continue;
           }
 
@@ -2981,14 +3139,25 @@ export async function getLiveSwiggyWafToken(forceRefresh = false, { solveBudgetM
     } catch {}
   }
 
+  // Direct route par solver abhi fail hua ho to har claim se pehle wahi
+  // 45s Chromium dobara mat chalao. Short cooldown me raw/Android recovery
+  // aage badhegi; asal WAF challenge par force-refresh wali recovery is
+  // cooldown ko bypass karke phir solve kar sakti hai.
+  if (!forceRefresh && _directWafSolveCooldownLeftMs() > 0) return '';
+
   // 2. Coalesce concurrent requests — lekin SIRF usi route ke andar.
   const token = await solveWafTokenOnce(forceRefresh, null, { solveBudgetMs });
-  if (token && !getBridgeProxy()?.id) {
+  const routeStillDirect = !getBridgeProxy()?.id;
+  if (token && routeStillDirect) {
+    directWafSolveFailedUntil = 0;
     latestSharedWafToken = token;
     latestSharedWafAt = Date.now();
     return token;
   }
-  return token && getBridgeProxy()?.id ? '' : (token || '');
+  if (!token && routeStillDirect && canUseStealthBrowser()) {
+    directWafSolveFailedUntil = Date.now() + DIRECT_WAF_SOLVE_FAILURE_COOLDOWN_MS;
+  }
+  return token && !routeStillDirect ? '' : (token || '');
 }
 
 // Chromium solver — ek valid `aws-waf-token` laata hai. Route snapshot

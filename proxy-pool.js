@@ -173,6 +173,8 @@ export function listProxies() {
       lastWafHitAt: rt.lastWafHitAt || '',
       wafSolveFailures: Number(rt.wafSolveFailures) || 0,
       consecutiveErrors: Number(rt.consecutiveErrors) || 0,
+      transientFailures: Number(rt.transientFailures) || 0,
+      lastTransientAt: rt.lastTransientAt || '',
       reservedBy: proxyReservations.get(p.id) || '',
     };
   });
@@ -253,16 +255,19 @@ export function pickProxy({ excludeIds = [], requireToken = false, reserveFor = 
 
   // Route quality — sirf round-robin kafi nahi. Pehle wo route jo asal me
   // OTP bhej sakne ke sab se qareeb hai:
-  //   clean/manual → fresh per-proxy WAF token → Indian IP → kam WAF hits
+  //   fresh per-proxy WAF token → clean/manual → Indian IP → kam WAF hits
   //   → kam latency → phir purani tokenAt/least-hits rotation.
+  // Token-ready challenged IP aksar token-less "clean" homepage IP se zyada
+  // kaam ki hoti hai; pehle quality rank token ko peeche dhakel deta tha,
+  // isliye solver ki mehnat rotation me zaya ho jati thi.
   const qualityRank = (p) => (p?.quality === 'challenged' ? 1 : 0);
   const tokenRank = (p) => (hasFreshProxyToken(runtime.get(p.id) || {}) ? 0 : 1);
   const countryRank = (p) => (String(p?.country || '').toUpperCase() === 'IN' ? 0 : 1);
   candidates.sort((a, b) => {
     const ra = runtime.get(a.id) || {};
     const rb = runtime.get(b.id) || {};
-    return qualityRank(a) - qualityRank(b) ||
-      tokenRank(a) - tokenRank(b) ||
+    return tokenRank(a) - tokenRank(b) ||
+      qualityRank(a) - qualityRank(b) ||
       countryRank(a) - countryRank(b) ||
       (Number(ra.wafHits) || 0) - (Number(rb.wafHits) || 0) ||
       (Number(ra.wafSolveFailures) || 0) - (Number(rb.wafSolveFailures) || 0) ||
@@ -352,7 +357,25 @@ export function getProxyRouteState(id) {
     wafHits: Number(rt.wafHits) || 0,
     wafSolveFailures: Number(rt.wafSolveFailures) || 0,
     consecutiveErrors: Number(rt.consecutiveErrors) || 0,
+    transientFailures: Number(rt.transientFailures) || 0,
+    lastTransientAt: rt.lastTransientAt || '',
   };
+}
+
+// Swiggy/proxy se asal OTP attempt par 5xx/network wala temporary jawab
+// aaya. Ye WAF hit nahi hai, isliye IP-bound token ko jalaana galat hoga;
+// lekin route ko thodi der side par rakhna zaroori hai. Pehle aisa route
+// sirf current lane se rotate hota tha, pool me "usable" reh kar dusre /
+// agle number par wapas aa sakta tha aur temporary outcomes ki line lag jati thi.
+export function markProxyTransientFailure(id, cooldownMs = 60_000) {
+  if (!id) return;
+  const rt = runtimeFor(id);
+  const waitMs = Math.max(0, Number(cooldownMs) || 0);
+  rt.cooldownUntil = Math.max(Number(rt.cooldownUntil) || 0, Date.now() + waitMs);
+  rt.consecutiveErrors = (Number(rt.consecutiveErrors) || 0) + 1;
+  rt.transientFailures = (Number(rt.transientFailures) || 0) + 1;
+  rt.lastTransientAt = new Date().toISOString();
+  rt.lastErrorAt = rt.lastTransientAt;
 }
 
 export function markProxyError(id) {

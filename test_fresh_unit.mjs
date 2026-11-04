@@ -709,6 +709,16 @@ console.log('proxy-pool (IP rotation — "rukna hi na pare"):');
   px.markProxySuccess(b.id);
   ok(px.listProxies().find((x) => x.id === b.id).consecutiveErrors === 0, 'success = errors reset');
 
+  // Asal OTP attempt par 5xx/network dene wali route pool me turant wapas
+  // nahi ghumni chahiye, lekin ye WAF hit nahi — IP-bound token na jale.
+  px.setProxyToken(b.id, 'TRANSIENT_KEEP_TOKEN'.padEnd(60, 't'));
+  px.markProxyTransientFailure(b.id, 60_000);
+  const transientDetail = px.listProxies().find((x) => x.id === b.id);
+  ok(transientDetail.cooldownLeftMs > 50_000
+    && transientDetail.transientFailures === 1
+    && transientDetail.tokenReady === true,
+  'transient proxy failure: 60s route side par, WAF token burn nahi');
+
   // fetchSwiggy — proxy null ho to plain fetch (backward compat)
   mock.calls.length = 0;
   const r1 = await px.fetchSwiggy('https://www.swiggy.com/dapi/test', {}, null);
@@ -853,6 +863,12 @@ console.log('chrome discovery + proxy dispatcher (2026 fixes):');
   ok(bridge._wafSolveRouteKey(null) === 'direct', 'WAF solver route-key: direct');
   ok(bridge._wafSolveRouteKey({ id: 'proxy-a' }) !== bridge._wafSolveRouteKey({ id: 'proxy-b' }),
     'WAF solver route-key: har proxy alag (IP-bound token safety)');
+  ok(bridge.WAF_SOLVE_FAST_BUDGET_MS === 15_000
+    && bridge.WAF_SOLVE_RELIABLE_BUDGET_MS === 45_000
+    && bridge.normalizeWafSolveBudgetMs(45_000) === 45_000
+    && bridge.normalizeWafSolveBudgetMs(999_000) === 60_000
+    && bridge.normalizeWafSolveBudgetMs(0) === 45_000,
+  'WAF solver: reliable 45s budget 15s hard cap me band nahi (slow proxy par token ban sakta hai)');
 
   // Challenge ke baad current proxy ka token asal me burn hona chahiye.
   // Pehle sirf direct/shared cache saaf hota tha — retry wahi jala token
@@ -1016,9 +1032,42 @@ console.log('Swiggy temporary 5xx/network — number FAILED nahi, retry queue:')
     && engine.rateLimitRecoveryWaitMs(2, 10 * 60_000) === 30_000
     && engine.fastRouteRecoveryCapMs(10 * 60_000) === 15_000,
   'engine: rate-limit/WAF pehli recovery max 15s (number queue me fasa nahi)');
+  ok(engine.telegramInfraRetryDecision({
+    telegramMode: true, willRetry: true, phone: '9876543210', stage: 'otp_send',
+  }) === true, 'Hermes: pehle OTP-send infra fail par current number capped retry ke liye safe');
+  ok(engine.telegramInfraRetryDecision({
+    telegramMode: true, willRetry: true, phone: '9876543210', stage: 'fresh_otp_send',
+  }) === true, 'Hermes: fresh OTP-send infra fail par bhi current number safe');
+  ok(engine.telegramInfraRetryDecision({
+    telegramMode: true, willRetry: true, phone: '9876543210', stage: 'verify',
+  }) === false
+    && engine.telegramInfraRetryDecision({
+      telegramMode: false, willRetry: true, phone: '9876543210', stage: 'otp_send',
+    }) === false
+    && engine.telegramInfraRetryDecision({
+      telegramMode: true, willRetry: false, phone: '9876543210', stage: 'otp_send',
+    }) === false,
+  'Hermes: aadha process / Firebase mode / cap khatam par current-number replay nahi');
+  ok(engine.routeClaimReadiness({
+    proxy: { id: 'p1', quality: 'challenged' },
+    routeState: { tokenReady: true },
+  }).ready === true, 'route gate: token-ready challenged proxy claim ke liye ready');
+  ok(engine.routeClaimReadiness({
+    proxy: { id: 'p1', quality: 'clean' },
+    routeState: { tokenReady: false, wafSolveCooldownLeftMs: 60_000 },
+  }).action === 'rotate', 'route gate: tokenless solve-cooling proxy par naya number claim nahi');
+  ok(engine.routeClaimReadiness({
+    proxy: { id: 'p1', quality: 'challenged' },
+    routeState: { tokenReady: false },
+  }).action === 'solve'
+    && engine.routeClaimReadiness({
+      proxy: { id: 'p2', quality: 'clean' },
+      routeState: { tokenReady: false },
+    }).rawFallback === true,
+  'route gate: challenged ko token solve, clean ko solve ke baad raw fallback mauqa');
   const snap = engine.getAutopilotSnapshot();
-  ok(Number.isFinite(snap.serverErrors) && Number.isFinite(snap.transientStrikes),
-    'engine snapshot: serverErrors/transientStrikes counters maujood');
+  ok(Number.isFinite(snap.serverErrors) && Number.isFinite(snap.transientStrikes) && Number.isFinite(snap.telegramInfraRetries),
+    'engine snapshot: serverErrors/transientStrikes/Hermes infra-retry counters maujood');
 }
 
 // ---------------------------------------------------------------------------

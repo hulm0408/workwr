@@ -27,7 +27,15 @@ import {
   preferOnline,
   isPhoneBlockedByPremiumLedger,
 } from './number-pipeline.js';
-import { getLiveSwiggyWafToken, runWithBridgeProxy, setBridgeProxy, getBridgeProxy, getChromeStatus } from './swiggy-bridge.js';
+import {
+  getLiveSwiggyWafToken,
+  runWithBridgeProxy,
+  setBridgeProxy,
+  getBridgeProxy,
+  getChromeStatus,
+  WAF_SOLVE_FAST_BUDGET_MS,
+  WAF_SOLVE_RELIABLE_BUDGET_MS,
+} from './swiggy-bridge.js';
 import {
   resolveNumberSourceMode,
   getTelegramOtpConfig,
@@ -267,6 +275,7 @@ const state = {
   telegramCurrentPhone: '',
   telegramClaimed: 0,
   telegramRejected: 0,
+  telegramInfraRetries: 0,
   telegramLastCheckedAt: 0,
   activeNumbers: [],      // parallel lanes: [{ phone, startedAt, laneId, proxyLabel }]
   history: [],            // { phone, kind, reason? } (last 200)
@@ -347,6 +356,7 @@ export function getAutopilotSnapshot() {
     telegramCurrentPhone: state.telegramCurrentPhone || '',
     telegramClaimed: state.telegramClaimed || 0,
     telegramRejected: state.telegramRejected || 0,
+    telegramInfraRetries: state.telegramInfraRetries || 0,
     telegramLastCheckedAt: state.telegramLastCheckedAt || 0,
     activeNumbers: (state.activeNumbers || []).map((n) => ({ ...n })),
     poolLoaded: Boolean(state.poolLoaded),
@@ -432,6 +442,47 @@ export function transientSwiggyRetryWaitMs(consecutiveStrikes) {
   return ladder[idx];
 }
 
+// Telegram/Hermes mode me current card NEW NUMBER click honay tak wahi
+// rehta hai. Agar pehle OTP-send stage par hi proxy/Swiggy infra fail ho
+// jaye (OTP dispatch confirm hi nahi hua), to current number ko kha kar
+// agla Hermes number claim karna regression tha: card par claimed badhta
+// rehta, processed 0. Ek capped retry ke liye wahi current entry rakho.
+// Verify/delete jaise aage ke stages yahan nahi aate — aadha process
+// dobara chalana duplicate OTP/delete ambiguity bana sakta hai.
+export function telegramInfraRetryDecision({
+  telegramMode = false,
+  willRetry = false,
+  phone = '',
+  stage = '',
+} = {}) {
+  if (!telegramMode || !willRetry || !String(phone || '').trim()) return false;
+  return ['otp_send', 'fresh_otp_send'].includes(String(stage || ''));
+}
+
+// Naya number claim karne se pehle route ki haalat. Tokenless +
+// solve-cooling proxy par OTP bhejna lagbhag pakka challenge/transient
+// hai; challenged proxy ko token ke baghair ready nahi mana jayega.
+// Clean/manual route par reliable solve ke baad bhi token na mile to ek
+// raw attempt allowed hai (homepage clean thi / Chrome solver alag fail
+// ho sakta hai), warna solver ki ek kharabi poori run ko rok degi.
+export function routeClaimReadiness({
+  proxy = null,
+  routeState = {},
+  tokenReady = false,
+} = {}) {
+  const solveCooldownLeftMs = Math.max(0, Number(routeState?.wafSolveCooldownLeftMs) || 0);
+  const readyToken = Boolean(tokenReady || routeState?.tokenReady);
+  if (readyToken) return { ready: true, action: 'ready', reason: 'token-ready', solveCooldownLeftMs };
+  if (!proxy?.id) return { ready: false, action: 'solve', reason: 'direct-token-missing', solveCooldownLeftMs };
+  if (solveCooldownLeftMs > 1_000) {
+    return { ready: false, action: 'rotate', reason: 'solve-cooling', solveCooldownLeftMs };
+  }
+  if (String(proxy.quality || '').toLowerCase() === 'challenged') {
+    return { ready: false, action: 'solve', reason: 'challenged-token-missing', solveCooldownLeftMs };
+  }
+  return { ready: false, action: 'solve', reason: 'token-missing', rawFallback: true, solveCooldownLeftMs };
+}
+
 // Security challenge ke baad route ka faisla. Free proxies teeno garam hon
 // to unhi ke beech ghumna dead-end hai — Render ki direct IP ko asal chance
 // do. Direct bhi 2 baar challenge de to best proxy route par wapas jao.
@@ -507,7 +558,7 @@ function statsLines() {
       ? field('🛡 WAF', `${state.wafCooldowns} cooldown · challenges: ${state.wafStrikes} · rotations: ${state.proxyRotations} · token-ready: ${pSummary?.tokenReadyCount || 0} · solve-cooling: ${pSummary?.solveCoolingCount || 0}`)
       : '',
     state.serverErrors
-      ? field('↻ Swiggy 5xx', `${state.serverErrors} temporary · ${state.sourceMode === 'telegram' ? 'Hermes current number dobara queue nahi hoga; consumed/side par' : 'numbers failed nahi, retry queue me'}`)
+      ? field('↻ Swiggy 5xx', `${state.serverErrors} temporary · ${state.sourceMode === 'telegram' ? 'Hermes current number safe hai — ready route par ek capped retry' : 'numbers failed nahi, retry queue me'}`)
       : '',
     field('⚡ Parallel lanes', `${state.activeWorkers || 0}/${state.concurrency || 1} active${state.requestedConcurrency > state.concurrency ? ` (maangi ${state.requestedConcurrency}, distinct IPs sirf ${state.concurrency})` : ''}`),
     pSummary?.enabled
@@ -522,7 +573,7 @@ function statsLines() {
       : field('🔥 Firebase', formatFirebaseSourceStatus(state)),
     field('Pool', formatPoolStatus(state)),
     state.sourceMode === 'telegram'
-      ? field('🔎 Hermes scan', `bypass hai · claimed ${state.telegramClaimed || 0} · rejected ${state.telegramRejected || 0}${state.telegramLastCheckedAt ? ` · last check ${fmtDuration(Math.max(0, Date.now() - state.telegramLastCheckedAt))} pehle` : ''}`)
+      ? field('🔎 Hermes scan', `bypass hai · claimed ${state.telegramClaimed || 0} · rejected ${state.telegramRejected || 0} · infra-retries ${state.telegramInfraRetries || 0}${state.telegramLastCheckedAt ? ` · last check ${fmtDuration(Math.max(0, Date.now() - state.telegramLastCheckedAt))} pehle` : ''}`)
       : (state.scanning || state.scanChecked)
         ? field('🔎 Device scan', `pass ${state.scanPass || 1}: ${state.scanUniqueChecked || 0}/${state.scanTotalDevices || 0} unique check · total probes ${state.scanTotalProbes || state.scanChecked || 0} · window ≤${fmtDuration(state.scanWindowMs || 0)} · ${state.scanBestActivityMs ? `scan ke waqt best SMS ~${fmtDuration(state.scanBestActivityAgeMs || Math.max(0, Date.now() - state.scanBestActivityMs))} purani · ` : ''}${state.scanFresh || 0} fresh ready${formatScanCandidateStates(state) ? ` · candidates: ${formatScanCandidateStates(state)}` : ''}${state.scanning ? ' · scanning…' : ''}`)
         : '',
@@ -553,7 +604,7 @@ function idleCard() {
           : `2️⃣ <b>Parallel lanes</b> — alag numbers, alag IPs par Swiggy OTP → live inbox poll`,
         `3️⃣ 🆕 naya = register · ♻️ purana = delete → fresh login`,
         state.sourceMode === 'telegram'
-          ? `4️⃣ OTP/verify ke baad existing fresh flow; consumed Hermes number dobara queue nahi hota · Firebase fallback <b>OFF</b>`
+          ? `4️⃣ Pehle route/WAF token ready, phir Hermes number claim; send-stage infra fail par wahi current number ek capped retry lega · Firebase fallback <b>OFF</b>`
           : `4️⃣ charges/order/wallet block = <b>skip</b> · rate-limit = <b>backoff</b>`,,
         ``,
         field('Target', `${state.target || envInt('PREMIUM_BATCH_TARGET', 100)} fresh sessions`),
@@ -790,6 +841,7 @@ export async function startAutopilot(opts = {}) {
     telegramCurrentPhone: '',
     telegramClaimed: 0,
     telegramRejected: 0,
+    telegramInfraRetries: 0,
     telegramLastCheckedAt: 0,
     poolLoaded: telegramMode, poolTotal: 0, poolFresh: 0,
     poolSourceId: '', poolSourceName: telegramMode ? 'Telegram Hermes' : '', poolSourceHost: '',
@@ -967,7 +1019,9 @@ export async function startAutopilot(opts = {}) {
       ps.enabledCount
         ? `🔀 Proxy pool: ${ps.enabledCount}/${ps.total} proxies ON — ${ps.rotation}`
         : `🔀 Koi proxy nahi — 🌐 <b>free proxies auto-fetch</b> try kar raha hoon (Swiggy par test karke sirf zinda wali rakhunga)…`,
-      'Swiggy WAF token arrange kar raha hoon (ek baar, ~15s)…',
+      telegramMode
+        ? 'Swiggy WAF token arrange kar raha hoon (token milte hi khatam; slow route par reliable budget 45s tak)…'
+        : 'Swiggy WAF token arrange kar raha hoon (ek baar, fast budget ~15s)…',
       telegramMode
         ? `📨 Telegram Hermes: @${esc(String(telegramCfg?.botUsername || telegramStatus.botUsername || 'HermeshuOTPROBOT').replace(/^@+/, ''))} · 1 lane (ek spare-account chat serialized rehta hai; requested ${requestedConcurrency}) · OTP Refresh budget ${Math.round(telegramOtpTimeoutMs / 1000)}s`
         : `⚡ Parallel lanes: ${requestedConcurrency} tak — har lane alag number + alag IP legi.`,
@@ -1226,7 +1280,9 @@ export async function startAutopilot(opts = {}) {
           state.routeMode = 'direct';
         }
         wafPool.loadFromDb?.();
-        wafTok = await getLiveSwiggyWafToken(false, { solveBudgetMs: FAST_ROUTE_RECOVERY_MS });
+        wafTok = await getLiveSwiggyWafToken(false, {
+          solveBudgetMs: telegramMode ? WAF_SOLVE_RELIABLE_BUDGET_MS : WAF_SOLVE_FAST_BUDGET_MS,
+        });
         console.log(wafTok ? '[Autopilot] WAF token ready (warm start).' : '[Autopilot] WAF token nahi mila (Chromium?) — raw mode me chalega.');
       } catch (e) {
         console.warn('[Autopilot] WAF warm-up skipped:', e?.message);
@@ -1612,7 +1668,15 @@ export async function startAutopilot(opts = {}) {
         const info = proxyPool.getProxy(lane.proxy.id);
         if (!info?.enabled) return false;
         const route = proxyPool.getProxyRouteState(lane.proxy.id);
-        return (route.cooldownLeftMs || 0) <= 5_000 && (route.consecutiveErrors || 0) < 3;
+        // Tokenless + abhi-abhi solver fail hua route asal me usable nahi:
+        // use current lane par chipka rakhne se har naya number raw request
+        // par challenge/transient khata tha. Token ready ho to purani solve
+        // failure irrelevant hai (setProxyToken use waise bhi clear karti hai).
+        const rawRouteProven = lane.rawRouteOkKey === `proxy:${lane.proxy.id}`;
+        const tokenlessSolveCooling = !rawRouteProven && !route.tokenReady && (route.wafSolveCooldownLeftMs || 0) > 1_000;
+        return !tokenlessSolveCooling &&
+          (route.cooldownLeftMs || 0) <= 5_000 &&
+          (route.consecutiveErrors || 0) < 3;
       } catch { return false; }
     };
     const releaseLaneRoute = (lane) => {
@@ -1624,6 +1688,7 @@ export async function startAutopilot(opts = {}) {
       lane.proxy = null;
       lane.routeKey = '';
       lane.routeMode = 'unassigned';
+      lane.rawRouteOkKey = '';
       syncRouteSummaryState();
       notifyRouteChanged();
     };
@@ -1635,6 +1700,7 @@ export async function startAutopilot(opts = {}) {
       }
       lane.proxy = proxy;
       lane.routeKey = `proxy:${proxy.id}`;
+      if (lane.rawRouteOkKey && lane.rawRouteOkKey !== lane.routeKey) lane.rawRouteOkKey = '';
       lane.routeMode = 'proxy';
       activeRouteKeys.add(lane.routeKey);
       syncRouteSummaryState();
@@ -1649,6 +1715,7 @@ export async function startAutopilot(opts = {}) {
       }
       lane.proxy = null;
       lane.routeKey = 'direct';
+      if (lane.rawRouteOkKey && lane.rawRouteOkKey !== 'direct') lane.rawRouteOkKey = '';
       lane.routeMode = ps.enabled ? 'direct-fallback' : 'direct';
       activeRouteKeys.add('direct');
       syncRouteSummaryState();
@@ -1773,14 +1840,119 @@ export async function startAutopilot(opts = {}) {
       }
       syncActiveNumbers();
     };
-    const solveLaneToken = async (lane, force = false) => {
+    const solveLaneToken = async (lane, force = false, budgetMs = 0) => {
       try {
+        const solveBudgetMs = Number(budgetMs) > 0
+          ? Number(budgetMs)
+          : ((laneCount || 1) <= 1 ? WAF_SOLVE_RELIABLE_BUDGET_MS : WAF_SOLVE_FAST_BUDGET_MS);
         return await runWithBridgeProxy(
           lane.proxy || null,
-          () => getLiveSwiggyWafToken(force, { solveBudgetMs: FAST_ROUTE_RECOVERY_MS }),
+          () => getLiveSwiggyWafToken(force, { solveBudgetMs }),
           { owner: lane.owner, releaseOnExit: false }
         );
       } catch { return ''; }
+    };
+
+    // Telegram/Hermes me number claim karna ek asal side-effect hai: FIND /
+    // NEW ke baad current card badal jata hai. Isliye route/WAF token ka
+    // intezaam claim se PEHLE hoga. Pehle worker pehle Hermes number le
+    // leta tha, phir tokenless/solve-cooling route par bhej kar use infra
+    // failure me consume kar deta tha. Ab zyada se zyada 3 routes tayyar
+    // hongi; challenged route token ke baghair aage nahi
+    // jayegi. Clean/manual route par solve fail ho tab bhi ek raw attempt
+    // allowed hai, kyunki us IP par Swiggy homepage clean aa chuki hoti hai
+    // aur bridge ke paas apni Android/browser recovery bhi hai.
+    const prepareLaneRouteBeforeClaim = async (lane) => {
+      if (!telegramMode) return true;
+      const attemptedRoutes = new Set();
+      let notified = false;
+      const notifyPreparing = async (routeLabel) => {
+        const now = Date.now();
+        if (notified || (lane.routePrepNoticeAt && now - lane.routePrepNoticeAt < 30_000)) return;
+        notified = true;
+        lane.routePrepNoticeAt = now;
+        await push(progressCard(section('🛡 Route Ready Kar Raha Hoon — Hermes Number Safe Hai', [
+          `› Lane ${lane.id} ki route <code>${esc(routeLabel || 'direct')}</code> par WAF token solve ho raha hai.`,
+          '› Is dauran <b>naya Hermes number claim nahi hoga</b> — pehle IP/token ready, phir FIND/NEW NUMBER.',
+          sub('Token jaldi mil jaye to solve turant khatam ho jayega; clean route par fast solve, challenged/direct route par reliable budget 45s tak hai.'),
+        ].join('\n'))), stopRows());
+      };
+
+      for (let attempt = 0; attempt < 3; attempt++) {
+        if (state.stopRequested) return false;
+        if (!ensureLaneRoute(lane)) return false;
+
+        const routeKey = lane.proxy?.id ? `proxy:${lane.proxy.id}` : 'direct';
+        if (attemptedRoutes.has(routeKey)) return false;
+        attemptedRoutes.add(routeKey);
+
+        // Isi route par pichhla number asal Swiggy response tak gaya tha
+        // (OTP send/verify stage paar hua). Token solver fail hone ke
+        // bawjood ye route raw kaam kar chuki hai — har agle number se
+        // pehle dobara solver ghuma kar use churn mat karo. Infra outcome
+        // aate hi ye raw-ok nishan saaf ho jata hai.
+        if (lane.rawRouteOkKey && lane.rawRouteOkKey === routeKey) return true;
+
+        if (!lane.proxy?.id) {
+          await notifyPreparing('direct');
+          const token = await solveLaneToken(lane, false, WAF_SOLVE_RELIABLE_BUDGET_MS);
+          if (state.stopRequested) return false;
+          if (token) return true;
+          if (ps.enabled) {
+            const next = rotateLaneProxy(lane, '', { countRotation: true });
+            if (next) continue;
+          }
+          // Direct-only / koi proxy free nahi: bridge ki raw + Android /
+          // browser recovery ko ek mauqa do. Send-stage infra fail par wahi
+          // Hermes current number capped retry me safe rahega.
+          return true;
+        }
+
+        let routeState = {};
+        try { routeState = proxyPool.getProxyRouteState(lane.proxy.id) || {}; } catch {}
+        const readiness = routeClaimReadiness({ proxy: lane.proxy, routeState });
+        if (readiness.ready) return true;
+
+        if (readiness.action === 'rotate') {
+          const failedId = lane.proxy.id;
+          const next = rotateLaneProxy(lane, failedId, { countRotation: true });
+          if (next && next.id !== failedId) continue;
+          maybeRefillFreeProxies();
+          return false;
+        }
+
+        await notifyPreparing(lane.proxy.label || lane.proxy.id);
+        // Challenged IP ko token ke baghair aage nahi bhejenge, isliye
+        // reliable budget. Clean/manual IP par fast solve kaafi hai —
+        // fail ho to neeche raw fallback hai, aur agar wo bhi infra de to
+        // outcome branch nayi route par reliable solve karega. Har clean
+        // route par pehle se 45s jalana throughput ko bina wajah marega.
+        const token = await solveLaneToken(
+          lane,
+          false,
+          readiness.rawFallback ? WAF_SOLVE_FAST_BUDGET_MS : WAF_SOLVE_RELIABLE_BUDGET_MS
+        );
+        if (state.stopRequested) return false;
+        try { routeState = proxyPool.getProxyRouteState(lane.proxy.id) || {}; } catch {}
+        if (token || routeState.tokenReady) return true;
+
+        let chromeFound = true;
+        try { chromeFound = Boolean(getChromeStatus()?.found); } catch {}
+        const challenged = String(lane.proxy.quality || '').toLowerCase() === 'challenged';
+        if (!chromeFound && !challenged) return true;
+        if (chromeFound && readiness.rawFallback) return true;
+
+        const failedId = lane.proxy.id;
+        const next = rotateLaneProxy(lane, failedId, { countRotation: true });
+        if (next && next.id !== failedId) continue;
+        // Chrome hi nahi aur sirf challenged route bachi hai to raw bridge
+        // recovery hi aakhri mauqa hai; warna tokenless challenged IP par
+        // number claim karke jalana sahi nahi.
+        return !chromeFound;
+      }
+
+      maybeRefillFreeProxies();
+      return false;
     };
 
     let freshWaitUntil = 0;
@@ -2096,6 +2268,9 @@ export async function startAutopilot(opts = {}) {
       directChallenges: 0,
       consecutiveFails: 0,
       currentEntry: null,
+      pendingTelegramRetry: null,
+      routePrepNoticeAt: 0,
+      rawRouteOkKey: '',
     }));
     for (const lane of lanes) ensureLaneRoute(lane);
     syncRouteSummaryState();
@@ -2134,7 +2309,33 @@ export async function startAutopilot(opts = {}) {
             await waitForRouteChange(1_000);
             continue;
           }
-          const claim = await claimNextPick();
+          // Hermes number claim karne se pehle is lane ki IP/WAF haalat
+          // tayyar karo. Route ready na ho to FIND/NEW bilkul nahi chalega.
+          if (telegramMode && !(await prepareLaneRouteBeforeClaim(lane))) {
+            await waitForRouteChange(1_000);
+            continue;
+          }
+
+          let claim;
+          if (telegramMode && lane.pendingTelegramRetry?.entry) {
+            const retryPicked = lane.pendingTelegramRetry;
+            if (!claimPickedEntry(retryPicked.entry)) {
+              await sleep(250, () => state.stopRequested);
+              continue;
+            }
+            lane.pendingTelegramRetry = null;
+            state.telegramCurrentPhone = retryPicked.entry.phone;
+            claim = {
+              status: 'picked',
+              picked: {
+                ...retryPicked,
+                checkedAt: Date.now(),
+                telegramInfraRetry: true,
+              },
+            };
+          } else {
+            claim = await claimNextPick();
+          }
           if (claim.status === 'target') { requestRunEnd('target'); break; }
           if (claim.status === 'stopped') break;
           if (claim.status === 'waiting') {
@@ -2161,13 +2362,21 @@ export async function startAutopilot(opts = {}) {
         const pickedAgeMs = picked.lastActivityMs
           ? Math.max(0, Date.now() - Number(picked.lastActivityMs))
           : null;
-        await push(progressCard(section('📟 Device Mil Gaya — Number Process Shuru', [
-          `📱 <b>Number:</b> <code>${esc(entry.phone)}</code> · lane ${lane.id} · ${esc(lane.proxy?.label || 'direct')}`,
-          picked.onlineFallback
-            ? '› Quick scan me taaza SMS activity nahi mili — Firebase <b>clients me ONLINE</b> dikh raha device liya hai. Full pool scan ka wait nahi kiya.'
-            : `› Device ki last SMS activity ~${fmtDuration(pickedAgeMs || 0)} purani · ladder ≤${fmtDuration(Math.max(Number(otpCfg.activeWindowMs) || 0, Number(picked.windowMs) || 0))} · queue me ${hotQueue.length} backup(s).`,
-          sub('Is lane par ab WAF/OTP flow chalega; baaki lanes apna kaam jaari rakhengi. Processed count result aate hi badhega.'),
-        ].join('\n'))), stopRows());
+        await push(progressCard(section(
+          picked.telegramInfraRetry
+            ? '↻ Hermes Current Number — Ready Route Par Retry'
+            : '📟 Device Mil Gaya — Number Process Shuru',
+          [
+            `📱 <b>Number:</b> <code>${esc(entry.phone)}</code> · lane ${lane.id} · ${esc(lane.proxy?.label || 'direct')}`,
+            picked.telegramInfraRetry
+              ? '› Pichhle send-stage infra failure par naya Hermes number claim nahi kiya — wahi current number ab tayyar route par dobara process ho raha hai.'
+              : picked.onlineFallback
+                ? '› Quick scan me taaza SMS activity nahi mili — Firebase <b>clients me ONLINE</b> dikh raha device liya hai. Full pool scan ka wait nahi kiya.'
+                : `› Device ki last SMS activity ~${fmtDuration(pickedAgeMs || 0)} purani · ladder ≤${fmtDuration(Math.max(Number(otpCfg.activeWindowMs) || 0, Number(picked.windowMs) || 0))} · queue me ${hotQueue.length} backup(s).`,
+            sub(picked.telegramInfraRetry
+              ? 'Ye capped infra retry hai; asal OTP/processed outcome aate hi agla number chalega.'
+              : 'Is lane par ab WAF/OTP flow chalega; baaki lanes apna kaam jaari rakhengi. Processed count result aate hi badhega.'),
+          ].join('\n'))), stopRows());
       }
 
       // WAF warm-up background me chal raha tha — pehla OTP iske baghair na jaye
@@ -2220,6 +2429,17 @@ export async function startAutopilot(opts = {}) {
 
       setLaneCurrent(lane, null);
       const outcome = tally(res);
+      // Route asal Swiggy response tak gayi ho (OTP send/verify paar) to
+      // use raw-proven rakho: solver fail/cooldown ke bawjood agli claim
+      // par wahi sticky IP chalegi. Infra outcome par proof khatam —
+      // route ab garam/bad mani jayegi aur recovery/rotation chalegi.
+      const routeReachedSwiggy = ['ok', 'skipped', 'deferred', 'failed'].includes(outcome) &&
+        !['failed_exception', 'failed_bad_entry'].includes(String(res?.kind || ''));
+      if (routeReachedSwiggy) {
+        lane.rawRouteOkKey = finalProxyId ? `proxy:${finalProxyId}` : 'direct';
+      } else if (['swiggy_transient', 'security_challenge', 'rate_limited', 'waf_cooldown'].includes(outcome)) {
+        lane.rawRouteOkKey = '';
+      }
       if (['ok', 'skipped', 'deferred', 'aborted', 'rate_limited', 'failed'].includes(outcome)) {
         lane.proxyChallenges = 0;
         lane.directChallenges = 0;
@@ -2233,6 +2453,28 @@ export async function startAutopilot(opts = {}) {
       if (outcome === 'failed' && res.phone) {
         failedAttemptsThisRun.set(res.phone, (failedAttemptsThisRun.get(res.phone) || 0) + 1);
       }
+      // Send-stage infra failure par Hermes ka current card abhi bhi wahi
+      // number dikha raha hota hai (NEW NUMBER abhi click nahi hua). Use
+      // lane ke pending retry me rakho — agli iteration provider se naya
+      // number claim kiye baghair wahi entry ready route par process hogi.
+      const preserveTelegramCurrentForRetry = (willRetry) => {
+        const shouldPreserve = telegramInfraRetryDecision({
+          telegramMode,
+          willRetry,
+          phone: entry?.phone || res?.phone || '',
+          stage: res?.stage || '',
+        });
+        if (!shouldPreserve) return false;
+        lane.pendingTelegramRetry = {
+          ...picked,
+          entry,
+          checkedAt: Date.now(),
+          telegramInfraRetry: true,
+        };
+        state.telegramCurrentPhone = entry.phone;
+        state.telegramInfraRetries = (state.telegramInfraRetries || 0) + 1;
+        return true;
+      };
       // Console visibility — exact failure reason (Telegram card ke alawa),
       // taaki WAF/rate-limit/verify/OTP-miss ka farq turant dikhe logs me.
       if (!res.ok) {
@@ -2291,7 +2533,11 @@ export async function startAutopilot(opts = {}) {
         if (res.phone) transientAttemptsThisRun.set(res.phone, attempt);
         const infra = recordInfraAttempt(res.phone);
         const willRetry = Boolean(res.phone && attempt < 2 && infra.willRetry);
+        const telegramRetryPreserved = preserveTelegramCurrentForRetry(willRetry);
         if (willRetry && !telegramMode) deferNumber(entry, 'swiggy_transient');
+        if (finalProxyId) {
+          try { proxyPool.markProxyTransientFailure(finalProxyId, 60_000); } catch {}
+        }
 
         let next = null;
         if (ps.enabled) {
@@ -2303,7 +2549,9 @@ export async function startAutopilot(opts = {}) {
         await push(progressCard(section('↻ Temporary Error — Number Safe Hai', [
           `› ${res.httpStatus ? `HTTP ${res.httpStatus}` : 'Network/5xx'} temporary error — ye number <b>FAILED count nahi</b> hua.`,
           telegramMode
-            ? `› Hermes current number consumed hai — retry queue me nahi jayega; agla number FIND NUMBER/NEW NUMBER se aayega.`
+            ? (telegramRetryPreserved
+              ? `› Hermes current number <b>safe rakha hai</b> — naya number claim nahi hoga; wahi number ready route par ek capped retry lega (attempt ${attempt}/2).`
+              : `› Is Hermes number ke capped infra attempts khatam — ab agla number FIND NUMBER/NEW NUMBER se aayega.`)
             : willRetry
               ? `› Number retry queue me daal diya (attempt ${attempt}/2) — isi run me dobara ayega.`
               : `› Is number ke is run ke 2 temporary attempts ho gaye — ledger/pool me failed mark nahi kiya, agli run me mil sakta hai.`,
@@ -2312,7 +2560,9 @@ export async function startAutopilot(opts = {}) {
             : `› Doosri proxy available nahi — isi IP par cool-off ke baad aage badhunga.`,
           waitMs
             ? `› Lagatar ${state.transientStrikes} temporary errors — sirf lane ${lane.id} ${Math.round(waitMs / 1000)}s cool-off legi, baaki lanes chalti rahengi.`
-            : `› Nayi IP par turant agla number — batch nahi rukega.`,
+            : (telegramRetryPreserved
+              ? `› Nayi IP par turant wahi Hermes current number retry hoga — batch nahi rukega.`
+              : `› Nayi IP par turant agla number — batch nahi rukega.`),
         ].join('\n'))), stopRows());
 
         if (waitMs) {
@@ -2333,6 +2583,7 @@ export async function startAutopilot(opts = {}) {
         // Number defer — isi run me aakhir me dobara try hoga (is run ke
         // combined infra attempts max 2; us ke baad ye phone side par).
         const rateInfra = recordInfraAttempt(res.phone);
+        const telegramRetryPreserved = preserveTelegramCurrentForRetry(Boolean(res.phone && rateInfra.willRetry));
         if (res.phone && rateInfra.willRetry && !telegramMode) deferNumber(entry, 'rate_limited');
 
         if (ps.enabled) {
@@ -2342,7 +2593,9 @@ export async function startAutopilot(opts = {}) {
             await push(progressCard(section('🔀 Rate Limit — Proxy Rotate (zero wait)', [
               `› IP ko limit lagi — nayi IP (proxy) le liya: <code>${esc(next.label)}</code>`,
               telegramMode
-                ? `› Hermes current number consumed hai — retry queue me nahi jayega; agla number NEW NUMBER se aayega.`
+                ? (telegramRetryPreserved
+                  ? `› Hermes current number safe hai — naya claim nahi hoga; wahi number nayi IP par capped retry lega.`
+                  : `› Is Hermes number ke capped infra attempts khatam — agla number NEW NUMBER se aayega.`)
                 : rateInfra.willRetry
                   ? `› Number defer kiya — baad me isi run me ek aur mauqa milega.`
                   : `› Is number ke is run ke 2 infra attempts ho gaye — ab ye is run me dobara nahi uthega.`,
@@ -2378,6 +2631,7 @@ export async function startAutopilot(opts = {}) {
         state.wafCooldowns++;
         if (state.wafCooldowns > wafCooldownLimit) { requestRunEnd('waf_stuck'); break; }
         const wafInfra = recordInfraAttempt(res.phone);
+        const telegramRetryPreserved = preserveTelegramCurrentForRetry(Boolean(res.phone && wafInfra.willRetry));
         if (res.phone && wafInfra.willRetry && !telegramMode) deferNumber(entry, 'waf_cooldown');
 
         // Fast recovery: ek wait kabhi 15s se zyada nahi. Uske baad nayi
@@ -2388,7 +2642,9 @@ export async function startAutopilot(opts = {}) {
         await push(progressCard(section('🛡 WAF Cooling — 15s Fast Recovery', [
           `› Swiggy ki WAF abhi lane ${lane.id} ki IP ko garam bol rahi hai — sirf ~${Math.max(1, Math.round(cdMs / 1000))}s me nayi IP/token try hogi; baaki lanes chalti rahengi.`,
           telegramMode
-            ? `› Hermes current number consumed hai — retry queue me nahi jayega; batch zinda hai, agla number NEW NUMBER se aayega.`
+            ? (telegramRetryPreserved
+              ? `› Hermes current number safe hai — naya claim nahi hoga; wahi number nayi IP/token par capped retry lega. Batch zinda hai.`
+              : `› Is Hermes number ke capped infra attempts khatam — batch zinda hai, agla number NEW NUMBER se aayega.`)
             : wafInfra.willRetry
               ? `› Number defer ho chuka hai (isi run me ek aur mauqa milega). Batch zinda hai.`
               : `› Is number ke is run ke 2 infra attempts ho gaye — ab ye is run me dobara nahi uthega. Batch zinda hai.`,
@@ -2420,9 +2676,12 @@ export async function startAutopilot(opts = {}) {
         state.wafStrikes++;
         state.lastError = `security challenge ×${state.wafStrikes}`;
         const securityInfra = recordInfraAttempt(res.phone);
+        const telegramRetryPreserved = preserveTelegramCurrentForRetry(Boolean(res.phone && securityInfra.willRetry));
         if (res.phone && securityInfra.willRetry && !telegramMode) deferNumber(entry, 'security_challenge');
         const numberRetryLine = telegramMode
-          ? 'Hermes current number consumed hai — retry queue me nahi jayega, agla number NEW NUMBER se aayega.'
+          ? (telegramRetryPreserved
+            ? 'Hermes current number safe hai — naya claim nahi hoga; wahi number ready route par capped retry lega.'
+            : 'Is Hermes number ke capped infra attempts khatam — agla number NEW NUMBER se aayega.')
           : securityInfra.willRetry
             ? 'Number defer hai — isi run me ek aur mauqa milega, failed mark nahi hua.'
             : 'Is number ke is run ke 2 infra attempts ho gaye — failed mark nahi hua, lekin ab ye is run me dobara nahi uthega.';
@@ -2550,7 +2809,7 @@ export async function startAutopilot(opts = {}) {
         ].join('\n'))), stopRows());
         // Wait aur 15s-cap wala token solve saath chalao — warna 15+15
         // hokar recovery phir slow ho jayegi.
-        const fastSolvePromise = solveLaneToken(lane, true);
+        const fastSolvePromise = solveLaneToken(lane, true, WAF_SOLVE_FAST_BUDGET_MS);
         await sleep(waitMs, () => state.stopRequested);
         if (state.stopRequested) { endReason = state.stopReason || 'manual'; break; }
         await fastSolvePromise;

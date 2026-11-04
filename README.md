@@ -72,15 +72,19 @@ bot ke andar hi hota hai:
    **⚙️ Settings → 🧪 Test Hermes** bhi hai; account hatana ho to
    **🗑 Remove Telegram** (confirmation ke baad session clear hoti hai).
 
-Batch is mode me ye karta hai: Hermes par **FIND NUMBER** → mile hue number
-par Swiggy OTP → **REFRESH** karte hue default **20 second** wait (⚙️
-Settings me 20/30/45/60/90s presets; env
-`TELEGRAM_OTP_TIMEOUT_MS`) → OTP mile to wahi purana verify/register/delete/
-fresh process → OTP na mile to **NEW NUMBER** aur agla number. Refresh ka gap
-default **2.5s** hai (Settings ya `TELEGRAM_OTP_REFRESH_MS`). Firebase
-fallback is mode me bilkul use nahi hota. Ek spare account ki ek hi Hermeshu
-chat serialized state hoti hai, isliye Telegram mode safety ke liye
-**1 lane** par rehta hai; Firebase mode ki 10-lane behavior unchanged hai.
+Batch is mode me ye karta hai: pehle lane ki proxy/direct route aur WAF
+token ready → Hermes par **FIND NUMBER** → mile hue number par Swiggy OTP →
+**REFRESH** karte hue default **20 second** wait (⚙️ Settings me
+20/30/45/60/90s presets; env `TELEGRAM_OTP_TIMEOUT_MS`) → OTP mile to wahi
+purana verify/register/delete/fresh process → OTP na mile to **NEW NUMBER**
+aur agla number. Agar pehle OTP-send stage par hi WAF/rate/5xx/network jaisa
+infra failure aaye, to Hermes ka current number consume nahi hota: wahi
+number ready route par ek capped retry leta hai (combined infra attempts
+max 2), uske baad hi NEW NUMBER chalega. Refresh ka gap default **2.5s**
+hai (Settings ya `TELEGRAM_OTP_REFRESH_MS`). Firebase fallback is mode me
+bilkul use nahi hota. Ek spare account ki ek hi Hermeshu chat serialized
+state hoti hai, isliye Telegram mode safety ke liye **1 lane** par rehta
+hai; Firebase mode ki 10-lane behavior unchanged hai.
 
 Session/API files `data/telegram.session` aur `data/telegram-api.json`
 me `0600` permissions se rehti hain aur gitignore me hain. Render free disk
@@ -265,12 +269,18 @@ Jo 403 challenge pehle poora batch maar deta tha, ab uska tod:
    — limit lanes ke hisaab se scale hoti hai taaki pehli parallel wave hi
    batch ko premature band na kar de; ek processed response bhi aa jaye
    to storm ginti reset ho jati hai.
-4. **Solver route-locked + 15s time-boxed** — har proxy ka solve alag route
-   key par hota hai (ek IP ka token doosri IP par leak nahi), ek solve
-   zyada se zyada **15 second** leta hai, aur jis proxy par solve fail ho
-   wo 90s side par rehti hai. WAF-hit proxy ki quarantine ab sirf 60–120s
-   hai (pehle 3–10 minute), isliye bada pool asal me usable rehta hai.
-5. **15-second route recovery** — engine WAF wait 5s→10s→**15s cap** hai;
+4. **Solver route-locked; fast 15s / reliable 45s** — har proxy ka solve
+   alag route key par hota hai (ek IP ka token doosri IP par leak nahi).
+   Chalti request ke beech recovery aur clean route ke pre-claim solve ke
+   liye **15s fast** budget hai; challenged/direct route ko number claim
+   karne se pehle **45s reliable** budget milta hai. Token jaldi aa jaye to
+   solver turant return karta hai.
+   Ek hi 15s total cap Chromium launch + slow proxy navigation + 15s cookie
+   wait ko jagah hi nahi deti thi. Jis proxy par solve fail ho wo 90s side
+   par rehti hai. WAF-hit proxy ki quarantine 60–120s hai, aur asal OTP
+   attempt par 5xx/network dene wali route 60s transient cooldown par jati
+   hai (token burn kiye baghair).
+5. **15-second route recovery waits** — engine WAF wait 5s→10s→**15s cap** hai;
    pehla direct rate-limit bhi max 15s rukta hai, dusra 30s. Global WAF
    circuit-breaker bhi ab 15s/30s/60s hai. Matlab garam IP par number
    minutes tak queue me nahi fasa rehta — route badli, fresh proxies
@@ -303,9 +313,10 @@ jitne chahein add karo (ek saath comma me bhi):
   hain; manual proxies ko haath nahi lagta. (Sach: free wali aksar slow/dead
   hoti hain — isliye health-check filter hai; best natija khud ki sticky
   proxies se hi milta hai.)
-- Add karte hi **rotation ON**. Picker sirf round-robin nahi — clean,
-  fresh per-proxy token wali, Indian, kam-hit aur kam-latency route pehle
-  aati hai; challenged/solve-failed routes peeche rehti hain.
+- Add karte hi **rotation ON**. Picker sirf round-robin nahi — fresh
+  per-proxy token wali route sabse pehle, phir clean, Indian, kam-hit aur
+  kam-latency route aati hai; challenged/solve-failed routes peeche
+  rehti hain.
 - **WAF/rate-limit/temporary 5xx hit = TURANT doosri proxy** — number
   failed count kiye baghair defer karke aage badhta hai, baad me **isi run
   me** ek aur mauqa milta hai (per number combined infra attempts max 2).

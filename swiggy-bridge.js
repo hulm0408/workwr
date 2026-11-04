@@ -283,6 +283,27 @@ const SWIGGY_WAF_COOKIE_WAIT_MS = 15000;
 const SWIGGY_WAF_COOKIE_POLL_MS = 250;
 const AUTH_PAGE_EVALUATE_TIMEOUT_MS = 9000;
 
+// WAF solver ke do budget hain:
+//   FAST (15s)     — chalti hui request ke beech ki recovery; number ko
+//                    minutes tak latkaya nahi jata.
+//   RELIABLE (45s) — number claim karne se pehle route tayyar karna.
+// Chromium launch + slow free-proxy navigation + 15s cookie wait ko ek
+// hi 15s total cap me band karna token banna lagbhag impossible bana deta
+// tha. Isi liye reliable budget alag hai; token jaldi aa jaye to solver
+// waise hi turant return kar deta hai (budget = upar ki had, fixed wait nahi).
+export const WAF_SOLVE_FAST_BUDGET_MS = 15_000;
+export const WAF_SOLVE_RELIABLE_BUDGET_MS = 45_000;
+export const WAF_SOLVE_MAX_BUDGET_MS = 60_000;
+
+export function normalizeWafSolveBudgetMs(value, fallbackMs = WAF_SOLVE_RELIABLE_BUDGET_MS) {
+  const base = Number(value);
+  const fallback = Number(fallbackMs);
+  const requested = Number.isFinite(base) && base > 0
+    ? base
+    : (Number.isFinite(fallback) && fallback > 0 ? fallback : WAF_SOLVE_RELIABLE_BUDGET_MS);
+  return Math.min(WAF_SOLVE_MAX_BUDGET_MS, Math.max(8_000, requested));
+}
+
 async function waitForSwiggyWafCookie(page, timeoutMs = SWIGGY_WAF_COOKIE_WAIT_MS) {
   const deadline = Date.now() + Math.max(0, Number(timeoutMs) || 0);
   while (Date.now() < deadline) {
@@ -1538,7 +1559,7 @@ async function bootstrapSwiggyAuthJar(session, { forceFresh = false } = {}) {
   return session.csrfToken;
 }
 
-async function postSwiggyAuthJson(session, endpointUrl, payload = {}, { timeoutMs = 6500, allowBrowserEscalation = true } = {}) {
+async function postSwiggyAuthJson(session, endpointUrl, payload = {}, { timeoutMs = 10_000, allowBrowserEscalation = true } = {}) {
   await bootstrapSwiggyAuthJar(session);
 
   // "Aaye hi na" — pehle send se pehle live WAF token arrange karo (pool > cached >
@@ -1615,7 +1636,7 @@ async function postSwiggyAuthJson(session, endpointUrl, payload = {}, { timeoutM
       if (nextProxy) {
         setBridgeProxy(nextProxy);
         session.wafToken = ''; // nayi IP = naya token chahiye
-        try { session.wafToken = await getLiveSwiggyWafToken(false, { solveBudgetMs: 15_000 }); } catch {}
+        try { session.wafToken = await getLiveSwiggyWafToken(false, { solveBudgetMs: WAF_SOLVE_FAST_BUDGET_MS }); } catch {}
         await bootstrapSwiggyAuthJar(session, { forceFresh: true });
         out = await sendOnce(session.transportMode === 'android');
       } else {
@@ -1775,7 +1796,7 @@ export async function prewarmBrowser() {
 // Universal cached / live AWS WAF token provider for both swiggy-bridge and swiggy-cart.
 // Doosra argument solver ka time budget hai — proxy screening me full
 // 80-90s solver har route par chalana batch ko maar deta tha.
-export async function getLiveSwiggyWafToken(forceRefresh = false, { solveBudgetMs = 15_000 } = {}) {
+export async function getLiveSwiggyWafToken(forceRefresh = false, { solveBudgetMs = WAF_SOLVE_RELIABLE_BUDGET_MS } = {}) {
   const now = Date.now();
   const routeProxy = getBridgeProxy() || null;
 
@@ -1845,7 +1866,7 @@ export async function getLiveSwiggyWafToken(forceRefresh = false, { solveBudgetM
 // maanga gaya tha, beech me active bridge route badal bhi jaye to token
 // galat IP par nahi chipkega. Coalescing bhi per-route hai.
 // Time budget hard cap hai — pehle ek fail solve 80-90s kha sakta tha.
-async function solveWafTokenOnce(forceRefresh = false, routeProxy = getBridgeProxy(), { solveBudgetMs = 15_000 } = {}) {
+async function solveWafTokenOnce(forceRefresh = false, routeProxy = getBridgeProxy(), { solveBudgetMs = WAF_SOLVE_RELIABLE_BUDGET_MS } = {}) {
   const routeKey = _wafSolveRouteKey(routeProxy);
   const existing = wafSolvePromises.get(routeKey);
   if (existing) return existing;
@@ -1862,7 +1883,7 @@ async function solveWafTokenOnce(forceRefresh = false, routeProxy = getBridgePro
   const solvePromise = (async () => {
     await previousSolve.catch(() => '');
     const startedAt = Date.now();
-    const budgetMs = Math.min(15_000, Math.max(8_000, Number(solveBudgetMs) || 15_000));
+    const budgetMs = normalizeWafSolveBudgetMs(solveBudgetMs);
     const deadline = startedAt + budgetMs;
     const remaining = () => Math.max(0, deadline - Date.now());
     let browser = null;

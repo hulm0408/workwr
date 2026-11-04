@@ -132,6 +132,8 @@ export function normalizeSwiggySessionPayload(rawInput) {
   ).trim();
 
   let rawTid = String(src.tid || src.jwt_tid || src.jwtTid || src.jwt || hdr.tid || '').trim();
+  let jwtTid = String(src.jwtTid || src.jwt_tid || src.jwt || '').trim();
+  if (!jwtTid.includes('.')) jwtTid = rawTid.includes('.') ? rawTid : '';
   // Critical fix: other bots often store the hex `_session_tid` directly inside `tid`!
   if (rawTid && !rawTid.includes('.') && !sessionTid) {
     sessionTid = rawTid;
@@ -199,11 +201,15 @@ export function normalizeSwiggySessionPayload(rawInput) {
     mobile: cleanPhone,
     customerId,
     _session_tid: sessionTid,
+    jwtTid,
     tid: rawTid,
     token,
     sid,
     deviceId,
     cookies: rawCookieStr,
+    ...(src.tidExpiresAt ? { tidExpiresAt: String(src.tidExpiresAt) } : {}),
+    ...(typeof src.sessionLongLived === 'boolean' ? { sessionLongLived: src.sessionLongLived } : {}),
+    ...(src.sessionRefreshedAt ? { sessionRefreshedAt: String(src.sessionRefreshedAt) } : {}),
     ...(typeof src.totalOrdersCount === 'number' ? { totalOrdersCount: src.totalOrdersCount } : {}),
     ...(typeof src.isZeroOrderAccount === 'boolean' ? { isZeroOrderAccount: src.isZeroOrderAccount } : {})
   };
@@ -218,6 +224,7 @@ export function normalizeSwiggySessionPayload(rawInput) {
   if (!normalized.tid || (!normalized.tid.includes('.') && getFromMap('tid').includes('.'))) {
     normalized.tid = getFromMap('tid') || normalized.tid;
   }
+  if (String(normalized.tid || '').includes('.')) normalized.jwtTid = normalized.tid;
   if (!normalized.token) normalized.token = getFromMap('token');
   if (!normalized.sid) normalized.sid = getFromMap('_sid') || getFromMap('sid');
   if (!normalized.deviceId) normalized.deviceId = getFromMap('_device_id') || getFromMap('_swuid');
@@ -619,10 +626,14 @@ function syncAccountsJsonMirror(data, { skipCloudPush = false } = {}) {
           mobile: a.mobile || a.phone || '',
           customerId: a.customerId || '',
           ...(sessionTidVal ? { _session_tid: sessionTidVal } : {}),
+          ...(a.jwtTid ? { jwtTid: a.jwtTid } : {}),
           token: a.token || '',
           tid: a.tid || '',
           sid: a.sid || '',
           deviceId: a.deviceId || '',
+          ...(a.tidExpiresAt ? { tidExpiresAt: a.tidExpiresAt } : {}),
+          ...(typeof a.sessionLongLived === 'boolean' ? { sessionLongLived: a.sessionLongLived } : {}),
+          ...(a.sessionRefreshedAt ? { sessionRefreshedAt: a.sessionRefreshedAt } : {}),
           cookies: cleanC,
           isLoggedIn: true,
           ...(a.isZeroOrderAccount !== undefined ? { isZeroOrderAccount: a.isZeroOrderAccount } : {}),
@@ -681,10 +692,14 @@ function seedAccountsFromJson(data) {
                 mobile: cleanPhone || '',
                 customerId: item.customerId || '',
                 ...(item._session_tid ? { _session_tid: item._session_tid } : {}),
+                ...(item.jwtTid ? { jwtTid: item.jwtTid } : {}),
                 token: item.token || item.tid || '',
                 tid: item.tid || '',
                 sid: item.sid || '',
                 deviceId: item.deviceId || '',
+                ...(item.tidExpiresAt ? { tidExpiresAt: item.tidExpiresAt } : {}),
+                ...(typeof item.sessionLongLived === 'boolean' ? { sessionLongLived: item.sessionLongLived } : {}),
+                ...(item.sessionRefreshedAt ? { sessionRefreshedAt: item.sessionRefreshedAt } : {}),
                 cookies: cookieStr,
                 ...(item.isZeroOrderAccount !== undefined ? { isZeroOrderAccount: item.isZeroOrderAccount } : {}),
                 ...(item.totalOrdersCount !== undefined ? { totalOrdersCount: item.totalOrdersCount } : {}),
@@ -1102,6 +1117,10 @@ export function getSessionExportJson(accountKey, bridgeAccount = null) {
     const acc = getDb()?.config?.accounts?.[accountKey];
     if (!acc) return null;
     const phone = acc.phone || acc.mobile || '';
+    const cleanCookies = cleanEssentialSwiggyCookies(acc.cookies || '', acc);
+    const sessionTidMatch = cleanCookies.match(/(?:^|;\s*)_session_tid=([^;]+)/);
+    const sessionTid = String(acc._session_tid || sessionTidMatch?.[1] || '').trim();
+    const jwtTid = String(acc.jwtTid || (String(acc.tid || '').includes('.') ? acc.tid : '')).trim();
     return {
       account: accountKey,
       name: acc.name || '',
@@ -1112,11 +1131,16 @@ export function getSessionExportJson(accountKey, bridgeAccount = null) {
       mobile: phone,
       phone,
       customerId: acc.customerId || '',
+      ...(sessionTid ? { _session_tid: sessionTid } : {}),
+      ...(jwtTid ? { jwtTid } : {}),
       token: acc.token || acc.tid || '',
       tid: acc.tid || '',
       sid: acc.sid || '',
       deviceId: acc.deviceId || '',
-      cookies: acc.cookies || '',
+      ...(acc.tidExpiresAt ? { tidExpiresAt: acc.tidExpiresAt } : {}),
+      ...(typeof acc.sessionLongLived === 'boolean' ? { sessionLongLived: acc.sessionLongLived } : {}),
+      ...(acc.sessionRefreshedAt ? { sessionRefreshedAt: acc.sessionRefreshedAt } : {}),
+      cookies: cleanCookies || acc.cookies || '',
       savedAt: acc.savedAt || '',
     };
   } catch {
@@ -1159,6 +1183,11 @@ export function updateAccount(key, updates) {
   if (merged.isLoggedIn && (merged.cookies || merged.tid || merged.token)) {
     const cleanCookies = cleanEssentialSwiggyCookies(merged.cookies || '', merged);
     if (cleanCookies) merged.cookies = cleanCookies;
+    const sessionTidMatch = cleanCookies.match(/(?:^|;\s*)_session_tid=([^;]+)/);
+    const sessionTid = String(merged._session_tid || sessionTidMatch?.[1] || '').trim();
+    if (sessionTid) merged._session_tid = sessionTid;
+    const jwtTid = String(merged.jwtTid || (String(merged.tid || '').includes('.') ? merged.tid : '')).trim();
+    if (jwtTid) merged.jwtTid = jwtTid;
     const vaultKey = (!isExplicitDifferentPhoneCloneKey(key, phone) && phone) ? phone : key;
     db.sessionVault[vaultKey] = {
       account: key,
@@ -1169,10 +1198,15 @@ export function updateAccount(key, updates) {
       mobile: phone,
       phone,
       customerId: merged.customerId || '',
+      ...(sessionTid ? { _session_tid: sessionTid } : {}),
+      ...(jwtTid ? { jwtTid } : {}),
       token: merged.token || '',
       tid: merged.tid || '',
       sid: merged.sid || '',
       deviceId: merged.deviceId || '',
+      ...(merged.tidExpiresAt ? { tidExpiresAt: merged.tidExpiresAt } : {}),
+      ...(typeof merged.sessionLongLived === 'boolean' ? { sessionLongLived: merged.sessionLongLived } : {}),
+      ...(merged.sessionRefreshedAt ? { sessionRefreshedAt: merged.sessionRefreshedAt } : {}),
       cookies: cleanCookies,
       savedAt: merged.savedAt || new Date().toISOString()
     };
@@ -1378,6 +1412,10 @@ export function exportSessionJson(key) {
     if (dm) deviceId = dm[1];
   }
 
+  const sessionTidMatch = cleanCookies.match(/(?:^|;\s*)_session_tid=([^;]+)/);
+  const sessionTid = String(source._session_tid || sessionTidMatch?.[1] || '').trim();
+  const jwtTid = String(source.jwtTid || (String(tid || '').includes('.') ? tid : '')).trim();
+
   let customerId = source.customerId || source.userId || '';
   if (!customerId && tid && tid.includes('.')) {
     try {
@@ -1400,10 +1438,15 @@ export function exportSessionJson(key) {
     mobile: phone,
     phone,
     customerId,
+    ...(sessionTid ? { _session_tid: sessionTid } : {}),
+    ...(jwtTid ? { jwtTid } : {}),
     token,
     tid,
     sid,
     deviceId,
+    ...(source.tidExpiresAt ? { tidExpiresAt: source.tidExpiresAt } : {}),
+    ...(typeof source.sessionLongLived === 'boolean' ? { sessionLongLived: source.sessionLongLived } : {}),
+    ...(source.sessionRefreshedAt ? { sessionRefreshedAt: source.sessionRefreshedAt } : {}),
     cookies: cleanCookies,
     savedAt: source.savedAt || new Date().toISOString()
   };
@@ -1432,7 +1475,9 @@ export function buildExactSessionExport(key) {
   };
 
   const token = source.token || cookieValue('token') || '';
-  let tid = source.tid || '';
+  // Refreshed long-life JWT alag `jwtTid` me ho to exact export bhi wahi
+  // use kare — warna 7-field JSON purana short `tid` bhej dega.
+  let tid = String(source.jwtTid || '').includes('.') ? String(source.jwtTid) : (source.tid || '');
   if ((!tid || !tid.includes('.')) && cookieValue('tid')) tid = cookieValue('tid');
   const sid = source.sid || cookieValue('_sid') || '';
   const deviceId = source.deviceId || cookieValue('_device_id') || '';
@@ -1519,6 +1564,7 @@ export function importSessionJson(rawJson, targetKey = null) {
       };
 
       const tid = data.tid || extractFromCookie('tid') || '';
+      const jwtTid = String(data.jwtTid || (tid.includes('.') ? tid : '')).trim();
       const sessionTid = extractFromCookie('_session_tid') || data._session_tid || (!tid.includes('.') && tid.length >= 64 ? tid : '');
       const token = data.token || extractFromCookie('token') || tid || '';
       const sid = data.sid || extractFromCookie('_sid') || '';
@@ -1543,10 +1589,14 @@ export function importSessionJson(rawJson, targetKey = null) {
         name: data.name || db.config.accounts[key].name || (cleanPhone ? `Swiggy ${cleanPhone}` : 'Swiggy User'),
         customerId: customerId || db.config.accounts[key].customerId || '',
         ...(sessionTid ? { _session_tid: sessionTid } : {}),
+        ...(jwtTid ? { jwtTid } : {}),
         token: token || db.config.accounts[key].token || '',
         tid: tid || db.config.accounts[key].tid || '',
         sid: sid || db.config.accounts[key].sid || '',
         deviceId: deviceId || db.config.accounts[key].deviceId || '',
+        ...(data.tidExpiresAt ? { tidExpiresAt: data.tidExpiresAt } : {}),
+        ...(typeof data.sessionLongLived === 'boolean' ? { sessionLongLived: data.sessionLongLived } : {}),
+        ...(data.sessionRefreshedAt ? { sessionRefreshedAt: data.sessionRefreshedAt } : {}),
         cookies: cookieStr,
         ...(typeof data.totalOrdersCount === 'number' && data.totalOrdersCount !== 999999 ? {
           totalOrdersCount: data.totalOrdersCount,
@@ -1575,10 +1625,15 @@ export function importSessionJson(rawJson, targetKey = null) {
         mobile: finalPhone,
         phone: finalPhone,
         customerId: db.config.accounts[key].customerId,
+        ...(db.config.accounts[key]._session_tid ? { _session_tid: db.config.accounts[key]._session_tid } : {}),
+        ...(db.config.accounts[key].jwtTid ? { jwtTid: db.config.accounts[key].jwtTid } : {}),
         token: db.config.accounts[key].token,
         tid: db.config.accounts[key].tid,
         sid: db.config.accounts[key].sid,
         deviceId: db.config.accounts[key].deviceId,
+        ...(db.config.accounts[key].tidExpiresAt ? { tidExpiresAt: db.config.accounts[key].tidExpiresAt } : {}),
+        ...(typeof db.config.accounts[key].sessionLongLived === 'boolean' ? { sessionLongLived: db.config.accounts[key].sessionLongLived } : {}),
+        ...(db.config.accounts[key].sessionRefreshedAt ? { sessionRefreshedAt: db.config.accounts[key].sessionRefreshedAt } : {}),
         cookies: cookieStr,
         savedAt: db.config.accounts[key].savedAt
       };

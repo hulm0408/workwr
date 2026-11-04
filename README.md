@@ -2,23 +2,23 @@
 
 **Ek START dabao — phone chhod ke aa jao.** Bot khud:
 
-1. Firebase **pool** (`clients/`) se number uthata hai — online devices pehle
-2. Swiggy par OTP bhejta hai → **10 second wait** → usi Firebase ke **OTP inbox** (`messages/`) se code padh kar paste karta hai
+1. Selected source se number uthata hai — Hermes mode me **NEW NUMBER**, Firebase mode me pool (`clients/`, online devices pehle)
+2. Swiggy par OTP bhejta hai → Hermes par **REFRESH** ya Firebase **OTP inbox** (`messages/`) se code padh kar paste karta hai
 3. Har number ko FRESH banata hai:
    - 🆕 **Naya number** → register + session JSON save
    - ♻️ **Purana number** → login → **Delete Account** flow → delete success par purge → **usi number se fresh registration**
    - ⚠️ **Delete block** (charges / active order / Swiggy Money / other) → **SKIP**, aage badhta hai
-   - 🚦 **Rate limit** → auto backoff (15 min) · 🛡 **Security check** → band · ⏹ **STOP** → current number complete hoke rukta hai
-4. Target (default **100 fresh sessions**) ya max time (default **120 min**) tak apne aap chalta rehta — **STATUS** live card par update hota rehta hai, aakhir me **summary** + latest sessions ki list.
+   - 🚦 **Rate limit / WAF / security / temporary network** → fast route recovery + retry; batch aam taur par force-stop nahi hota · ⏹ **STOP** → current safe point par rukta hai
+4. Target (default **100 fresh sessions**) ya max time (default **120 min**) tak apne aap chalta rehta — live card ab ek hi compact mono flow dikhata hai (`NEW › OTP › REFRESH › VERIFY › ADDR › FRESH`), current number, progress, elapsed time, source lock, short error/next step aur verified-address count ke saath. Lambi pool/scan diagnostics live card me repeat nahi hoti.
 
-> Numbers aur OTP **dono** isi ek Firebase (`vuvhbjbi-default-rtdb`) se aate hain — koi third/premium source NAHI.
+> Ek run me source **locked** rehta hai: Hermes ON ho to numbers + OTP sirf @HermeshuOTPROBOT se aate hain aur Firebase bilkul try nahi hota; Firebase mode deliberately select ho tabhi saved ACTIVE Firebase sources use hotay hain.
 
 ## Zaroori cheezein (warna bot "work nahi karega")
 
 | Cheez | Kyun |
 |---|---|
 | **Node.js 20+** ([nodejs.org](https://nodejs.org)) | isse purane Node par dependencies toot-ti hain. Check: `node --version` |
-| **Google Chrome** (ya Chromium/Edge) installed | WAF token banane ke liye. `puppeteer-core` ke saath browser bundled **nahi** aata — bot system Chrome khud dhoondhta hai. Na mile to `.env` me `PUPPETEER_EXECUTABLE_PATH=<chrome.exe ka full path>` do |
+| **Google Chrome** (ya Chromium/Edge) installed | WAF token aur Swiggy ke asal Add Address page ke liye. `puppeteer-core` ke saath browser bundled **nahi** aata — bot system Chrome khud dhoondhta hai. Na mile to `.env` me `PUPPETEER_EXECUTABLE_PATH=<chrome.exe ka full path>` do |
 | **BOT_TOKEN** (@BotFather se) | bot iske baghair start hi nahi hoga |
 | Internet | Telegram + Firebase + Swiggy teeno tak pahunch chahiye |
 
@@ -72,19 +72,30 @@ bot ke andar hi hota hai:
    **⚙️ Settings → 🧪 Test Hermes** bhi hai; account hatana ho to
    **🗑 Remove Telegram** (confirmation ke baad session clear hoti hai).
 
-Batch is mode me ye karta hai: pehle lane ki proxy/direct route aur WAF
-token ready → Hermes par **FIND NUMBER** → mile hue number par Swiggy OTP →
+Batch is mode me ye simple flow karta hai: pehle lane ki proxy/direct route
+aur WAF token ready → Hermes par **NEW NUMBER** (sirf bilkul nayi chat me NEW
+button na mile tab bootstrap ke liye FIND) → mile hue number par Swiggy OTP →
 **REFRESH** karte hue default **20 second** wait (⚙️ Settings me
 20/30/45/60/90s presets; env `TELEGRAM_OTP_TIMEOUT_MS`) → OTP mile to wahi
-purana verify/register/delete/fresh process → OTP na mile to **NEW NUMBER**
-aur agla number. Agar pehle OTP-send stage par hi WAF/rate/5xx/network jaisa
-infra failure aaye, to Hermes ka current number consume nahi hota: wahi
-number ready route par ek capped retry leta hai (combined infra attempts
-max 2), uske baad hi NEW NUMBER chalega. Refresh ka gap default **2.5s**
-hai (Settings ya `TELEGRAM_OTP_REFRESH_MS`). Firebase fallback is mode me
-bilkul use nahi hota. Ek spare account ki ek hi Hermeshu chat serialized
-state hoti hai, isliye Telegram mode safety ke liye **1 lane** par rehta
-hai; Firebase mode ki 10-lane behavior unchanged hai.
+purana verify/register/delete/fresh process → OTP na mile to agla **NEW
+NUMBER**. Agar pehle OTP-send stage par hi WAF/rate/5xx/network jaisa infra
+failure aaye, to Hermes ka current number consume nahi hota: wahi number ready
+route par ek capped retry leta hai (combined infra attempts max 2), uske baad
+hi NEW NUMBER chalega. Refresh ka gap default **2.5s** hai (Settings ya
+`TELEGRAM_OTP_REFRESH_MS`).
+
+Bot ke andar **Hermes mode ON** ho to wahi is run ka locked source hai —
+Render par purana `NUMBER_SOURCE=firebase` reh jaye tab bhi Hermes batch
+Firebase numbers, pool, device scan ya Firebase OTP try nahi karega. Live card
+par `HERMES ONLY · Firebase OFF` saaf dikhta hai. Ek spare account ki ek hi
+Hermeshu chat serialized state hoti hai, isliye Telegram mode safety ke liye
+**1 lane** par rehta hai; Firebase mode ki 10-lane behavior unchanged hai.
+
+Hermes/MTProto claim, worker exception, Swiggy rate-limit, WAF/security aur
+proxy-rotation ki temporary rukawatein ab recovery checkpoint hain: counters
+reset, chhota backoff/route change, phir kaam jaari. Batch aam taur par sirf
+target, max-time, manual STOP, ya asal terminal setup/auth masle par rukega;
+final compact card me stop ki wajah aur short last error rahega.
 
 Session/API files `data/telegram.session` aur `data/telegram-api.json`
 me `0600` permissions se rehti hain aur gitignore me hain. Render free disk
@@ -100,13 +111,24 @@ Fresh signup ka email ab number ke **first 5 digits +
 duplicate bole, tabhi numbered fallback use hota hai taaki signup atak na
 jaye. Account fresh finalize hone par **Maharashtra** ki random city
 (Mumbai/Pune/Nagpur/Nashik/Thane/Chhatrapati Sambhajinagar/Kolhapur/
-Solapur) ka complete delivery address banta hai — owner ka Lucknow/UP
-address bilkul use nahi hota. Bot usi authenticated fresh session se
-Swiggy central-address-service (`addresses/v1`) par address asal account
-me add karne ki koshish karta hai; JSON me `remoteAddressStatus` =
-`added` + `remoteAddressId` sirf tab dikhega jab Swiggy response me pakka
-address ID aaye. Remote create fail ho to fresh session fail nahi hota,
-lekin status honestly `failed` rahega aur address local record me bachega.
+Solapur) ka complete delivery address sirf ek **candidate** banta hai —
+owner ka Lucknow/UP address bilkul use nahi hota, aur candidate apne aap
+success nahi mana jata. Bot pehle authenticated session se Swiggy ki saved
+address list (`POST /dapi/address/all`) check karta hai; wahi address pehle
+se saved ho to duplicate nahi banata. Warna woh asal authenticated
+**`/web-cart-add-address`** page kholkar Maharashtra pin/geolocation ke saath
+**Address + Door / Flat No. + Landmark + Home → SAVE ADDRESS & PROCEED** karta
+hai. Success tabhi hai jab create response ya saved-address list se pakka
+remote address ID verify ho jaye.
+
+Browser page submit hi na kar paye tabhi purana central-address-service
+(`addresses/v1`) CAS fallback chalega. SAVE ho chuka ho lekin verification
+uncertain ho to duplicate rokne ke liye dusra CAS POST nahi hota. JSON/account
+record me address, `remoteAddressStatus=added` aur `remoteAddressId` sirf
+verified remote record par aayenge. Remote Add Address fail ho to fresh JSON
+phir bhi turant bhej diya jayega, lekin usme generated/fake address data nahi
+hoga — sirf `remoteAddressStatus=failed` aur short wajah hogi; live card aur
+JSON caption par `ADDR x/y` / `NOT ADDED` saaf dikhega.
 
 ## ☁️ Render par host karo (24×7, PC band phir bhi bot on)
 

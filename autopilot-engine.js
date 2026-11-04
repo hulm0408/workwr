@@ -46,7 +46,7 @@ import {
 } from './telegram-otp-source.js';
 import * as wafPool from './waf-pool.js';
 import * as proxyPool from './proxy-pool.js';
-import { esc, section, sub, field } from './rich-text.js';
+import { esc, section, sub, field, mono, progressBar, statusCard } from './rich-text.js';
 
 const envInt = (key, dflt) => {
   const v = Number(process.env[key]);
@@ -276,6 +276,10 @@ const state = {
   telegramClaimed: 0,
   telegramRejected: 0,
   telegramInfraRetries: 0,
+  telegramClaimRetries: 0,
+  workerRecoveries: 0,
+  addressAdded: 0,
+  addressFailed: 0,
   telegramLastCheckedAt: 0,
   activeNumbers: [],      // parallel lanes: [{ phone, startedAt, laneId, proxyLabel }]
   history: [],            // { phone, kind, reason? } (last 200)
@@ -357,6 +361,10 @@ export function getAutopilotSnapshot() {
     telegramClaimed: state.telegramClaimed || 0,
     telegramRejected: state.telegramRejected || 0,
     telegramInfraRetries: state.telegramInfraRetries || 0,
+    telegramClaimRetries: state.telegramClaimRetries || 0,
+    workerRecoveries: state.workerRecoveries || 0,
+    addressAdded: state.addressAdded || 0,
+    addressFailed: state.addressFailed || 0,
     telegramLastCheckedAt: state.telegramLastCheckedAt || 0,
     activeNumbers: (state.activeNumbers || []).map((n) => ({ ...n })),
     poolLoaded: Boolean(state.poolLoaded),
@@ -547,121 +555,216 @@ function fmtDuration(ms) {
   return `${sec}s`;
 }
 
+function plainStageText(raw = '') {
+  return String(raw || '')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/[ \t]+/g, ' ')
+    .trim();
+}
+
+function truncateUiText(value = '', max = 96) {
+  const text = String(value || '').replace(/\s+/g, ' ').trim();
+  return text.length > max ? `${text.slice(0, Math.max(0, max - 1)).trim()}…` : text;
+}
+
+function stageParts(stageText = '') {
+  const raw = String(stageText || '');
+  const titleMatch = raw.match(/<b>([\s\S]*?)<\/b>/i);
+  const title = plainStageText(titleMatch?.[1] || '');
+  const lines = raw
+    .split(/\n+/)
+    .map((line) => plainStageText(line).replace(/^[›•·-]\s*/, '').trim())
+    .filter(Boolean)
+    .filter((line) => line !== title && !/^(processed|fresh sessions|skipped|failed|parallel lanes|proxy|pool)\b/i.test(line) && !/number\s*:/i.test(line));
+  return { title, detail: truncateUiText(lines[0] || '', 104) };
+}
+
+function compactStepInfo(snap = {}, stageText = '') {
+  const { title, detail } = stageParts(stageText);
+  const text = `${title} ${detail}`.toLowerCase();
+  const telegram = snap.sourceMode === 'telegram';
+  let step = telegram ? 'NEW' : 'POOL';
+  let now = telegram ? 'New number le raha hoon' : 'Number select ho raha hai';
+
+  if (/address/.test(text)) {
+    step = 'ADDR';
+    now = 'Swiggy me address add ho raha hai';
+  } else if (/route ready|waf|token|security|proxy|direct ip|rate limit/.test(text)) {
+    step = telegram ? 'NEW' : 'POOL';
+    now = /rate limit/.test(text) ? 'Rate-limit — nayi IP le raha hoon' : 'Route/WAF ready ho raha hai';
+  } else if (/otp wait|refresh|otp.*intezaar|otp.*wait/.test(text)) {
+    step = telegram ? 'REFRESH' : 'INBOX';
+    now = telegram ? 'REFRESH par OTP aa raha hai' : 'OTP inbox check ho raha hai';
+  } else if (/verify retry|verify/.test(text)) {
+    step = 'VERIFY';
+    now = 'OTP verify ho raha hai';
+  } else if (/delete ho gaya|fresh registration|fresh account|signup/.test(text)) {
+    step = 'VERIFY';
+    now = 'Fresh account ban raha hai';
+  } else if (/delete account|delete otp/.test(text)) {
+    step = 'VERIFY';
+    now = 'Purana account delete ho raha hai';
+  } else if (/number done|fresh session/.test(text)) {
+    step = 'FRESH';
+    now = 'Fresh session ready hai';
+  } else if (/device mil gaya|number process|current number|otp bheja|otp send/.test(text)) {
+    step = 'OTP';
+    now = 'Number mil gaya — OTP bhej raha hoon';
+  } else if (/zinda devices|device scan|fresh device ka wait|scanning/.test(text) || snap.scanning) {
+    step = 'POOL';
+    now = 'Zinda device dhoondh raha hoon';
+  } else if (/hermes ready|telegram hermes ready/.test(text)) {
+    step = 'NEW';
+    now = 'Hermes ready — NEW NUMBER lunga';
+  } else if (/temporary error|retry|claim.*fail|number safe/.test(text)) {
+    step = telegram ? 'NEW' : 'POOL';
+    now = 'Temporary error — khud retry hoga';
+  } else if (/result|failed|skipped|aborted/.test(text)) {
+    step = telegram ? 'NEW' : 'POOL';
+    now = 'Result aaya — agla number lunga';
+  } else if (/parallel lanes ready|warm-up|warm up/.test(text)) {
+    step = telegram ? 'NEW' : 'POOL';
+    now = telegram ? 'Hermes + route ready ho rahe hain' : 'Pool + lanes ready ho rahe hain';
+  } else if (snap.current?.phone || snap.activeNumbers?.length) {
+    step = 'OTP';
+    now = 'Number process ho raha hai';
+  } else if (title) {
+    now = truncateUiText(title.replace(/^[^\p{L}\p{N}]+/u, ''), 54);
+  }
+
+  const flow = telegram
+    ? ['NEW', 'OTP', 'REFRESH', 'VERIFY', 'ADDR', 'FRESH']
+    : ['POOL', 'OTP', 'INBOX', 'VERIFY', 'ADDR', 'FRESH'];
+  if (!flow.includes(step)) step = flow[0];
+  const flowText = flow.map((x) => (x === step ? `[${x}]` : x)).join(' › ');
+  const nextByStep = telegram
+    ? {
+        NEW: 'Number aate hi Swiggy OTP jayega',
+        OTP: 'OTP ke baad REFRESH chalega',
+        REFRESH: 'OTP mila to verify · na mila to NEW NUMBER',
+        VERIFY: 'Fresh banega, phir address add hoga',
+        ADDR: 'Address verify hote hi JSON aayega',
+        FRESH: 'JSON isi chat me bhej diya hai',
+      }
+    : {
+        POOL: 'Device milte hi OTP jayega',
+        OTP: 'OTP inbox me check hoga',
+        INBOX: 'OTP milte hi verify hoga',
+        VERIFY: 'Fresh banega, phir address add hoga',
+        ADDR: 'Address verify hote hi JSON aayega',
+        FRESH: 'JSON isi chat me bhej diya hai',
+      };
+  const errorish = /error|retry|waf|security|rate|temporary|fail|claim/.test(text);
+  return {
+    title,
+    detail,
+    step,
+    now,
+    flowText,
+    next: errorish ? 'Route badal kar khud retry hoga — STOP nahi hoga' : nextByStep[step],
+    errorish,
+  };
+}
+
+function compactSourceLine(snap = {}) {
+  if (snap.sourceMode === 'telegram') {
+    return `📨 ${mono('HERMES ONLY')} · 🔥 Firebase ${mono('OFF')}`;
+  }
+  const source = truncateUiText(snap.poolSourceHost || snap.poolSourceName || 'Firebase', 28);
+  return `🔥 ${mono(source)} · Pool ${mono(`${Number(snap.poolFresh) || 0} fresh`)}`;
+}
+
+function compactElapsedMs(snap = {}) {
+  if (Number(snap.elapsedMs) > 0) return Number(snap.elapsedMs);
+  const start = Number(snap.startedAt) || Date.now();
+  const end = Number(snap.finishedAt) || Date.now();
+  return Math.max(0, end - start);
+}
+
+// Live card ka ek hi sach: abhi kya ho raha hai, kaunsa number hai,
+// kitna target hua, aur agla step kya hai. Purani lambi diagnostics
+// (pool/scan/proxy counters ke paragraphs) yahan nahi ghusengi.
+export function formatCompactAutopilotCard(snap = state, { stageText = '', final = false } = {}) {
+  const s = snap || {};
+  const info = compactStepInfo(s, stageText);
+  const active = Array.isArray(s.activeNumbers) ? s.activeNumbers.filter(Boolean) : [];
+  const currentPhone = active[0]?.phone || s.current?.phone || s.telegramCurrentPhone || '';
+  const phoneText = active.length > 1
+    ? `${active.slice(0, 2).map((n) => n.phone).join(', ')} +${active.length - 2}`
+    : (currentPhone || '—');
+  const retries = (Number(s.serverErrors) || 0)
+    + (Number(s.telegramClaimRetries) || 0)
+    + (Number(s.workerRecoveries) || 0)
+    + (Number(s.telegramInfraRetries) || 0);
+  const fresh = Number(s.fresh) || 0;
+  const target = Number(s.target) || 0;
+  const reason = {
+    target: 'Target complete',
+    time: 'Max time complete',
+    manual: 'Aapne STOP kiya',
+    stopped: 'STOP kiya gaya',
+    'pool-exhausted': s.sourceMode === 'telegram' ? 'Hermes number nahi mila' : 'Firebase pool khatam',
+    'telegram-setup': 'Hermes account setup pending',
+    telegram: 'Hermes connection error',
+    firebase: s.sourceMode === 'telegram' ? 'Hermes connection error' : 'Firebase error',
+    rate_limited: 'Swiggy rate-limit',
+    security_challenge: 'Security challenge rukawat',
+    waf_stuck: 'WAF rukawat',
+    circuit_breaker: 'Lagatar failures par safety stop',
+  }[s.stopReason] || (s.stopReason ? `Stop: ${s.stopReason}` : 'Batch complete');
+  const now = final ? reason : info.now;
+  const title = final ? '🏁 BATCH KHATAM' : '🟢 LIVE';
+  const lines = [
+    mono(info.flowText),
+    `<b>Abhi:</b> ${esc(now)}`,
+    !final && info.detail && info.detail !== now ? `<i>${esc(info.detail)}</i>` : '',
+    progressBar(fresh, target),
+    `📱 ${mono(phoneText)} · ⏱ ${mono(fmtDuration(compactElapsedMs(s)))}${s.sourceMode !== 'telegram' && (s.concurrency || 1) > 1 ? ` · ⚡ ${mono(`${Number(s.activeWorkers) || active.length}/${Number(s.concurrency) || 1}`)}` : ''}`,
+    compactSourceLine(s),
+    `✅ ${mono(`FRESH ${fresh}`)} · ⚙ ${mono(`DONE ${Number(s.processed) || 0}`)} · × ${mono(`FAIL ${Number(s.failed) || 0}`)}${retries ? ` · ↻ ${mono(`RETRY ${retries}`)}` : ''}${fresh ? ` · 🏠 ${mono(`ADDR ${Number(s.addressAdded) || 0}/${fresh}`)}` : ''}`,
+    final
+      ? (fresh ? sub('Fresh JSON chat me bhej diye hain.') : sub('Is run me fresh session nahi bana.'))
+      : `<b>Next:</b> ${esc(info.next)}`,
+    (final || info.errorish) && s.lastError ? `⚠ ${mono(truncateUiText(s.lastError, 76))}` : '',
+  ];
+  if (final && Array.isArray(s.freshAccounts) && s.freshAccounts.length) {
+    const latest = s.freshAccounts.slice(-5);
+    lines.push(`<b>Latest:</b> ${latest.map((a) => mono(a.phone)).join(' · ')}${s.freshAccounts.length > latest.length ? ` <i>+${s.freshAccounts.length - latest.length} aur</i>` : ''}`);
+  }
+  return statusCard(title, lines);
+}
+
 function statsLines() {
-  const pSummary = (() => { try { return proxyPool.proxySummary(); } catch { return null; } })();
   return [
-    field('Processed', String(state.processed)),
-    field('✅ Fresh sessions', `${state.fresh}  (naye: ${state.freshNew} · delete+fresh: ${state.freshAfterDelete})`),
-    field('⚠️ Skipped', `${state.skipped} · deferred: ${state.deferred} · ⏳ 7-day cooldown: ${state.cooldownSkips || 0} · ${state.sourceMode === 'telegram' ? `📨 Hermes rejected: ${state.telegramRejected || 0}` : `📴 stale devices: ${state.staleSkips || 0}`}`),
-    field('× Failed', `${state.failed} · aborted: ${state.aborted} · rate-limit: ${state.rateStrikes}`),
-    (state.wafCooldowns || state.wafStrikes || state.proxyRotations)
-      ? field('🛡 WAF', `${state.wafCooldowns} cooldown · challenges: ${state.wafStrikes} · rotations: ${state.proxyRotations} · token-ready: ${pSummary?.tokenReadyCount || 0} · solve-cooling: ${pSummary?.solveCoolingCount || 0}`)
-      : '',
-    state.serverErrors
-      ? field('↻ Swiggy 5xx', `${state.serverErrors} temporary · ${state.sourceMode === 'telegram' ? 'Hermes current number safe hai — ready route par ek capped retry' : 'numbers failed nahi, retry queue me'}`)
-      : '',
-    field('⚡ Parallel lanes', `${state.activeWorkers || 0}/${state.concurrency || 1} active${state.requestedConcurrency > state.concurrency ? ` (maangi ${state.requestedConcurrency}, distinct IPs sirf ${state.concurrency})` : ''}`),
-    pSummary?.enabled
-      ? field('🔀 Proxy', state.routeMode === 'direct-fallback' && (state.concurrency || 1) <= 1
-          ? `DIRECT fallback (Render IP)  ·  ${pSummary.usableCount ?? pSummary.enabledCount}/${pSummary.enabledCount} free usable · lanes me ${pSummary.reservedCount || 0} · cooling ${pSummary.wafCoolingCount || 0}  ·  rotates: ${state.proxyRotations}`
-          : (state.concurrency || 1) > 1
-            ? `Har lane alag IP par  ·  ${pSummary.usableCount ?? pSummary.enabledCount}/${pSummary.enabledCount} free usable · lanes me ${pSummary.reservedCount || 0} · cooling ${pSummary.wafCoolingCount || 0}  ·  rotates: ${state.proxyRotations}`
-            : `${state.activeNumbers?.[0]?.proxyLabel || getBridgeProxy()?.label || '—'}  ·  ${pSummary.usableCount ?? pSummary.enabledCount}/${pSummary.enabledCount} free usable · lanes me ${pSummary.reservedCount || 0} · cooling ${pSummary.wafCoolingCount || 0}  ·  rotates: ${state.proxyRotations}`)
-      : field('🔀 Proxy', 'OFF (ek hi IP — ⚙️ Settings me add karo)'),
-    state.sourceMode === 'telegram'
-      ? field('📨 Telegram Hermes', formatTelegramSourceStatus(state))
-      : field('🔥 Firebase', formatFirebaseSourceStatus(state)),
-    field('Pool', formatPoolStatus(state)),
-    state.sourceMode === 'telegram'
-      ? field('🔎 Hermes scan', `bypass hai · claimed ${state.telegramClaimed || 0} · rejected ${state.telegramRejected || 0} · infra-retries ${state.telegramInfraRetries || 0}${state.telegramLastCheckedAt ? ` · last check ${fmtDuration(Math.max(0, Date.now() - state.telegramLastCheckedAt))} pehle` : ''}`)
-      : (state.scanning || state.scanChecked)
-        ? field('🔎 Device scan', `pass ${state.scanPass || 1}: ${state.scanUniqueChecked || 0}/${state.scanTotalDevices || 0} unique check · total probes ${state.scanTotalProbes || state.scanChecked || 0} · window ≤${fmtDuration(state.scanWindowMs || 0)} · ${state.scanBestActivityMs ? `scan ke waqt best SMS ~${fmtDuration(state.scanBestActivityAgeMs || Math.max(0, Date.now() - state.scanBestActivityMs))} purani · ` : ''}${state.scanFresh || 0} fresh ready${formatScanCandidateStates(state) ? ` · candidates: ${formatScanCandidateStates(state)}` : ''}${state.scanning ? ' · scanning…' : ''}`)
-        : '',
-    state.activeNumbers?.length
-      ? `📍 <b>Abhi ${state.activeNumbers.length} lane(s):</b>\n${state.activeNumbers.slice(0, 10).map((n) => `• <code>${esc(n.phone)}</code> · lane ${n.laneId || '?'} · ${esc(n.proxyLabel || 'direct')} (${fmtDuration(Date.now() - n.startedAt)})`).join('\n')}`
-      : state.current
-        ? `📍 <b>Abhi:</b> <code>${esc(state.current.phone)}</code> (${fmtDuration(Date.now() - state.current.startedAt)})`
-        : sub(state.scanning ? 'Zinda devices dhoondh raha hoon (parallel scan)…' : 'Agla number select ho raha hai…'),
+    `✅ ${mono(`FRESH ${Number(state.fresh) || 0}/${Number(state.target) || 0}`)} · ⚙ ${mono(`DONE ${Number(state.processed) || 0}`)} · × ${mono(`FAIL ${Number(state.failed) || 0}`)}`,
+    compactSourceLine(state),
   ];
 }
 
 function idleCard() {
-  const running = state.running;
-  const last = state.finishedAt ? state : null;
-  const body = running
-    ? [
-        `● <b>RUNNING</b> — ${fmtDuration(Date.now() - state.startedAt)} hue`,
-        ...statsLines(),
-      ]
-    : [
-        `› <b>READY.</b> Ek tap = autopilot ON.`,
-        ``,
-        state.sourceMode === 'telegram'
-          ? `1️⃣ Telegram Hermes me <b>FIND NUMBER</b> (na aaye to <b>NEW NUMBER</b>)`
-          : `1️⃣ Pehle <b>zinda devices</b> parallel scan (last-seen fresh pehle)`,
-        state.sourceMode === 'telegram'
-          ? `2️⃣ Swiggy OTP bhejo → Hermes card par <b>REFRESH</b> (${Math.round((state.telegramOtpTimeoutMs || 20_000) / 1000)}s)`
-          : `2️⃣ <b>Parallel lanes</b> — alag numbers, alag IPs par Swiggy OTP → live inbox poll`,
-        `3️⃣ 🆕 naya = register · ♻️ purana = delete → fresh login`,
-        state.sourceMode === 'telegram'
-          ? `4️⃣ Pehle route/WAF token ready, phir Hermes number claim; send-stage infra fail par wahi current number ek capped retry lega · Firebase fallback <b>OFF</b>`
-          : `4️⃣ charges/order/wallet block = <b>skip</b> · rate-limit = <b>backoff</b>`,,
-        ``,
-        field('Target', `${state.target || envInt('PREMIUM_BATCH_TARGET', 100)} fresh sessions`),
-        field('Parallel', `${state.concurrency || envInt('PREMIUM_BATCH_CONCURRENCY', 10)} lanes tak`),
-        field('Max time', `${state.maxMinutes || envInt('PREMIUM_BATCH_MAX_MINUTES', 120)} minutes`),
-        last && last.stopReason
-          ? field('Last run', `${state.fresh} fresh · ${fmtDuration(state.finishedAt - state.startedAt)} · ${state.stopReason}`)
-          : '',
-      ].filter(Boolean);
-  return section('👑 Premium Autopilot', body.join('\n'));
+  if (state.running) return formatCompactAutopilotCard(state);
+  if (state.finishedAt) return formatCompactAutopilotCard(state, { final: true });
+  const telegram = state.sourceMode === 'telegram';
+  return statusCard('🟢 READY', [
+    mono(telegram ? '[NEW] › OTP › REFRESH › VERIFY › ADDR › FRESH' : '[POOL] › OTP › INBOX › VERIFY › ADDR › FRESH'),
+    '<b>Abhi:</b> START ka wait hai',
+    compactSourceLine(state),
+    `🎯 ${mono(`${state.target || envInt('PREMIUM_BATCH_TARGET', 100)} fresh`)} · ⏱ ${mono(`${state.maxMinutes || envInt('PREMIUM_BATCH_MAX_MINUTES', 120)} min`)}`,
+    '<b>Next:</b> START dabao — live card par har step saaf dikhega',
+  ]);
 }
 
 function progressCard(stageText) {
-  return [
-    `● <b>AUTOPILOT RUNNING</b> — ${fmtDuration(Date.now() - state.startedAt)} hue · target ${state.target}`,
-    ``,
-    stageText,
-    ``,
-    ...statsLines(),
-  ].join('\n');
+  return formatCompactAutopilotCard(state, { stageText });
 }
 
 function summaryCard() {
-  const freshList = state.freshAccounts.slice(-12)
-    .map((a) => `• <code>${esc(a.phone)}</code> → <b>${esc(a.accountKey)}</b>`)
-    .join('\n');
-  const reasonText = {
-    target: '🎯 Target pura ho gaya!',
-    time: '⏱ Max time ho gaya.',
-    'pool-exhausted': poolExhaustedReasonText(state),
-    manual: '⏹ Aapne STOP dabaya.',
-    stopped: '⏹ Stop kiya gaya.',
-    rate_limited: '🚦 Swiggy ne rate limit laga di — thodi der baad dobara start karein.',
-    security_challenge: '🛡 Bahut lagatar security challenges — routes abhi Swiggy ke liye flagged lag rahe hain. Kuch der baad, ya behtar proxies ke saath, dobara start karein.',
-    waf_stuck: '🛡 Bahut der tak WAF cooldown raha — proxies add karke dobara start karein (nayi IP par wait khatam ho jati hai).',
-    circuit_breaker: '🔌 Bahut lagatar failures (proxy rotation ke baavjood) — reason dekh kar dobara start karein.',
-    'no-online-devices': '📵 Pool me koi online device nahi mila — thodi der baad try karein.',
-    'telegram-setup': `📨 Telegram Hermes setup pending hai — pehle Settings → <b>Add Telegram Account</b> se spare-account login complete karo, phir dobara start dabao.`,
-    telegram: '📨 Telegram Hermes error — spare-account/Hermes connection check karo (Firebase fallback OFF hai).',
-    firebase: state.sourceMode === 'telegram'
-      ? '📨 Telegram Hermes error — spare-account/Hermes connection check karo (Firebase fallback OFF hai).'
-      : '🔥 Firebase error — config/rules check karein.',
-  }[state.stopReason] || `Band: ${state.stopReason}`;
-
-  return section('📊 Autopilot — Final Summary', [
-    reasonText,
-    ``,
-    ...statsLines(),
-    ``,
-    field('Runtime', fmtDuration((state.finishedAt || Date.now()) - state.startedAt)),
-    state.lastError ? field('Last error', state.lastError) : '',
-    freshList ? `` : '',
-    freshList ? `▤ <b>Latest fresh sessions:</b>` : '',
-    freshList || sub('Is run me koi fresh session nahi bana.'),
-    ``,
-    sub('Har fresh session ka JSON chat me file ki surat me bhej diya gaya hai (bot DB + cloud vault me bhi saved hai).'),
-  ].filter((x) => x !== '' && x !== false).join('\n'));
+  return formatCompactAutopilotCard(state, { final: true });
 }
 
 function stopRows() {
@@ -842,6 +945,10 @@ export async function startAutopilot(opts = {}) {
     telegramClaimed: 0,
     telegramRejected: 0,
     telegramInfraRetries: 0,
+    telegramClaimRetries: 0,
+    workerRecoveries: 0,
+    addressAdded: 0,
+    addressFailed: 0,
     telegramLastCheckedAt: 0,
     poolLoaded: telegramMode, poolTotal: 0, poolFresh: 0,
     poolSourceId: '', poolSourceName: telegramMode ? 'Telegram Hermes' : '', poolSourceHost: '',
@@ -926,6 +1033,7 @@ export async function startAutopilot(opts = {}) {
     // Yahan pahuncha matlab request WAF ko paar karke Swiggy tak gayi
     // (OTP miss/fail bhi) — challenge "storm" khatam, strikes reset.
     state.wafStrikes = 0;
+    if (res.kind !== 'rate_limited') state.rateStrikes = 0;
     state.proxyChallenges = 0;
     state.directChallenges = 0;
     state.history.push({ phone: res.phone, kind: res.kind, reason: res.reason || '', at: new Date().toISOString() });
@@ -935,6 +1043,10 @@ export async function startAutopilot(opts = {}) {
       state.fresh++;
       if (res.kind === 'fresh_new') state.freshNew++;
       if (res.kind === 'fresh_after_delete') state.freshAfterDelete++;
+      const remoteAddressStatus = String(res.account?.remoteAddressStatus || res.account?.exportJson?.remoteAddressStatus || '').toLowerCase();
+      const remoteAddressId = String(res.account?.remoteAddressId || res.account?.exportJson?.remoteAddressId || '').trim();
+      if (remoteAddressStatus === 'added' && remoteAddressId) state.addressAdded = (state.addressAdded || 0) + 1;
+      else if (remoteAddressStatus) state.addressFailed = (state.addressFailed || 0) + 1;
       state.freshAccounts.push({ phone: res.phone, accountKey: res.accountKey });
       // 📤 Fresh JSON isi waqt chat me bhej do — boss ko batch khatam
       // hone tak ruk kar list se nahi dhoondhna padega.
@@ -1015,26 +1127,9 @@ export async function startAutopilot(opts = {}) {
     // `let` isliye: free-proxy auto-fetch ke baad summary badal jati hai
     // (pool OFF → ON) aur poora loop isi snapshot par faisle karta hai.
     let ps = proxyPool.proxySummary();
-    await push(section('🔥 Warm-up', [
-      ps.enabledCount
-        ? `🔀 Proxy pool: ${ps.enabledCount}/${ps.total} proxies ON — ${ps.rotation}`
-        : `🔀 Koi proxy nahi — 🌐 <b>free proxies auto-fetch</b> try kar raha hoon (Swiggy par test karke sirf zinda wali rakhunga)…`,
-      telegramMode
-        ? 'Swiggy WAF token arrange kar raha hoon (token milte hi khatam; slow route par reliable budget 45s tak)…'
-        : 'Swiggy WAF token arrange kar raha hoon (ek baar, fast budget ~15s)…',
-      telegramMode
-        ? `📨 Telegram Hermes: @${esc(String(telegramCfg?.botUsername || telegramStatus.botUsername || 'HermeshuOTPROBOT').replace(/^@+/, ''))} · 1 lane (ek spare-account chat serialized rehta hai; requested ${requestedConcurrency}) · OTP Refresh budget ${Math.round(telegramOtpTimeoutMs / 1000)}s`
-        : `⚡ Parallel lanes: ${requestedConcurrency} tak — har lane alag number + alag IP legi.`,
-      telegramMode
-        ? '📨 Number + OTP dono Telegram Hermes se — Firebase fallback OFF; spare account/Hermes connection verify ho raha hai…'
-        : `🔥 Firebase: <b>${runSources.length}/${runSources.length} ACTIVE</b> sources is batch ke pool me hain — <b>${esc(state.poolSourceName || 'first-try source')}</b> pehle${runSources.length > 1 ? `, khali/error/exhaust par baaki <b>${runSources.length - 1} ACTIVE</b> sources isi batch me auto-try honge.` : '.'}`,
-      telegramMode
-        ? '🔍 Hermes FIND NUMBER / NEW NUMBER card verify karoonga; Firebase pool load aur device scan skip rahenge.'
-        : '📋 Saath hi pool load + zinda devices ki parallel scan chal rahi hai…',
-      sub(telegramMode
-        ? 'Verification ke baad FIND NUMBER mehla pehla number milega; OTP na aaye to usi card par NEW NUMBER.'
-        : 'Sab ready hote hi lanes ke pehle OTP fresh devices par jayenge.'),
-    ].join('\n')), stopRows());
+    await push(progressCard(section('🔥 Warm-up', telegramMode
+      ? 'Hermes + route/WAF ready ho rahe hain'
+      : 'Pool + route/WAF ready ho rahe hain')), stopRows());
 
     // Proxy assign — pehli enabled proxy (round-robin se). WAF token bhi
     // usi IP ke liye arrange hoga.
@@ -1147,6 +1242,7 @@ export async function startAutopilot(opts = {}) {
         pool = [];
         poolLoadedAt = Date.now();
         syncTelegramState(poolLoadedAt);
+        for (let attempt = 1; attempt <= 5; attempt++) {
         try {
           const check = await verifyTelegramOtpConnection({ sendStartIfEmpty: true });
           if (check && check.ok === false) {
@@ -1168,7 +1264,7 @@ export async function startAutopilot(opts = {}) {
           state.lastError = '';
           await push(progressCard(section('📨 Telegram Hermes Ready', [
             `› @${esc(String(state.telegramBotUsername || telegramCfg?.botUsername || 'HermeshuOTPROBOT').replace(/^@+/, ''))} connected hai${state.telegramMe ? ` (${esc(state.telegramMe)})` : ''}.`,
-            `› Number FIND NUMBER se aayega; OTP ${Math.round(telegramOtpTimeoutMs / 1000)}s tak REFRESH karunga, na aaye to NEW NUMBER.`,
+            `› Har naya number NEW NUMBER se aayega; OTP ${Math.round(telegramOtpTimeoutMs / 1000)}s tak REFRESH karunga.`,
             sub('Firebase pool/device scan bypass hai — Telegram only mode me fallback OFF hai.'),
           ].join('\n'))), stopRows());
           return pool;
@@ -1178,7 +1274,18 @@ export async function startAutopilot(opts = {}) {
           state.poolStatus = 'error';
           syncTelegramState(Date.now());
           state.poolStatus = 'error';
+          if (attempt < 5 && !state.stopRequested) {
+            state.telegramClaimRetries = (state.telegramClaimRetries || 0) + 1;
+            const waitMs = Math.min(12_000, 2_000 * (2 ** (attempt - 1)));
+            await push(progressCard(section('↻ Hermes Retry', [
+              'Connection abhi nahi bana — batch band nahi ho raha.',
+              `Chhota wait ke baad dobara try hoga. ${esc(truncateUiText(message, 90))}`,
+            ].join('\n'))), stopRows());
+            await sleep(waitMs, () => state.stopRequested);
+            continue;
+          }
           throw new Error(message);
+        }
         }
       }
       if (!runSources.length) {
@@ -2046,6 +2153,7 @@ export async function startAutopilot(opts = {}) {
       }
       return false;
     };
+    let telegramClaimRetryStreak = 0;
     const claimNextPick = () => withClaimLock(async () => {
     for (;;) {
       if (state.stopRequested) return { status: 'stopped' };
@@ -2093,6 +2201,7 @@ export async function startAutopilot(opts = {}) {
         let entry;
         try {
           entry = await getNextTelegramNumber({
+            forceNew: true,
             excludePhones: [...excluded],
             maxAttempts: 8,
             timeoutMs: telegramOtpTimeoutMs,
@@ -2100,16 +2209,31 @@ export async function startAutopilot(opts = {}) {
             shouldAbort: () => state.stopRequested,
           });
         } catch (e) {
-          state.lastError = String(e?.message || e || 'Telegram Hermes se usable number nahi mila').slice(0, 240);
+          const message = String(e?.message || e || 'Telegram Hermes se usable number nahi mila');
+          state.lastError = message.slice(0, 240);
           syncTelegramState(Date.now());
           state.telegramRejected = telegramRejectedThisRun.size;
-          return { status: state.stopRequested ? 'stopped' : 'exhausted' };
+          if (state.stopRequested) return { status: 'stopped' };
+          const terminalSetup = telegramCfg?.configured === false
+            || /not configured|missing.*(api|session)|install teleproto|login in progress/i.test(message);
+          if (terminalSetup) return { status: 'exhausted' };
+          // Hermes/MTProto ki temporary rukawat par pura batch force-stop
+          // nahi hoga. Worker chhota backoff lekar NEW NUMBER phir try karega;
+          // target/max-time/manual STOP hi normal end points rahenge.
+          telegramClaimRetryStreak += 1;
+          state.telegramClaimRetries = (state.telegramClaimRetries || 0) + 1;
+          return {
+            status: 'claim-retry',
+            waitMs: Math.min(15_000, 2_000 * (2 ** Math.min(3, telegramClaimRetryStreak - 1))),
+            error: message,
+          };
         }
 
         syncTelegramState(Date.now());
         if (!state.telegramConnected) state.telegramConnected = true;
         if (!state.telegramAuthorized) state.telegramAuthorized = true;
         const phone = String(entry.phone).replace(/\D/g, '').slice(-10);
+        telegramClaimRetryStreak = 0;
         telegramClaimedThisRun.add(phone);
         state.telegramClaimed = telegramClaimedThisRun.size;
         state.telegramCurrentPhone = phone;
@@ -2288,6 +2412,9 @@ export async function startAutopilot(opts = {}) {
     ].join('\n'))), stopRows());
 
     const runWorker = async (lane) => {
+      let restartWorker = true;
+      while (restartWorker && !state.stopRequested) {
+        restartWorker = false;
       try {
         for (;;) {
           if (state.stopRequested) {
@@ -2303,7 +2430,25 @@ export async function startAutopilot(opts = {}) {
             continue;
           }
           const failLimit = (ps.enabled ? 10 : 6) * laneCount;
-          if (state.consecutiveFails >= failLimit) { requestRunEnd('circuit_breaker'); break; }
+          if (state.consecutiveFails >= failLimit) {
+            if (telegramMode) {
+              // Hermes-only batch ko generic fail streak par force-stop
+              // nahi karna. Ye sirf recovery checkpoint hai: counters reset,
+              // chhota saans, phir NEW NUMBER se kaam jaari. Target/max-time/
+              // manual STOP hi batch khatam karenge.
+              state.consecutiveFails = 0;
+              lane.consecutiveFails = 0;
+              state.workerRecoveries = (state.workerRecoveries || 0) + 1;
+              await push(progressCard(section('↻ Recovery Checkpoint', [
+                'Lagatar failures aaye — batch band nahi ho raha.',
+                'Route recovery ke baad NEW NUMBER se kaam jaari rahega.',
+              ].join('\n'))), stopRows());
+              await sleep(2_000, () => state.stopRequested);
+              continue;
+            }
+            requestRunEnd('circuit_breaker');
+            break;
+          }
 
           if (!ensureLaneRoute(lane)) {
             await waitForRouteChange(1_000);
@@ -2340,6 +2485,14 @@ export async function startAutopilot(opts = {}) {
           if (claim.status === 'stopped') break;
           if (claim.status === 'waiting') {
             await sleep(claim.waitMs || 1_000, () => state.stopRequested);
+            continue;
+          }
+          if (claim.status === 'claim-retry') {
+            await push(progressCard(section('↻ Hermes Retry', [
+              'NEW NUMBER abhi nahi mila — batch band nahi ho raha.',
+              `Chhota wait ke baad dobara try hoga. ${esc(truncateUiText(claim.error || state.lastError || '', 90))}`,
+            ].join('\n'))), stopRows());
+            await sleep(claim.waitMs || 2_000, () => state.stopRequested);
             continue;
           }
           if (claim.status !== 'picked' || !claim.picked?.entry) {
@@ -2608,8 +2761,13 @@ export async function startAutopilot(opts = {}) {
         }
 
         // Direct mode (koi proxy nahi) — fast recovery: pehla retry 15s,
-        // doosra 30s. Number minuteon queue me nahi fasega. 3 strikes = band.
-        if (state.rateStrikes >= 3) { requestRunEnd('rate_limited'); break; }
+        // doosra 30s. Number minuteon queue me nahi fasega. Hermes mode me
+        // 3 strikes sirf recovery checkpoint hai — batch force-stop nahi.
+        if (state.rateStrikes >= 3) {
+          if (!telegramMode) { requestRunEnd('rate_limited'); break; }
+          state.rateStrikes = 1;
+          state.workerRecoveries = (state.workerRecoveries || 0) + 1;
+        }
         const backoff = rateLimitRecoveryWaitMs(state.rateStrikes, backoffMs);
         void proxyPool.ensureFreeProxies?.({ min: 12, want: FREE_PROXY_TARGET_COUNT }).then((r) => {
           if (r?.added) ps = proxyPool.proxySummary();
@@ -2629,7 +2787,13 @@ export async function startAutopilot(opts = {}) {
       // sirf waqti slow hona chahiye.
       if (outcome === 'waf_cooldown') {
         state.wafCooldowns++;
-        if (state.wafCooldowns > wafCooldownLimit) { requestRunEnd('waf_stuck'); break; }
+        if (state.wafCooldowns > wafCooldownLimit) {
+          if (!telegramMode) { requestRunEnd('waf_stuck'); break; }
+          // Cumulative counter Hermes run ko safalta ke baghair bhi sirf
+          // waqt guzarne par maar sakta tha. Ise recovery checkpoint rakho.
+          state.wafCooldowns = 0;
+          state.workerRecoveries = (state.workerRecoveries || 0) + 1;
+        }
         const wafInfra = recordInfraAttempt(res.phone);
         const telegramRetryPreserved = preserveTelegramCurrentForRetry(Boolean(res.phone && wafInfra.willRetry));
         if (res.phone && wafInfra.willRetry && !telegramMode) deferNumber(entry, 'waf_cooldown');
@@ -2685,7 +2849,13 @@ export async function startAutopilot(opts = {}) {
           : securityInfra.willRetry
             ? 'Number defer hai — isi run me ek aur mauqa milega, failed mark nahi hua.'
             : 'Is number ke is run ke 2 infra attempts ho gaye — failed mark nahi hua, lekin ab ye is run me dobara nahi uthega.';
-        if (state.wafStrikes >= securityStormLimit) { requestRunEnd('security_challenge'); break; }
+        if (state.wafStrikes >= securityStormLimit) {
+          if (!telegramMode) { requestRunEnd('security_challenge'); break; }
+          // Hermes lane ke liye security storm bhi recovery checkpoint hai;
+          // route rotation/cooldown neeche chalega, batch force-stop nahi.
+          state.wafStrikes = 1;
+          state.workerRecoveries = (state.workerRecoveries || 0) + 1;
+        }
 
         const routeKind = securityChallengeRouteKind({
           proxyEnabled: Boolean(ps.enabled),
@@ -2826,7 +2996,11 @@ export async function startAutopilot(opts = {}) {
         if (next) {
           state.consecutiveFails = 0;
           lane.consecutiveFails = 0;
-          if (state.proxyRotations > rotationLimit) { requestRunEnd('circuit_breaker'); break; }
+          if (state.proxyRotations > rotationLimit) {
+            if (!telegramMode) { requestRunEnd('circuit_breaker'); break; }
+            state.proxyRotations = 0;
+            state.workerRecoveries = (state.workerRecoveries || 0) + 1;
+          }
           await push(progressCard(section('🔀 Fail Streak — Proxy Rotate', [
             `› Lane ${lane.id} par ${laneFailStreak} lagatar failures — IP issue lag raha hai.`,
             `› Sirf is lane ki nayi IP: <code>${esc(next.label)}</code> (rotation #${state.proxyRotations}/${rotationLimit})`,
@@ -2851,13 +3025,31 @@ export async function startAutopilot(opts = {}) {
         }
       } catch (err) {
         console.error(`[Autopilot] Lane ${lane.id}:`, err?.stack || err?.message);
-        state.lastError = String(err?.message || err);
-        requestRunEnd(telegramMode ? 'telegram' : 'firebase');
+        state.lastError = String(err?.message || err).slice(0, 240);
+        // Ek iteration ka unexpected error poori run/lane ko force-stop na
+        // kare. Current entry finally me release hogi; worker fresh state
+        // ke saath dobara chalega. Manual STOP/time/target par restart nahi.
+        state.workerRecoveries = (state.workerRecoveries || 0) + 1;
+        restartWorker = Boolean(
+          !state.stopRequested
+          && state.fresh < target
+          && Date.now() - state.startedAt <= maxMinutes * 60_000
+        );
+        if (restartWorker) {
+          try {
+            await push(progressCard(section('↻ Worker Recovery', [
+              'Ek temporary error aaya — batch band nahi ho raha.',
+              `Worker khud restart hokar agla step lega. ${esc(truncateUiText(state.lastError, 90))}`,
+            ].join('\n'))), stopRows());
+          } catch {}
+          await sleep(1_500, () => state.stopRequested);
+        }
       } finally {
         if (lane.currentEntry) releaseClaimedEntry(lane.currentEntry);
         lane.currentEntry = null;
         setLaneCurrent(lane, null);
         releaseLaneRoute(lane);
+      }
       }
     };
 

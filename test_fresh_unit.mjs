@@ -1682,8 +1682,39 @@ console.log('telegram Hermes source + Add Telegram Account primitives:');
   const engine = await import('./autopilot-engine.js');
   const bridge = await import('./swiggy-bridge.js');
   const store = await import('./store.js');
+  const rich = await import('./rich-text.js');
 
   tg._resetTelegramOtpSourceForTests();
+
+  // Compact live UI: mono values + ek chhota flow card. Lambi pool/scan
+  // diagnostics is card me wapas nahi ghusni chahiye.
+  ok(rich.mono('98765<43210&') === '<code>98765&lt;43210&amp;</code>', 'mono helper value ko escape karke <code> me rakhta hai');
+  ok(rich.progressBar(3, 10).includes('3/10') && rich.progressBar(3, 10).includes('█') && rich.progressBar(3, 10).includes('░'), 'progress bar mono blocks + done/total dikhata hai');
+  ok(rich.progressBar(99, 10).includes('99/10') && !rich.progressBar(99, 10).includes('░'), 'progress bar over-target par full rehta hai, crash nahi');
+  ok(rich.statusCard('LIVE', ['one', '', 'two']).includes('<b>LIVE</b>') && !rich.statusCard('LIVE', ['one', '', 'two']).includes('\n\n'), 'statusCard khali lines hata kar compact card banata hai');
+  const compactLive = engine.formatCompactAutopilotCard({
+    sourceMode: 'telegram', running: true, target: 10, fresh: 2, processed: 3, failed: 1,
+    addressAdded: 1, startedAt: Date.now() - 65_000, elapsedMs: 65_000,
+    current: { phone: '9876543210' }, activeNumbers: [{ phone: '9876543210' }],
+    telegramCurrentPhone: '9876543210', concurrency: 1,
+  }, { stageText: rich.section('🔎 OTP Wait', 'REFRESH par naya OTP dhoondh raha hoon') });
+  ok(compactLive.includes('[REFRESH]') && compactLive.includes('HERMES ONLY') && compactLive.includes('Firebase') && compactLive.includes('<code>OFF</code>'), 'compact live card: REFRESH step + Hermes-only/Firebase OFF lock saaf');
+  ok(compactLive.includes('<code>9876543210</code>') && compactLive.includes('2/10') && compactLive.includes('ADDR 1/2'), 'compact live card: current number + progress + verified address count mono me');
+  ok(!compactLive.includes('Device scan') && !compactLive.includes('Parallel lanes') && compactLive.length < 900, 'compact live card purani lambi diagnostics nahi dohrata');
+  const compactAddress = engine.formatCompactAutopilotCard({
+    sourceMode: 'telegram', running: true, target: 10, fresh: 2, processed: 3,
+    current: { phone: '9876543210' }, elapsedMs: 90_000,
+  }, { stageText: rich.section('🏠 Address Add Ho Raha Hai', 'Swiggy Add Address page par Maharashtra address save + verify ho raha hai') });
+  ok(compactAddress.includes('[ADDR]') && compactAddress.includes('Swiggy me address add ho raha hai'), 'compact live card asal Add Address step ko ADDR dikhata hai');
+  const compactFinal = engine.formatCompactAutopilotCard({
+    sourceMode: 'telegram', running: false, stopReason: 'manual', target: 10, fresh: 1,
+    processed: 2, failed: 1, addressAdded: 1, elapsedMs: 120_000,
+    freshAccounts: [{ phone: '9876543210', accountKey: 'AK1' }],
+  }, { final: true });
+  ok(compactFinal.includes('BATCH KHATAM') && compactFinal.includes('Aapne STOP kiya') && compactFinal.includes('Fresh JSON chat me'), 'compact final card asal stop reason + JSON note deta hai');
+  const recoverySnapshot = engine.getAutopilotSnapshot();
+  ok(recoverySnapshot.telegramClaimRetries === 0 && recoverySnapshot.workerRecoveries === 0
+    && recoverySnapshot.addressAdded === 0 && recoverySnapshot.addressFailed === 0, 'snapshot: claim-retry/worker-recovery/address counters maujood');
 
   // Visible Hermeshu labels: FIND strict hai; SEARCH/ACTIVE ko FIND nahi
   // samjha jayega, warna bot galat screen par ja sakta hai.
@@ -1727,7 +1758,15 @@ console.log('telegram Hermes source + Add Telegram Account primitives:');
   ok(['TELEGRAM_API_ID', 'TELEGRAM_API_HASH', 'TELEGRAM_SESSION'].every((k) => missingStatus.missing.includes(k)), 'Telegram status missing keys saaf batata hai');
   ok(tg.telegramOtpSetupHintLines(noTelegramEnv).join('\n').includes('Add Telegram Account'), 'setup hint Add Telegram Account flow batata hai');
   ok(tg.resolveNumberSourceMode({ env: { NUMBER_SOURCE: 'telegram' }, telegramSetting: false }) === 'telegram', 'NUMBER_SOURCE=telegram → Telegram only');
-  ok(tg.resolveNumberSourceMode({ env: { NUMBER_SOURCE: 'firebase' }, telegramSetting: true }) === 'firebase', 'NUMBER_SOURCE=firebase env force respect');
+  ok(tg.resolveNumberSourceMode({ env: { NUMBER_SOURCE: 'firebase' }, telegramSetting: true }) === 'telegram', 'Bot Hermes ON stale NUMBER_SOURCE=firebase ko override karta hai — Hermes run me Firebase try nahi');
+  ok(tg.resolveNumberSourceMode({ env: { NUMBER_SOURCE: 'firebase' }, telegramSetting: false }) === 'firebase', 'Bot Hermes OFF ho tabhi NUMBER_SOURCE=firebase respect');
+  ok(engine.resolveAutopilotNumberSource({ sourceMode: 'telegram', env: { NUMBER_SOURCE: 'firebase' }, telegramSetting: false }) === 'telegram', 'launch par locked sourceMode=telegram stale env se upar');
+  ok(tg._isTelegramClientConnectionError(new Error('read ECONNRESET')) === true
+    && tg._isTelegramClientConnectionError(new Error('socket timeout')) === true
+    && tg._isTelegramClientConnectionError(new Error('button nahi mila')) === false, 'MTProto dead-socket/timeout errors cached client invalidate karte hain');
+  ok(tg._telegramClientLooksConnected({ connected: false }) === false
+    && tg._telegramClientLooksConnected({ _connected: false }) === false
+    && tg._telegramClientLooksConnected({ isConnected: () => true }) === true, 'MTProto cached client disconnected dikhe to reuse nahi hota');
   ok(engine.resolveAutopilotNumberSource({ env: { NUMBER_SOURCE: 'telegram' } }) === 'telegram', 'Autopilot source resolver Telegram env');
   ok(engine.effectiveAutopilotLanes({ sourceMode: 'telegram', requested: 10, proxyEnabled: true, enabledProxyCount: 20 }) === 1, 'ek Hermes chat → Telegram mode hamesha 1 lane');
   ok(engine.effectiveAutopilotLanes({ sourceMode: 'firebase', requested: 10, proxyEnabled: true, enabledProxyCount: 9 }) === 10, 'Firebase mode ki 10-lane behavior unchanged');
@@ -1790,6 +1829,102 @@ console.log('telegram Hermes source + Add Telegram Account primitives:');
   });
   ok(!remoteForbidden.ok && forbiddenCalls === 1, 'remote address: 403 par dusra blind POST nahi (duplicate bacha)');
 
+  // Asal saved-address list se hi verified address banta hai. Generated
+  // candidate ko match/normalize karna remote proof nahi hai — pakka ID
+  // Swiggy ke record se aana chahiye.
+  const savedRemoteAddress = {
+    id: 'ADDR-SAVED-9',
+    address: randomAddress.address,
+    flat_no: randomAddress.flatNo,
+    landmark: randomAddress.landmark,
+    area: randomAddress.area,
+    city: randomAddress.city,
+    pincode: randomAddress.pincode,
+    mobile: '9876543210',
+    lat: randomAddress.lat,
+    lng: randomAddress.lng,
+  };
+  const extractedSaved = bridge.extractSwiggySavedAddresses({ statusCode: 0, data: { addresses: [savedRemoteAddress] } });
+  ok(bridge.setSwiggyBridgeSessionProgressReporter('missing-user', () => {}) === false, 'address progress reporter missing bridge session par safe false deta hai');
+  ok(extractedSaved.length === 1 && extractedSaved[0].id === 'ADDR-SAVED-9', 'saved-address extractor nested Swiggy list se real ID wala record nikalta hai');
+  ok(bridge.findMatchingSwiggySavedAddress(extractedSaved, randomAddress)?.id === 'ADDR-SAVED-9', 'saved-address matcher candidate ko Swiggy ke saved record se verify karta hai');
+  ok(bridge.findMatchingSwiggySavedAddress(extractedSaved, { ...randomAddress, mobile: '9123456780', phone: '9123456780', lat: randomAddress.lat + 1, lng: randomAddress.lng + 1, flatNo: 'Flat Z-999', addressLine: 'Flat Z-999', pincode: '400001', area: 'Bandra', city: 'Mumbai', landmark: 'Near Station' }) === null, 'saved-address matcher alag address ko galat match nahi karta');
+  const verifiedSavedAddress = bridge.normalizeVerifiedSwiggyAddress(savedRemoteAddress, randomAddress);
+  ok(verifiedSavedAddress.source === 'swiggy-saved-address' && verifiedSavedAddress.remoteAddressStatus === 'added'
+    && verifiedSavedAddress.remoteAddressId === 'ADDR-SAVED-9', 'verified address normalization sirf remote ID ke saath ADDED banti hai');
+  const webForm = bridge.buildSwiggyWebAddressFormValues(randomAddress);
+  ok(webForm.flatNo === randomAddress.flatNo && webForm.landmark === randomAddress.landmark
+    && webForm.address.includes(randomAddress.city) && webForm.label === 'Home'
+    && webForm.lat === randomAddress.lat && webForm.lng === randomAddress.lng, 'Add Address web form: Address + Door/Flat + Landmark + Home + Maharashtra coords sahi');
+
+  // Browser Add Address UI ka mocked page flow: pehle saved list khali,
+  // form fill + SAVE, phir saved list me wahi address real ID ke saath.
+  {
+    let evaluateCalls = 0;
+    let visitedUrl = '';
+    const cookiesSet = [];
+    const mockPage = {
+      setViewport: async () => {}, setGeolocation: async () => {},
+      setCookie: async (cookie) => { cookiesSet.push(cookie); },
+      cookies: async () => [], on: () => {}, off: () => {},
+      goto: async (url) => { visitedUrl = url; },
+      evaluate: async () => {
+        evaluateCalls++;
+        if (evaluateCalls === 1) return { status: 200, data: { statusCode: 0, data: { addresses: [] } } };
+        if (evaluateCalls === 2) return { ok: true, filled: { address: true, flatNo: true, landmark: true }, fields: 3 };
+        if (evaluateCalls === 3) return true;
+        return { status: 200, data: { statusCode: 0, data: { addresses: [savedRemoteAddress] } } };
+      },
+    };
+    const uiAdded = await bridge.addSwiggyAddressViaWebUi(addressSession, randomAddress, {
+      pageFactory: async () => ({ page: mockPage, owned: false }),
+      timeoutMs: 12_000,
+    });
+    ok(uiAdded.ok && uiAdded.addressId === 'ADDR-SAVED-9' && uiAdded.verifiedAddress?.source === 'swiggy-saved-address', 'asal Add Address UI flow SAVE ke baad saved list se verify karta hai');
+    ok(visitedUrl.includes('/web-cart-add-address') && visitedUrl.includes(`lat=${randomAddress.lat}`) && cookiesSet.some((c) => c.name === '_is_logged_in'), 'Add Address UI authenticated cookies + Maharashtra pin ke saath page kholta hai');
+  }
+
+  // Orchestration order: saved list → browser UI → sirf non-submit UI
+  // failure par CAS. UI SAVE ke baad uncertain ho to CAS POST bilkul nahi.
+  {
+    const jsonResponse = (data, status = 200) => ({ status, headers: new Headers(), text: async () => JSON.stringify(data) });
+    let browserCalls = 0;
+    const existingFirst = await bridge.addSwiggyAddressToAccount(addressSession, randomAddress, {
+      customerId: 'CUSTTG1',
+      fetchImpl: async (url) => String(url).includes('/dapi/address/all')
+        ? jsonResponse({ statusCode: 0, data: { addresses: [savedRemoteAddress] } })
+        : jsonResponse({ error: 'should-not-post' }, 500),
+      browserAddImpl: async () => { browserCalls++; return { ok: false, submitAttempted: false }; },
+    });
+    ok(existingFirst.ok && existingFirst.method === 'saved-address-list' && browserCalls === 0, 'address orchestration: saved list me pehle se ho to duplicate Add Address nahi khulta');
+
+    let casCalls = 0;
+    const browserBeforeCas = await bridge.addSwiggyAddressToAccount(addressSession, randomAddress, {
+      customerId: 'CUSTTG1',
+      urls: ['https://example.test/addresses/v1'],
+      fetchImpl: async (url) => {
+        if (String(url).includes('/dapi/address/all')) return jsonResponse({ statusCode: 0, data: { addresses: [] } });
+        casCalls++;
+        return jsonResponse({ id: 'ADDR-CAS-1' });
+      },
+      browserAddImpl: async () => ({ ok: false, addressId: '', submitAttempted: false, message: 'Chrome nahi mila' }),
+    });
+    ok(browserBeforeCas.ok && browserBeforeCas.method === 'cas-address-api' && casCalls === 1, 'address orchestration: UI submit hi na ho tabhi CAS fallback');
+
+    casCalls = 0;
+    const uncertainUi = await bridge.addSwiggyAddressToAccount(addressSession, randomAddress, {
+      customerId: 'CUSTTG1',
+      urls: ['https://example.test/addresses/v1'],
+      fetchImpl: async (url) => {
+        if (String(url).includes('/dapi/address/all')) return jsonResponse({ statusCode: 0, data: { addresses: [] } });
+        casCalls++;
+        return jsonResponse({ id: 'ADDR-DUPLICATE-RISK' });
+      },
+      browserAddImpl: async () => ({ ok: false, addressId: '', submitAttempted: true, uncertain: true, message: 'SAVE verify nahi hua' }),
+    });
+    ok(!uncertainUi.ok && uncertainUi.submitAttempted === true && casCalls === 0, 'address orchestration: UI SAVE uncertain ho to duplicate rokne ke liye CAS POST nahi');
+  }
+
   // Saved account se /session fallback export me email/address survive kare.
   store.updateAccount('TEST_TELEGRAM_FRESH_EXPORT', {
     name: 'Telegram Fresh Test',
@@ -1810,10 +1945,36 @@ console.log('telegram Hermes source + Add Telegram Account primitives:');
   });
   const sessionExport = store.getSessionExportJson('TEST_TELEGRAM_FRESH_EXPORT', null);
   ok(sessionExport?.email === '98765Rahul@gmail.com', 'session fallback export me fresh email included');
-  ok(sessionExport?.address === randomAddress.address && sessionExport?.addressDetails?.pincode === randomAddress.pincode
-    && sessionExport?.remoteAddressStatus === 'pending', 'session fallback export me random Maharashtra address + remote status included');
+  ok(store._isUnverifiedGeneratedAddress({ addressDetails: randomAddress, remoteAddressStatus: 'pending' }) === true, 'unverified generated candidate ko store fake success nahi manta');
+  ok(sessionExport?.address === undefined && sessionExport?.addressDetails === undefined
+    && sessionExport?.remoteAddressStatus === 'pending', 'session fallback export unverified fake address data nahi bhejta — sirf pending status');
   const fullExport = store.exportSessionJson('TEST_TELEGRAM_FRESH_EXPORT');
-  ok(fullExport?.email === '98765Rahul@gmail.com' && fullExport?.address === randomAddress.address, 'full session export me email + address included');
+  ok(fullExport?.email === '98765Rahul@gmail.com' && fullExport?.address === undefined && fullExport?.addressDetails === undefined, 'full session export bhi unverified generated address suppress karta hai');
+  const bridgeProvidedUnverified = {
+    account: 'TEST_TELEGRAM_FRESH_EXPORT', address: randomAddress.address,
+    addressDetails: randomAddress, remoteAddressStatus: 'failed', remoteAddressId: 'FAKE-ID',
+  };
+  const bridgeProvidedClean = store.getSessionExportJson('TEST_TELEGRAM_FRESH_EXPORT', { exportJson: bridgeProvidedUnverified });
+  ok(bridgeProvidedClean?.address === undefined && bridgeProvidedClean?.remoteAddressId === undefined
+    && bridgeProvidedUnverified.remoteAddressId === 'FAKE-ID', 'bridge-provided export unverified address/ID strip karta hai bina original mutate kiye');
+
+  // Remote proof milne ke baad wahi account ka verified Swiggy record
+  // export me aana chahiye — generated candidate apne aap nahi.
+  store.updateAccount('TEST_TELEGRAM_FRESH_EXPORT', {
+    address: verifiedSavedAddress.address,
+    addressDetails: verifiedSavedAddress,
+    deliveryAddress: verifiedSavedAddress,
+    remoteAddressStatus: 'added',
+    remoteAddressId: verifiedSavedAddress.remoteAddressId,
+    remoteAddressMessage: verifiedSavedAddress.remoteAddressMessage,
+  });
+  const verifiedExport = store.getSessionExportJson('TEST_TELEGRAM_FRESH_EXPORT', null);
+  ok(verifiedExport?.address === verifiedSavedAddress.address
+    && verifiedExport?.addressDetails?.source === 'swiggy-saved-address'
+    && verifiedExport?.remoteAddressStatus === 'added'
+    && verifiedExport?.remoteAddressId === 'ADDR-SAVED-9', 'verified remote address + real ID session export me included');
+  const verifiedFullExport = store.exportSessionJson('TEST_TELEGRAM_FRESH_EXPORT');
+  ok(verifiedFullExport?.addressDetails?.remoteAddressId === 'ADDR-SAVED-9', 'full export me sirf verified Swiggy address ID aata hai');
 }
 
 console.log(`\n✅ ALL PASSED — ${passed} checks`);

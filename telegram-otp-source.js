@@ -157,10 +157,13 @@ export function isTelegramOtpConfigured(env = process.env) {
 }
 
 export function resolveNumberSourceMode({ env = process.env, telegramSetting = false } = {}) {
+  // Bot ke andar Hermes ON hai to wahi final hai. Render par purana
+  // NUMBER_SOURCE=firebase bacha reh jaye tab bhi Hermes wale run me
+  // Firebase pool/OTP galti se try nahi hona chahiye.
+  if (telegramSetting) return 'telegram';
   const raw = firstEnv(env, ['NUMBER_SOURCE', 'PREMIUM_NUMBER_SOURCE', 'OTP_SOURCE']).toLowerCase();
   if (['telegram', 'hermes', 'hermeshu', 'hermeshu-bot', 'Hermeshu'].includes(raw)) return 'telegram';
   if (['firebase', 'firebase-pool', 'pool'].includes(raw)) return 'firebase';
-  if (telegramSetting) return 'telegram';
   return isTelegramOtpConfigured(env) ? 'telegram' : 'firebase';
 }
 
@@ -414,9 +417,13 @@ export async function createTelegramUserClient(sessionString = '', config = getT
   });
 }
 
-function invalidateClient(error) {
+export function _isTelegramClientConnectionError(error) {
   const msg = String(error?.message || error || '');
-  if (!/(AUTH_KEY|SESSION_REVOKED|USER_DEACTIVATED|not connected|disconnected|Connection closed)/i.test(msg)) return;
+  return /(AUTH_KEY|SESSION_REVOKED|USER_DEACTIVATED|not connected|disconnected|Connection closed|ECONNRESET|EPIPE|socket|timed?\s*out|timeout|network)/i.test(msg);
+}
+
+function invalidateClient(error) {
+  if (!_isTelegramClientConnectionError(error)) return;
   clientRef = null;
   clientPromise = null;
   entityRef = null;
@@ -424,6 +431,18 @@ function invalidateClient(error) {
   providerState.connected = false;
   providerState.authorized = false;
 }
+
+function telegramClientLooksConnected(client) {
+  if (!client) return false;
+  try {
+    if (typeof client.connected === 'boolean') return client.connected;
+    if (typeof client._connected === 'boolean') return client._connected;
+    if (typeof client.isConnected === 'function') return Boolean(client.isConnected());
+  } catch {}
+  return true;
+}
+
+export { telegramClientLooksConnected as _telegramClientLooksConnected };
 
 async function ensureClientUnlocked() {
   if (providerState.loginInProgress) {
@@ -433,7 +452,18 @@ async function ensureClientUnlocked() {
   if (!config.configured) {
     throw new Error(`Telegram Hermes setup missing hai: ${config.missing.join(', ')}`);
   }
-  if (clientRef && providerState.connected) return { client: clientRef, config };
+  if (clientRef && providerState.connected && telegramClientLooksConnected(clientRef)) return { client: clientRef, config };
+  if (clientRef && !telegramClientLooksConnected(clientRef)) {
+    // Render/network jhatke ke baad Teleproto socket mar sakta hai lekin
+    // providerState purana connected=true dikhata rehta tha — phir har
+    // claim wahi murda client use karke batch ko exhausted bana deta tha.
+    clientRef = null;
+    clientPromise = null;
+    entityRef = null;
+    entityCacheKey = '';
+    providerState.connected = false;
+    providerState.authorized = false;
+  }
   if (clientPromise) return clientPromise;
 
   clientPromise = (async () => {

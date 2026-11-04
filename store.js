@@ -1050,6 +1050,39 @@ export function getAccounts() {
   return db.config.accounts || defaultData.config.accounts;
 }
 
+// Generated Maharashtra address tab tak sirf ek candidate hai jab tak
+// Swiggy ke saved-address list / create response se pakka addressId na
+// mil jaye. Unverified candidate ko fresh JSON me "address" bana kar
+// bhejna hi woh fake-address data tha jo baar-baar dikh raha tha.
+export function _isUnverifiedGeneratedAddress(source = {}) {
+  if (!source || typeof source !== 'object') return false;
+  const details = source.addressDetails || source.deliveryAddress || {};
+  const status = String(source.remoteAddressStatus || details.remoteAddressStatus || '').trim().toLowerCase();
+  const remoteId = String(source.remoteAddressId || details.remoteAddressId || '').trim();
+  if (status === 'added' && remoteId) return false;
+  return details.source === 'generated-maharashtra' || Boolean(status && status !== 'added');
+}
+
+function exportableAddressFields(source = {}) {
+  const details = source.addressDetails || source.deliveryAddress || null;
+  const status = source.remoteAddressStatus || details?.remoteAddressStatus || '';
+  const remoteId = source.remoteAddressId || details?.remoteAddressId || '';
+  const message = source.remoteAddressMessage || details?.remoteAddressMessage || '';
+  if (_isUnverifiedGeneratedAddress(source)) {
+    return {
+      ...(status ? { remoteAddressStatus: status } : {}),
+      ...(message ? { remoteAddressMessage: String(message).slice(0, 240) } : {}),
+    };
+  }
+  return {
+    ...(source.address ? { address: source.address } : {}),
+    ...(details ? { addressDetails: details } : {}),
+    ...(status ? { remoteAddressStatus: status } : {}),
+    ...(remoteId ? { remoteAddressId: remoteId } : {}),
+    ...(message ? { remoteAddressMessage: String(message).slice(0, 240) } : {}),
+  };
+}
+
 // Fresh session ka "JSON" — wahi shape jo bridge verify/signup par
 // exportJson ki surat me deta hai (account/name/token/tid/sid/cookies...).
 // Pehle bridge ke diye hue exportJson ko tarjeeh do; na ho to DB me saved
@@ -1057,7 +1090,13 @@ export function getAccounts() {
 // mil jaye. Account hi na mile to null.
 export function getSessionExportJson(accountKey, bridgeAccount = null) {
   if (bridgeAccount?.exportJson && typeof bridgeAccount.exportJson === 'object') {
-    return bridgeAccount.exportJson;
+    if (!_isUnverifiedGeneratedAddress(bridgeAccount.exportJson)) return bridgeAccount.exportJson;
+    const exported = { ...bridgeAccount.exportJson };
+    delete exported.address;
+    delete exported.addressDetails;
+    delete exported.deliveryAddress;
+    delete exported.remoteAddressId;
+    return exported;
   }
   try {
     const acc = getDb()?.config?.accounts?.[accountKey];
@@ -1069,10 +1108,7 @@ export function getSessionExportJson(accountKey, bridgeAccount = null) {
       swiggyName: acc.swiggyName || '',
       botTag: acc.botTag || '',
       ...(acc.email ? { email: acc.email } : {}),
-      ...(acc.address ? { address: acc.address } : {}),
-      ...(acc.addressDetails ? { addressDetails: acc.addressDetails } : {}),
-      ...((acc.remoteAddressStatus || acc.addressDetails?.remoteAddressStatus) ? { remoteAddressStatus: acc.remoteAddressStatus || acc.addressDetails.remoteAddressStatus } : {}),
-      ...((acc.remoteAddressId || acc.addressDetails?.remoteAddressId) ? { remoteAddressId: acc.remoteAddressId || acc.addressDetails.remoteAddressId } : {}),
+      ...exportableAddressFields(acc),
       mobile: phone,
       phone,
       customerId: acc.customerId || '',
@@ -1129,10 +1165,7 @@ export function updateAccount(key, updates) {
       name: merged.name || key,
       swiggyName: merged.swiggyName || '',
       ...(merged.email ? { email: merged.email } : {}),
-      ...(merged.address ? { address: merged.address } : {}),
-      ...(merged.addressDetails ? { addressDetails: merged.addressDetails } : {}),
-      ...((merged.remoteAddressStatus || merged.addressDetails?.remoteAddressStatus) ? { remoteAddressStatus: merged.remoteAddressStatus || merged.addressDetails.remoteAddressStatus } : {}),
-      ...((merged.remoteAddressId || merged.addressDetails?.remoteAddressId) ? { remoteAddressId: merged.remoteAddressId || merged.addressDetails.remoteAddressId } : {}),
+      ...exportableAddressFields(merged),
       mobile: phone,
       phone,
       customerId: merged.customerId || '',
@@ -1363,10 +1396,7 @@ export function exportSessionJson(key) {
     name: source.name || key,
     ...(source.swiggyName ? { swiggyName: source.swiggyName } : {}),
     ...(source.email ? { email: source.email } : {}),
-    ...(source.address ? { address: source.address } : {}),
-    ...(source.addressDetails ? { addressDetails: source.addressDetails } : {}),
-    ...((source.remoteAddressStatus || source.addressDetails?.remoteAddressStatus) ? { remoteAddressStatus: source.remoteAddressStatus || source.addressDetails.remoteAddressStatus } : {}),
-    ...((source.remoteAddressId || source.addressDetails?.remoteAddressId) ? { remoteAddressId: source.remoteAddressId || source.addressDetails.remoteAddressId } : {}),
+    ...exportableAddressFields(source),
     mobile: phone,
     phone,
     customerId,

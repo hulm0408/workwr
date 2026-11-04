@@ -29,6 +29,7 @@ import {
   verifySwiggyOtpViaBridge,
   verifyAndDeleteSwiggyAccountViaBridge,
   signupSwiggyViaBridge,
+  setSwiggyBridgeSessionProgressReporter,
 } from './swiggy-bridge.js';
 import {
   snapshotSeenOtpState,
@@ -512,6 +513,7 @@ export async function processSingleNumber({
       });
     }
 
+    try { setSwiggyBridgeSessionProgressReporter(userId, say); } catch {}
     const isNew = Boolean(otpReq.isNewUser);
     await say(
       section(
@@ -629,6 +631,7 @@ export async function processSingleNumber({
       });
     }
 
+    try { setSwiggyBridgeSessionProgressReporter(userId, say); } catch {}
     const round3 = await grabAndVerifyRound({
       userId, phone, deviceIds, seen: seen3, waitCfg, report: say, shouldAbort,
       waitOtp, sourceLabel,

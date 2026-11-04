@@ -26,6 +26,27 @@ export function sub(text) {
   return `<i>${esc(text)}</i>`;
 }
 
+// Short machine-readable values (numbers, counts, timers, modes) mono me
+// dikhte hain — live card par aankh seedha wahi padhti hai jo badal raha hai.
+export function mono(value) {
+  return `<code>${esc(value)}</code>`;
+}
+
+export function progressBar(done = 0, total = 0, width = 12) {
+  const safeTotal = Math.max(0, Number(total) || 0);
+  const safeDone = Math.max(0, Number(done) || 0);
+  const filled = safeTotal > 0
+    ? Math.min(width, Math.round((Math.min(safeDone, safeTotal) / safeTotal) * width))
+    : 0;
+  return mono(`${'█'.repeat(filled)}${'░'.repeat(Math.max(0, width - filled))} ${safeDone}/${safeTotal}`);
+}
+
+// Ek hi compact status card: title + flow + abhi kya ho raha hai + progress.
+// Body pehle se trusted internal HTML hai; caller sirf chhoti lines dega.
+export function statusCard(title, lines = []) {
+  return section(title, (Array.isArray(lines) ? lines : [lines]).filter(Boolean).join('\n'));
+}
+
 // Field line: <b>Label:</b> value
 export function field(label, value) {
   return `<b>${esc(label)}:</b> ${esc(value)}`;

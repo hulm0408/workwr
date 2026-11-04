@@ -52,6 +52,7 @@ const {
   formatScanCandidateStates,
   poolExhaustedReasonText,
   resolveAutopilotNumberSource,
+  formatCompactAutopilotCard,
 } = await import('./autopilot-engine.js');
 const { isFirebaseConfigured, firebaseSetupHintLines, listPoolNumbers, _countDeviceOnlineStates } = await import('./firebase-numbers.js');
 const telegramOtp = await import('./telegram-otp-source.js');
@@ -60,7 +61,7 @@ const bs = await import('./bot-settings.js');
 const proxyPool = await import('./proxy-pool.js');
 const { getChromeStatus } = await import('./swiggy-bridge.js');
 const wafPool = await import('./waf-pool.js');
-const { esc, section, sub, field } = await import('./rich-text.js');
+const { esc, section, sub, field, mono, statusCard } = await import('./rich-text.js');
 const { createServer } = await import('node:http');
 const { startKeepAlive } = await import('./keep-alive.js');
 
@@ -275,88 +276,30 @@ function activeSourceLine() {
 
 function startCard() {
   const snap = getAutopilotSnapshot();
-  const target = bs.getSetting('target');
-  const maxMin = bs.getSetting('maxMinutes');
-  return section('🆕 Swiggy Fresh Bot', [
-    `Bas <b>START</b> dabao — phone pe chhod ke aa jao,`,
-    `baaki sab ye khud karega:`,
-    ``,
-    isTelegramNumberSource()
-      ? `1️⃣ Telegram Hermes me <b>FIND NUMBER</b> → spare-account se number claim`
-      : `1️⃣ Firebase pool se number (online pehle)`,
-    isTelegramNumberSource()
-      ? `2️⃣ Swiggy OTP bhejo → Hermes par ${Math.round((Number(bs.getSetting('telegramOtpTimeoutMs')) || 20_000) / 1000)}s <b>REFRESH</b>; na aaye to <b>NEW NUMBER</b>`
-      : `2️⃣ Swiggy OTP → <b>live inbox poll</b> → OTP khud padh kar paste`,
-    `3️⃣ 🆕 naya = register · ♻️ purana = delete → fresh login`,
-    `4️⃣ charges/order/wallet block = <b>SKIP</b> · WAF = <b>auto token-refresh + retry</b>`,
-    ``,
-    activeSourceLine(),
-    field('🎯 Target', `${target} fresh sessions`),
-    field('⏱ Max time', `${maxMin} minutes`),
-    snap.finishedAt
-      ? field('Last run', `${snap.fresh} fresh · ${fmtDuration(snap.elapsedMs)} · ${esc(snap.stopReason || 'done')}`)
-      : '',
-    ``,
-    isAutopilotRunning()
-      ? `● <b>RUNNING</b> — STOP/STATUS niche.`
-      : sub('Start karke chhod do — ~1 hr baad aakar summary dekh lena.'),
-  ].filter(Boolean).join('\n'));
+  if (snap.running) return runningCard(snap);
+  if (snap.finishedAt) return summaryCard(snap);
+  const telegram = isTelegramNumberSource();
+  const target = Number(bs.getSetting('target')) || 100;
+  const maxMin = Number(bs.getSetting('maxMinutes')) || 120;
+  return statusCard('🆕 Swiggy Fresh Bot', [
+    mono(telegram ? '[NEW] › OTP › REFRESH › VERIFY › ADDR › FRESH' : '[POOL] › OTP › INBOX › VERIFY › ADDR › FRESH'),
+    '<b>Abhi:</b> START ka wait hai',
+    telegram
+      ? `📨 ${mono('HERMES ONLY')} · 🔥 Firebase ${mono('OFF')}`
+      : activeSourceLine(),
+    `🎯 ${mono(`${target} fresh`)} · ⏱ ${mono(`${maxMin} min`)}`,
+    telegram
+      ? '<b>Next:</b> START dabao — NEW NUMBER se kaam shuru hoga'
+      : '<b>Next:</b> START dabao — live card par har step dikhega',
+  ]);
 }
 
 function runningCard(snap, stageText = '') {
-  return section('● Autopilot RUNNING', [
-    field('Runtime', fmtDuration(snap.elapsedMs)),
-    field('Target', String(snap.target)),
-    field('⚡ Parallel lanes', `${snap.activeWorkers || 0}/${snap.concurrency || 1} active`),
-    stageText || '',
-    ``,
-    field('Processed', String(snap.processed)),
-    field('✅ Fresh', `${snap.fresh}  (naye: ${snap.freshNew} · delete+fresh: ${snap.freshAfterDelete})`),
-    field('⚠️ Skipped', `${snap.skipped} · deferred: ${snap.deferred} · 7-day cooldown: ${snap.cooldownSkips || 0} · 📴 stale devices: ${snap.staleSkips || 0}`),
-    field('× Failed', `${snap.failed} · rate-limit: ${snap.rateStrikes}`),
-    numberSourceLine(snap),
-    field('Pool', formatPoolStatus(snap)),
-    normalizedTelegramSnapshot(snap).sourceMode === 'telegram'
-      ? field('🔎 Hermes scan', `bypass hai · ${Number(snap.telegramClaimed) || 0} claimed · ${Number(snap.telegramRejected) || 0} rejected`)
-      : (snap.scanning || snap.scanChecked)
-        ? field('🔎 Device scan', `pass ${snap.scanPass || 1}: ${snap.scanUniqueChecked || 0}/${snap.scanTotalDevices || 0} unique · probes ${snap.scanTotalProbes || snap.scanChecked || 0} · window ≤${fmtDuration(snap.scanWindowMs || 0)} · ${snap.scanBestActivityMs ? `scan ke waqt best SMS ~${fmtDuration(snap.scanBestActivityAgeMs || Math.max(0, Date.now() - snap.scanBestActivityMs))} purani · ` : ''}${snap.scanFresh || 0} fresh ready${formatScanCandidateStates(snap) ? ` · candidates: ${formatScanCandidateStates(snap)}` : ''}${snap.scanning ? ' · scanning…' : ''}`)
-        : '',
-    (snap.activeNumbers?.length)
-      ? `📍 <b>Abhi ${snap.activeNumbers.length} lanes:</b>\n${snap.activeNumbers.slice(0, 10).map((n) => `• <code>${esc(n.phone)}</code> · lane ${n.laneId || '?'} · ${esc(n.proxyLabel || 'direct')} (${fmtDuration(Date.now() - n.startedAt)})`).join('\n')}`
-      : (snap.current
-        ? `📍 <b>Abhi:</b> <code>${esc(snap.current.phone)}</code> (${fmtDuration(Date.now() - snap.current.startedAt)})`
-        : (snap.scanning ? '🔎 Zinda devices dhoondh raha hoon (parallel scan)…' : '')),
-    snap.lastError ? field('Last error', snap.lastError) : '',
-  ].filter(Boolean).join('\n'));
+  return formatCompactAutopilotCard(normalizedTelegramSnapshot(snap), { stageText });
 }
 
 function summaryCard(snap) {
-  const freshList = (snap.freshAccounts || []).slice(-12)
-    .map((a) => `• <code>${esc(a.phone)}</code> → <b>${esc(a.accountKey)}</b>`)
-    .join('\n');
-  return section('📊 Batch — Final Summary', [
-    field('Status', snap.running ? '● RUNNING' : `⏹ ${esc(snap.stopReason || 'stopped')}`),
-    field('Runtime', fmtDuration(snap.elapsedMs)),
-    ``,
-    field('Processed', String(snap.processed)),
-    field('✅ Fresh', `${snap.fresh}  (naye: ${snap.freshNew} · delete+fresh: ${snap.freshAfterDelete})`),
-    field('⚠️ Skipped', `${snap.skipped} · deferred: ${snap.deferred} · 7-day cooldown: ${snap.cooldownSkips || 0} · 📴 stale devices: ${snap.staleSkips || 0}`),
-    field('× Failed', `${snap.failed} · rate-limit: ${snap.rateStrikes}`),
-    numberSourceLine(snap),
-    field('Pool', formatPoolStatus(snap)),
-    snap.stopReason === 'pool-exhausted' ? poolExhaustedReasonText(snap) : '',
-    normalizedTelegramSnapshot(snap).sourceMode === 'telegram'
-      ? field('🔎 Hermes scan', `bypass hai · ${Number(snap.telegramClaimed) || 0} claimed · ${Number(snap.telegramRejected) || 0} rejected`)
-      : snap.scanChecked
-        ? field('🔎 Device scan', `pass ${snap.scanPass || 1}: ${snap.scanUniqueChecked || 0}/${snap.scanTotalDevices || 0} unique · total probes ${snap.scanTotalProbes || snap.scanChecked}${formatScanCandidateStates(snap) ? ` · candidates: ${formatScanCandidateStates(snap)}` : ''}`)
-        : '',
-    snap.lastError ? field('Last error', snap.lastError) : '',
-    freshList ? `` : '',
-    freshList ? `▤ <b>Latest fresh sessions:</b>` : '',
-    freshList || sub('Abhi tak koi fresh session nahi bana.'),
-    ``,
-    sub('Har fresh session ka JSON chat me file bana kar bhej diya gaya hai (data/db.json + cloud vault me bhi saved).'),
-  ].filter((x) => x !== '' && x !== false).join('\n'));
+  return formatCompactAutopilotCard(normalizedTelegramSnapshot(snap), { final: !snap.running });
 }
 
 const startRows = () => [
@@ -681,19 +624,24 @@ async function deliverSessionJson(chatId, { phone, accountKey, kind, account } =
     : kind === 'resend'
       ? '↩️ Dobara Bheja'
       : '🆕 Naya Fresh';
-  const caption = [
+  const baseCaption = [
     `✅ <b>Fresh Session Ready</b> — ${typeText}`,
-    `📱 <b>Number:</b> <code>${esc(phone || '')}</code>`,
-    `👤 <b>Account:</b> <b>${esc(accountKey || '')}</b>`,
+    `📱 ${mono(phone || '')} · 👤 ${mono(accountKey || '')}`,
   ].join('\n');
 
   const exportData = getSessionExportJson(accountKey, account);
   if (!exportData) {
     await bot.telegram.sendMessage(chatId,
-      `${caption}\n\n<i>(JSON export nahi mil paya — session bot DB me saved hai)</i>`,
+      `${baseCaption}\n\n<i>(JSON export nahi mil paya — session bot DB me saved hai)</i>`,
       { parse_mode: 'HTML' }).catch(() => {});
     return false;
   }
+  const addressLine = exportData.remoteAddressStatus === 'added' && exportData.remoteAddressId
+    ? `🏠 Address: ${mono(`ADDED · ${exportData.remoteAddressId}`)}`
+    : exportData.remoteAddressStatus
+      ? `🏠 Address: ${mono('NOT ADDED')} — wajah JSON me hai`
+      : '';
+  const caption = [baseCaption, addressLine].filter(Boolean).join('\n');
 
   const jsonText = JSON.stringify(exportData, null, 2);
   const filename = `${phone || accountKey || 'session'}.json`;
@@ -794,9 +742,15 @@ async function launchBatch(ctx) {
     },
   };
 
+  const lockedSourceMode = resolvedNumberSourceMode();
   startAutopilot({
     userId: String(ctx.from.id),
     telegramSetting: telegramSettingEnabled(),
+    // Is run ka source yahin lock kar do. Hermes ON ho to stale env ya
+    // beech-run setting is batch ko Firebase par nahi ghuma sakti.
+    sourceMode: lockedSourceMode,
+    numberSource: lockedSourceMode,
+    source: lockedSourceMode,
     ui,
   }).catch((e) => console.error('[FreshBot] autopilot:', e?.stack || e?.message));
 }
@@ -2308,6 +2262,14 @@ function startTelegramWatchdog() {
       runtimeHealth.lastTelegramError = String(e?.message || e || '').slice(0, 180);
       console.warn(`[FreshBot] Telegram watchdog fail ${runtimeHealth.telegramApiFailures}/3: ${runtimeHealth.lastTelegramError}`);
       if (code === 401 || runtimeHealth.telegramApiFailures >= 3) {
+        if (isAutopilotRunning()) {
+          // Active batch ko Telegram UI/API ke jhatke par force-stop mat
+          // karo. Hermes/Swiggy ka kaam process ke andar jaari reh sakta
+          // hai; restart sirf batch khatam honay ke baad watchdog karega.
+          runtimeHealth.telegramApiFailures = 2;
+          console.error('[FreshBot] Telegram API fail hai, lekin batch chal raha hai — restart batch ke baad tak deferred.');
+          return;
+        }
         console.error('[FreshBot] Telegram API lagatar fail hai — Render restart ke liye process exit kar raha hoon.');
         try { requestAutopilotStop('telegram-watchdog'); } catch {}
         process.exit(1);
@@ -2365,11 +2327,13 @@ const armLiveConfirm = (attempt) => {
 };
 const disarmLiveConfirm = () => { if (liveTimer) { clearTimeout(liveTimer); liveTimer = null; } };
 
-for (let attempt = 1; attempt <= 4; attempt++) {
+let conflictAttempts = 0;
+let transientLaunchAttempts = 0;
+for (let attempt = 1; ; attempt++) {
   armLiveConfirm(attempt);
   try {
     await bot.launch({ dropPendingUpdates: true }, () => {
-      console.log(`🔄 Telegram connect ho raha hai (attempt ${attempt}/4)…`);
+      console.log(`🔄 Telegram connect ho raha hai (attempt ${attempt})…`);
     });
     // Yahan tab aate hain jab launch resolve ho (yaani polling stop ho chuki —
     // shutdown already chal raha hoga). Dobara launch ki zaroorat nahi.
@@ -2382,12 +2346,32 @@ for (let attempt = 1; attempt <= 4; attempt++) {
     runtimeHealth.telegramApiFailures++;
     runtimeHealth.lastTelegramError = String(e?.message || e || '').slice(0, 180);
     const code = tgCode(e);
-    if (code === 409 && attempt < 4) {
-      console.error(`[FreshBot] 409 Conflict (try ${attempt}/4) — doosri copy abhi band ho rahi hogi; webhook saaf karke 15s baad dobara…`);
-      try { bot.stop('retry-409'); } catch {}
-      await bot.telegram.deleteWebhook({ drop_pending_updates: true }).catch(() => {});
-      await sleepMs(15_000);
+    if (shuttingDown) break;
+    const batchRunning = (() => { try { return isAutopilotRunning(); } catch { return false; } })();
+    if (code === 409) {
+      conflictAttempts += 1;
+      if (conflictAttempts < 4 || batchRunning) {
+        console.error(`[FreshBot] 409 Conflict (try ${conflictAttempts}) — doosri copy abhi band ho rahi hogi; webhook saaf karke 15s baad dobara…`);
+        try { bot.stop('retry-409'); } catch {}
+        await bot.telegram.deleteWebhook({ drop_pending_updates: true }).catch(() => {});
+        await sleepMs(15_000);
+        continue;
+      }
+    }
+    if (code === 401 && batchRunning) {
+      console.error('[FreshBot] Telegram 401 aaya, lekin batch chal raha hai — process ko force-stop nahi kar raha; 30s baad polling retry.');
+      await sleepMs(30_000);
       continue;
+    }
+    if (code !== 401 && code !== 409) {
+      transientLaunchAttempts += 1;
+      if (batchRunning || transientLaunchAttempts <= 12) {
+        const waitMs = Math.min(30_000, 5_000 * (2 ** Math.min(3, transientLaunchAttempts - 1)));
+        console.error(`[FreshBot] Telegram launch temporary fail (try ${transientLaunchAttempts}) — ${Math.round(waitMs / 1000)}s baad retry. Batch force-stop nahi hoga.`);
+        try { bot.stop('retry-launch'); } catch {}
+        await sleepMs(waitMs);
+        continue;
+      }
     }
     if (code === 409) {
       console.error('❌ Telegram 409 Conflict — isi BOT_TOKEN se bot ki DOOSRI copy pehle se chal rahi hai.');

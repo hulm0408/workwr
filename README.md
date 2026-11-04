@@ -81,8 +81,12 @@ bot ke andar hi hota hai:
 Batch is mode me ye simple one-shot flow karta hai: pehle lane ki
 proxy/direct route aur WAF token ready → Hermes ki **sabse latest
 button-screen** par **NEW NUMBER ho to NEW NUMBER, warna FIND NUMBER**
-(purani Hermes screens ke stale buttons kabhi click nahi hote) → mile
-hue number par Swiggy OTP → **REFRESH** karte hue default **20 second**
+(purani Hermes screens ke stale buttons kabhi click nahi hote) → click ke
+baad **sirf sabse last me aayi number-card** par Swiggy OTP. Click se pehli
+wali card baseline me chhoot bhi jaye to woh fresh nahi mani jayegi; latest
+card excluded ho to usse purani card fallback me try nahi hogi — bot usi
+latest card par NEW karega ya naye jawab ka wait karega. Phir **REFRESH**
+karte hue default **20 second**
 wait (⚙️ Settings me 20/30/45/60/90s presets; env
 `TELEGRAM_OTP_TIMEOUT_MS`) → OTP mile to ek hi verification round me
 verify/register/delete/fresh process. OTP send, miss, verify ya delete-OTP
@@ -252,7 +256,14 @@ Sab `data/db.json` me save hota hai — restart ke baad bhi yaad rehta hai.
   alag-alag dikhte hain.
 - Har fresh session ka JSON usi waqt chat me `.json` file ki surat me jata hai.
   Telegram/document send fail ho to bot 3 baar retry karta hai; phir bhi na jaye
-  to poora JSON code-block hissoun me bhej deta hai.
+  to poora JSON code-block hissoun me bhej deta hai. Caption me bachi hui
+  session life bhi dikhti hai.
+- **JSON 2–3 ghante me purana kyun lagta tha:** web/DAPI OTP login ka JWT
+  `tid` short-life ho sakta hai. Ab fresh JSON save/export hone se pehle bot
+  usi authenticated session ko Android `chkout` se rotate karne ki koshish
+  karta hai aur sirf isi customer ka non-guest, zyada-life wala JWT accept
+  karta hai. Export me `_session_tid`, `jwtTid`, `tidExpiresAt` aur
+  `sessionLongLived` bhi rehte hain, taaki asal life chhupi na rahe.
 - **⏳ 7-day extracted-number cooldown:** jis number ka fresh session ek
   baar extract/send ho jaye, woh number **7 din se pehle dobara process
   nahi hota** — na hot-queue se, na purani retry-later entry se, na next
@@ -261,8 +272,16 @@ Sab `data/db.json` me save hota hai — restart ke baad bhi yaad rehta hai.
   ke baad bhi ye rok barqarar rehti hai. Ledger kisi wajah se missing ho
   to saved account/session ke `savedAt` se bhi wahi 7 din ginay jate hain.
   7 din guzarne ke baad hi number dobara eligible hota hai.
-- Purane saved session ko dobara lena ho to owner command:
-  `/session 9876543210` ya `/session acc_9876543210`.
+- Purane saved session ka latest JSON lena ho to owner command:
+  `/session 9876543210` ya `/session acc_9876543210`. JWT short/expired ho
+  to ye command pehle **usi saved account ko bina naya OTP liye refresh**
+  karne ki koshish karti hai (Android chkout; JWT mar gaya ho lekin
+  `_session_tid` zinda ho to DAPI fallback), naya token DB me save karti hai,
+  phir updated JSON bhejti hai. Isliye dusra tool 2–3 ghante baad JSON
+  maange to naya account turant mat banao — pehle `/session <number>` se
+  refreshed JSON lo. Agar Swiggy ne session asal me revoke/expire kar diya
+  ho, bot saaf batayega aur purana saved JSON bhejega; us haalat me naya OTP
+  login hi asal ilaaj hai.
 
 ## ⚡ Parallel lanes — 10 numbers, 10 alag IPs, ek saath
 

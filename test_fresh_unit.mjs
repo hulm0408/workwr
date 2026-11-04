@@ -1448,6 +1448,7 @@ console.log('fresh JSON chat me turant bhejna (export + engine notify):');
 {
   const store = await import('./store.js');
   const engine = await import('./autopilot-engine.js');
+  const bridge = await import('./swiggy-bridge.js');
 
   // Bridge ke diye exportJson ko waisi ka waisa tarjeeh
   const bridgeJson = { account: 'AK1', name: 'Naya', phone: '9812345670', token: 'TOK', cookies: 'x=y' };
@@ -1486,6 +1487,139 @@ console.log('fresh JSON chat me turant bhejna (export + engine notify):');
   const rej = engine.notifyFreshSession({ sendSession: async () => { throw new Error('tg 500'); } }, {});
   ok(rej === true, 'async reject fire-and-forget (batch nahi rukta)');
   await new Promise((r) => setTimeout(r, 10)); // unhandledRejection hota to yahin crash hota
+
+  // JSON har 2–3 ghante me dobara isliye maangna padta tha kyunki web
+  // login ka JWT short-life hota hai. Export se pehle / /session par
+  // Android chkout se lambi-life JWT rotate hogi; guest ya dusre
+  // customer ka JWT kabhi accept nahi hoga.
+  const jwtNowMs = Date.parse('2026-11-04T00:00:00.000Z');
+  const jwtNowSec = Math.floor(jwtNowMs / 1000);
+  const b64url = (value) => Buffer.from(JSON.stringify(value)).toString('base64url');
+  const makeJwt = ({ user = '123456', iat = jwtNowSec, exp }) => [
+    b64url({ alg: 'none', typ: 'JWT' }),
+    b64url({ user_id: user, iat, exp }),
+    'sig',
+  ].join('.');
+  const shortJwt = makeJwt({ exp: jwtNowSec + 2 * 60 * 60 });
+  const longJwt = makeJwt({ exp: jwtNowSec + 30 * 24 * 60 * 60 });
+  const guestJwt = makeJwt({ user: '0', exp: jwtNowSec + 30 * 24 * 60 * 60 });
+  const expiredJwt = makeJwt({ iat: jwtNowSec - 3 * 60 * 60, exp: jwtNowSec - 10 * 60 });
+  const dapiJwt = makeJwt({ exp: jwtNowSec + 3 * 60 * 60 });
+  const jsonResponse = (data, status = 200) => ({
+    status,
+    ok: status >= 200 && status < 300,
+    headers: new Headers(),
+    text: async () => JSON.stringify(data),
+    json: async () => data,
+  });
+
+  const shortInfo = bridge.getSwiggyJwtSessionInfo(shortJwt, jwtNowMs);
+  const longInfo = bridge.getSwiggyJwtSessionInfo(longJwt, jwtNowMs);
+  ok(shortInfo.customerId === '123456' && shortInfo.isShortLived && shortInfo.remainingMs === 2 * 60 * 60 * 1000,
+    'session life: 2-hour web JWT short-lived pehchana jata hai');
+  ok(longInfo.isLongLived && longInfo.remainingMs === 30 * 24 * 60 * 60 * 1000,
+    'session life: 30-day Android JWT long-lived pehchana jata hai');
+
+  const baseCreds = {
+    phone: '9812345670',
+    customerId: '123456',
+    tid: shortJwt,
+    token: 'TOKEN9',
+    sid: 'SID9',
+    deviceId: 'DEV9',
+    _session_tid: 'SESSION-TID-9',
+    cookies: `tid=${shortJwt}; _session_tid=SESSION-TID-9; token=TOKEN9; _sid=SID9; _device_id=DEV9; _is_logged_in=1`,
+  };
+  const rotated = await bridge.refreshSwiggySessionCredentials(baseCreds, {
+    nowMs: jwtNowMs,
+    allowDapiFallback: false,
+    fetchImpl: async (url) => {
+      ok(String(url).includes('chkout.swiggy.com'), 'session refresh: Android chkout rotation endpoint use hota hai');
+      return jsonResponse({ statusCode: 0, tid: longJwt, sid: 'SIDLONG', deviceId: 'DEVLONG' });
+    },
+  });
+  ok(rotated.ok && rotated.refreshed && rotated.tid === longJwt && rotated.longLived,
+    'session refresh: short web JWT export se pehle 30-day JWT se rotate hota hai');
+  ok(rotated.cookies.includes(`tid=${longJwt}`) && rotated.cookies.includes('_session_tid=SESSION-TID-9'),
+    'session refresh: rotated JWT cookies me bhi save hota hai, _session_tid gayab nahi hota');
+  const aliasRotated = await bridge.refreshSwiggySessionCredentials({
+    ...baseCreds,
+    token: shortJwt,
+    cookies: `tid=${shortJwt}; _session_tid=SESSION-TID-9; token=${shortJwt}; _sid=SID9; _device_id=DEV9; _is_logged_in=1`,
+  }, {
+    nowMs: jwtNowMs,
+    allowDapiFallback: false,
+    fetchImpl: async () => jsonResponse({ statusCode: 0, tid: longJwt }),
+  });
+  ok(aliasRotated.token === longJwt && aliasRotated.cookies.includes(`token=${longJwt}`),
+    'session refresh: token agar purane short JWT ki copy ho to woh bhi long JWT se badalta hai');
+
+  const guestRejected = await bridge.refreshSwiggySessionCredentials(baseCreds, {
+    nowMs: jwtNowMs,
+    allowDapiFallback: false,
+    fetchImpl: async () => jsonResponse({ statusCode: 0, tid: guestJwt }),
+  });
+  ok(guestRejected.tid === shortJwt && !guestRejected.refreshed,
+    'session refresh: guest JWT ko long session kehkar accept nahi karta');
+
+  let chkoutCalls = 0;
+  const expiredRecovered = await bridge.refreshSwiggySessionCredentials({
+    ...baseCreds,
+    tid: expiredJwt,
+    cookies: `tid=${expiredJwt}; _session_tid=SESSION-TID-9; token=TOKEN9; _sid=SID9; _device_id=DEV9; _is_logged_in=1`,
+  }, {
+    nowMs: jwtNowMs,
+    fetchImpl: async (url) => {
+      const u = String(url);
+      if (u.includes('chkout.swiggy.com')) {
+        chkoutCalls++;
+        return chkoutCalls === 1
+          ? jsonResponse({ statusCode: 999, statusMessage: 'expired' })
+          : jsonResponse({ statusCode: 0, tid: longJwt, sid: 'SIDLONG', deviceId: 'DEVLONG' });
+      }
+      if (u.includes('/dapi/profile/info')) {
+        return jsonResponse({
+          statusCode: 0,
+          tid: dapiJwt,
+          sid: 'SIDDAPI',
+          deviceId: 'DEVDAPI',
+          data: { customer_id: '123456', token: 'TOKEN-DAPI' },
+        });
+      }
+      return jsonResponse({ statusCode: 1, statusMessage: 'unexpected test URL' }, 404);
+    },
+  });
+  ok(expiredRecovered.ok && expiredRecovered.tid === longJwt && chkoutCalls === 2,
+    'session refresh: expired JWT + zinda _session_tid se bina naya OTP liye session refresh hota hai');
+
+  store.updateAccount('TEST_LONG_SESSION', {
+    name: 'Long Session Test',
+    phone: '9812345670',
+    customerId: '123456',
+    _session_tid: 'SESSION-TID-9',
+    token: 'TOKEN9',
+    tid: shortJwt,
+    sid: 'SID9',
+    deviceId: 'DEV9',
+    cookies: baseCreds.cookies,
+    isLoggedIn: true,
+    savedAt: '2026-11-04T00:00:00.000Z',
+  });
+  const savedRefresh = await bridge.refreshSavedSwiggySession('TEST_LONG_SESSION', {
+    nowMs: jwtNowMs,
+    allowDapiFallback: false,
+    fetchImpl: async () => jsonResponse({ statusCode: 0, tid: longJwt, sid: 'SIDLONG', deviceId: 'DEVLONG' }),
+  });
+  const persistedLong = store.getDb()?.config?.accounts?.TEST_LONG_SESSION;
+  const longExport = store.getSessionExportJson('TEST_LONG_SESSION', null);
+  ok(savedRefresh.ok && persistedLong?.tid === longJwt && persistedLong?.jwtTid === longJwt
+    && persistedLong?._session_tid === 'SESSION-TID-9' && persistedLong?.sessionLongLived === true,
+    'saved session refresh: rotated 30-day JWT DB me persist hota hai');
+  ok(longExport?.tid === longJwt && longExport?.jwtTid === longJwt
+    && longExport?._session_tid === 'SESSION-TID-9'
+    && longExport?.tidExpiresAt === new Date(longInfo.expiresAtMs).toISOString()
+    && longExport?.sessionLongLived === true,
+    'saved session refresh: /session wala JSON updated long-life token ke saath banta hai');
 }
 
 // ---------------------------------------------------------------------------
@@ -1837,6 +1971,59 @@ console.log('telegram Hermes source + Add Telegram Account primitives:');
   ], { mode: 'refresh', phone: '9876543210' });
   ok(refreshMatchingLatest?.role === 'refresh' && refreshMatchingLatest.cardPhone === '9876543210',
     'REFRESH sirf latest matching number card par click hota hai');
+
+  // FIND/NEW ke baad jo SABSE LAST number aaye wahi try hoga. Click se
+  // pehle wala card baseline me chhoot bhi jaye, tab bhi woh fresh nahi
+  // mana jayega; latest excluded ho to usse purana number fallback nahi.
+  const oldCardText = 'YOUR NUMBER: +91 91234 56780\nSTATUS: ACTIVE\nDEVICE: OLD-1';
+  const newCardText = 'YOUR NUMBER: +91 99887 76655\nSTATUS: ACTIVE\nDEVICE: NEW-1';
+  const freshAfterFind = tg._selectLatestFreshHermesNumberCard([
+    { id: 103, text: 'Hermes notice' },
+    { id: 102, text: newCardText },
+    { id: 99, text: oldCardText },
+  ], { afterMessageId: 100, afterSignature: '100|0|WELCOME TO Hermes' });
+  ok(freshAfterFind.status === 'fresh' && freshAfterFind.result?.card?.phone === '9988776655',
+    'FIND ke baad sabse last aaya number hi fresh mana jata hai');
+  const previousOnlyAfterFind = tg._selectLatestFreshHermesNumberCard([
+    { id: 99, text: oldCardText },
+  ], { afterMessageId: 100, afterSignature: '100|0|WELCOME TO Hermes' });
+  ok(previousOnlyAfterFind.status === 'before-click-latest' && previousOnlyAfterFind.result?.card?.phone === '9123456780',
+    'FIND click se pehle wala number baseline miss par bhi try nahi hota');
+  const baselineLatestCard = tg._selectLatestFreshHermesNumberCard([
+    { id: 102, text: newCardText },
+  ], {
+    baselineSignatures: new Set([`102|0|${newCardText}`]),
+    afterMessageId: 100,
+  });
+  ok(baselineLatestCard.status === 'baseline-latest',
+    'click se pehle baseline me li gayi latest card dobara fresh nahi banti');
+  const excludedLatestCard = tg._selectLatestFreshHermesNumberCard([
+    { id: 102, text: newCardText },
+    { id: 99, text: oldCardText },
+  ], {
+    afterMessageId: 100,
+    excludePhones: new Set(['9988776655']),
+  });
+  ok(excludedLatestCard.status === 'excluded-latest' && excludedLatestCard.result?.card?.phone === '9988776655',
+    'latest card excluded ho to usse pehla purana number fallback me try nahi hota');
+  const editedClickedCard = tg._selectLatestFreshHermesNumberCard([
+    { id: 100, text: newCardText },
+  ], {
+    afterMessageId: 100,
+    afterSignature: `100|0|${oldCardText}`,
+    afterPhone: '9123456780',
+  });
+  ok(editedClickedCard.status === 'fresh' && editedClickedCard.result?.card?.phone === '9988776655',
+    'clicked card edit hokar naya number bane to wahi latest fresh mana jata hai');
+  const editedSamePhoneCard = tg._selectLatestFreshHermesNumberCard([
+    { id: 100, text: `${oldCardText}\nLAST SMS: [AD-SWIGGY] OTP: 111111` },
+  ], {
+    afterMessageId: 100,
+    afterSignature: `100|0|${oldCardText}`,
+    afterPhone: '9123456780',
+  });
+  ok(editedSamePhoneCard.status === 'baseline-latest',
+    'clicked card par sirf SMS edit ho aur phone wahi ho to use naya number nahi mana jata');
 
   ok(tg.normalizeTelegramLoginPhone('98765 43210') === '+919876543210', 'in-bot login: Indian 10-digit → +91');
   ok(tg.normalizeTelegramLoginPhone('+1 202 555 0101') === '+12025550101', 'in-bot login: country-code phone preserved');

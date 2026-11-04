@@ -60,7 +60,12 @@ const telegramOtp = await import('./telegram-otp-source.js');
 const sources = await import('./firebase-sources.js');
 const bs = await import('./bot-settings.js');
 const proxyPool = await import('./proxy-pool.js');
-const { getChromeStatus } = await import('./swiggy-bridge.js');
+const {
+  getChromeStatus,
+  getSwiggyAccountJwtSessionInfo,
+  refreshSavedSwiggySession,
+  SWIGGY_LONG_SESSION_MIN_MS,
+} = await import('./swiggy-bridge.js');
 const wafPool = await import('./waf-pool.js');
 const { esc, section, sub, field, mono, statusCard } = await import('./rich-text.js');
 const { createServer } = await import('node:http');
@@ -625,16 +630,43 @@ function splitJsonForTelegram(jsonText, maxEscapedLength = 2400) {
   return chunks.length ? chunks : [''];
 }
 
+function formatSessionRemaining(ms) {
+  const value = Number(ms);
+  if (!Number.isFinite(value)) return '';
+  if (value <= 0) return 'EXPIRED';
+  const minutes = Math.max(1, Math.round(value / 60_000));
+  if (minutes < 60) return `~${minutes}m`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 48) return `~${hours}h`;
+  return `~${Math.round(hours / 24)}d`;
+}
+
+function sessionLifeLine(exportData = {}) {
+  try {
+    const info = getSwiggyAccountJwtSessionInfo(exportData);
+    if (info.expiresAtMs) {
+      const left = formatSessionRemaining(info.remainingMs);
+      return info.remainingMs >= SWIGGY_LONG_SESSION_MIN_MS
+        ? `⏳ Session: ${mono(`${left} LEFT`)}`
+        : `⚠️ Short session: ${mono(`${left} LEFT`)} — /session par refresh hoga`;
+    }
+    if (info.hasSessionTid) return `⏳ Session: ${mono('WEB SESSION SAVED')}`;
+  } catch {}
+  return '';
+}
+
 // Fresh JSON ki asal delivery — Autopilot ke instant send aur owner ke
 // /session resend command dono yahi use karte hain. Document 3 baar try;
 // phir bhi fail ho to poora JSON code-block hissoun me.
-async function deliverSessionJson(chatId, { phone, accountKey, kind, account } = {}) {
+async function deliverSessionJson(chatId, { phone, accountKey, kind, account, note = '' } = {}) {
   if (!chatId) return false;
   const typeText = kind === 'fresh_after_delete'
     ? '♻️ Delete + Fresh'
-    : kind === 'resend'
-      ? '↩️ Dobara Bheja'
-      : '🆕 Naya Fresh';
+    : kind === 'resend_refreshed'
+      ? '♻️ Session Refresh'
+      : kind === 'resend'
+        ? '↩️ Dobara Bheja'
+        : '🆕 Naya Fresh';
   const baseCaption = [
     `✅ <b>Fresh Session Ready</b> — ${typeText}`,
     `📱 ${mono(phone || '')} · 👤 ${mono(accountKey || '')}`,
@@ -652,7 +684,12 @@ async function deliverSessionJson(chatId, { phone, accountKey, kind, account } =
     : exportData.remoteAddressStatus
       ? `🏠 Address: ${mono('NOT ADDED')} — wajah JSON me hai`
       : '';
-  const caption = [baseCaption, addressLine].filter(Boolean).join('\n');
+  const caption = [
+    baseCaption,
+    sessionLifeLine(exportData),
+    addressLine,
+    note ? esc(String(note).slice(0, 220)) : '',
+  ].filter(Boolean).join('\n');
 
   const jsonText = JSON.stringify(exportData, null, 2);
   const filename = `${phone || accountKey || 'session'}.json`;
@@ -780,7 +817,7 @@ bot.start(async (ctx) => {
   await ctx.reply(startCard(), kb(isAutopilotRunning() ? stopRows() : startRows())).catch(() => {});
 });
 
-bot.help((ctx) => ctx.reply('/start — menu · /status — current batch · /diag — kya toota hai, check karo · /session <number> — saved fresh JSON dobara bhejo', { parse_mode: 'HTML' }).catch(() => {}));
+bot.help((ctx) => ctx.reply('/start — menu · /status — current batch · /diag — kya toota hai, check karo · /session <number> — saved session refresh karke latest JSON bhejo', { parse_mode: 'HTML' }).catch(() => {}));
 
 // ---------------------------------------------------------------------------
 // 🩺 /diag — "bot work nahi kar raha" ka jawab ek tap me.
@@ -929,8 +966,12 @@ bot.command('status', async (ctx) => {
     kb(snap.running ? stopRows() : idleRows())).catch(() => {});
 });
 
-// Kisi fresh session ka JSON pehli baar send fail ho jaye to owner usi ko
-// dobara manga sakta hai: /session 9876543210  ya  /session acc_9876543210
+// Owner saved session ka latest JSON manga sakta hai:
+// /session 9876543210  ya  /session acc_9876543210
+// Short/expired JWT par pehle wahi saved account bina naya OTP liye
+// Android chkout / web _session_tid se refresh hota hai; phir updated
+// JSON bhejta hai. Isiliye 2–3 ghante baad naya number/account banane ki
+// zaroorat nahi — pehle /session se refreshed JSON lo.
 bot.command('session', async (ctx) => {
   if (!isOwner(ctx.from?.id)) return;
   const query = String(ctx.message?.text || '').trim().split(/\s+/)[1] || '';
@@ -956,13 +997,46 @@ bot.command('session', async (ctx) => {
   }
 
   const phone = String(account.phone || account.mobile || phone10 || '').replace(/\D/g, '').slice(-10);
+  let liveAccount = account;
+  let deliveryKind = 'resend';
+  let deliveryNote = '';
+  try {
+    const info = getSwiggyAccountJwtSessionInfo(account);
+    const needsRefresh = Boolean(
+      !info.expiresAtMs
+      || info.isExpired
+      || info.remainingMs < SWIGGY_LONG_SESSION_MIN_MS
+    );
+    if (needsRefresh && isAutopilotRunning()) {
+      deliveryNote = 'Batch chal raha hai — saved JSON bheja. Batch rukne ke baad /session dobara chalane par refresh hoga.';
+    } else if (needsRefresh) {
+      await ctx.reply('♻️ Saved Swiggy session refresh karke latest JSON bhej raha hoon…', { parse_mode: 'HTML' }).catch(() => {});
+      const refreshed = await refreshSavedSwiggySession(accountKey, { timeoutMs: 5_000 });
+      if (refreshed?.ok) {
+        liveAccount = getDb()?.config?.accounts?.[accountKey] || refreshed.account || account;
+        deliveryKind = 'resend_refreshed';
+        deliveryNote = refreshed.longLived
+          ? 'Session refresh ho gaya — ye updated JSON use karo.'
+          : 'Session rotate ho gaya, lekin Swiggy ne is baar bhi short-life token diya. Expire par /session se phir refresh hoga.';
+      } else {
+        deliveryNote = refreshed?.authRejected
+          ? 'Refresh fail: Swiggy ne saved session expired/revoked mana. Purana saved JSON bhej raha hoon; asal zinda session ke liye naya OTP login lagega.'
+          : 'Refresh abhi fail hua — saved purana JSON bhej raha hoon.';
+      }
+    }
+  } catch (e) {
+    console.warn('[FreshBot] /session refresh:', e?.message || e);
+    deliveryNote = 'Refresh fail hua — saved purana JSON bhej raha hoon.';
+  }
+
   const delivered = await deliverSessionJson(ctx.chat?.id, {
     phone,
     accountKey,
-    kind: 'resend',
-    account,
+    kind: deliveryKind,
+    account: liveAccount,
+    note: deliveryNote,
   });
-  if (!delivered && getSessionExportJson(accountKey, account)) {
+  if (!delivered && getSessionExportJson(accountKey, liveAccount)) {
     await ctx.reply('⚠️ JSON phir bhi poora send nahi ho paya — thodi der baad /session dobara try karo.', { parse_mode: 'HTML' }).catch(() => {});
   }
 });

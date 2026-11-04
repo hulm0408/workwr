@@ -406,6 +406,573 @@ export function decodeJwtPayload(jwtToken) {
   }
 }
 
+// Web/DAPI OTP login aksar short-life JWT `tid` deta hai — isiliye exported
+// JSON 2–3 ghante me purana lagne lagta hai aur dusra tool dobara JSON
+// maangta hai. Android `chkout` wahi authenticated token ko rotate karke
+// aam taur par lambi-life wala JWT deta hai. Is block ka kaam hai:
+//   1) JWT ki asal bachi hui life pehchano;
+//   2) export/save se pehle short JWT ko rotate karne ki koshish karo;
+//   3) saved JSON ko bina naya OTP liye refresh karo jab tak Swiggy ke
+//      paas purana token/_session_tid zinda hai.
+// Guest JWT, dusre customer ka JWT, ya pehle-se-expired JWT kabhi accept
+// nahi hoga — galat token chipka kar "long session" ka jhootha daava nahi.
+export const SWIGGY_LONG_SESSION_MIN_MS = 7 * 24 * 60 * 60 * 1000;
+
+export function getSwiggyJwtSessionInfo(tid, nowMs = Date.now()) {
+  const token = String(tid || '').trim();
+  const isJwt = token.includes('.');
+  const claims = isJwt ? decodeJwtPayload(token) : null;
+  const customerRaw = String(
+    claims?.user_id ?? claims?.userId ?? claims?.customer_id ?? claims?.customerId ?? claims?.sub ?? ''
+  ).trim();
+  const customerId = /^\d+$/.test(customerRaw) && customerRaw !== '0' ? customerRaw : '';
+  const issuedAtMs = Number(claims?.iat) > 0 ? Number(claims.iat) * 1000 : null;
+  const expiresAtMs = Number(claims?.exp) > 0 ? Number(claims.exp) * 1000 : null;
+  const remainingMs = expiresAtMs ? expiresAtMs - (Number(nowMs) || Date.now()) : null;
+  const lifetimeMs = issuedAtMs && expiresAtMs ? expiresAtMs - issuedAtMs : null;
+  return {
+    tid: isJwt ? token : '',
+    claims,
+    customerId,
+    isGuest: Boolean(isJwt && !customerId),
+    issuedAtMs,
+    expiresAtMs,
+    remainingMs,
+    lifetimeMs,
+    isExpired: Boolean(remainingMs !== null && remainingMs <= 0),
+    isShortLived: Boolean(remainingMs !== null && remainingMs < SWIGGY_LONG_SESSION_MIN_MS),
+    isLongLived: Boolean(remainingMs !== null && remainingMs >= SWIGGY_LONG_SESSION_MIN_MS),
+  };
+}
+
+function swiggyJwtCandidate(tid, source, { nowMs = Date.now(), expectedCustomerId = '' } = {}) {
+  const info = getSwiggyJwtSessionInfo(tid, nowMs);
+  if (!info.tid) return null;
+  const expected = /^\d+$/.test(String(expectedCustomerId || '')) ? String(expectedCustomerId) : '';
+  return {
+    tid: info.tid,
+    source,
+    info,
+    customerId: info.customerId,
+    expiresAtMs: info.expiresAtMs,
+    remainingMs: info.remainingMs,
+    valid: Boolean(
+      info.customerId
+      && !info.isGuest
+      && !info.isExpired
+      && (!expected || info.customerId === expected)
+    ),
+  };
+}
+
+function chooseBestSwiggyJwtCandidate(candidates = []) {
+  return (Array.isArray(candidates) ? candidates : [])
+    .filter((candidate) => candidate?.valid)
+    .sort((a, b) => (Number(b.expiresAtMs) || -1) - (Number(a.expiresAtMs) || -1))[0] || null;
+}
+
+function swiggyCookieMapFromCredentials(input = {}) {
+  if (input?.cookieMap instanceof Map) {
+    return new Map([...input.cookieMap.entries()].map(([k, v]) => [String(k), String(v)]));
+  }
+  const map = new Map();
+  const raw = typeof input === 'string'
+    ? input
+    : (input?.cookies ?? input?.cookie ?? input?.cookieString ?? input?.headers?.cookie ?? input?.headers?.Cookie ?? '');
+  if (Array.isArray(raw)) {
+    for (const cookie of raw) {
+      const name = String(cookie?.name || cookie?.key || '').trim();
+      const value = String(cookie?.value ?? '').trim();
+      if (name && value) map.set(name, value);
+    }
+  } else if (raw && typeof raw === 'object') {
+    for (const [name, value] of Object.entries(raw)) {
+      if (name && value !== undefined && value !== null && String(value) !== '') map.set(String(name), String(value));
+    }
+  } else {
+    for (const part of String(raw || '').split(';')) {
+      const trimmed = part.trim();
+      const eq = trimmed.indexOf('=');
+      if (eq <= 0) continue;
+      const name = trimmed.slice(0, eq).trim();
+      const value = trimmed.slice(eq + 1).trim();
+      if (name && value) map.set(name, value);
+    }
+  }
+  return map;
+}
+
+function normalizeSwiggySessionCredentials(input = {}, { nowMs = Date.now() } = {}) {
+  const source = typeof input === 'string'
+    ? { cookies: input }
+    : (input && typeof input === 'object' ? input : {});
+  const cookieMap = swiggyCookieMapFromCredentials(source);
+  const getCookie = (name) => String(cookieMap.get(name) || '').trim();
+  const explicitCustomerRaw = String(
+    source.customerId || source.customerid || source.customer_id || source.userId || source.user_id || ''
+  ).trim();
+  const explicitCustomerId = /^\d+$/.test(explicitCustomerRaw) && explicitCustomerRaw !== '0'
+    ? explicitCustomerRaw
+    : '';
+
+  const jwtValues = [...new Set([
+    source.jwtTid,
+    source.jwt_tid,
+    source.tid,
+    getCookie('tid'),
+  ].map((value) => String(value || '').trim()).filter((value) => value.includes('.')))];
+  const bestJwt = chooseBestSwiggyJwtCandidate(
+    jwtValues.map((value) => swiggyJwtCandidate(value, 'saved', { nowMs, expectedCustomerId: explicitCustomerId }))
+  );
+  const tid = bestJwt?.tid || jwtValues[0] || '';
+  const jwtInfo = getSwiggyJwtSessionInfo(tid, nowMs);
+  const customerId = explicitCustomerId || jwtInfo.customerId || '';
+
+  let sessionTid = String(
+    source._session_tid || source.session_tid || source.sessionTid || getCookie('_session_tid') || ''
+  ).trim();
+  if (!sessionTid && source.tid && !String(source.tid).includes('.')) sessionTid = String(source.tid).trim();
+
+  const token = String(
+    source.token || source.auth_token || source.authToken || source.access_token || source.accessToken || getCookie('token') || ''
+  ).trim();
+  const sid = String(source.sid || source._sid || getCookie('_sid') || getCookie('sid') || '').trim();
+  const deviceId = String(
+    source.deviceId || source.device_id || source._device_id || source.swuid || source._swuid
+    || getCookie('_device_id') || getCookie('_swuid') || source.deviceProfile?.deviceId || ''
+  ).trim();
+  const phone = normalizeIndianMobileNumber(source.phone || source.mobile || '') || '';
+
+  if (sessionTid) cookieMap.set('_session_tid', sessionTid);
+  if (tid) cookieMap.set('tid', tid);
+  if (token) cookieMap.set('token', token);
+  if (sid) cookieMap.set('_sid', sid);
+  if (deviceId) {
+    cookieMap.set('_device_id', deviceId);
+    if (!cookieMap.has('swuid')) cookieMap.set('swuid', deviceId);
+  }
+  if (sessionTid || tid || token) cookieMap.set('_is_logged_in', '1');
+
+  return {
+    phone,
+    customerId,
+    tid,
+    jwtTid: tid,
+    _session_tid: sessionTid,
+    token,
+    sid,
+    deviceId,
+    cookieMap,
+    cookies: serializeCookieMap(cookieMap),
+    deviceProfile: source.deviceProfile || null,
+  };
+}
+
+export function getSwiggyAccountJwtSessionInfo(account = {}, nowMs = Date.now()) {
+  const credentials = normalizeSwiggySessionCredentials(account, { nowMs });
+  return {
+    ...getSwiggyJwtSessionInfo(credentials.tid, nowMs),
+    _session_tid: credentials._session_tid,
+    hasSessionTid: Boolean(credentials._session_tid),
+    hasToken: Boolean(credentials.token),
+  };
+}
+
+async function readSwiggyJsonResponse(res) {
+  if (!res) return { json: null, rawText: '' };
+  if (typeof res.text === 'function') {
+    const rawText = await res.text().catch(() => '');
+    if (rawText) {
+      try { return { json: JSON.parse(rawText), rawText }; } catch { return { json: null, rawText }; }
+    }
+  }
+  if (typeof res.json === 'function') {
+    return { json: await res.json().catch(() => null), rawText: '' };
+  }
+  return { json: null, rawText: '' };
+}
+
+async function requestSwiggyAndroidChkoutTid(credentials, {
+  fetchImpl,
+  timeoutMs = 5_000,
+  nowMs = Date.now(),
+} = {}) {
+  if (!credentials?.tid && !credentials?.token) {
+    return { ok: false, source: 'android-chkout', reason: 'tid/token missing' };
+  }
+  try {
+    const res = await fetchImpl('https://chkout.swiggy.com/api/v2/cart/client', {
+      method: 'GET',
+      headers: {
+        'User-Agent': 'Swiggy-Android',
+        'app-version': '4.67.0',
+        'version-code': '1365',
+        'os-version': String(credentials.deviceProfile?.osVersion || '14'),
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+        'platform': 'swiggy-android',
+        'agent-type': 'Swiggy-Android',
+        'analyticsPlatform': 'an',
+        ...(credentials.tid ? { tid: credentials.tid } : {}),
+        ...(credentials.token ? { token: credentials.token } : {}),
+        ...(credentials.sid ? { sid: credentials.sid } : {}),
+        ...(credentials.deviceId ? { deviceId: credentials.deviceId, swuid: credentials.deviceId } : {}),
+        ...(credentials.customerId ? {
+          userid: credentials.customerId,
+          'user-id': credentials.customerId,
+          customer_id: credentials.customerId,
+        } : {}),
+      },
+      signal: AbortSignal.timeout(Math.max(1_000, Number(timeoutMs) || 5_000)),
+    });
+    const { json } = await readSwiggyJsonResponse(res);
+    const statusCode = json?.statusCode !== undefined && json?.statusCode !== null
+      ? Number(json.statusCode)
+      : null;
+    const candidate = swiggyJwtCandidate(json?.tid, 'android-chkout', {
+      nowMs,
+      expectedCustomerId: credentials.customerId,
+    });
+    const ok = Boolean(candidate?.valid && (statusCode === 0 || statusCode === null));
+    return {
+      ok,
+      source: 'android-chkout',
+      candidate: ok ? candidate : null,
+      httpStatus: Number(res?.status) || 0,
+      statusCode,
+      statusMessage: String(json?.statusMessage || json?.message || ''),
+      sid: json?.sid ? String(json.sid) : '',
+      deviceId: json?.deviceId ? String(json.deviceId) : '',
+      authRejected: statusCode === 999 || statusCode === 401 || Number(res?.status) === 401,
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      source: 'android-chkout',
+      reason: String(error?.message || error).slice(0, 160),
+    };
+  }
+}
+
+async function requestSwiggyDapiSessionRefresh(credentials, {
+  fetchImpl,
+  timeoutMs = 5_000,
+  nowMs = Date.now(),
+} = {}) {
+  const cookieMap = new Map(credentials?.cookieMap || []);
+  if (credentials?._session_tid) cookieMap.set('_session_tid', credentials._session_tid);
+  if (credentials?.tid) cookieMap.set('tid', credentials.tid);
+  if (credentials?.token) cookieMap.set('token', credentials.token);
+  if (credentials?.sid) cookieMap.set('_sid', credentials.sid);
+  if (credentials?.deviceId) cookieMap.set('_device_id', credentials.deviceId);
+
+  const updated = { ...credentials, cookieMap };
+  const sessionLike = {
+    phone: credentials?.phone || '',
+    cookieMap,
+    deviceProfile: credentials?.deviceProfile || buildAntiBotDeviceProfile(credentials?.phone || ''),
+    csrfToken: cookieMap.get('_csrf') || '',
+    transportMode: 'android',
+  };
+
+  let authRejected = false;
+  let last = {};
+  for (const endpoint of ['profile/info', 'order/all']) {
+    try {
+      const res = await fetchImpl(`https://www.swiggy.com/dapi/${endpoint}`, {
+        method: 'GET',
+        headers: buildAuthRequestHeaders(sessionLike, {
+          referer: 'https://www.swiggy.com/my-account',
+          useAndroidUa: true,
+          extra: {
+            ...(updated.token ? { token: updated.token } : {}),
+            ...(updated.deviceId ? { deviceId: updated.deviceId, swuid: updated.deviceId } : {}),
+          },
+        }),
+        signal: AbortSignal.timeout(Math.max(1_000, Number(timeoutMs) || 5_000)),
+      });
+      applySetCookiesToMap(cookieMap, getResponseSetCookies(res));
+      const { json } = await readSwiggyJsonResponse(res);
+      const statusCode = json?.statusCode !== undefined && json?.statusCode !== null
+        ? Number(json.statusCode)
+        : null;
+      last = {
+        source: `dapi-${endpoint}`,
+        httpStatus: Number(res?.status) || 0,
+        statusCode,
+        statusMessage: String(json?.statusMessage || json?.message || ''),
+      };
+      if (statusCode === 1 || statusCode === 999 || Number(res?.status) === 401) authRejected = true;
+      if (statusCode !== 0) continue;
+
+      const data = json?.data && typeof json.data === 'object' ? json.data : {};
+      const responseCustomerRaw = String(data.customer_id || data.customerId || data.user_id || data.id || '').trim();
+      const responseCustomerId = /^\d+$/.test(responseCustomerRaw) && responseCustomerRaw !== '0'
+        ? responseCustomerRaw
+        : '';
+      if (updated.customerId && responseCustomerId && updated.customerId !== responseCustomerId) continue;
+
+      const candidate = swiggyJwtCandidate(json?.tid, `dapi-${endpoint}`, {
+        nowMs,
+        expectedCustomerId: updated.customerId || responseCustomerId,
+      });
+      if (responseCustomerId) updated.customerId = responseCustomerId;
+      if (candidate?.valid) {
+        updated.tid = candidate.tid;
+        updated.jwtTid = candidate.tid;
+        cookieMap.set('tid', candidate.tid);
+        if (!updated.customerId) updated.customerId = candidate.customerId;
+      }
+      if (data.token) {
+        updated.token = String(data.token);
+        cookieMap.set('token', updated.token);
+      }
+      if (json?.sid) {
+        updated.sid = String(json.sid);
+        cookieMap.set('_sid', updated.sid);
+      }
+      if (json?.deviceId) {
+        updated.deviceId = String(json.deviceId);
+        cookieMap.set('_device_id', updated.deviceId);
+      }
+      updated._session_tid = String(cookieMap.get('_session_tid') || updated._session_tid || '');
+      updated.cookies = serializeCookieMap(cookieMap);
+      return {
+        ok: true,
+        authenticated: true,
+        source: `dapi-${endpoint}`,
+        candidate: candidate?.valid ? candidate : null,
+        credentials: updated,
+        ...last,
+      };
+    } catch (error) {
+      last = { source: `dapi-${endpoint}`, reason: String(error?.message || error).slice(0, 160) };
+    }
+  }
+
+  updated.cookies = serializeCookieMap(cookieMap);
+  return {
+    ok: false,
+    authenticated: false,
+    authRejected,
+    credentials: updated,
+    ...last,
+  };
+}
+
+export async function refreshSwiggySessionCredentials(input = {}, {
+  fetchImpl = null,
+  timeoutMs = 5_000,
+  force = false,
+  allowDapiFallback = true,
+  minRemainingMs = SWIGGY_LONG_SESSION_MIN_MS,
+  nowMs = Date.now(),
+} = {}) {
+  const doFetch = fetchImpl || fetchSwiggy;
+  const original = normalizeSwiggySessionCredentials(input, { nowMs });
+  let working = { ...original, cookieMap: new Map(original.cookieMap) };
+  const originalInfo = getSwiggyJwtSessionInfo(original.tid, nowMs);
+  const minRemaining = Math.max(0, Number(minRemainingMs) || SWIGGY_LONG_SESSION_MIN_MS);
+  const baseResult = () => {
+    const info = getSwiggyJwtSessionInfo(working.tid, nowMs);
+    working.cookies = cleanEssentialSwiggyCookies(serializeCookieMap(working.cookieMap), working);
+    return {
+      tid: working.tid || '',
+      jwtTid: working.tid || '',
+      _session_tid: working._session_tid || '',
+      token: working.token || '',
+      sid: working.sid || '',
+      deviceId: working.deviceId || '',
+      customerId: working.customerId || info.customerId || '',
+      cookies: working.cookies,
+      cookieMap: working.cookieMap,
+      expiresAtMs: info.expiresAtMs,
+      remainingMs: info.remainingMs,
+      longLived: Boolean(info.remainingMs !== null && info.remainingMs >= minRemaining),
+      info,
+    };
+  };
+
+  if (!force && originalInfo.remainingMs !== null && originalInfo.remainingMs >= minRemaining && originalInfo.customerId) {
+    return { ok: true, refreshed: false, attempts: [], ...baseResult() };
+  }
+  if (!original.tid && !original.token && !original._session_tid && !original.cookies) {
+    return { ok: false, refreshed: false, attempts: [], reason: 'session credentials missing', ...baseResult() };
+  }
+
+  const attempts = [];
+  const candidates = [];
+  const originalCandidate = swiggyJwtCandidate(original.tid, 'saved', {
+    nowMs,
+    expectedCustomerId: original.customerId,
+  });
+  if (originalCandidate) candidates.push(originalCandidate);
+  let authenticated = Boolean(originalCandidate?.valid);
+  let authRejected = false;
+
+  const runChkout = async () => {
+    const chkout = await requestSwiggyAndroidChkoutTid(working, { fetchImpl: doFetch, timeoutMs, nowMs });
+    attempts.push({
+      source: chkout.source,
+      ok: Boolean(chkout.ok),
+      httpStatus: chkout.httpStatus || 0,
+      statusCode: chkout.statusCode ?? null,
+    });
+    if (chkout.authRejected) authRejected = true;
+    if (chkout.candidate) {
+      candidates.push(chkout.candidate);
+      authenticated = true;
+      if (!working.customerId) working.customerId = chkout.candidate.customerId;
+    }
+    if (chkout.sid) {
+      working.sid = chkout.sid;
+      working.cookieMap.set('_sid', chkout.sid);
+    }
+    if (chkout.deviceId) {
+      working.deviceId = chkout.deviceId;
+      working.cookieMap.set('_device_id', chkout.deviceId);
+    }
+    return chkout;
+  };
+
+  if (working.tid || working.token) await runChkout();
+
+  // Chkout se valid JWT mil gaya ho to DAPI par extra round-trip nahi.
+  // DAPI fallback sirf tab hai jab JWT expire/invalid ho lekin web
+  // `_session_tid` abhi zinda ho — wahi purane saved JSON ko bina OTP ke
+  // dobara zinda kar sakta hai.
+  if (allowDapiFallback && !chooseBestSwiggyJwtCandidate(candidates) && (working._session_tid || working.cookies)) {
+    const dapi = await requestSwiggyDapiSessionRefresh(working, { fetchImpl: doFetch, timeoutMs, nowMs });
+    attempts.push({
+      source: dapi.source || 'dapi',
+      ok: Boolean(dapi.ok),
+      httpStatus: dapi.httpStatus || 0,
+      statusCode: dapi.statusCode ?? null,
+    });
+    if (dapi.authRejected) authRejected = true;
+    if (dapi.credentials) working = { ...working, ...dapi.credentials, cookieMap: dapi.credentials.cookieMap || working.cookieMap };
+    if (dapi.candidate) candidates.push(dapi.candidate);
+    if (dapi.authenticated) {
+      authenticated = true;
+      const bestAfterDapi = chooseBestSwiggyJwtCandidate(candidates);
+      const seedChanged = Boolean(
+        (working.tid && working.tid !== original.tid)
+        || (working.token && working.token !== original.token)
+      );
+      if (seedChanged && (!bestAfterDapi || (bestAfterDapi.remainingMs !== null && bestAfterDapi.remainingMs < minRemaining))) {
+        await runChkout();
+      }
+    }
+  }
+
+  const best = chooseBestSwiggyJwtCandidate(candidates);
+  if (best?.tid) {
+    working.tid = best.tid;
+    working.jwtTid = best.tid;
+    working.cookieMap.set('tid', best.tid);
+    // Kuch exports me `token` alag credential nahi, sirf purane JWT ki
+    // copy hoti hai. Rotation ke baad us copy ko short JWT par chhod diya
+    // to dusra tool phir wahi 2–3 ghante wala token use karega.
+    if (original.token && original.token === original.tid) working.token = best.tid;
+    if (!working.customerId) working.customerId = best.customerId;
+  }
+  if (working._session_tid) working.cookieMap.set('_session_tid', working._session_tid);
+  if (working.token) working.cookieMap.set('token', working.token);
+  if (working.sid) working.cookieMap.set('_sid', working.sid);
+  if (working.deviceId) working.cookieMap.set('_device_id', working.deviceId);
+
+  const result = baseResult();
+  const ok = Boolean(best?.valid || (authenticated && (working._session_tid || working.token)));
+  const refreshed = Boolean(ok && (
+    result.tid !== original.tid
+    || result._session_tid !== original._session_tid
+    || result.token !== original.token
+    || result.sid !== original.sid
+    || result.deviceId !== original.deviceId
+  ));
+  return {
+    ok,
+    refreshed,
+    authRejected: Boolean(authRejected && !ok),
+    attempts,
+    reason: ok ? '' : (authRejected ? 'Swiggy session expired/revoked' : 'Swiggy session refresh nahi ho paya'),
+    ...result,
+  };
+}
+
+export async function refreshSavedSwiggySession(accountKey, opts = {}) {
+  const key = String(accountKey || '').trim();
+  if (!key) return { ok: false, refreshed: false, reason: 'account key missing' };
+  try {
+    const { getDb } = await import('./store.js');
+    const db = getDb();
+    const account = db.config?.accounts?.[key] || null;
+    const phone = normalizeIndianMobileNumber(account?.phone || account?.mobile || key.replace(/^acc_/, '')) || '';
+    const vault = (phone && db.sessionVault?.[phone]) || db.sessionVault?.[key] || null;
+    const deleted = db.config?.deletedAccounts || {};
+    if (deleted[key] || (phone && (deleted[`acc_${phone}`] || deleted[phone]))) {
+      return { ok: false, refreshed: false, reason: 'account deleted hai' };
+    }
+
+    let source = account ? { ...(vault || {}), ...account } : (vault ? { ...vault } : null);
+    if (account && vault?.cookies && !String(account.cookies || '').includes('_session_tid=') && String(vault.cookies).includes('_session_tid=')) {
+      source = { ...source, cookies: vault.cookies };
+    }
+    if (!source) return { ok: false, refreshed: false, reason: 'saved session nahi mila' };
+    if (source.isLoggedOut || source.isLoggedIn === false) {
+      return { ok: false, refreshed: false, reason: 'saved session logged out hai' };
+    }
+
+    const result = await refreshSwiggySessionCredentials(source, opts);
+    if (!result.ok) return { ...result, accountKey: key, account };
+
+    const targetKey = account ? key : String(source.account || (phone ? `acc_${phone}` : key));
+    const shouldPersist = Boolean(
+      result.refreshed
+      || !source.tidExpiresAt
+      || String(source.jwtTid || '') !== String(result.tid || '')
+      || String(source._session_tid || '') !== String(result._session_tid || '')
+    );
+    let persisted = account;
+    if (shouldPersist) {
+      persisted = updateAccount(targetKey, {
+        ...(account ? {} : {
+          name: source.name || targetKey,
+          swiggyName: source.swiggyName || '',
+          ...(source.email ? { email: source.email } : {}),
+          ...(source.address ? { address: source.address } : {}),
+          ...(source.addressDetails ? { addressDetails: source.addressDetails } : {}),
+          ...(source.remoteAddressStatus ? { remoteAddressStatus: source.remoteAddressStatus } : {}),
+          ...(source.remoteAddressId ? { remoteAddressId: source.remoteAddressId } : {}),
+        }),
+        phone: phone || source.phone || source.mobile || '',
+        mobile: phone || source.mobile || source.phone || '',
+        customerId: result.customerId || source.customerId || '',
+        _session_tid: result._session_tid || source._session_tid || '',
+        jwtTid: result.tid || '',
+        tid: result.tid || source.tid || '',
+        token: result.token || source.token || result.tid || '',
+        sid: result.sid || source.sid || '',
+        deviceId: result.deviceId || source.deviceId || '',
+        cookies: result.cookies || source.cookies || '',
+        tidExpiresAt: result.expiresAtMs ? new Date(result.expiresAtMs).toISOString() : (source.tidExpiresAt || ''),
+        sessionLongLived: Boolean(result.longLived),
+        sessionRefreshedAt: new Date().toISOString(),
+        isLoggedIn: true,
+        sessionExpired: false,
+      });
+    }
+    return { ...result, accountKey: targetKey, account: persisted || account };
+  } catch (error) {
+    return {
+      ok: false,
+      refreshed: false,
+      accountKey: key,
+      reason: String(error?.message || error).slice(0, 180),
+    };
+  }
+}
+
 export function sanitizeSwiggyName(name) {
   if (!name) return 'Rahul Kumar';
   // Strip any previously appended "(User 1)" or "(6296591407)" tag first
@@ -4260,33 +4827,109 @@ async function finalizeAuthenticatedSwiggyAccount(userId, session, authResult, {
     };
   }
 
-  // Cookies address attempt ke BAAD serialize karo — Add Address page /
-  // saved-list verification se nayi Set-Cookies aayein to woh purani
-  // fullCookieStr me reh nahi jayengi.
-  const rawCookieJoined = serializeCookieMap(session.cookieMap);
-  const fullCookieStr = cleanEssentialSwiggyCookies(rawCookieJoined, {
+  // Exported JSON 2–3 ghante me dobara na maangna pade: web/DAPI login ka
+  // short JWT save karne se pehle Android chkout se rotate karne ki koshish
+  // karo. Sirf wahi candidate accept hoga jo isi customer ka, non-guest aur
+  // current JWT se zyada life wala ho. Fail ho to asal authenticated
+  // session phir bhi save hoga — fake long-life claim nahi banega.
+  let sessionRefreshResult = null;
+  try {
+    const tidBeforeRotate = String(tidVal || '');
+    sessionRefreshResult = await refreshSwiggySessionCredentials({
+      phone,
+      customerId,
+      tid: tidVal,
+      jwtTid: tidVal,
+      token: tokenVal,
+      sid: sidVal,
+      deviceId: deviceIdVal,
+      _session_tid: session.cookieMap.get('_session_tid') || '',
+      cookieMap: session.cookieMap,
+      deviceProfile: session.deviceProfile,
+    }, {
+      timeoutMs: 5_000,
+      allowDapiFallback: false,
+    });
+    if (sessionRefreshResult?.ok) {
+      if (sessionRefreshResult.tid) {
+        tidVal = String(sessionRefreshResult.tid);
+        session.cookieMap.set('tid', tidVal);
+      }
+      if (sessionRefreshResult._session_tid) {
+        session.cookieMap.set('_session_tid', String(sessionRefreshResult._session_tid));
+      }
+      if (sessionRefreshResult.sid) {
+        sidVal = String(sessionRefreshResult.sid);
+        session.cookieMap.set('_sid', sidVal);
+      }
+      if (sessionRefreshResult.deviceId) {
+        deviceIdVal = String(sessionRefreshResult.deviceId);
+        session.cookieMap.set('_device_id', deviceIdVal);
+      }
+      if (sessionRefreshResult.token && (!tokenVal || tokenVal === tidBeforeRotate || sessionRefreshResult.token !== tokenVal)) {
+        tokenVal = String(sessionRefreshResult.token);
+        session.cookieMap.set('token', tokenVal);
+      }
+    }
+  } catch {}
+
+  // Cookies address attempt + JWT rotation ke BAAD serialize karo — Add
+  // Address page / saved-list verification / chkout se nayi values aayein
+  // to woh purani fullCookieStr me reh nahi jayengi.
+  const serializeFinalCookies = () => cleanEssentialSwiggyCookies(serializeCookieMap(session.cookieMap), {
     tid: tidVal,
     sid: sidVal,
     deviceId: deviceIdVal,
-    token: tokenVal
+    token: tokenVal,
+    _session_tid: session.cookieMap.get('_session_tid') || '',
   });
+  let fullCookieStr = serializeFinalCookies();
 
   // Fast sub-second Today+Tomorrow offer pre-lock (bounded at 2.4s max so OTP verification NEVER stalls!)
   let offersResult = { success: false, pendingBackgroundLock: true };
+  const offerAccount = {
+    id: accKey,
+    phone,
+    customerId,
+    token: tokenVal || tidVal,
+    tid: tidVal,
+    jwtTid: String(tidVal || '').includes('.') ? tidVal : '',
+    sid: sidVal,
+    deviceId: deviceIdVal,
+    cookies: fullCookieStr
+  };
   try {
     offersResult = await Promise.race([
-      claimSwiggyBreakfastAndLateNightOffers({
-        id: accKey,
-        phone,
-        token: tokenVal || tidVal,
-        tid: tidVal,
-        sid: sidVal,
-        deviceId: deviceIdVal,
-        cookies: fullCookieStr
-      }, { quickLockOnly: true }),
+      claimSwiggyBreakfastAndLateNightOffers(offerAccount, { quickLockOnly: true }),
       new Promise(resolve => setTimeout(() => resolve({ success: false, pendingBackgroundLock: true }), 2400))
     ]);
   } catch {}
+
+  // Offer pre-lock ke andar chkout/DAPI se aur lambi-life wala JWT mil
+  // gaya ho to use bhi save/export me le lo. Pehle ye rotation sirf ek
+  // throwaway object par hoti thi aur JSON purana short `tid` bhej deta tha.
+  const offerRotatedTid = String(offerAccount.jwtTid || offerAccount.tid || '');
+  if (offerRotatedTid && offerRotatedTid !== tidVal) {
+    const currentInfo = getSwiggyJwtSessionInfo(tidVal);
+    const offerInfo = getSwiggyJwtSessionInfo(offerRotatedTid);
+    const sameCustomer = !customerId || !offerInfo.customerId || offerInfo.customerId === customerId;
+    if (sameCustomer && offerInfo.customerId && !offerInfo.isExpired
+      && (offerInfo.expiresAtMs || 0) > (currentInfo.expiresAtMs || 0)) {
+      tidVal = offerRotatedTid;
+      session.cookieMap.set('tid', tidVal);
+      if (!tokenVal || tokenVal === currentInfo.tid) tokenVal = tidVal;
+      fullCookieStr = serializeFinalCookies();
+      sessionRefreshResult = {
+        ...(sessionRefreshResult || {}),
+        ok: true,
+        refreshed: true,
+        tid: tidVal,
+        expiresAtMs: offerInfo.expiresAtMs,
+        remainingMs: offerInfo.remainingMs,
+        longLived: offerInfo.isLongLived,
+      };
+    }
+  }
 
   // Offers wale chhote await ke dauran bhi SKIP aa sakta hai. DB save se
   // just pehle ye last check skipped account ko persist/export hone se
@@ -4311,6 +4954,13 @@ async function finalizeAuthenticatedSwiggyAccount(userId, session, authResult, {
     ? requestedAccountLabel
     : getNextAutoUserName();
   const finalName = rawSlot || cleanActual || getNextAutoUserName();
+  const finalJwtInfo = getSwiggyJwtSessionInfo(tidVal);
+  const sessionTidMatch = fullCookieStr.match(/(?:^|;\s*)_session_tid=([^;]+)/);
+  const sessionTidVal = String(session.cookieMap.get('_session_tid') || sessionTidMatch?.[1] || '').trim();
+  const jwtTidVal = finalJwtInfo.tid || '';
+  const tidExpiresAt = finalJwtInfo.expiresAtMs ? new Date(finalJwtInfo.expiresAtMs).toISOString() : '';
+  const sessionLongLived = Boolean(finalJwtInfo.isLongLived);
+  const sessionRefreshedAt = new Date().toISOString();
 
   const savedData = {
     name: finalName,
@@ -4337,10 +4987,15 @@ async function finalizeAuthenticatedSwiggyAccount(userId, session, authResult, {
     phone,
     mobile: phone,
     customerId,
+    ...(sessionTidVal ? { _session_tid: sessionTidVal } : {}),
+    ...(jwtTidVal ? { jwtTid: jwtTidVal } : {}),
     tid: tidVal || '',
     sid: sidVal || '',
     deviceId: deviceIdVal || '',
     token: tokenVal || tidVal || '',
+    ...(tidExpiresAt ? { tidExpiresAt } : {}),
+    sessionLongLived,
+    sessionRefreshedAt,
     ...(typeof totalOrdersCount === 'number' ? {
       totalOrdersCount,
       isZeroOrderAccount: totalOrdersCount === 0
@@ -4375,10 +5030,15 @@ async function finalizeAuthenticatedSwiggyAccount(userId, session, authResult, {
     mobile: phone,
     phone,
     customerId,
+    ...(sessionTidVal ? { _session_tid: sessionTidVal } : {}),
+    ...(jwtTidVal ? { jwtTid: jwtTidVal } : {}),
     token: savedData.token,
     tid: savedData.tid,
     sid: savedData.sid,
     deviceId: savedData.deviceId,
+    ...(tidExpiresAt ? { tidExpiresAt } : {}),
+    sessionLongLived,
+    sessionRefreshedAt,
     cookies: fullCookieStr,
     savedAt: savedData.savedAt
   };
@@ -4403,6 +5063,9 @@ async function finalizeAuthenticatedSwiggyAccount(userId, session, authResult, {
     accountKey: finalSavedKey,
     phone,
     customerId: customerId || 'Verified',
+    ...(tidExpiresAt ? { tidExpiresAt } : {}),
+    sessionLongLived,
+    sessionRefreshed: Boolean(sessionRefreshResult?.refreshed),
     totalOrdersCount,
     isZeroOrderAccount: totalOrdersCount === 0,
     offers: offersResult,

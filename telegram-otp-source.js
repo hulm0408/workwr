@@ -634,6 +634,64 @@ function messageSignature(message) {
   return `${messageId(message)}|${messageEditMs(message)}|${messageText(message)}`;
 }
 
+// FIND / NEW ke baad sirf SABSE LATEST number-card hi try hogi.
+// Purana wait saari history scan karke pehla aisa card utha sakta tha jo
+// baseline (sirf 6 messages) me nahi tha — yani click se PEHLA wala number
+// galti se "naya" ban jata tha. Ab pehli parseable latest card par hi
+// faisla hoga: woh baseline/click se pehle ki hai to wait chalega, excluded
+// hai to wahi latest excluded mani jayegi; usse peeche wale purane cards
+// kabhi fallback ke roop me try nahi honge.
+export function _selectLatestFreshHermesNumberCard(messages = [], {
+  baselineSignatures = new Set(),
+  excludePhones = new Set(),
+  afterMessageId = 0,
+  afterSignature = '',
+  afterPhone = '',
+} = {}) {
+  const excluded = new Set(
+    [...(excludePhones || [])]
+      .map((phone) => String(phone || '').replace(/\D/g, '').slice(-10))
+      .filter(Boolean)
+  );
+  const cursorId = Number(afterMessageId) || 0;
+  const cursorPhone = String(afterPhone || '').replace(/\D/g, '').slice(-10);
+
+  for (const message of Array.isArray(messages) ? messages : []) {
+    const card = parseTelegramNumberCard(messageText(message));
+    if (!card?.phone) continue;
+
+    const signature = messageSignature(message);
+    const result = { message, card, signature };
+    if (baselineSignatures?.has?.(signature)) {
+      return { status: 'baseline-latest', result };
+    }
+
+    const currentId = messageId(message);
+    if (cursorId > 0 && currentId > 0) {
+      if (currentId < cursorId) {
+        return { status: 'before-click-latest', result };
+      }
+      if (currentId === cursorId) {
+        // Clicked screen khud edit hokar naya card ban sakti hai. Wahi
+        // purana phone/signature ho to ye click ka naya jawab nahi hai.
+        if (!afterSignature || signature === afterSignature) {
+          return { status: 'baseline-latest', result };
+        }
+        if (cursorPhone && card.phone === cursorPhone) {
+          return { status: 'baseline-latest', result };
+        }
+      }
+    }
+
+    if (excluded.has(card.phone)) {
+      return { status: 'excluded-latest', result };
+    }
+    return { status: 'fresh', result };
+  }
+
+  return { status: 'none', result: null };
+}
+
 async function fetchIncomingUnlocked(limit = 10) {
   try {
     const { client, config } = await ensureClientUnlocked();
@@ -764,6 +822,7 @@ async function clickLatestHermesButtonUnlocked({ mode = 'claim', phone = '' } = 
     ok: true,
     role: action.role,
     messageId: messageId(screen.message),
+    screenSignature: messageSignature(screen.message),
     buttonText: entry.text,
     screenButtons: [...screen.buttons],
     cardPhone: screen.card?.phone || '',
@@ -787,13 +846,11 @@ async function sendStartUnlocked() {
 }
 
 async function latestNumberCardUnlocked(excludePhones = new Set()) {
-  const messages = await fetchIncomingUnlocked(12);
-  for (const message of messages) {
-    const card = parseTelegramNumberCard(messageText(message));
-    if (!card?.phone || excludePhones.has(card.phone)) continue;
-    return { message, card, signature: messageSignature(message) };
-  }
-  return null;
+  const messages = await fetchIncomingUnlocked(20);
+  // "Latest" ka matlab sach-much sabse nayi card hai. Woh excluded ho to
+  // usse peeche wali purani card ko chup-chaap try nahi karenge.
+  const selection = _selectLatestFreshHermesNumberCard(messages, { excludePhones });
+  return selection.status === 'fresh' ? selection.result : null;
 }
 
 async function waitForNumberCardUnlocked({
@@ -801,18 +858,25 @@ async function waitForNumberCardUnlocked({
   excludePhones = new Set(),
   timeoutMs = 20_000,
   shouldAbort = null,
+  afterMessageId = 0,
+  afterSignature = '',
+  afterPhone = '',
 } = {}) {
   const deadline = Date.now() + Math.max(1_000, Number(timeoutMs) || 20_000);
   while (Date.now() < deadline) {
     if (typeof shouldAbort === 'function' && shouldAbort()) return null;
-    const messages = await fetchIncomingUnlocked(12);
-    for (const message of messages) {
-      const card = parseTelegramNumberCard(messageText(message));
-      if (!card?.phone || excludePhones.has(card.phone)) continue;
-      const signature = messageSignature(message);
-      if (baselineSignatures.has(signature)) continue;
-      return { message, card, signature };
-    }
+    const messages = await fetchIncomingUnlocked(20);
+    const selection = _selectLatestFreshHermesNumberCard(messages, {
+      baselineSignatures,
+      excludePhones,
+      afterMessageId,
+      afterSignature,
+      afterPhone,
+    });
+    if (selection.status === 'fresh') return selection.result;
+    // Latest jawab aa chuka hai lekin consumed/excluded hai — poori wait
+    // jalane ke bajaye obtain ko turant usi latest card par NEW chalane do.
+    if (selection.status === 'excluded-latest') return null;
     await sleepInterruptibly(Math.min(700, Math.max(0, deadline - Date.now())), shouldAbort);
   }
   return null;
@@ -828,7 +892,7 @@ async function obtainCardUnlocked({
   const deadline = Date.now() + totalMs;
   const remainingMs = () => Math.max(0, deadline - Date.now());
   const currentSignatures = async () => new Set(
-    (await fetchIncomingUnlocked(6)).map(messageSignature)
+    (await fetchIncomingUnlocked(20)).map(messageSignature)
   );
 
   if (!forceNew) {
@@ -837,9 +901,15 @@ async function obtainCardUnlocked({
   }
 
   let baselineSignatures = await currentSignatures();
+  let lastClaimCursor = { afterMessageId: 0, afterSignature: '', afterPhone: '' };
   const freshSinceBaseline = async () => {
-    const latest = await latestNumberCardUnlocked(excludePhones);
-    return latest && !baselineSignatures.has(latest.signature) ? latest : null;
+    const messages = await fetchIncomingUnlocked(20);
+    const selection = _selectLatestFreshHermesNumberCard(messages, {
+      baselineSignatures,
+      excludePhones,
+      ...lastClaimCursor,
+    });
+    return selection.status === 'fresh' ? selection.result : null;
   };
   let sentStart = false;
 
@@ -863,6 +933,12 @@ async function obtainCardUnlocked({
       continue;
     }
 
+    lastClaimCursor = {
+      afterMessageId: Number(clicked.messageId) || 0,
+      afterSignature: clicked.screenSignature || '',
+      afterPhone: clicked.cardPhone || '',
+    };
+
     const waitMs = cycle === 2
       ? remainingMs()
       : Math.min(5_000, remainingMs());
@@ -871,6 +947,7 @@ async function obtainCardUnlocked({
       excludePhones,
       timeoutMs: waitMs,
       shouldAbort,
+      ...lastClaimCursor,
     });
     if (fresh) return fresh;
     if ((typeof shouldAbort === 'function' && shouldAbort()) || remainingMs() <= 500) return null;

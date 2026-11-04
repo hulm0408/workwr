@@ -43,6 +43,7 @@ const {
 const {
   startAutopilot,
   requestAutopilotStop,
+  requestAutopilotSkipCurrent,
   getAutopilotSnapshot,
   isAutopilotRunning,
   formatPoolStatus,
@@ -288,6 +289,7 @@ function startCard() {
       ? `📨 ${mono('HERMES ONLY')} · 🔥 Firebase ${mono('OFF')}`
       : activeSourceLine(),
     `🎯 ${mono(`${target} fresh`)} · ⏱ ${mono(`${maxMin} min`)}`,
+    '⏭ Running card par <b>SKIP NUMBER</b> bhi rahega — sirf current number chhodega, batch nahi rukega.',
     telegram
       ? '<b>Next:</b> START dabao — NEW NUMBER se kaam shuru hoga'
       : '<b>Next:</b> START dabao — live card par har step dikhega',
@@ -307,7 +309,10 @@ const startRows = () => [
   [{ text: '📊 Status', callback_data: 'ap_status' }, { text: '⚙️ Settings', callback_data: 'ap_settings' }],
 ];
 const stopRows = () => [
-  [{ text: '⏹ STOP BATCH', callback_data: 'ap_stop', style: 'danger' }],
+  [
+    { text: '⏭ SKIP NUMBER', callback_data: 'ap_skip_current', style: 'primary' },
+    { text: '⏹ STOP BATCH', callback_data: 'ap_stop', style: 'danger' },
+  ],
   [{ text: '📊 Status', callback_data: 'ap_status' }, { text: '⚙️ Settings', callback_data: 'ap_settings' }],
 ];
 const idleRows = () => [
@@ -971,6 +976,31 @@ bot.action('prem_batch_stop', async (ctx) => {
   const stopped = requestAutopilotStop('manual');
   await ctx.answerCbQuery(stopped ? '⏹ STOP signal bhej diya…' : 'Kuch chal nahi raha.').catch(() => {});
 });
+
+async function skipCurrentNumber(ctx) {
+  if (!(await gate(ctx))) return;
+  const result = requestAutopilotSkipCurrent('manual');
+  if (!result?.ok) {
+    await ctx.answerCbQuery(
+      result?.reason === 'no-current-number'
+        ? 'Abhi koi current number active nahi hai.'
+        : 'Batch chal nahi raha — SKIP nahi ho sakta.',
+      { show_alert: true }
+    ).catch(() => {});
+    return;
+  }
+  await ctx.answerCbQuery(
+    result.already
+      ? `⏭ ${result.phone} par SKIP pehle se laga hai…`
+      : `⏭ ${result.phone} SKIP ho raha hai — NEW NUMBER aayega`
+  ).catch(() => {});
+  const snap = getAutopilotSnapshot();
+  if (snap.running && ctx.callbackQuery?.message) {
+    await ctx.editMessageText(runningCard(snap), kb(stopRows())).catch(() => {});
+  }
+}
+bot.action('ap_skip_current', skipCurrentNumber);
+bot.action('prem_batch_skip_current', skipCurrentNumber);
 
 bot.action('ap_status', async (ctx) => {
   if (!(await gate(ctx))) return;

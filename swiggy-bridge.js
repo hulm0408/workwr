@@ -247,6 +247,22 @@ export function setSwiggyBridgeSessionProgressReporter(userId, reporter) {
   session.progressReporter = typeof reporter === 'function' ? reporter : null;
   return true;
 }
+
+// Owner ka ⏭ SKIP current number ke liye cooperative abort checker.
+// Ye sirf manual SKIP se judta hai (poora batch wala STOP nahi): finalization
+// ke lambay Add Address step ko safe checkpoint par rok kar engine ko
+// `manual_skip` ka mauqa deta hai, baghair aadhi request ko zabardasti
+// kaate hue.
+export function setSwiggyBridgeSessionAbortChecker(userId, checker) {
+  const session = activeSessions[userId];
+  if (!session) return false;
+  session.abortChecker = typeof checker === 'function' ? checker : null;
+  return true;
+}
+
+export function _swiggyBridgeSessionAbortRequested(session) {
+  try { return Boolean(session?.abortChecker?.()); } catch { return false; }
+}
 // Dedicated in-memory session map for Swiggy account deletions (strictly isolated from login)
 const activeDeleteSessions = {};
 let deleteOtpRequestCount = 0;
@@ -568,21 +584,68 @@ function findSwiggyAddressId(value, depth = 0) {
   return '';
 }
 
+export function _isHtmlSwiggyResponseText(rawText = '') {
+  const text = String(rawText || '').trimStart().toLowerCase();
+  return text.startsWith('<!doctype html')
+    || text.startsWith('<html')
+    || text.startsWith('<head')
+    || text.startsWith('<body')
+    || (text.startsWith('<') && /<meta\b|<title\b|<script\b/.test(text.slice(0, 500)));
+}
+
+// Live run me CAS ka raw `<!doctype html>...` user ke card/export me chala
+// gaya tha. Failure reason hamesha chhoti, insaan ke padhne layak hogi:
+// HTML/WAF page ko naam se classify karo, markup kabhi wapas mat bhejo.
+export function sanitizeSwiggyAddressFailureMessage(message = '', fallback = 'Swiggy address request fail ho gayi') {
+  const raw = String(message ?? '').trim();
+  if (!raw) return fallback;
+  if (_isHtmlSwiggyResponseText(raw)) {
+    return 'Swiggy ne HTML/WAF page diya (JSON address response nahi)';
+  }
+  const withoutTags = raw
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+    .replace(/\s+/g, ' ')
+    .trim();
+  const clean = withoutTags || fallback;
+  if (/<!doctype|<html\b/i.test(clean)) {
+    return 'Swiggy ne HTML/WAF page diya (JSON address response nahi)';
+  }
+  return clean.length > 220 ? `${clean.slice(0, 217).trim()}…` : clean;
+}
+
 export function parseSwiggyCreateAddressResponse(status, data = null, rawText = '') {
   const httpOk = Number(status) >= 200 && Number(status) < 300;
   const rpcError = data?.error?.message || data?.error?.status || (typeof data?.error === 'string' ? data.error : '');
   const swiggyCode = data?.statusCode;
   const swiggyOk = swiggyCode === undefined || swiggyCode === null || Number(swiggyCode) === 0;
   const addressId = findSwiggyAddressId(data);
-  const ok = Boolean(httpOk && swiggyOk && !rpcError && addressId);
+  const responseKind = _isHtmlSwiggyResponseText(rawText)
+    ? 'html'
+    : (data ? 'json' : (String(rawText || '').trim() ? 'text' : 'empty'));
+  const ok = Boolean(httpOk && swiggyOk && !rpcError && addressId && responseKind === 'json');
   return {
     ok,
     addressId,
     status: Number(status) || 0,
-    message: String(
+    responseKind,
+    message: sanitizeSwiggyAddressFailureMessage(
       rpcError || data?.statusMessage || data?.message ||
-      (ok ? 'Address added in Swiggy account' : (rawText || '').slice(0, 160))
-    ).trim(),
+      (ok
+        ? 'Address added in Swiggy account'
+        : responseKind === 'html'
+          ? '<!doctype html>'
+          : responseKind === 'text'
+            ? String(rawText || '').slice(0, 220)
+            : (httpOk ? 'Swiggy address response me addressId nahi mila' : `Swiggy address request HTTP ${Number(status) || 0} par fail ho gayi`))
+    ),
   };
 }
 
@@ -816,7 +879,12 @@ export async function fetchSwiggySavedAddressesViaBridgeSession(session, {
       status: Number(res?.status) || 0,
       addresses: ok ? extractSwiggySavedAddresses(data) : [],
       data,
-      message: String(data?.statusMessage || data?.message || data?.error?.message || (ok ? '' : rawText.slice(0, 160))).trim(),
+      message: ok
+        ? ''
+        : sanitizeSwiggyAddressFailureMessage(
+          data?.statusMessage || data?.message || data?.error?.message || rawText,
+          `Saved address list HTTP ${Number(res?.status) || 0} par fail ho gayi`
+        ),
     };
   } catch (e) {
     return { ok: false, status: 0, addresses: [], message: String(e?.message || e).slice(0, 180) };
@@ -841,6 +909,329 @@ export function buildSwiggyWebAddressFormValues(addressDetails = {}) {
   };
 }
 
+// Browser se wapas aayi cookies ko HTTP-auth session par andha overwrite
+// nahi karna. Solver/guest page ke `_is_logged_in=0` ya guest tid/token
+// asal authenticated cookies ko downgrade kar dein to Add Address page
+// login state me chala jata hai aur form kabhi render nahi hota.
+export function _mergeSwiggyBrowserCookies(cookieMap, cookies = []) {
+  if (!cookieMap || typeof cookieMap.get !== 'function' || typeof cookieMap.set !== 'function') return 0;
+  const list = Array.isArray(cookies) ? cookies.filter((c) => c?.name && c?.value && c.name !== 'aws-waf-token') : [];
+  const pageLoggedIn = checkLoggedInFromCookies(list);
+  const critical = new Set(['tid', '_session_tid', 'token', '_sid', '_is_logged_in']);
+  let merged = 0;
+  for (const cookie of list) {
+    const name = String(cookie.name);
+    const value = String(cookie.value);
+    const existing = cookieMap.get(name);
+    if (name === '_is_logged_in' && existing === '1' && value !== '1') continue;
+    if (critical.has(name) && existing && !pageLoggedIn) continue;
+    cookieMap.set(name, value);
+    merged++;
+  }
+  return merged;
+}
+
+function normalizeAddressPageText(value = '') {
+  return String(value || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+}
+
+// Live page kis haalat me hai, ye pehle classify karo. Pehle wala code
+// map/login/WAF/loading sab ko ek hi `fields=0` bol kar 35-45s ghumta
+// rehta tha. Ab terminal states turant rukengi aur map-gate par asal
+// Proceed/Confirm action try hoga.
+export function classifySwiggyAddressPageState(snapshot = {}, savedList = {}) {
+  const snap = snapshot || {};
+  const url = String(snap.url || '');
+  const title = normalizeAddressPageText(snap.title || '');
+  const body = normalizeAddressPageText(snap.bodyText || snap.text || '');
+  const fields = Array.isArray(snap.fields) ? snap.fields : [];
+  const usableFields = fields.filter((field) => field && field.visible !== false && !field.disabled);
+  const buttons = (Array.isArray(snap.buttons) ? snap.buttons : [])
+    .map((button) => normalizeAddressPageText(typeof button === 'string' ? button : button?.text || ''))
+    .filter(Boolean);
+  const hasAddressLabels = /door flat|landmark|save address|delivery address/.test(body);
+  const savedStatus = Number(savedList?.status) || 0;
+
+  if (usableFields.length > 0 && (hasAddressLabels || buttons.some((text) => text.includes('save address')))) {
+    return 'form-ready';
+  }
+  if (/security check|verify you are human|are you human|captcha|aws waf|unusual traffic|request blocked/.test(`${title} ${body}`)) {
+    return 'security-challenge';
+  }
+  if (url && !url.includes('/web-cart-add-address') && !hasAddressLabels) {
+    return 'redirected';
+  }
+  if ((savedStatus === 401 && !hasAddressLabels)
+    || (/\b(log in|login|sign up|signup)\b/.test(body) && /account|existing account/.test(body) && !hasAddressLabels)) {
+    return 'login-required';
+  }
+  if (/drag map|save delivery address|select delivery address|confirm location/.test(body)
+    || buttons.some((text) => text === 'proceed' || text.includes('confirm location'))) {
+    return 'map-gate';
+  }
+  if (snap.readyState && snap.readyState !== 'complete') return 'loading';
+  if (body.length < 20) return 'loading';
+  return usableFields.length > 0 ? 'form-ready' : 'form-not-found';
+}
+
+function swiggyAddressSnapshotInBrowser() {
+  const norm = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+  const collect = (selector, root = document, out = [], seen = new Set()) => {
+    if (!root || seen.has(root)) return out;
+    seen.add(root);
+    try { out.push(...root.querySelectorAll(selector)); } catch {}
+    try {
+      for (const el of root.querySelectorAll('*')) {
+        if (el.shadowRoot) collect(selector, el.shadowRoot, out, seen);
+      }
+    } catch {}
+    return out;
+  };
+  const describe = (el) => {
+    const rect = typeof el.getBoundingClientRect === 'function' ? el.getBoundingClientRect() : null;
+    let style = null;
+    try { style = window.getComputedStyle(el); } catch {}
+    const visible = Boolean(
+      rect && rect.width > 0 && rect.height > 0
+      && style?.display !== 'none'
+      && style?.visibility !== 'hidden'
+      && Number(style?.opacity ?? 1) !== 0
+    );
+    let labelText = '';
+    try {
+      labelText = [...(el.labels || [])].map((label) => label.textContent || '').join(' ');
+    } catch {}
+    if (!labelText) {
+      let node = el;
+      for (let i = 0; i < 4 && node; i += 1) {
+        const candidate = node.parentElement?.querySelector?.('label, [class*="label" i]');
+        if (candidate?.textContent) { labelText = candidate.textContent; break; }
+        node = node.parentElement;
+      }
+    }
+    return {
+      tag: String(el.tagName || '').toLowerCase(),
+      type: String(el.getAttribute?.('type') || el.type || ''),
+      name: String(el.getAttribute?.('name') || el.name || ''),
+      id: String(el.id || ''),
+      placeholder: String(el.getAttribute?.('placeholder') || el.placeholder || ''),
+      ariaLabel: String(el.getAttribute?.('aria-label') || ''),
+      label: norm(labelText).slice(0, 80),
+      visible,
+      disabled: Boolean(el.disabled || el.getAttribute?.('aria-disabled') === 'true'),
+      readOnly: Boolean(el.readOnly),
+    };
+  };
+  const fields = collect('input, textarea, [contenteditable="true"], [role="textbox"]')
+    .filter((el) => !['hidden', 'checkbox', 'radio', 'button', 'submit', 'file'].includes(String(el.getAttribute?.('type') || el.type || '').toLowerCase()))
+    .map(describe);
+  const buttons = collect('button, a, [role="button"]')
+    .map((el) => {
+      const d = describe(el);
+      return { text: norm(el.textContent || el.getAttribute?.('aria-label') || '').slice(0, 80), visible: d.visible, disabled: d.disabled };
+    })
+    .filter((button) => button.text);
+  return {
+    url: location.href,
+    title: document.title || '',
+    readyState: document.readyState || '',
+    bodyText: String(document.body?.innerText || document.body?.textContent || '').slice(0, 4000),
+    fields,
+    buttons,
+  };
+}
+
+function swiggyAddressFillInBrowser(values) {
+  const norm = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+  const collect = (selector, root = document, out = [], seen = new Set()) => {
+    if (!root || seen.has(root)) return out;
+    seen.add(root);
+    try { out.push(...root.querySelectorAll(selector)); } catch {}
+    try {
+      for (const el of root.querySelectorAll('*')) {
+        if (el.shadowRoot) collect(selector, el.shadowRoot, out, seen);
+      }
+    } catch {}
+    return out;
+  };
+  const visible = (el) => {
+    if (!el) return false;
+    const rect = typeof el.getBoundingClientRect === 'function' ? el.getBoundingClientRect() : null;
+    let style = null;
+    try { style = window.getComputedStyle(el); } catch {}
+    return Boolean(rect && rect.width > 0 && rect.height > 0 && style?.display !== 'none' && style?.visibility !== 'hidden' && Number(style?.opacity ?? 1) !== 0);
+  };
+  const labelFor = (el) => {
+    let text = '';
+    try { text = [...(el.labels || [])].map((label) => label.textContent || '').join(' '); } catch {}
+    if (text) return norm(text);
+    let node = el;
+    for (let i = 0; i < 5 && node; i += 1) {
+      const candidate = node.parentElement?.querySelector?.('label, [class*="label" i]');
+      if (candidate?.textContent) return norm(candidate.textContent);
+      node = node.parentElement;
+    }
+    return '';
+  };
+  const attrs = (el) => norm([
+    el.getAttribute?.('name') || el.name,
+    el.id,
+    el.getAttribute?.('placeholder') || el.placeholder,
+    el.getAttribute?.('aria-label'),
+  ].filter(Boolean).join(' '));
+  const editables = collect('input, textarea, [contenteditable="true"], [role="textbox"]')
+    .filter((el) => visible(el) && !el.disabled && !el.readOnly
+      && !['hidden', 'checkbox', 'radio', 'button', 'submit', 'file'].includes(String(el.getAttribute?.('type') || el.type || '').toLowerCase()));
+  const score = (el, kind) => {
+    const attr = attrs(el);
+    const label = labelFor(el);
+    const hay = `${attr} ${label}`;
+    if (kind === 'flatNo') {
+      if (/\b(building|house)\b/.test(attr)) return 100;
+      if (/\b(flat|door)\b/.test(attr)) return 95;
+      if (/door flat|flat no|door no|house no/.test(hay)) return 90;
+      if (/\bflat\b|\bdoor\b/.test(label)) return 80;
+    }
+    if (kind === 'landmark') {
+      if (/\blandmark\b/.test(attr)) return 100;
+      if (/\blandmark\b/.test(label)) return 95;
+    }
+    if (kind === 'address') {
+      if (/\b(address|street|completeaddress)\b/.test(attr) && !/\b(building|house|flat|door|landmark)\b/.test(attr)) return 100;
+      if (label === 'address' || /complete address/.test(label)) return 90;
+      if (/\baddress\b/.test(label) && !/door|flat|landmark/.test(label)) return 75;
+    }
+    return 0;
+  };
+  const used = new Set();
+  const pick = (kind) => {
+    const ranked = editables
+      .filter((el) => !used.has(el))
+      .map((el) => ({ el, value: score(el, kind) }))
+      .filter((item) => item.value > 0)
+      .sort((a, b) => b.value - a.value);
+    const el = ranked[0]?.el || null;
+    if (el) used.add(el);
+    return el;
+  };
+  let flatEl = pick('flatNo');
+  let landmarkEl = pick('landmark');
+  let addressEl = pick('address');
+  if (!flatEl || !landmarkEl || !addressEl) {
+    const remaining = editables.filter((el) => !used.has(el));
+    if (!flatEl && !landmarkEl && !addressEl) {
+      if (editables.length >= 3) {
+        [addressEl, flatEl, landmarkEl] = editables;
+      } else if (editables.length === 2) {
+        [flatEl, landmarkEl] = editables;
+      } else if (editables.length === 1) {
+        [flatEl] = editables;
+      }
+    } else {
+      if (!flatEl && remaining.length) flatEl = remaining.shift();
+      if (!landmarkEl && remaining.length) landmarkEl = remaining.shift();
+      if (!addressEl && remaining.length >= 2) addressEl = remaining.shift();
+    }
+  }
+  const setValue = (el, value) => {
+    if (!el || !String(value || '')) return false;
+    try {
+      el.scrollIntoView?.({ block: 'center' });
+      el.focus?.();
+      el.click?.();
+      if (el.isContentEditable || el.getAttribute?.('contenteditable') === 'true') {
+        el.textContent = value;
+      } else {
+        const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+        const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+        if (setter) setter.call(el, value); else el.value = value;
+      }
+      try { el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: value })); }
+      catch { el.dispatchEvent(new Event('input', { bubbles: true })); }
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+      el.blur?.();
+      const current = el.isContentEditable ? el.textContent : el.value;
+      return String(current || '') === String(value || '');
+    } catch {
+      return false;
+    }
+  };
+  const filled = {
+    address: setValue(addressEl, values.address),
+    flatNo: setValue(flatEl, values.flatNo),
+    landmark: setValue(landmarkEl, values.landmark),
+  };
+  const homeCandidates = collect('button, a, [role="button"], div, span')
+    .filter((el) => visible(el) && norm(el.textContent) === 'home');
+  const home = homeCandidates.find((el) => {
+    let node = el;
+    for (let i = 0; i < 6 && node; i += 1) {
+      const group = norm(node.parentElement?.textContent || node.textContent);
+      if (group.includes('work') && group.includes('other')) return true;
+      node = node.parentElement;
+    }
+    return false;
+  }) || homeCandidates.sort((a, b) => String(a.textContent).length - String(b.textContent).length)[0];
+  try { (home?.closest?.('button, a, [role="button"]') || home)?.click(); } catch {}
+  const save = collect('button, a, [role="button"], div, span')
+    .filter((el) => visible(el) && norm(el.textContent).includes('save address'))
+    .sort((a, b) => String(a.textContent).length - String(b.textContent).length)[0];
+  const descriptor = (el) => el ? `${String(el.tagName || '').toLowerCase()}:${String(el.getAttribute?.('name') || el.name || el.id || el.getAttribute?.('placeholder') || '')}` : '';
+  return {
+    ok: Boolean(filled.flatNo && (filled.address || !addressEl)),
+    filled,
+    fields: editables.length,
+    addressStatic: Boolean(!addressEl),
+    selected: { address: descriptor(addressEl), flatNo: descriptor(flatEl), landmark: descriptor(landmarkEl) },
+    saveDisabled: save ? Boolean(save.disabled || save.getAttribute?.('aria-disabled') === 'true') : null,
+    url: location.href,
+  };
+}
+
+function swiggyAddressClickTextInBrowser(patterns) {
+  const norm = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+  const collect = (selector, root = document, out = [], seen = new Set()) => {
+    if (!root || seen.has(root)) return out;
+    seen.add(root);
+    try { out.push(...root.querySelectorAll(selector)); } catch {}
+    try {
+      for (const el of root.querySelectorAll('*')) {
+        if (el.shadowRoot) collect(selector, el.shadowRoot, out, seen);
+      }
+    } catch {}
+    return out;
+  };
+  const visible = (el) => {
+    const rect = typeof el?.getBoundingClientRect === 'function' ? el.getBoundingClientRect() : null;
+    let style = null;
+    try { style = window.getComputedStyle(el); } catch {}
+    return Boolean(el && rect && rect.width > 0 && rect.height > 0 && style?.display !== 'none' && style?.visibility !== 'hidden');
+  };
+  const wanted = (Array.isArray(patterns) ? patterns : []).map(norm).filter(Boolean);
+  const candidates = collect('button, a, [role="button"], div, span')
+    .map((el) => ({ el, text: norm(el.textContent || el.getAttribute?.('aria-label') || '') }))
+    .filter(({ el, text }) => visible(el) && !el.disabled && text && wanted.some((pattern) => text === pattern || text.includes(pattern)))
+    .sort((a, b) => {
+      const aExact = wanted.some((pattern) => a.text === pattern) ? 0 : 1;
+      const bExact = wanted.some((pattern) => b.text === pattern) ? 0 : 1;
+      return (aExact - bExact) || (a.text.length - b.text.length);
+    });
+  const found = candidates[0];
+  if (!found) return { clicked: false, text: '' };
+  const target = found.el.closest?.('button, a, [role="button"]') || found.el;
+  try {
+    target.scrollIntoView?.({ block: 'center' });
+    for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+      const EventCtor = type.startsWith('pointer') && typeof PointerEvent === 'function' ? PointerEvent : MouseEvent;
+      target.dispatchEvent(new EventCtor(type, { bubbles: true, cancelable: true, view: window }));
+    }
+    if (typeof target.click === 'function') target.click();
+  } catch {
+    try { target.click?.(); } catch { return { clicked: false, text: found.text }; }
+  }
+  return { clicked: true, text: found.text };
+}
+
 async function fetchSavedAddressesInSwiggyPage(page) {
   const result = await page.evaluate(async () => {
     try {
@@ -850,7 +1241,7 @@ async function fetchSavedAddressesInSwiggyPage(page) {
         headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
         body: JSON.stringify(csrf ? { _csrf: csrf } : {}),
         credentials: 'include',
-        signal: AbortSignal.timeout(8000),
+        signal: AbortSignal.timeout(5000),
       });
       const text = await res.text().catch(() => '');
       let data = null;
@@ -866,32 +1257,80 @@ async function fetchSavedAddressesInSwiggyPage(page) {
     ok,
     status: Number(result?.status) || 0,
     addresses: ok ? extractSwiggySavedAddresses(result.data) : [],
-    message: String(result?.error || result?.data?.statusMessage || result?.data?.message || '').slice(0, 180),
+    message: ok
+      ? ''
+      : sanitizeSwiggyAddressFailureMessage(
+        result?.error || result?.data?.statusMessage || result?.data?.message || result?.rawText,
+        `Saved address list HTTP ${Number(result?.status) || 0} par fail ho gayi`
+      ),
+    responseKind: _isHtmlSwiggyResponseText(result?.rawText) ? 'html' : (result?.data ? 'json' : 'empty'),
   };
 }
 
-// Asal Swiggy "Add Address" web page par jaakar form bharna. CAS guess
-// endpoint par andha POST karne ke bajaye ye wahi page hai jo checkout /
-// WebView use karta hai: map pin generated Maharashtra coordinates par,
-// phir Address + Door/Flat + Landmark + Home → SAVE ADDRESS & PROCEED.
-// Success tabhi mana jayega jab create response ya saved-address list se
-// pakka addressId verify ho jaye.
+function summarizeSwiggyAddressSnapshot(snapshot = {}) {
+  const fields = (Array.isArray(snapshot?.fields) ? snapshot.fields : []).slice(0, 6).map((field) => ({
+    tag: String(field?.tag || ''),
+    name: String(field?.name || ''),
+    id: String(field?.id || ''),
+    placeholder: String(field?.placeholder || '').slice(0, 40),
+    label: String(field?.label || '').slice(0, 40),
+    visible: field?.visible !== false,
+  }));
+  const buttons = (Array.isArray(snapshot?.buttons) ? snapshot.buttons : [])
+    .map((button) => String(typeof button === 'string' ? button : button?.text || '').trim())
+    .filter(Boolean)
+    .slice(0, 6);
+  let path = '';
+  try { path = new URL(String(snapshot?.url || '')).pathname; } catch { path = String(snapshot?.url || '').slice(0, 80); }
+  return { path, title: String(snapshot?.title || '').slice(0, 60), fields, buttons };
+}
+
+function swiggyAddressPageFailureMessage(state, snapshot = {}) {
+  const summary = summarizeSwiggyAddressSnapshot(snapshot);
+  const fieldCount = Array.isArray(snapshot?.fields) ? snapshot.fields.filter((field) => field?.visible !== false && !field?.disabled).length : 0;
+  const buttons = summary.buttons.slice(0, 3).join('|') || 'none';
+  if (state === 'login-required') return 'Add Address page par login session recognize nahi hua (state=login-required)';
+  if (state === 'security-challenge') return 'Add Address page security check par atka hai (state=security-challenge)';
+  if (state === 'redirected') return `Add Address page redirect ho gaya (state=redirected, path=${summary.path || 'unknown'})`;
+  if (state === 'map-gate') return `Add Address map/Proceed gate se aage nahi badha (fields=${fieldCount}, buttons=${buttons})`;
+  if (state === 'loading') return `Add Address page time par load nahi hua (fields=${fieldCount})`;
+  return `Add Address form ready nahi hua (state=${state || 'unknown'}, fields=${fieldCount}, buttons=${buttons})`;
+}
+
+// Asal Swiggy "Add Address" web page par jaakar form bharna. Desktop web
+// pehle, mobile WebView uske baad; har frame/shadow-root me asal fields
+// dhoondhe jayenge. Checkout ke proven input names `building`/`house`
+// aur `landmark` ko pehli tarjeeh milegi; Address static map text ho to
+// use zabardasti kisi galat input me nahi bhara jayega. Success tabhi
+// mana jayega jab create response ya saved-address list se pakka
+// addressId verify ho jaye.
 export async function addSwiggyAddressViaWebUi(session, addressDetails, {
-  timeoutMs = 45_000,
+  timeoutMs = 32_000,
   pageFactory = null,
+  shouldAbort = null,
 } = {}) {
   const form = buildSwiggyWebAddressFormValues(addressDetails);
   if (!session?.cookieMap || !form.address || !form.flatNo || !Number.isFinite(form.lat) || !Number.isFinite(form.lng)) {
-    return { ok: false, addressId: '', status: 0, method: 'web-add-address-ui', submitAttempted: false, message: 'Add Address form ke liye session/address/coordinates missing hain' };
+    return { ok: false, addressId: '', status: 0, method: 'web-add-address-ui', submitAttempted: false, pageState: 'invalid-input', message: 'Add Address form ke liye session/address/coordinates missing hain' };
   }
   if (!pageFactory && !(session.page && session.browser?.connected) && !canUseStealthBrowser()) {
-    return { ok: false, addressId: '', status: 0, method: 'web-add-address-ui', submitAttempted: false, message: 'Chrome/Chromium nahi mila — asal Add Address page nahi khul paya' };
+    return { ok: false, addressId: '', status: 0, method: 'web-add-address-ui', submitAttempted: false, pageState: 'browser-missing', message: 'Chrome/Chromium nahi mila — asal Add Address page nahi khul paya' };
   }
 
   return withBrowserEscalationSlot(async () => {
     const startedAt = Date.now();
-    const deadline = startedAt + Math.max(10_000, Number(timeoutMs) || 45_000);
+    const deadline = startedAt + Math.max(10_000, Number(timeoutMs) || 32_000);
     const remaining = () => Math.max(0, deadline - Date.now());
+    const abortRequested = () => {
+      try { return Boolean(shouldAbort?.() || _swiggyBridgeSessionAbortRequested(session)); } catch { return false; }
+    };
+    const waitInterruptibly = async (ms) => {
+      const endAt = Date.now() + Math.max(0, Number(ms) || 0);
+      while (Date.now() < endAt) {
+        if (abortRequested()) return;
+        await new Promise((resolve) => setTimeout(resolve, Math.min(120, Math.max(0, endAt - Date.now()))));
+      }
+    };
     let browser = null;
     let page = null;
     let ownedBrowser = false;
@@ -902,13 +1341,24 @@ export async function addSwiggyAddressViaWebUi(session, addressDetails, {
     const syncCookiesBack = async () => {
       try {
         const cookies = await page.cookies('https://www.swiggy.com/').catch(() => []);
-        for (const c of cookies || []) {
-          if (c?.name && c?.value && c.name !== 'aws-waf-token') session.cookieMap.set(c.name, c.value);
-        }
+        _mergeSwiggyBrowserCookies(session.cookieMap, cookies || []);
       } catch {}
     };
+    const abortedResult = (extra = {}) => ({
+      ok: false,
+      addressId: '',
+      status: 0,
+      method: 'web-add-address-ui',
+      submitAttempted,
+      uncertain: submitAttempted,
+      aborted: true,
+      pageState: 'aborted',
+      message: 'Owner ne current number SKIP kar diya — Add Address step roka gaya',
+      ...extra,
+    });
 
     try {
+      if (abortRequested()) return abortedResult();
       if (typeof pageFactory === 'function') {
         const launched = await pageFactory();
         browser = launched?.browser || null;
@@ -925,17 +1375,13 @@ export async function addSwiggyAddressViaWebUi(session, addressDetails, {
       }
       if (!page) throw new Error('Add Address browser page nahi bana');
 
-      try { await page.setViewport({ width: 430, height: 900, isMobile: true, hasTouch: true }); } catch {}
-      if (session.deviceProfile?.ua) {
-        try { await page.setUserAgent(session.deviceProfile.ua); } catch {}
-      }
       try {
         const context = typeof page.browserContext === 'function'
           ? page.browserContext()
           : (typeof browser?.defaultBrowserContext === 'function' ? browser.defaultBrowserContext() : null);
         await context?.overridePermissions?.('https://www.swiggy.com', ['geolocation']);
       } catch {}
-      try { await page.setGeolocation({ latitude: form.lat, longitude: form.lng, accuracy: 25 }); } catch {}
+      try { await page.setGeolocation?.({ latitude: form.lat, longitude: form.lng, accuracy: 25 }); } catch {}
 
       const cookieMap = new Map(session.cookieMap);
       cookieMap.set('_is_logged_in', '1');
@@ -947,11 +1393,34 @@ export async function addSwiggyAddressViaWebUi(session, addressDetails, {
         id: '',
       })));
       if (session.wafToken) cookieMap.set('aws-waf-token', session.wafToken);
+
+      // Reused solver page par guest cookies pehle se ho sakte hain. Same
+      // naam wali purani cookie delete kiye baghair dusri host-only copy
+      // ban jayegi aur server guest wali pehle padh sakta hai.
+      try {
+        const existingCookies = await page.cookies('https://www.swiggy.com/').catch(() => []);
+        for (const cookie of existingCookies || []) {
+          if (!cookie?.name || !cookieMap.has(cookie.name)) continue;
+          try { await page.deleteCookie?.(cookie); } catch {}
+        }
+      } catch {}
+      let cookiesAccepted = 0;
       for (const [name, value] of cookieMap.entries()) {
         if (!name || value === undefined || value === null || value === '') continue;
+        const cookie = { name, value: String(value) };
         try {
-          await page.setCookie({ name, value: String(value), url: 'https://www.swiggy.com/', path: '/' });
-        } catch {}
+          await page.setCookie({ ...cookie, domain: '.swiggy.com', path: '/', secure: true });
+          cookiesAccepted++;
+        } catch {
+          try {
+            await page.setCookie({ ...cookie, url: 'https://www.swiggy.com/', path: '/' });
+            cookiesAccepted++;
+          } catch {}
+        }
+        if (abortRequested()) return abortedResult();
+      }
+      if (cookieMap.size && !cookiesAccepted) {
+        return { ok: false, addressId: '', status: 0, method: 'web-add-address-ui', submitAttempted: false, pageState: 'cookie-sync-failed', message: 'Browser me Swiggy login cookies set nahi ho payi' };
       }
 
       responseHandler = async (res) => {
@@ -959,7 +1428,7 @@ export async function addSwiggyAddressViaWebUi(session, addressDetails, {
           const req = typeof res.request === 'function' ? res.request() : null;
           const method = String(req?.method?.() || '').toUpperCase();
           const url = String(typeof res.url === 'function' ? res.url() : res.url || '');
-          if (!['POST', 'PUT'].includes(method) || !/address/i.test(url) || /\/address\/all(?:\?|$)/i.test(url)) return;
+          if (!['POST', 'PUT', 'PATCH'].includes(method) || !/address/i.test(url) || /\/address\/all(?:\?|$)/i.test(url)) return;
           const text = typeof res.text === 'function' ? await res.text().catch(() => '') : '';
           let data = null;
           try { data = text ? JSON.parse(text) : null; } catch {}
@@ -969,162 +1438,200 @@ export async function addSwiggyAddressViaWebUi(session, addressDetails, {
       };
       try { page.on?.('response', responseHandler); } catch {}
 
-      const addUrl = `https://www.swiggy.com/web-cart-add-address?lat=${encodeURIComponent(form.lat)}&lng=${encodeURIComponent(form.lng)}`;
-      await page.goto(addUrl, { waitUntil: 'domcontentloaded', timeout: Math.min(20_000, Math.max(5_000, remaining())) });
-
-      const before = await fetchSavedAddressesInSwiggyPage(page);
-      const existing = findMatchingSwiggySavedAddress(before.addresses, addressDetails);
-      if (existing) {
-        const verifiedAddress = normalizeVerifiedSwiggyAddress(existing, addressDetails);
-        await syncCookiesBack();
-        return { ok: true, addressId: verifiedAddress.remoteAddressId, status: 200, method: 'web-add-address-ui-existing', submitAttempted: false, verifiedAddress, message: 'Address Swiggy account me pehle se saved verify ho gaya' };
-      }
-
-      let fillResult = null;
-      let clickedProceed = false;
-      while (remaining() > 8_000) {
-        fillResult = await page.evaluate((values) => {
-          const norm = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
-          const visible = (el) => Boolean(el && (el.offsetParent !== null || el.getClientRects?.length));
-          const editables = [...document.querySelectorAll('input, textarea')]
-            .filter((el) => visible(el) && !el.disabled && !['hidden', 'checkbox', 'radio', 'button', 'submit'].includes(String(el.type || '').toLowerCase()));
-          const attrs = (el) => norm([el.name, el.id, el.placeholder, el.getAttribute?.('aria-label')].filter(Boolean).join(' '));
-          const findField = (patterns) => {
-            for (const el of editables) if (patterns.some((p) => attrs(el).includes(p))) return el;
-            const labelScore = (el) => {
-              const text = norm(el.textContent);
-              let best = Number.POSITIVE_INFINITY;
-              for (const p of patterns) {
-                if (text === p) return 0;
-                if (text.startsWith(p)) best = Math.min(best, text.length - p.length);
-              }
-              return best;
-            };
-            const labels = [...document.querySelectorAll('label, div, span, p')]
-              .filter((el) => visible(el))
-              .map((el) => ({ el, score: labelScore(el), len: norm(el.textContent).length }))
-              .filter(({ score }) => Number.isFinite(score) && score <= 12)
-              .sort((a, b) => (a.score - b.score) || (a.len - b.len))
-              .map(({ el }) => el);
-            for (const label of labels) {
-              const forId = label.getAttribute?.('for');
-              if (forId) {
-                const byId = document.getElementById(forId);
-                if (byId && editables.includes(byId)) return byId;
-              }
-              let node = label;
-              for (let i = 0; i < 6 && node; i += 1) {
-                const found = [...(node.querySelectorAll?.('input, textarea') || [])].find((el) => editables.includes(el));
-                if (found) return found;
-                node = node.parentElement;
-              }
-              const after = editables.find((el) => (label.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0);
-              if (after) return after;
-            }
-            return null;
-          };
-          const setValue = (el, value) => {
-            if (!el) return false;
-            const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-            const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
-            el.focus();
-            if (setter) setter.call(el, value); else el.value = value;
-            el.dispatchEvent(new Event('input', { bubbles: true }));
-            el.dispatchEvent(new Event('change', { bubbles: true }));
-            el.blur();
-            return String(el.value || '') === String(value || '');
-          };
-          const addressEl = findField(['address']);
-          const flatEl = findField(['door flat no', 'door flat', 'flat no', 'door', 'flat']);
-          const landmarkEl = findField(['landmark']);
-          const usedFields = new Set();
-          const chooseField = (candidate) => {
-            const el = candidate && !usedFields.has(candidate)
-              ? candidate
-              : editables.find((item) => !usedFields.has(item));
-            if (el) usedFields.add(el);
-            return el || null;
-          };
-          const aEl = chooseField(addressEl);
-          const fEl = chooseField(flatEl);
-          const lEl = chooseField(landmarkEl);
-          const filled = {
-            address: setValue(aEl, values.address),
-            flatNo: setValue(fEl, values.flatNo),
-            landmark: setValue(lEl, values.landmark),
-          };
-          const homeCandidates = [...document.querySelectorAll('button, a, div, span')]
-            .filter((el) => visible(el) && norm(el.textContent) === 'home');
-          const home = homeCandidates.find((el) => {
-            let node = el;
-            for (let i = 0; i < 6 && node; i += 1) {
-              const group = norm(node.parentElement?.textContent || node.textContent);
-              if (group.includes('work') && group.includes('other')) return true;
-              node = node.parentElement;
-            }
-            return false;
-          }) || homeCandidates[0];
-          try { home?.click(); } catch {}
-          return { ok: Boolean(filled.address && filled.flatNo), filled, fields: editables.length, url: location.href };
-        }, form).catch((e) => ({ ok: false, error: String(e?.message || e) }));
-        if (fillResult?.ok) break;
-        if (!clickedProceed) {
-          clickedProceed = await page.evaluate(() => {
-            const norm = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
-            const visible = (el) => Boolean(el && (el.offsetParent !== null || el.getClientRects?.length));
-            const btn = [...document.querySelectorAll('button, a, div, span')]
-              .find((el) => visible(el) && norm(el.textContent) === 'proceed');
-            if (!btn) return false;
-            btn.click();
-            return true;
-          }).catch(() => false);
+      const targets = () => {
+        try {
+          const frames = typeof page.frames === 'function' ? page.frames() : [];
+          const usable = (Array.isArray(frames) ? frames : []).filter((frame) => typeof frame?.evaluate === 'function');
+          return usable.length ? usable : [page];
+        } catch {
+          return [page];
         }
-        await new Promise((resolve) => setTimeout(resolve, 700));
+      };
+      const inspectTargets = async (savedList = {}) => {
+        const out = [];
+        const list = targets();
+        for (let index = 0; index < list.length; index++) {
+          const target = list[index];
+          const snapshot = await target.evaluate(swiggyAddressSnapshotInBrowser)
+            .catch((e) => ({ url: '', title: '', readyState: '', bodyText: '', fields: [], buttons: [], error: String(e?.message || e) }));
+          const state = classifySwiggyAddressPageState(snapshot, savedList);
+          const usableFields = (snapshot?.fields || []).filter((field) => field?.visible !== false && !field?.disabled).length;
+          const score = (state === 'form-ready' ? 100 : state === 'map-gate' ? 50 : state === 'form-not-found' ? 20 : state === 'loading' ? 10 : 0) + usableFields;
+          out.push({ target, index, snapshot, state, usableFields, score });
+        }
+        return out.sort((a, b) => b.score - a.score);
+      };
+
+      const addUrl = `https://www.swiggy.com/web-cart-add-address?lat=${encodeURIComponent(form.lat)}&lng=${encodeURIComponent(form.lng)}`;
+      const phases = [
+        { name: 'desktop', viewport: { width: 1280, height: 900 }, userAgent: '' },
+        { name: 'mobile', viewport: { width: 430, height: 900, isMobile: true, hasTouch: true }, userAgent: session.deviceProfile?.ua || '' },
+      ];
+      let before = { ok: false, status: 0, addresses: [] };
+      let fillResult = null;
+      let fillTarget = page;
+      let lastSnapshot = {};
+      let lastState = 'loading';
+      let lastPhase = phases[0].name;
+
+      for (let phaseIndex = 0; phaseIndex < phases.length && !fillResult?.ok; phaseIndex++) {
+        const phase = phases[phaseIndex];
+        lastPhase = phase.name;
+        if (phaseIndex > 0 && remaining() <= 9_000) break;
+        try { await page.setViewport?.(phase.viewport); } catch {}
+        if (phase.userAgent) {
+          try { await page.setUserAgent?.(phase.userAgent); } catch {}
+        }
+        try {
+          await page.goto(addUrl, {
+            waitUntil: 'domcontentloaded',
+            timeout: Math.min(15_000, Math.max(4_000, remaining())),
+          });
+        } catch (navError) {
+          // DOMContentLoaded timeout par bhi SPA ka shell/form aksar ready
+          // hota hai. Seedha fail karne ke bajaye snapshot se asal haalat lo.
+          lastState = 'loading';
+          lastSnapshot = { url: addUrl, bodyText: String(navError?.message || '') };
+        }
+        if (abortRequested()) return abortedResult();
+
+        if (phaseIndex === 0) {
+          before = await fetchSavedAddressesInSwiggyPage(page);
+          const existing = findMatchingSwiggySavedAddress(before.addresses, addressDetails);
+          if (existing) {
+            const verifiedAddress = normalizeVerifiedSwiggyAddress(existing, addressDetails);
+            await syncCookiesBack();
+            return { ok: true, addressId: verifiedAddress.remoteAddressId, status: 200, method: 'web-add-address-ui-existing', submitAttempted: false, verifiedAddress, pageState: 'existing-saved', message: 'Address Swiggy account me pehle se saved verify ho gaya' };
+          }
+        }
+
+        const phaseBudgetMs = phaseIndex === 0
+          ? Math.min(9_000, Math.max(3_500, remaining() - 11_000))
+          : Math.min(7_000, Math.max(3_000, remaining() - 8_000));
+        const phaseDeadline = Date.now() + phaseBudgetMs;
+        let clickedGate = false;
+        let tappedMap = false;
+        let terminalChecks = 0;
+
+        while (Date.now() < phaseDeadline && remaining() > 6_500) {
+          if (abortRequested()) return abortedResult();
+          const inspected = await inspectTargets(before);
+          const best = inspected[0] || { target: page, snapshot: {}, state: 'loading', usableFields: 0 };
+          lastSnapshot = best.snapshot || {};
+          lastState = best.state || 'unknown';
+          fillTarget = best.target || page;
+
+          if (['login-required', 'security-challenge', 'redirected'].includes(lastState)) {
+            terminalChecks++;
+            if (terminalChecks >= 2) break;
+          } else {
+            terminalChecks = 0;
+          }
+
+          if (best.usableFields > 0) {
+            fillResult = await fillTarget.evaluate(swiggyAddressFillInBrowser, form)
+              .catch((e) => ({ ok: false, fields: best.usableFields, error: String(e?.message || e) }));
+            if (fillResult?.ok) break;
+            // Fields hain lekin React abhi hydrate ho raha hai to ek-do
+            // short retry kaafi hai; poora timeout yahin nahi jalega.
+            await waitInterruptibly(500);
+            continue;
+          }
+
+          if (!clickedGate && ['map-gate', 'form-not-found'].includes(lastState)) {
+            const gate = await fillTarget.evaluate(
+              swiggyAddressClickTextInBrowser,
+              ['proceed', 'enter complete address', 'confirm location', 'save delivery address', 'use current location', 'add new address']
+            ).catch(() => ({ clicked: false }));
+            clickedGate = Boolean(gate?.clicked);
+            if (clickedGate) {
+              await waitInterruptibly(900);
+              continue;
+            }
+          }
+
+          if (!tappedMap && lastState === 'map-gate') {
+            tappedMap = true;
+            try {
+              const viewport = typeof page.viewport === 'function' ? page.viewport() : phase.viewport;
+              const x = Math.round((Number(viewport?.width) || phase.viewport.width) / 2);
+              const y = Math.round((Number(viewport?.height) || phase.viewport.height) / 2);
+              if (typeof page.touchscreen?.tap === 'function') await page.touchscreen.tap(x, y);
+              else if (typeof page.mouse?.click === 'function') await page.mouse.click(x, y);
+            } catch {}
+            await waitInterruptibly(700);
+            continue;
+          }
+
+          await waitInterruptibly(500);
+        }
+
+        if (['login-required', 'security-challenge', 'redirected'].includes(lastState)) break;
       }
+
       if (!fillResult?.ok) {
         await syncCookiesBack();
-        return { ok: false, addressId: '', status: 0, method: 'web-add-address-ui', submitAttempted: false, message: `Add Address form fields nahi mile (${fillResult?.error || `fields=${fillResult?.fields || 0}`})` };
+        return {
+          ok: false,
+          addressId: '',
+          status: Number(before?.status) || 0,
+          method: 'web-add-address-ui',
+          submitAttempted: false,
+          pageState: lastState,
+          pagePhase: lastPhase,
+          pageSnapshot: summarizeSwiggyAddressSnapshot(lastSnapshot),
+          message: fillResult?.error
+            ? sanitizeSwiggyAddressFailureMessage(fillResult.error, swiggyAddressPageFailureMessage(lastState, lastSnapshot))
+            : swiggyAddressPageFailureMessage(lastState, lastSnapshot),
+        };
       }
 
-      submitAttempted = await page.evaluate(() => {
-        const norm = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
-        const visible = (el) => Boolean(el && (el.offsetParent !== null || el.getClientRects?.length));
-        const buttons = [...document.querySelectorAll('button, a, div, span')]
-          .filter((el) => visible(el) && !el.disabled && norm(el.textContent).includes('save address'));
-        const btn = buttons.sort((a, b) => String(a.textContent).length - String(b.textContent).length)[0];
-        if (!btn) return false;
-        btn.scrollIntoView?.({ block: 'center' });
-        btn.click();
-        return true;
-      }).catch(() => false);
+      if (abortRequested()) return abortedResult();
+      const saveClick = await fillTarget.evaluate(
+        swiggyAddressClickTextInBrowser,
+        ['save address & proceed', 'save address and proceed', 'save address', 'save & proceed', 'save and proceed']
+      ).catch(() => ({ clicked: false }));
+      submitAttempted = Boolean(saveClick?.clicked);
       if (!submitAttempted) {
         await syncCookiesBack();
-        return { ok: false, addressId: '', status: 0, method: 'web-add-address-ui', submitAttempted: false, message: 'SAVE ADDRESS button nahi mila' };
+        return { ok: false, addressId: '', status: 0, method: 'web-add-address-ui', submitAttempted: false, pageState: 'save-button-missing', pageSnapshot: summarizeSwiggyAddressSnapshot(lastSnapshot), message: 'SAVE ADDRESS button nahi mila' };
       }
 
       let lastPageError = '';
-      while (remaining() > 0) {
+      let failureChecks = 0;
+      const verifyDeadline = Date.now() + Math.min(12_000, Math.max(0, remaining()));
+      while (Date.now() < verifyDeadline && remaining() > 0) {
+        if (abortRequested()) return abortedResult();
         const created = createResponses.find((r) => r.ok && r.addressId);
         if (created) {
           const verifiedAddress = normalizeVerifiedSwiggyAddress({ id: created.addressId }, addressDetails);
           await syncCookiesBack();
-          return { ok: true, ...created, method: 'web-add-address-ui', submitAttempted: true, verifiedAddress, message: 'Address asal Swiggy Add Address page se save ho gaya' };
+          return { ok: true, ...created, method: 'web-add-address-ui', submitAttempted: true, verifiedAddress, pageState: 'saved', message: 'Address asal Swiggy Add Address page se save ho gaya' };
         }
         const listed = await fetchSavedAddressesInSwiggyPage(page);
         const matched = findMatchingSwiggySavedAddress(listed.addresses, addressDetails);
         if (matched) {
           const verifiedAddress = normalizeVerifiedSwiggyAddress(matched, addressDetails);
           await syncCookiesBack();
-          return { ok: true, addressId: verifiedAddress.remoteAddressId, status: 200, method: 'web-add-address-ui', submitAttempted: true, verifiedAddress, message: 'Address asal Swiggy Add Address page se save + saved list me verify ho gaya' };
+          return { ok: true, addressId: verifiedAddress.remoteAddressId, status: 200, method: 'web-add-address-ui', submitAttempted: true, verifiedAddress, pageState: 'saved', message: 'Address asal Swiggy Add Address page se save + saved list me verify ho gaya' };
         }
         const failedCreate = createResponses.find((r) => r.status && !r.ok);
-        if (failedCreate?.message) lastPageError = failedCreate.message;
-        const pageText = await page.evaluate(() => String(document.body?.innerText || '').slice(0, 3000)).catch(() => '');
-        const errorLine = String(pageText).split(/\n+/).map((x) => x.trim())
+        if (failedCreate?.message) lastPageError = sanitizeSwiggyAddressFailureMessage(failedCreate.message);
+        const inspected = await inspectTargets(listed).catch(() => []);
+        const currentSnapshot = inspected[0]?.snapshot || {};
+        lastSnapshot = currentSnapshot;
+        lastState = inspected[0]?.state || lastState;
+        const errorLine = String(currentSnapshot.bodyText || '').split(/\n+/).map((x) => x.trim())
           .find((x) => /please enter|required|not serviceable|serviceable|something went wrong|try again|invalid|error/i.test(x));
-        if (errorLine) lastPageError = errorLine;
-        if (remaining() <= 1_000) break;
-        await new Promise((resolve) => setTimeout(resolve, 900));
+        if (errorLine) lastPageError = sanitizeSwiggyAddressFailureMessage(errorLine);
+        if (failedCreate || errorLine) {
+          failureChecks++;
+          // Explicit validation/create failure ke baad saved list 2 dafa
+          // check ho chuki hai to bachi hui poori timeout mat jalao.
+          if (failureChecks >= 2) break;
+        }
+        if (remaining() <= 900 || Date.now() >= verifyDeadline - 900) break;
+        await waitInterruptibly(800);
       }
 
       await syncCookiesBack();
@@ -1135,11 +1642,14 @@ export async function addSwiggyAddressViaWebUi(session, addressDetails, {
         method: 'web-add-address-ui',
         submitAttempted: true,
         uncertain: true,
-        message: lastPageError || 'Add Address SAVE ke baad saved address verify nahi ho paya',
+        pageState: lastState,
+        pageSnapshot: summarizeSwiggyAddressSnapshot(lastSnapshot),
+        message: sanitizeSwiggyAddressFailureMessage(lastPageError || 'Add Address SAVE ke baad saved address verify nahi ho paya'),
       };
     } catch (e) {
       try { await syncCookiesBack(); } catch {}
-      return { ok: false, addressId: '', status: 0, method: 'web-add-address-ui', submitAttempted, uncertain: submitAttempted, message: String(e?.message || e).slice(0, 220) };
+      if (abortRequested()) return abortedResult();
+      return { ok: false, addressId: '', status: 0, method: 'web-add-address-ui', submitAttempted, uncertain: submitAttempted, pageState: 'browser-error', message: sanitizeSwiggyAddressFailureMessage(e?.message || e) };
     } finally {
       try {
         if (page && responseHandler) {
@@ -1154,20 +1664,23 @@ export async function addSwiggyAddressViaWebUi(session, addressDetails, {
   });
 }
 
-// Pehle asal Add Address page, phir hi CAS API fallback. UI SAVE click
-// ho chuka ho lekin verification uncertain ho to dusra POST nahi hoga —
-// warna ek hi address duplicate ban sakta hai.
+// Pehle asal Add Address page. CAS API sirf tab fallback hai jab caller
+// ne explicit URL diya ho (ya SWIGGY_ADDRESS_CREATE_URL configure ho) —
+// www wali guessed `/mapi`/`/dapi` paths live run me HTML de kar sirf
+// time jalati rahi hain. UI SAVE click ho chuka ho lekin verification
+// uncertain ho to dusra POST nahi hoga, warna duplicate ban sakta hai.
 export async function addSwiggyAddressToAccount(session, addressDetails, {
   customerId = '',
-  timeoutMs = 55_000,
+  timeoutMs = 38_000,
   fetchImpl = null,
   urls = null,
   browserAddImpl = null,
   pageFactory = null,
+  shouldAbort = null,
 } = {}) {
   const before = await fetchSwiggySavedAddressesViaBridgeSession(session, {
     fetchImpl,
-    timeoutMs: Math.min(8_000, Math.max(2_000, Number(timeoutMs) || 8_000)),
+    timeoutMs: Math.min(5_000, Math.max(2_000, Number(timeoutMs) || 5_000)),
   }).catch(() => ({ ok: false, addresses: [] }));
   const existing = findMatchingSwiggySavedAddress(before.addresses, addressDetails);
   if (existing) {
@@ -1179,11 +1692,12 @@ export async function addSwiggyAddressToAccount(session, addressDetails, {
   let ui;
   try {
     ui = await uiFn(session, addressDetails, {
-      timeoutMs: Math.max(10_000, Math.min(50_000, Number(timeoutMs) || 45_000)),
+      timeoutMs: Math.max(10_000, Math.min(34_000, Number(timeoutMs) || 32_000)),
       pageFactory,
+      shouldAbort,
     });
   } catch (e) {
-    ui = { ok: false, submitAttempted: false, message: String(e?.message || e).slice(0, 220) };
+    ui = { ok: false, submitAttempted: false, pageState: 'browser-error', message: sanitizeSwiggyAddressFailureMessage(e?.message || e) };
   }
   if (ui?.ok && ui.addressId) {
     const verifiedAddress = ui.verifiedAddress?.remoteAddressId
@@ -1192,24 +1706,60 @@ export async function addSwiggyAddressToAccount(session, addressDetails, {
     return { ...ui, verifiedAddress };
   }
   if (ui?.submitAttempted || ui?.uncertain) {
-    const afterUi = await fetchSwiggySavedAddressesViaBridgeSession(session, { fetchImpl, timeoutMs: 8_000 })
+    const afterUi = await fetchSwiggySavedAddressesViaBridgeSession(session, { fetchImpl, timeoutMs: 5_000 })
       .catch(() => ({ ok: false, addresses: [] }));
     const matched = findMatchingSwiggySavedAddress(afterUi.addresses, addressDetails);
     if (matched) {
       const verifiedAddress = normalizeVerifiedSwiggyAddress(matched, addressDetails);
       return { ok: true, addressId: verifiedAddress.remoteAddressId, status: 200, method: 'web-add-address-ui-verify', verifiedAddress, message: 'Address Add Address page ke baad saved list me verify ho gaya' };
     }
-    return { ok: false, addressId: '', status: Number(ui?.status) || 0, method: 'web-add-address-ui', submitAttempted: true, message: ui?.message || 'Add Address SAVE verify nahi ho paya' };
+    return {
+      ok: false,
+      addressId: '',
+      status: Number(ui?.status) || 0,
+      method: 'web-add-address-ui',
+      submitAttempted: true,
+      aborted: Boolean(ui?.aborted),
+      pageState: ui?.pageState || '',
+      pageSnapshot: ui?.pageSnapshot || null,
+      message: sanitizeSwiggyAddressFailureMessage(ui?.message || 'Add Address SAVE verify nahi ho paya'),
+    };
+  }
+
+  const explicitCasUrls = Array.isArray(urls) && urls.length
+    ? urls
+    : (String(process.env.SWIGGY_ADDRESS_CREATE_URL || '').trim()
+      ? [String(process.env.SWIGGY_ADDRESS_CREATE_URL).trim()]
+      : []);
+  const casBlockedStates = new Set([
+    'login-required',
+    'security-challenge',
+    'redirected',
+    'cookie-sync-failed',
+    'aborted',
+  ]);
+  if (!explicitCasUrls.length || casBlockedStates.has(String(ui?.pageState || '')) || ui?.aborted) {
+    return {
+      ok: false,
+      addressId: '',
+      status: Number(ui?.status) || 0,
+      method: 'web-add-address-ui',
+      submitAttempted: Boolean(ui?.submitAttempted),
+      aborted: Boolean(ui?.aborted),
+      pageState: ui?.pageState || '',
+      pageSnapshot: ui?.pageSnapshot || null,
+      message: sanitizeSwiggyAddressFailureMessage(ui?.message || 'Add Address page se address save nahi ho paya'),
+    };
   }
 
   const cas = await addSwiggyAddressViaBridgeSession(session, addressDetails, {
     customerId,
-    timeoutMs: Math.min(10_000, Math.max(2_000, Number(timeoutMs) || 8_000)),
+    timeoutMs: Math.min(8_000, Math.max(2_000, Number(timeoutMs) || 8_000)),
     fetchImpl,
-    urls,
+    urls: explicitCasUrls,
   });
   if (cas.ok && cas.addressId) {
-    const afterCas = await fetchSwiggySavedAddressesViaBridgeSession(session, { fetchImpl, timeoutMs: 8_000 })
+    const afterCas = await fetchSwiggySavedAddressesViaBridgeSession(session, { fetchImpl, timeoutMs: 5_000 })
       .catch(() => ({ ok: false, addresses: [] }));
     const matched = findMatchingSwiggySavedAddress(afterCas.addresses, addressDetails)
       || (afterCas.addresses || []).find((raw) => directSwiggyAddressId(raw) === cas.addressId);
@@ -1222,7 +1772,12 @@ export async function addSwiggyAddressToAccount(session, addressDetails, {
     status: Number(cas.status) || Number(ui?.status) || 0,
     method: 'web-add-address-ui+cas',
     submitAttempted: Boolean(ui?.submitAttempted),
-    message: `Add Address page: ${ui?.message || 'fail'} · CAS: ${cas.message || cas.status || 'fail'}`.slice(0, 280),
+    pageState: ui?.pageState || '',
+    pageSnapshot: ui?.pageSnapshot || null,
+    responseKind: cas.responseKind || '',
+    message: sanitizeSwiggyAddressFailureMessage(
+      `Add Address page: ${sanitizeSwiggyAddressFailureMessage(ui?.message || 'fail')} · CAS: ${sanitizeSwiggyAddressFailureMessage(cas.message || cas.status || 'fail')}`
+    ),
   };
 }
 
@@ -3376,11 +3931,7 @@ async function finalizeAuthenticatedSwiggyAccount(userId, session, authResult, {
 
   if (session.page && session.browser?.connected) {
     const pageCookies = await waitForSwiggyLoginCookies(session.page, 500);
-    for (const c of pageCookies) {
-      if (c?.name && c?.value && c.name !== 'aws-waf-token') {
-        session.cookieMap.set(c.name, c.value);
-      }
-    }
+    _mergeSwiggyBrowserCookies(session.cookieMap, pageCookies);
   }
 
   const resUserData = authResult?.data?.data || {};
@@ -3494,11 +4045,15 @@ async function finalizeAuthenticatedSwiggyAccount(userId, session, authResult, {
       remoteAddressResult = await addSwiggyAddressToAccount(
         session,
         generatedAddressDetails,
-        { customerId, timeoutMs: 55_000 }
+        {
+          customerId,
+          timeoutMs: 38_000,
+          shouldAbort: () => _swiggyBridgeSessionAbortRequested(session),
+        }
       );
       generatedAddressDetails.remoteAddressStatus = remoteAddressResult.ok ? 'added' : 'failed';
       if (remoteAddressResult.addressId) generatedAddressDetails.remoteAddressId = remoteAddressResult.addressId;
-      if (remoteAddressResult.message) generatedAddressDetails.remoteAddressMessage = remoteAddressResult.message;
+      if (remoteAddressResult.message) generatedAddressDetails.remoteAddressMessage = sanitizeSwiggyAddressFailureMessage(remoteAddressResult.message);
       if (remoteAddressResult.ok && remoteAddressResult.addressId) {
         verifiedAddressDetails = remoteAddressResult.verifiedAddress?.remoteAddressId
           ? remoteAddressResult.verifiedAddress
@@ -3507,7 +4062,7 @@ async function finalizeAuthenticatedSwiggyAccount(userId, session, authResult, {
       console.log(`[SwiggyBridge] Fresh account Maharashtra address remote ${remoteAddressResult.ok ? `added (id ${remoteAddressResult.addressId}, ${remoteAddressResult.method || 'verified'})` : `failed: ${remoteAddressResult.message || remoteAddressResult.status}`}`);
     } catch (e) {
       generatedAddressDetails.remoteAddressStatus = 'failed';
-      generatedAddressDetails.remoteAddressMessage = String(e?.message || e).slice(0, 240);
+      generatedAddressDetails.remoteAddressMessage = sanitizeSwiggyAddressFailureMessage(e?.message || e);
       remoteAddressResult = { ok: false, addressId: '', message: generatedAddressDetails.remoteAddressMessage };
       console.warn('[SwiggyBridge] Remote address add failed:', generatedAddressDetails.remoteAddressMessage);
     }
@@ -3517,8 +4072,24 @@ async function finalizeAuthenticatedSwiggyAccount(userId, session, authResult, {
     ? (verifiedAddressDetails ? 'added' : 'failed')
     : '';
   const remoteAddressMessage = generatedAddressDetails
-    ? String(remoteAddressResult?.message || generatedAddressDetails.remoteAddressMessage || '').slice(0, 240)
+    ? sanitizeSwiggyAddressFailureMessage(remoteAddressResult?.message || generatedAddressDetails.remoteAddressMessage || '', '')
     : '';
+
+  // Owner ne isi number ko SKIP kar diya hai to account ko fresh count /
+  // instant JSON ke liye persist mat karo. Remote account ban chuka ho
+  // sakta hai, lekin is run ke liye ye number yahin khatam hai.
+  if (_swiggyBridgeSessionAbortRequested(session) || remoteAddressResult?.aborted) {
+    closeBridgeSessionCleanly(session);
+    delete activeSessions[userId];
+    return {
+      success: false,
+      code: 'ABORTED',
+      aborted: true,
+      manualSkip: true,
+      message: 'Owner ne current number SKIP kar diya',
+      swiggyStatus: 'manual_skip',
+    };
+  }
 
   // Cookies address attempt ke BAAD serialize karo — Add Address page /
   // saved-list verification se nayi Set-Cookies aayein to woh purani
@@ -3547,6 +4118,22 @@ async function finalizeAuthenticatedSwiggyAccount(userId, session, authResult, {
       new Promise(resolve => setTimeout(() => resolve({ success: false, pendingBackgroundLock: true }), 2400))
     ]);
   } catch {}
+
+  // Offers wale chhote await ke dauran bhi SKIP aa sakta hai. DB save se
+  // just pehle ye last check skipped account ko persist/export hone se
+  // rokta hai.
+  if (_swiggyBridgeSessionAbortRequested(session)) {
+    closeBridgeSessionCleanly(session);
+    delete activeSessions[userId];
+    return {
+      success: false,
+      code: 'ABORTED',
+      aborted: true,
+      manualSkip: true,
+      message: 'Owner ne current number SKIP kar diya',
+      swiggyStatus: 'manual_skip',
+    };
+  }
 
   // Auto label saare awaits ke BAAD lo. Parallel lanes me do finalizes ek
   // saath aayein to dono await se pehle same "User N" nahi uthayengi;

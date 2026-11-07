@@ -3236,6 +3236,15 @@ console.log('Ek number = ek hi baar (1-minute decision window, koi parking nahi)
     'rule: consumed/retired number pick filter se block hota hai');
   ok(src.includes('retiredNumbers: 0'), 'rule: state me retiredNumbers counter');
   ok(src.includes('consumedNumbers: 0'), 'rule: state me all consumed numbers counter');
+  ok(engine.SECURITY_CHALLENGE_STOP_LIMIT === 3, 'safety: 3 consecutive security challenges stop batch');
+  ok(src.includes('if (state.wafStrikes >= SECURITY_CHALLENGE_STOP_LIMIT)'),
+    'safety: security challenge threshold checked');
+  ok(src.includes("requestRunEnd('security_challenge');\n          break;"),
+    'safety: repeated 403 gracefully ends batch for every source');
+  ok(!/if \(!telegramMode\) \{ requestRunEnd\('security_challenge'\)/.test(src),
+    'safety: Hermes no longer loops forever after repeated security blocks');
+  ok(src.includes('Swiggy ne 3 baar OTP security challenge diya — batch safety stop'),
+    'safety: final status explains 403 stop');
 
   // --- messaging imaandaar ---
   const card = engine.formatCompactAutopilotCard({
@@ -3272,6 +3281,8 @@ console.log('Ek number = ek hi baar (1-minute decision window, koi parking nahi)
   const envExample = await fsp.readFile(new URL('./.env.example', import.meta.url), 'utf8');
   const readme = await fsp.readFile(new URL('./README.md', import.meta.url), 'utf8');
   ok(docs.includes('Ek number = ek hi baar'), 'docs: 4f rule ka naam');
+  ok(/3\s+lagataar security-challenge outcomes/.test(docs), 'docs: 403 safety stop');
+  ok(readme.includes('WAF solver OK'), 'docs: solver OK != OTP permission');
   ok(docs.includes('queue me park karke baad me try karna allowed nahi')
     || docs.includes('park karke baad me try karna allowed nahi'), 'docs: parking allowed nahi');
   ok(!envExample.includes('PREMIUM_NUMBER_DECISION_WINDOW_MS'), 'docs: 60s rule hard-coded (no env override)');

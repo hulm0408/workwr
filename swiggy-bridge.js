@@ -3827,6 +3827,13 @@ export async function safeEvaluateAuthOnce(page, fn, ...args) {
 }
 
 export function parseSwiggyOtpError(otpResult) {
+  try {
+    const r0 = arguments[0] || {};
+    const h0 = r0.headers || {};
+    const wa = h0['x-amzn-waf-action'] || (typeof h0.get === 'function' ? h0.get('x-amzn-waf-action') : '') || 'none';
+    console.warn('[OTPdbg] parse | status=' + (r0.status || r0.statusCode || '?') + ' | wafAction=' + wa + ' | body=' + String(r0.rawText || r0.body || '').replace(/\s+/g, ' ').slice(0, 200));
+  } catch {}
+
   if (!otpResult) {
     return {
       code: 'NO_RESPONSE',
@@ -5534,4 +5541,38 @@ export async function logoutSwiggySessionRemote(accountOrKey) {
   } catch (e) {
     return { ok: false, status: 'INCONCLUSIVE', revoked: false, httpStatus, attempts, message: e?.message || 'Logout request failed' };
   }
+}
+
+// 403 par ladder: (1) seedha, (2) naya token, (3) naya token + route rotate.
+export async function requestSwiggyOtpViaBridge(userId, phone, targetAcc = '', targetAccName = null) {
+  const steps = [
+    { name: 'a1-plain', forceToken: false, rotate: false, waitMs: 0 },
+    { name: 'a2-fresh-token', forceToken: true, rotate: false, waitMs: 1200 },
+    { name: 'a3-token-rotate', forceToken: true, rotate: true, waitMs: 2500 }
+  ];
+  let last = null;
+  for (const step of steps) {
+    if (step.forceToken) {
+      try { await getLiveSwiggyWafToken(true, { solveBudgetMs: WAF_SOLVE_RELIABLE_BUDGET_MS }); } catch {}
+    }
+    if (step.rotate) {
+      try {
+        if (typeof proxyPool.quarantineCurrentRoute === 'function') await proxyPool.quarantineCurrentRoute('waf');
+        else if (typeof proxyPool.markRouteWafHit === 'function') await proxyPool.markRouteWafHit();
+      } catch {}
+    }
+    if (step.waitMs) await new Promise((r) => setTimeout(r, step.waitMs));
+
+    let tokenLen = -1, routeKey = '?';
+    try { tokenLen = (getTokenSync() || '').length; } catch {}
+    try { routeKey = _wafSolveRouteKey(getBridgeProxy()); } catch {}
+    console.log('[OTPdbg] try ' + step.name + ' | phone=******' + String(phone).slice(-4) + ' | tokenLen=' + tokenLen + ' | route=' + routeKey);
+
+    last = await requestSwiggyOtpViaBridgeRaw(userId, phone, targetAcc, targetAccName);
+    console.log('[OTPdbg] try ' + step.name + ' -> success=' + Boolean(last && last.success) + ' code=' + ((last && last.code) || 'none') + ' | ' + String((last && (last.details || last.swiggyStatus)) || '').slice(0, 140));
+
+    if (last && last.success) return Object.assign({}, last, { otpAttempts: step.name });
+    if (!last || last.code !== 'SWIGGY_SECURITY_CHALLENGE') return last;
+  }
+  return last;
 }

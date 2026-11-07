@@ -480,16 +480,23 @@ console.log('firebase-sources (db-backed manager):');
       && srcMod.listRunSources().some((s) => s.id === seeded[0].id),
     'purana disabled source load par ACTIVE normalize — sirf Delete se hatega');
   }
-  ok(srcMod.BUILTIN_FIREBASE_SOURCE_URLS.length === 55, 'owner ke 55 Firebase URLs built-in list me hain');
-  ok(new Set(srcMod.BUILTIN_FIREBASE_SOURCE_URLS).size === 55, 'built-in Firebase URLs me duplicate nahi');
+  ok(srcMod.BUILTIN_FIREBASE_SOURCE_URLS.length >= 400,
+    `owner ki poori ROLEX VIP list built-in hai (${srcMod.BUILTIN_FIREBASE_SOURCE_URLS.length} URLs)`);
+  ok(new Set(srcMod.BUILTIN_FIREBASE_SOURCE_URLS.map((u) => u.toLowerCase())).size === srcMod.BUILTIN_FIREBASE_SOURCE_URLS.length,
+    'built-in Firebase URLs me duplicate nahi');
   ok(srcMod.BUILTIN_FIREBASE_SOURCE_URLS[0] === 'https://admin143-dab82-default-rtdb.firebaseio.com', 'pehla built-in Firebase URL sahi');
-  ok(srcMod.BUILTIN_FIREBASE_SOURCE_URLS.at(-1) === 'https://do-admin-v21-default-rtdb.firebaseio.com', 'aakhri built-in Firebase URL sahi');
+  ok(srcMod.BUILTIN_FIREBASE_SOURCE_URLS.includes('https://do-admin-v21-default-rtdb.firebaseio.com'), 'purani 55 wali list bhi shamil');
   ok(srcMod.BUILTIN_FIREBASE_SOURCE_URLS.includes('https://choduu00111-default-rtdb.firebaseio.com'), 'choduu00111 Firebase URL shamil');
   ok(srcMod.BUILTIN_FIREBASE_SOURCE_URLS.includes('https://myypppp-default-rtdb.asia-southeast1.firebasedatabase.app'), 'asia-southeast1 Firebase URL shamil');
+  ok(srcMod.BUILTIN_FIREBASE_SOURCE_URLS.includes('https://a4jaat-208cb-default-rtdb.firebaseio.com'), 'ROLEX list ka pehla Firebase URL shamil');
+  ok(srcMod.BUILTIN_FIREBASE_SOURCE_URLS.includes('https://painislv-default-rtdb.firebaseio.com'), 'ROLEX list ka aakhri poora Firebase URL shamil');
+  ok(!srcMod.BUILTIN_FIREBASE_SOURCE_URLS.some((u) => /pari-7907d/i.test(u)), 'adhoora cut hua URL seed list me nahi');
+  ok(srcMod.MAX_BULK_FIREBASE_SOURCES >= 1000, 'ek message me 1000 tak Firebase add ho sakte hain');
   {
     const seededUrls = new Set(seeded.map((s) => s.url.replace(/\/+$/, '').toLowerCase()));
     ok(srcMod.BUILTIN_FIREBASE_SOURCE_URLS.every((u) => seededUrls.has(u.toLowerCase())), 'saare built-in Firebase sources seed ho gaye');
-    ok(seeded.filter((s) => s.builtin).length === 55, '55 built-in sources builtin tag ke saath save');
+    ok(seeded.filter((s) => s.builtin).length === srcMod.BUILTIN_FIREBASE_SOURCE_URLS.length,
+      'poori built-in list builtin tag ke saath save');
     ok(new Set(seeded.map((s) => s.id)).size === seeded.length, 'source IDs unique hain');
     ok(seeded.every((s) => /^[a-f0-9-]{1,10}$/.test(s.id)), 'source IDs Telegram callback-compatible hain');
   }
@@ -588,6 +595,120 @@ console.log('firebase-sources (db-backed manager):');
     try { verified = await srcMod.verifySource(srcMod.getActiveSource().id); }
     finally { globalThis.fetch = mockFetch; }
     ok(verified.ok === false && /deactivated/.test(verified.error), 'verifySource Firebase error JSON ko fail kehta hai');
+  }
+}
+
+// ---------------------------------------------------------------------------
+console.log('firebase durability + speed (env seed, delete-memory, health, vault):');
+{
+  // 1) env FIREBASE_DB_URLS → boot par missing URLs auto-add
+  const prevEnvUrls = process.env.FIREBASE_DB_URLS;
+  process.env.FIREBASE_DB_URLS = 'https://envone-default-rtdb.firebaseio.com\nhttps://envtwo-default-rtdb.firebaseio.com';
+  try {
+    const envUrls = srcMod.envSeedUrls();
+    ok(envUrls.length === 2 && envUrls[0] === 'https://envone-default-rtdb.firebaseio.com'
+      && envUrls[1] === 'https://envtwo-default-rtdb.firebaseio.com',
+    'FIREBASE_DB_URLS se poori list parse (newline/comma)');
+    ok(srcMod.FIREBASE_ENV_URL_KEYS.includes('FIREBASE_DB_URLS'), 'env key documented/exported');
+
+    const seededEnv = srcMod.ensureSeeded();
+    const envAdded = seededEnv.list.filter((s) => /env(one|two)-default-rtdb/.test(s.url));
+    ok(envAdded.length === 2, 'env URLs boot seed me add ho gayi (restart-proof setup)');
+
+    // Delete-memory: delete ki hui URL seed se wapas nahi aati
+    srcMod.removeSource(envAdded[0].id);
+    const afterDelete = srcMod.ensureSeeded();
+    ok(!afterDelete.list.some((s) => /envone-default-rtdb/.test(s.url)),
+      'Delete ki hui URL env/built-in seed se wapas nahi aati');
+    const reAdd = srcMod.addSource({ url: 'https://envone-default-rtdb.firebaseio.com' });
+    ok(reAdd.ok === true, 'manually dobara add karna chalta hai');
+    const readded = srcMod.ensureSeeded().list.filter((s) => /envone-default-rtdb/.test(s.url));
+    ok(readded.length === 1, 're-add ke baad duplicate nahi banta');
+  } finally {
+    if (prevEnvUrls === undefined) delete process.env.FIREBASE_DB_URLS;
+    else process.env.FIREBASE_DB_URLS = prevEnvUrls;
+  }
+
+  // 2) Health: 2 fail → 30 min quarantine → order me sabse aakhir
+  {
+    const victim = srcMod.getActiveSource();
+    srcMod.resetSourceHealth();
+    srcMod.recordSourceResult(victim.id, { ok: false, error: 'timeout' });
+    ok(srcMod.getSourceHealth(victim.id).failStreak === 1, 'ek failure par streak 1');
+    ok(srcMod.isSourceQuarantined(victim.id) === false, 'ek failure par abhi quarantine nahi');
+    srcMod.recordSourceResult(victim.id, { ok: false, error: 'timeout' });
+    ok(srcMod.isSourceQuarantined(victim.id) === true, '2 lagatar failure par quarantine');
+    const ordered = srcMod.listRunSources();
+    ok(ordered.at(-1)?.id === victim.id, 'quarantined DB run order me sabse aakhir');
+    ok(ordered.length === srcMod.listSources().length, 'quarantine DB ko list se nahi hatata');
+    ok(ordered[0]?.primary === true && ordered[0]?.id !== victim.id, 'top healthy/untried DB first-try banti hai');
+
+    srcMod.recordSourceResult(victim.id, { ok: true, ms: 90 });
+    ok(srcMod.getSourceHealth(victim.id).failStreak === 0, 'success par fail streak reset');
+    ok(srcMod.isSourceQuarantined(victim.id) === false, 'success quarantine clear karta hai');
+
+    srcMod.recordSourceResult(victim.id, { empty: true, error: 'khali pool' });
+    srcMod.recordSourceResult(victim.id, { empty: true, error: 'khali pool' });
+    ok(srcMod.isSourceQuarantined(victim.id) === true, 'khali pool bhi 2 baar par quarantine');
+    srcMod.resetSourceHealth();
+    const summary = srcMod.sourceHealthSummary();
+    ok(summary.total === srcMod.listSources().length && summary.quarantined === 0,
+      'health summary reset ke baad saaf');
+  }
+
+  // 3) Bulk limit: 250 URLs ek message me (purani 200 limit nahi)
+  {
+    const many = Array.from({ length: 250 }, (_, i) => `https://loadtest${i}-default-rtdb.firebaseio.com`).join('\n');
+    const bulkRes = srcMod.addSourcesBulk(many, { setFirstAsPrimary: false, applyReader: false });
+    ok(bulkRes.added.length === 250, 'ek message me 250 Firebase add (200 se zyada)');
+    ok(bulkRes.invalid.length === 0, 'bulk 250 me koi invalid nahi');
+    for (const a of bulkRes.added) srcMod.removeSource(a.id);
+    ok(!srcMod.listSources().some((s) => /loadtest\d+-default-rtdb/.test(s.url)), 'bulk test sources delete ho gaye');
+  }
+
+  // 4) Cloud vault: sources + settings snapshot aur hydrate-merge
+  {
+    const store = await import('./store.js');
+    const db = store.getDb();
+    db.freshSettings = { ...(db.freshSettings || {}), target: 321, concurrency: 10 };
+    store.saveDb(db);
+
+    const snap = store.buildCloudVaultSnapshot(store.getDb());
+    ok(Array.isArray(snap.firebaseSources?.list) && snap.firebaseSources.list.length >= 400,
+      `vault snapshot me poori Firebase list (${snap.firebaseSources?.list?.length})`);
+    ok(snap.firebaseSources.list.every((s) => s.enabled === true), 'vault snapshot me sab sources ACTIVE');
+    ok(snap.freshSettings?.target === 321, 'vault snapshot me batch settings');
+
+    // Remote snapshot me ek naya source + setting — merge hone chahiye
+    const fakeDb = { firebaseSources: { activeId: '', list: [], deleted: [], health: {} }, freshSettings: {} };
+    const remote = {
+      firebaseSources: {
+        activeId: '',
+        seedVersion: 3,
+        deleted: [],
+        health: {},
+        list: [
+          { id: 'abc12345', url: 'https://vaultonly-default-rtdb.firebaseio.com', enabled: true },
+          { id: 'def67890', url: 'https://vaulttwo-default-rtdb.firebaseio.com', enabled: true },
+        ],
+      },
+      freshSettings: { target: 500, gapMs: 4000 },
+    };
+    const merged = store.mergeVaultFirebaseState(fakeDb, remote);
+    ok(merged.restoredSources === 2 && merged.restoredSettings === 2,
+      'vault se missing Firebase sources + settings restore');
+    ok(fakeDb.firebaseSources.list.every((s) => s.enabled === true), 'restored sources ACTIVE');
+    ok(fakeDb.firebaseSources.seedVersion === 3, 'seedVersion vault se restore');
+
+    // Local delete vault se undo nahi hota
+    fakeDb.firebaseSources.deleted = ['https://vaultonly-default-rtdb.firebaseio.com'];
+    const db2 = { firebaseSources: { activeId: '', list: [], deleted: [], health: {} }, freshSettings: {} };
+    const merged2 = store.mergeVaultFirebaseState(db2, {
+      firebaseSources: { ...remote.firebaseSources, deleted: ['https://vaultonly-default-rtdb.firebaseio.com'] },
+    });
+    ok(merged2.restoredSources === 1
+      && !db2.firebaseSources.list.some((s) => /vaultonly/.test(s.url)),
+    'vault merge delete-memory ka respect karta hai');
   }
 }
 

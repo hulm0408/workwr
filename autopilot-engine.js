@@ -19,7 +19,13 @@
 // Engine process-singleton hai: dono bots (main + autopilot) isi state ko dekhte hain.
 
 import { isFirebaseConfigured, firebaseSetupHintLines, listPoolNumbers, scanFreshDevices, _countDeviceOnlineStates } from './firebase-numbers.js';
-import { applyActiveSource, applySourceForRun, listRunSources } from './firebase-sources.js';
+import {
+  applyActiveSource,
+  applySourceForRun,
+  listRunSources,
+  recordSourceResult,
+  sourceHealthSummary,
+} from './firebase-sources.js';
 import { getSetting } from './bot-settings.js';
 import {
   processSingleNumber,
@@ -424,6 +430,22 @@ export function getAutopilotSnapshot() {
     freshAccounts: state.freshAccounts.slice(-100),
     elapsedMs: state.startedAt ? ((state.finishedAt || Date.now()) - state.startedAt) : 0,
     endReason: state.stopReason,
+    // "1 minute = 1 ID" ka live measure: kitne fresh sessions per minute
+    // ban rahe hain + target tak pahunchne ka ETA. UI isi ko dikhata hai.
+    idsPerMinute: (() => {
+      const ms = state.startedAt ? ((state.finishedAt || Date.now()) - state.startedAt) : 0;
+      if (ms < 30_000) return 0;
+      return Math.round(((Number(state.fresh) || 0) / ms) * 60_000 * 10) / 10;
+    })(),
+    etaMinutes: (() => {
+      const ms = state.startedAt ? ((state.finishedAt || Date.now()) - state.startedAt) : 0;
+      const fresh = Number(state.fresh) || 0;
+      const left = Math.max(0, (Number(state.target) || 0) - fresh);
+      if (!left) return 0;
+      if (ms < 30_000 || fresh < 1) return 0;
+      return Math.max(1, Math.round((left * ms) / fresh / 60_000));
+    })(),
+    sourceHealth: (() => { try { return sourceHealthSummary(); } catch { return null; } })(),
   };
 }
 
@@ -828,6 +850,17 @@ function compactElapsedMs(snap = {}) {
   return Math.max(0, end - start);
 }
 
+// "1 ID / minute" target ko card par seedha dikhao — user ko andaza na
+// lagana pade ki speed theek hai ya nahi.
+function rateText(snap = {}) {
+  const perMin = Number(snap.idsPerMinute) || 0;
+  const fresh = Number(snap.fresh) || 0;
+  const elapsed = compactElapsedMs(snap);
+  if (elapsed < 30_000 || fresh < 1) return '';
+  const eta = Number(snap.etaMinutes) || 0;
+  return `⚡ ${mono(`${perMin.toFixed(1)}/min`)}${eta ? ` · ETA ${mono(`${eta}m`)}` : ''}`;
+}
+
 // Live card ka ek hi sach: abhi kya ho raha hai, kaunsa number hai,
 // kitna target hua, aur agla step kya hai. Purani lambi diagnostics
 // (pool/scan/proxy counters ke paragraphs) yahan nahi ghusengi.
@@ -868,7 +901,7 @@ export function formatCompactAutopilotCard(snap = state, { stageText = '', final
     `<b>Abhi:</b> ${esc(now)}`,
     !final && info.detail && info.detail !== now ? `<i>${esc(info.detail)}</i>` : '',
     progressBar(fresh, target),
-    `📱 ${mono(phoneText)} · ⏱ ${mono(fmtDuration(compactElapsedMs(s)))}${s.sourceMode !== 'telegram' && (s.concurrency || 1) > 1 ? ` · ⚡ ${mono(`${Number(s.activeWorkers) || active.length}/${Number(s.concurrency) || 1}`)}` : ''}`,
+    `📱 ${mono(phoneText)} · ⏱ ${mono(fmtDuration(compactElapsedMs(s)))}${rateText(s) ? ` · ${rateText(s)}` : ''}${s.sourceMode !== 'telegram' && (s.concurrency || 1) > 1 ? ` · ⚡ ${mono(`${Number(s.activeWorkers) || active.length}/${Number(s.concurrency) || 1}`)}` : ''}`,
     compactSourceLine(s),
     `✅ ${mono(`FRESH ${fresh}`)} · ⚙ ${mono(`DONE ${Number(s.processed) || 0}`)} · × ${mono(`FAIL ${Number(s.failed) || 0}`)}${retries ? ` · ↻ ${mono(`RETRY ${retries}`)}` : ''}${Number(s.manualSkips) ? ` · ⏭ ${mono(`SKIP ${Number(s.manualSkips) || 0}`)}` : ''}${fresh ? ` · 🏠 ${mono(`ADDR ${Number(s.addressAdded) || 0}/${fresh}`)}` : ''}`,
     final
@@ -1122,6 +1155,13 @@ export async function startAutopilot(opts = {}) {
   let runSourceIndex = -1;
   let currentRunSource = null;
   const triedRunSourceKeys = new Set();
+  // Source health: 400+ DBs ke pool me zinda DB pehle, dead/quarantine
+  // baad me — taaki har run 10s ke network timeouts par na atke.
+  const noteSourceHealth = (src, { ok = false, error = '', ms = 0, empty = false } = {}) => {
+    if (!src?.id) return;
+    try { recordSourceResult(src.id, { ok, error, ms, empty }); } catch {}
+  };
+
   const markRunSourceState = (src) => {
     currentRunSource = src || null;
     if (src) {
@@ -1489,10 +1529,14 @@ export async function startAutopilot(opts = {}) {
         }
 
         try {
+          const sourceT0 = Date.now();
           await loadPool();
           sawSuccessfulLoad = true;
           const usable = usablePoolCount();
           if (!pool.length) state.poolEmptySources = (state.poolEmptySources || 0) + 1;
+          noteSourceHealth(src, usable > 0
+            ? { ok: true, ms: Date.now() - sourceT0 }
+            : { empty: true, error: 'khali pool — koi usable number nahi' });
           console.log(
             `[Autopilot] 🔥 Firebase source ${i + 1}/${runSources.length} (${src.name || firebaseSourceHost(src.url)}): ` +
             `${state.poolFresh} fresh / ${pool.length} numbers, usable ${usable}.`
@@ -1512,6 +1556,7 @@ export async function startAutopilot(opts = {}) {
           state.poolFresh = 0;
           state.poolStatus = 'error';
           pool = [];
+          noteSourceHealth(src, { error: lastSourceError });
           console.warn(
             `[Autopilot] 🔥 Firebase source ${i + 1}/${runSources.length} (${src.name || firebaseSourceHost(src.url)}) fail: ${lastSourceError}`
           );
@@ -2303,10 +2348,14 @@ export async function startAutopilot(opts = {}) {
         ].join('\n'))), stopRows());
 
         try {
+          const sourceT0 = Date.now();
           await loadPool();
           sawSuccessfulLoad = true;
           const usable = usablePoolCount();
           if (!pool.length) state.poolEmptySources = (state.poolEmptySources || 0) + 1;
+          noteSourceHealth(src, usable > 0
+            ? { ok: true, ms: Date.now() - sourceT0 }
+            : { empty: true, error: 'khali pool — koi usable number nahi' });
           console.log(
             `[Autopilot] 🔁 Firebase source switch → ${src.name || firebaseSourceHost(src.url)}: ` +
             `${state.poolFresh} fresh / ${pool.length} numbers, usable ${usable}.`
@@ -2328,6 +2377,7 @@ export async function startAutopilot(opts = {}) {
           state.poolFresh = 0;
           state.poolStatus = 'error';
           pool = [];
+          noteSourceHealth(src, { error: lastSourceError });
           console.warn(`[Autopilot] 🔁 Firebase source ${src.name || firebaseSourceHost(src.url)} fail: ${lastSourceError}`);
         }
       }

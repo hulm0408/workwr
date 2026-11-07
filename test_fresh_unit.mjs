@@ -3025,4 +3025,131 @@ console.log('Multi-instance shard + JSON file + card polish:');
   ok(cardShard, 'card: shard share live card par dikhta hai');
 }
 
+// ---------------------------------------------------------------------------
+console.log('Telegram accounts: health classify + multi-account roster:');
+{
+  const health = await import('./telegram-account-health.js');
+  const rosterMod = await import('./telegram-account-roster.js');
+  const fsp = await import('node:fs/promises');
+
+  // ---- error classification: har asli Telegram error ka apna matlab ----
+  const peer = health.classifyTelegramError(new Error('400: PEER_FLOOD (caused by messages.SendMessage)'));
+  ok(peer.code === 'PEER_FLOOD' && peer.kind === 'peer-flood' && peer.fatal === true,
+    'health: PEER_FLOOD alag pehchana jata hai');
+  ok(peer.hint.includes('account') && peer.cooldownMs >= 3_600_000,
+    'health: PEER_FLOOD par saaf hint + lamba cooldown');
+
+  const flood = health.classifyTelegramError(new Error('420: FLOOD_WAIT_900 (caused by messages.GetBotCallbackAnswer)'));
+  ok(flood.code === 'FLOOD_WAIT_900' && flood.seconds === 900 && flood.fatal === false,
+    'health: FLOOD_WAIT_900 ke seconds nikalte hain');
+  ok(flood.cooldownMs === 900_000 && flood.label.includes('15 min'),
+    'health: flood ka cooldown = wait time (15 min)');
+
+  const dup = health.classifyTelegramError(new Error('406: AUTH_KEY_DUPLICATED'));
+  ok(dup.kind === 'dead' && dup.hint.includes('apna account'),
+    'health: AUTH_KEY_DUPLICATED = ek session do jagah');
+
+  const revoked = health.classifyTelegramError(new Error('401: AUTH_KEY_UNREGISTERED'));
+  ok(revoked.kind === 'dead' && revoked.fatal === true, 'health: revoked session dead hai');
+
+  const banned = health.classifyTelegramError(new Error('403: USER_DEACTIVATED_BAN'));
+  ok(banned.kind === 'dead' && banned.label.includes('ban'), 'health: banned account');
+
+  const blocked = health.classifyTelegramError(new Error('403: CHAT_WRITE_FORBIDDEN'));
+  ok(blocked.kind === 'blocked', 'health: bot ne likhna band kiya');
+
+  const badSession = health.classifyTelegramError(new Error('Not a valid string'));
+  ok(badSession.code === 'SESSION_INVALID' && badSession.kind === 'dead',
+    'health: adhuri/galat session string pakdi jati hai');
+  ok(badSession.hint.includes('poori copy'), 'health: session fix hint');
+
+  const net = health.classifyTelegramError(new Error('socket hang up ECONNRESET'));
+  ok(net.code === 'NETWORK' && net.fatal === false && net.cooldownMs > 0,
+    'health: network jhatka retry-able (account dead nahi)');
+
+  const btn = health.classifyTelegramError(new Error('400: MESSAGE_ID_INVALID'));
+  ok(btn.kind === 'unknown' && btn.cooldownMs === 0, 'health: purana button/message = account theek');
+
+  const weird = health.classifyTelegramError(new Error('kuch ajeeb'));
+  ok(weird.code === 'UNKNOWN' && weird.hint.length > 0, 'health: anjaan error bhi hint deta hai');
+
+  ok(health.accountStateLine({ status: 'ready', slot: 0, tag: 'abc12345' }).startsWith('✅'),
+    'health: ready state line');
+  ok(health.accountStateLine({ status: 'cooldown', slot: 1, tag: 'x', code: 'FLOOD_WAIT_600', until: Date.now() + 600_000 }).includes('10m'),
+    'health: cooldown line me baaki time');
+
+  // ---- roster: env se kai accounts ----
+  rosterMod._resetRosterStateForTests();
+  const two = rosterMod.buildRoster({
+    TELEGRAM_SESSION: 'session-alpha',
+    TELEGRAM_SESSION_2: 'session-beta',
+  });
+  ok(two.length === 2, 'roster: TELEGRAM_SESSION + _2 dono milte hain');
+  ok(two[0].envKey === 'TELEGRAM_SESSION' && two[1].envKey === 'TELEGRAM_SESSION_2',
+    'roster: env keys sahi map hote hain');
+  ok(two[0].tag !== two[1].tag && two[0].tag.length === 8, 'roster: har account ka alag chhota tag');
+  ok(!JSON.stringify(two).includes('session-alpha'), 'roster: poora session kabhi expose nahi hota');
+
+  const gap = rosterMod.buildRoster({ TELEGRAM_SESSION: 'a', TELEGRAM_SESSION_3: 'c' });
+  ok(gap.length === 2 && gap[1].slot === 2 && gap[1].envKey === 'TELEGRAM_SESSION_3',
+    'roster: beech ka gap (_2 missing) chalega, slot number sahi rehta hai');
+
+  const single = rosterMod.buildRoster({ TELEGRAM_SESSION: 'only' });
+  ok(single.length === 1, 'roster: ek session = single-slot (purana behaviour)');
+
+  const fallback = rosterMod.buildRoster({}, { fallbackSession: 'file-session' });
+  ok(fallback.length === 1 && fallback[0].session === 'file-session',
+    'roster: file/env fallback session slot 0 banta hai');
+
+  // ---- health state machine: kharab account side par, doosra chalta rahe ----
+  rosterMod._resetRosterStateForTests();
+  const accounts = rosterMod.buildRoster({ TELEGRAM_SESSION: 's1', TELEGRAM_SESSION_2: 's2' });
+  ok(rosterMod.isHealthy(0) && rosterMod.isHealthy(1), 'roster: shuru me dono healthy');
+
+  rosterMod.markAccountFailure(0, new Error('400: PEER_FLOOD'));
+  ok(!rosterMod.isHealthy(0), 'roster: PEER_FLOOD ke baad account 0 side par');
+  ok(rosterMod.isHealthy(1), 'roster: doosra account chalta rehta hai');
+  ok(rosterMod.nextHealthySlot(accounts) === 1, 'roster: agla healthy account 1 chuna jata hai');
+
+  rosterMod.pinSlot(1);
+  ok(rosterMod.pinnedAccountSlot() === 1, 'roster: pin (us number ka account badalna nahi)');
+  rosterMod.unpinSlot();
+
+  rosterMod.markAccountFailure(1, new Error('420: FLOOD_WAIT_60'));
+  ok(rosterMod.accountState(1).status === 'cooldown', 'roster: flood = cooldown, dead nahi');
+  ok(rosterMod.accountState(1).until > Date.now(), 'roster: cooldown ka time set');
+
+  // cooldown khatam hone par khud wapas ready
+  const soonState = rosterMod.accountState(1, Date.now() + 61_000);
+  ok(soonState.status === 'ready', 'roster: cooldown khatam = account wapas ready');
+
+  const summary = rosterMod.rosterSummary(accounts);
+  ok(summary.count === 2 && summary.accounts.length === 2, 'roster: summary me dono accounts');
+  ok(summary.accounts.some((a) => a.status === 'dead') && summary.accounts.some((a) => a.status !== 'dead'),
+    'roster: summary me ek dead, ek zinda');
+  ok(summary.accounts.every((a) => !String(a.line).includes('session')), 'roster: summary me session value nahi');
+
+  rosterMod.markAccountHealthy(0, { me: '@spare1' });
+  ok(rosterMod.isHealthy(0) && rosterMod.rosterSummary(accounts).accounts[0].me === '@spare1',
+    'roster: healthy mark + me label');
+
+  // ---- wiring in otp-source / bot / cli ----
+  const otpSrc = await fsp.readFile(new URL('./telegram-otp-source.js', import.meta.url), 'utf8');
+  const fbSrc2 = await fsp.readFile(new URL('./fresh-bot.js', import.meta.url), 'utf8');
+  const pkg = JSON.parse(await fsp.readFile(new URL('./package.json', import.meta.url), 'utf8'));
+  ok(otpSrc.includes("import * as roster from './telegram-account-roster.js'"),
+    'wiring: otp-source roster use karta hai');
+  ok(otpSrc.includes('claimNumberWithActiveAccount'), 'wiring: claim par account pin hota hai');
+  ok(otpSrc.includes('resetClientForSlotSwitch'), 'wiring: account badalne par client band hota hai');
+  ok(otpSrc.includes('auditTelegramAccounts'), 'wiring: audit function exported');
+  ok(fbSrc2.includes('TELEGRAM_SESSION, _2, _3, _4'), '/diag: multi-account ka hint');
+  ok(fbSrc2.includes('Last account error'), '/diag: account error code + fix dikhta hai');
+  ok(pkg.scripts['telegram:audit'] === 'node scratch/telegram-audit.mjs',
+    'cli: npm run telegram:audit available');
+
+  // ---- live-ish check: ek hi session do slots me = same tag (conflict pakda jaye) ----
+  const dupRoster = rosterMod.buildRoster({ TELEGRAM_SESSION: 'same', TELEGRAM_SESSION_2: 'same' });
+  ok(dupRoster[0].tag === dupRoster[1].tag, 'roster: duplicate session same tag deti hai (detect ho jata hai)');
+}
+
 console.log(`\n✅ ALL PASSED — ${passed} checks`);

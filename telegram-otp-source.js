@@ -19,6 +19,8 @@ import { existsSync, readFileSync, mkdirSync, writeFileSync, chmodSync, rmSync }
 import { dirname } from 'node:path';
 import { normalizeIndianMobileNumber } from './phone-utils.js';
 import { parseForwarderDateTime, _extractSixDigitCode } from './firebase-numbers.js';
+import * as roster from './telegram-account-roster.js';
+import { classifyTelegramError, accountStateLine } from './telegram-account-health.js';
 import {
   DEFAULT_OTP_BOT_PROFILE_ID,
   OTP_BOT_PROFILES,
@@ -202,6 +204,29 @@ export function getTelegramOtpConfig(env = process.env) {
     ? profile.username
     : envBotUsername).replace(/^@+/, '').trim();
 
+  // Multi-account: TELEGRAM_SESSION_2.._8 ho to healthy account chuno.
+  // Ek hi session ho to roster single-slot hai — behaviour bilkul purana.
+  const accounts = roster.buildRoster(env, {
+    fallbackSession: session,
+    fallbackApiId: apiId,
+    fallbackApiHash: apiHash,
+  });
+  let accountSlot = 0;
+  let accountTag = accounts[0]?.tag || '';
+  let accountCount = accounts.length;
+  if (accounts.length > 1) {
+    const picked = roster.pinnedAccountSlot() >= 0 && roster.isHealthy(roster.pinnedAccountSlot())
+      ? roster.pinnedAccountSlot()
+      : roster.nextHealthySlot(accounts);
+    accountSlot = picked >= 0 ? picked : accounts[0].slot;
+    const chosen = accounts.find((a) => a.slot === accountSlot) || accounts[0];
+    if (chosen?.session) {
+      session = chosen.session;
+      sessionSource = 'roster';
+      accountTag = chosen.tag;
+    }
+  }
+
   const missing = [];
   if (!apiId) missing.push('TELEGRAM_API_ID');
   if (!apiHash) missing.push('TELEGRAM_API_HASH');
@@ -229,6 +254,10 @@ export function getTelegramOtpConfig(env = process.env) {
     newButtonText: firstEnv(env, ['TELEGRAM_NEW_BUTTON_TEXT', 'Hermeshu_NEW_BUTTON_TEXT']),
     configured: missing.length === 0,
     missing,
+    accountSlot,
+    accountTag,
+    accountCount,
+    accounts,
   };
 }
 
@@ -494,7 +523,14 @@ export function normalizeTelegramLoginPhone(value = '') {
 }
 
 function setLastError(error) {
-  providerState.lastError = String(error?.message || error || '').slice(0, 220);
+  const classified = classifyTelegramError(error);
+  const raw = String(error?.message || error || '').slice(0, 190);
+  providerState.lastErrorCode = classified.code;
+  providerState.lastErrorHint = classified.hint;
+  providerState.lastErrorLabel = classified.label;
+  providerState.lastError = classified.code && classified.code !== 'UNKNOWN'
+    ? `${classified.label} — ${raw}`
+    : raw.slice(0, 220);
 }
 
 async function withTelegramLock(fn) {
@@ -605,6 +641,9 @@ async function ensureClientUnlocked() {
     await client.connect();
     const authorized = await client.checkAuthorization();
     if (!authorized) {
+      // Auth fail = ye account (session) mara hua hai — roster me mark karo
+      // taaki agli claim doosra spare account uthaye, batch na ruke.
+      roster.markAccountFailure(config.accountSlot, new Error('AUTH_KEY_UNREGISTERED session authorized nahi'));
       throw new Error('Telegram session authorized nahi hai — Settings → Add Telegram Account se spare account dobara login karo (ya local fallback: npm run telegram:login)');
     }
     let meLabel = '';
@@ -613,10 +652,13 @@ async function ensureClientUnlocked() {
       meLabel = me?.username ? `@${me.username}` : [me?.firstName, me?.lastName].filter(Boolean).join(' ');
     } catch {}
     clientRef = client;
+    roster.markAccountHealthy(config.accountSlot, { me: meLabel });
     Object.assign(providerState, {
       connected: true,
       authorized: true,
       meLabel,
+      accountSlot: config.accountSlot,
+      accountTag: config.accountTag,
       lastError: '',
       lastCheckedAt: Date.now(),
     });
@@ -1049,9 +1091,26 @@ function entryFromCard(result, config) {
   };
 }
 
-export async function getNextTelegramNumber(opts = {}) {
-  return withTelegramLock(async () => {
+// Account badalne ke liye client band karo (ek hi waqt par ek account).
+async function resetClientForSlotSwitch(reason = 'account-rotate') {
+  try { await clientRef?.disconnect?.(); } catch {}
+  clientRef = null;
+  clientPromise = null;
+  entityRef = null;
+  entityCacheKey = '';
+  providerState.connected = false;
+  providerState.authorized = false;
+  providerState.lastActionAt = Date.now();
+  providerState.lastScreenButtons = [];
+  providerState.claimPhase = reason;
+}
+
+// Ek account ke saath number claim — account pin ho jata hai taaki us number
+// ka OTP/REFRESH bhi usi account se ho (doosre account ke chat me wo number
+// hota hi nahi).
+async function claimNumberWithActiveAccount(opts = {}) {
     const { config } = await ensureClientUnlocked();
+    roster.pinSlot(Number(config.accountSlot) || 0);
     const excluded = new Set((Array.isArray(opts.excludePhones) ? opts.excludePhones : []).map(String));
     if (providerState.currentConsumed && providerState.currentPhone) excluded.add(providerState.currentPhone);
     let forceNew = Boolean(opts.forceNew || providerState.currentConsumed);
@@ -1098,6 +1157,37 @@ export async function getNextTelegramNumber(opts = {}) {
     }
 
     throw new Error(`Telegram Hermes se usable number nahi mila (${maxAttempts} tries${lastEntry ? `, last ${lastEntry.phone}` : ''})`);
+}
+
+// Multi-account claim: agar active account PEER_FLOOD / FLOOD_WAIT / session
+// dead nikle to us account ko side par rakh kar doosra spare account try karo.
+// (Sirf claim par rotate — number mil jane ke baad account badalna galat hai,
+// kyunki OTP usi account ke chat me aata hai.)
+export async function getNextTelegramNumber(opts = {}) {
+  return withTelegramLock(async () => {
+    let lastAccountError = null;
+    for (let accountAttempt = 0; accountAttempt < 2; accountAttempt++) {
+      try {
+        return await claimNumberWithActiveAccount(opts);
+      } catch (error) {
+        const classified = classifyTelegramError(error);
+        const actionable = classified.fatal || classified.kind === 'flood' || classified.cooldownMs > 0;
+        if (!actionable) throw error;
+        const config = getTelegramOtpConfig();
+        const slot = Number(config.accountSlot) || 0;
+        roster.markAccountFailure(slot, error);
+        lastAccountError = classified;
+        const next = Number(config.accountCount) > 1
+          ? roster.nextHealthySlot(config.accounts || [], { skipPinned: true })
+          : -1;
+        if (accountAttempt === 1 || next < 0 || next === slot) {
+          throw new Error(`${classified.label}. ${classified.hint}`);
+        }
+        roster.pinSlot(next);
+        await resetClientForSlotSwitch(`rotate-from-slot-${slot}`);
+      }
+    }
+    throw new Error(`${lastAccountError?.label || 'Telegram account error'}. ${lastAccountError?.hint || ''}`.trim());
   });
 }
 
@@ -1271,8 +1361,21 @@ export async function waitForTelegramOtpCode(phone, opts = {}) {
         await sleepInterruptibly(Math.min(700, Math.max(0, deadline - Date.now())), shouldAbort);
       }
 
+      const classified = lastError ? classifyTelegramError(lastError) : null;
+      if (classified && (classified.fatal || classified.kind === 'flood')) {
+        // Account hi block/flood hai — roster me mark karo taaki agli claim
+        // doosra spare account uthaye.
+        try { roster.markAccountFailure(getTelegramOtpConfig().accountSlot, lastError); } catch {}
+      }
       return lastError
-        ? { code: '', error: `Telegram Hermes OTP wait fail: ${String(lastError?.message || lastError).slice(0, 180)}` }
+        ? {
+          code: '',
+          error: classified && classified.code !== 'UNKNOWN'
+            ? `${classified.label} — ${String(lastError?.message || lastError).slice(0, 150)}`
+            : `Telegram OTP wait fail: ${String(lastError?.message || lastError).slice(0, 180)}`,
+          errorCode: classified?.code || '',
+          hint: classified?.hint || '',
+        }
         : { code: '' };
     } catch (error) {
       setLastError(error);
@@ -1303,6 +1406,13 @@ export function getTelegramOtpStatus(env = process.env) {
     me: providerState.meLabel,
     currentPhone: providerState.currentPhone,
     lastError: providerState.lastError,
+    lastErrorCode: providerState.lastErrorCode || '',
+    lastErrorLabel: providerState.lastErrorLabel || '',
+    lastErrorHint: providerState.lastErrorHint || '',
+    accountSlot: Number.isInteger(providerState.accountSlot) ? providerState.accountSlot : (config.accountSlot || 0),
+    accountTag: config.accountTag || '',
+    accounts: roster.rosterSummary(config.accounts || []),
+    accountLines: roster.rosterSummary(config.accounts || []).accounts.map((a) => a.line),
     lastActionAt: providerState.lastActionAt,
     lastCheckedAt: providerState.lastCheckedAt,
     lastScreenButtons: [...(providerState.lastScreenButtons || [])],
@@ -1356,6 +1466,8 @@ export async function verifyTelegramOtpConnection(opts = {}) {
       currentPhone: found.currentPhone,
       buttons: found.buttons,
       sentStart,
+      accountSlot: config.accountSlot,
+      accountTag: config.accountTag,
     };
   });
 }
@@ -1623,6 +1735,61 @@ export async function disconnectTelegramUserClient() {
   providerState.connected = false;
   providerState.authorized = false;
   try { await client?.disconnect?.(); } catch {}
+}
+
+// ---------------------------------------------------------------------------
+// 🔍 Account audit — har spare account ko alag-alag test karo.
+//   npm run telegram:audit
+// Ye batata hai kaun sa account (a) connect hota hai, (b) authorized hai,
+// (c) OTP bot ka chat khol pata hai, (d) kaun se buttons dikh rahe hain.
+// Yhi "kaun sa account kharab hai" ka seedha jawab hai.
+// ---------------------------------------------------------------------------
+export async function auditTelegramAccounts() {
+  const base = getTelegramOtpConfig();
+  const accounts = base.accounts || [];
+  const results = [];
+  if (!accounts.length) {
+    return [{ slot: 0, tag: '', ok: false, stage: 'config', error: 'Koi TELEGRAM_SESSION set nahi hai' }];
+  }
+  for (const account of accounts) {
+    roster.pinSlot(account.slot);
+    await resetClientForSlotSwitch(`audit-slot-${account.slot}`);
+    const row = {
+      slot: account.slot,
+      label: `account ${account.slot + 1}`,
+      envKey: account.envKey,
+      tag: account.tag,
+      ok: false,
+      stage: 'connect',
+      me: '',
+      currentPhone: '',
+      buttons: [],
+      error: '',
+      code: '',
+      hint: '',
+    };
+    try {
+      const status = await verifyTelegramOtpConnection({ skipDisconnect: true });
+      row.ok = true;
+      row.stage = 'ready';
+      row.me = status?.me || '';
+      row.currentPhone = status?.currentPhone || '';
+      row.buttons = Array.isArray(status?.buttons) ? status.buttons : [];
+      roster.markAccountHealthy(account.slot, { me: row.me });
+    } catch (error) {
+      const classified = classifyTelegramError(error);
+      row.error = String(error?.message || error || '').slice(0, 200);
+      row.code = classified.code;
+      row.hint = classified.hint;
+      row.stage = classified.kind === 'dead' || classified.kind === 'blocked' ? 'dead' : classified.kind;
+      roster.markAccountFailure(account.slot, error);
+    } finally {
+      await resetClientForSlotSwitch(`audit-end-${account.slot}`);
+    }
+    results.push(row);
+  }
+  roster.unpinSlot();
+  return results;
 }
 
 export function _resetTelegramOtpSourceForTests() {

@@ -12,7 +12,8 @@
     "test": "node test_fresh_unit.mjs",
     "inspect": "node scratch/firebase-inspect.mjs",
     "telegram:login": "node telegram-login.js",
-    "telegram:check": "node telegram-login.js --check"
+    "telegram:check": "node telegram-login.js --check",
+    "telegram:audit": "node scratch/telegram-audit.mjs"
   },
   "dependencies": {
     "dotenv": "^16.4.7",

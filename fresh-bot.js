@@ -999,8 +999,23 @@ async function diagCard() {
     const runSnap = getAutopilotSnapshot();
     const botName = String(status.botUsername || 'HermeshuOTPROBOT').replace(/^@+/, '');
     lines.push(field('📨 Number source', `Telegram only — Hermes @${esc(botName)}`));
+    const accounts = status.accounts || { count: 0, healthy: 0, accounts: [] };
     const tag = (() => { try { return telegramOtp.telegramSessionTag(); } catch { return ''; } })();
-    if (tag) lines.push(field('🔑 Session tag', `${mono(tag)} <i>(do bots par same tag = ek hi account → conflict)</i>`));
+    if (tag && accounts.count <= 1) {
+      lines.push(field('🔑 Session tag', `${mono(tag)} <i>(do bots par same tag = ek hi account → conflict)</i>`));
+    }
+    if (accounts.count > 1) {
+      lines.push(field('👥 Accounts', `${mono(`${accounts.healthy}/${accounts.count} READY`)} · active #${Number(status.accountSlot) + 1}`));
+      for (const line of (accounts.accounts || []).map((a) => a.line || '')) {
+        lines.push(sub(String(line)));
+      }
+      lines.push(sub('Account flood/dead ho to bot khud agla account uthata hai — batch rukta nahi.'));
+    } else {
+      lines.push(sub('Ek hi account hai. 4 accounts hain to TELEGRAM_SESSION, _2, _3, _4 env me daalo — ek kharab ho to baaki chalte rahenge.'));
+    }
+    if (status.lastErrorCode && status.lastErrorCode !== 'UNKNOWN') {
+      lines.push(field('🧯 Last account error', `${mono(status.lastErrorLabel || status.lastErrorCode)}${status.lastErrorHint ? `\n<i>${esc(status.lastErrorHint)}</i>` : ''}`));
+    }
     lines.push(field('👤 Telegram account', status.configured
       ? `✅ configured${status.me ? ` — ${esc(status.me)}` : ''} · API ${status.apiIdPresent && status.apiHashPresent ? '✅' : '❌'} · session ${status.sessionPresent ? '✅' : '❌'}`
       : `❌ setup pending${status.missing?.length ? ` — missing ${esc(status.missing.join(', '))}` : ''} · Settings → Add Telegram Account`));

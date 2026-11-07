@@ -35,6 +35,19 @@ const env = (key, dflt = '') => String(process.env[key] ?? dflt).trim();
 // src = { url, auth?, clientsPath?, messagesPath?, numbersPath?, smsPath?, otpPath? }
 // ---------------------------------------------------------------------------
 let _source = null;
+// Owner ne "Delete All Firebase" dabaya to Firebase bilkul off — env
+// FIREBASE_DB_URL par bhi chup-chaap fallback nahi hoga (warna delete ka
+// koi matlab nahi bachta).
+let _firebaseDisabled = false;
+
+export function setFirebaseDisabled(disabled = false) {
+  _firebaseDisabled = Boolean(disabled);
+  return _firebaseDisabled;
+}
+
+export function isFirebaseDisabled() {
+  return _firebaseDisabled;
+}
 
 export function setFirebaseSource(src) {
   if (!src || typeof src !== 'object' || !String(src.url || '').trim()) {
@@ -58,6 +71,7 @@ export function getFirebaseSource() {
 }
 
 export function isFirebaseConfigured() {
+  if (_firebaseDisabled) return false;
   return Boolean(_source?.url || env('FIREBASE_DB_URL'));
 }
 
@@ -78,6 +92,9 @@ export function firebaseSetupHintLines() {
 // URL building (query params + auth sahi tarah)
 // ---------------------------------------------------------------------------
 function baseUrl() {
+  if (_firebaseDisabled && !_source?.url) {
+    throw new Error('Firebase OFF hai — Settings → Firebase Sources me naya DB add karo.');
+  }
   return (_source?.url || env('FIREBASE_DB_URL')).replace(/\/+$/, '');
 }
 

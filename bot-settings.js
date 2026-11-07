@@ -19,6 +19,10 @@ const SPECS = {
   telegramOtpMode:   { bool: true, dflt: false, label: '📨 Telegram Hermes mode (number + OTP Telegram bot se)' },
   telegramOtpTimeoutMs: { min: 5000, max: 180000, dflt: 20000, label: 'Hermes OTP Refresh budget (ms)' },
   telegramOtpRefreshMs: { min: 1000, max: 15000, dflt: 2500, label: 'Hermes Refresh interval (ms)' },
+  // Kaunsa OTP bot — 'hermes' (@HermeshuOTPROBOT) ya 'chauhan' (@HardXotp_Bot).
+  // START par owner jo chunta hai wahi yahan save ho jata hai.
+  otpBotProfile:     { dflt: 'hermes', label: '📨 OTP bot (hermes = @HermeshuOTPROBOT, chauhan = @HardXotp_Bot)',
+                       enum: ['hermes', 'chauhan'] },
 };
 
 const ENV_MAP = {
@@ -53,6 +57,13 @@ export function getSetting(key) {
     if (['0', 'false', 'no', 'off'].includes(envVal)) return false;
     return spec.dflt;
   }
+  if (spec.enum) {
+    const local = String(s[key] || '').trim().toLowerCase();
+    if (spec.enum.includes(local)) return local;
+    const envVal = String(process.env[ENV_MAP[key]] || '').trim().toLowerCase();
+    if (spec.enum.includes(envVal)) return envVal;
+    return spec.dflt;
+  }
   if (Number.isFinite(s[key])) return s[key];
   const envVal = Number(process.env[ENV_MAP[key]]);
   return Number.isFinite(envVal) && envVal >= 0 ? envVal : spec.dflt;
@@ -70,6 +81,10 @@ export function setSetting(key, value) {
   const s = load();
   if (spec.bool) {
     s[key] = value === true || value === 'true' || value === 1 || value === '1';
+  } else if (spec.enum) {
+    const v = String(value || '').trim().toLowerCase();
+    if (!spec.enum.includes(v)) return { ok: false, error: `${spec.label}: ${spec.enum.join(' / ')} me se chuno.` };
+    s[key] = v;
   } else {
     const n = Number(value);
     if (!Number.isFinite(n)) return { ok: false, error: 'Number daalo.' };
@@ -99,6 +114,7 @@ export function settingsSpecs() {
 export function fmtSetting(key) {
   const v = getSetting(key);
   if (key === 'allowOffline' || key === 'telegramOtpMode') return v ? 'ON' : 'OFF';
+  if (key === 'otpBotProfile') return v === 'chauhan' ? 'HardXotp' : 'Hermes';
   if (key === 'gapMs' || key === 'backoffMs' || key === 'otpWaitMs' || key === 'otpTimeoutMs' || key === 'telegramOtpTimeoutMs' || key === 'telegramOtpRefreshMs') {
     return v >= 60000 ? `${Math.round(v / 60000)} min` : `${Math.round(v / 1000)}s`;
   }

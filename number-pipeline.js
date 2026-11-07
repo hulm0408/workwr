@@ -416,6 +416,9 @@ export async function processSingleNumber({
     try { setSwiggyBridgeSessionAbortChecker(userId, skipRequested); } catch {}
   };
   const telegramBotLabel = `@${String(entry?.telegramBotUsername || 'HermeshuOTPROBOT').replace(/^@+/, '')}`;
+  // HardXotp me REFRESH button nahi hota — wahan "VIEW MESSAGES" hi naya SMS
+  // dekhta hai. UI wahi naam bole jo asal me click hoga.
+  const telegramRefreshLabel = String(entry?.otpBotProfile || '') === 'chauhan' ? 'VIEW MESSAGES' : 'REFRESH';
   const sourceLabel = telegramMode ? telegramBotLabel : 'Firebase SMS inbox';
 
   const telegramTimeoutMs = Number(otpCfg.telegramOtpTimeoutMs ?? otpCfg.hermesOtpTimeoutMs ?? 20_000);
@@ -456,10 +459,10 @@ export async function processSingleNumber({
   };
   const otpWaitSeconds = Math.max(1, Math.round((waitCfg.timeoutMs || 0) / 1000));
   const waitLine = telegramMode
-    ? `⏳ OTP bhej diya — <b>${esc(telegramBotLabel)}</b> me Refresh dabate hue ${otpWaitSeconds}s tak naya OTP check kar raha hoon.`
+    ? `⏳ OTP bhej diya — <b>${esc(telegramBotLabel)}</b> me ${telegramRefreshLabel} dabate hue ${otpWaitSeconds}s tak naya OTP check kar raha hoon.`
     : '⏳ OTP bhej diya — Firebase inbox live poll kar raha hoon (jaise hi SMS forward hoga, code mil jayega).';
   const pollLine = telegramMode
-    ? `Hermes card par Refresh dabate hue naya OTP check kar raha hoon (${otpWaitSeconds}s)…`
+    ? `${telegramRefreshLabel} par naya OTP check kar raha hoon (${otpWaitSeconds}s)…`
     : 'Firebase SMS inbox live poll kar raha hoon…';
 
   const mapVerify = (r, failKind) => {

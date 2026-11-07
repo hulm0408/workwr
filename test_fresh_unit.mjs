@@ -2534,8 +2534,9 @@ console.log('manual SKIP current number — owner control + one-shot outcome:');
   const pipe = await import('./number-pipeline.js');
   const engine = await import('./autopilot-engine.js');
   const fs = await import('node:fs/promises');
-  const freshBotSource = await fs.readFile(new URL('./fresh-bot.js', import.meta.url), 'utf8');
-  const engineSource = await fs.readFile(new URL('./autopilot-engine.js', import.meta.url), 'utf8');
+  const fsp = await import('node:fs/promises');
+  const freshBotSource = await fsp.readFile(new URL('./fresh-bot.js', import.meta.url), 'utf8');
+  const engineSource = await fsp.readFile(new URL('./autopilot-engine.js', import.meta.url), 'utf8');
 
   const skipped = await pipe.processSingleNumber({
     userId: 'manual-skip-test',
@@ -2566,6 +2567,189 @@ console.log('manual SKIP current number — owner control + one-shot outcome:');
     && !engineSource.includes('pendingTelegramRetry'),
     'engine: OTP-failed/manual-skipped numbers run-consumed hain, pending same-number retry nahi'
   );
+}
+
+// ---------------------------------------------------------------------------
+console.log('OTP bot profiles (Hermes + HardXotp) — buttons/cards/latest-screen:');
+{
+  const profiles = await import('./otp-bot-profiles.js');
+  const tg = await import('./telegram-otp-source.js');
+  const store = await import('./store.js');
+
+  ok(profiles.normalizeOtpBotProfileId('chauhan') === 'chauhan', 'profile: chauhan id');
+  ok(profiles.normalizeOtpBotProfileId('@HardXotp_Bot') === 'chauhan', 'profile: @HardXotp_Bot username se pehchana jata hai');
+  ok(profiles.normalizeOtpBotProfileId('HermeshuOTPROBOT') === 'hermes', 'profile: Hermes username se hermes');
+  ok(profiles.normalizeOtpBotProfileId('kuch-bhi') === 'hermes', 'profile: unknown → default Hermes');
+  ok(profiles.getOtpBotProfile('chauhan').username === 'HardXotp_Bot', 'profile: HardXotp username');
+
+  // Button roles
+  ok(profiles.otpBotButtonRole('GET NUMBERS 📱', 'chauhan') === 'find', 'HardXotp: GET NUMBERS = naya number (find)');
+  ok(profiles.otpBotButtonRole('NEW NUMBER ➕', 'chauhan') === 'new', 'HardXotp: NEW NUMBER = new');
+  ok(profiles.otpBotButtonRole('VIEW MESSAGES 💬', 'chauhan') === 'view', 'HardXotp: VIEW MESSAGES = messages/view');
+  ok(profiles.otpBotButtonRole('LIVE STATS 📊', 'chauhan') === '', 'HardXotp: LIVE STATS ignore');
+  ok(profiles.otpBotButtonRole('FIND DEVICE 🔍', 'chauhan') === '', 'HardXotp: FIND DEVICE ignore (FIND NUMBER nahi)');
+  ok(profiles.otpBotButtonRole('BACK', 'chauhan') === '', 'HardXotp: BACK ignore');
+  ok(profiles.otpBotButtonRole('FIND NUMBER', 'hermes') === 'find', 'Hermes: FIND NUMBER = find');
+  ok(profiles.otpBotButtonRole('NEW NUMBER', 'hermes') === 'new', 'Hermes: NEW NUMBER = new');
+  ok(profiles.otpBotButtonRole('REFRESH', 'hermes') === 'refresh', 'Hermes: REFRESH = refresh');
+  ok(profiles.otpBotButtonRole('VIEW MESSAGES', 'hermes') === '', 'Hermes: VIEW MESSAGES role nahi (purana behaviour intact)');
+
+  // Card parse (screenshot wala HardXotp card)
+  const cardText = [
+    '✅ CONNECTED SUCCESSFULLY!',
+    '🔑 FINDER KEY: CH-HK3D',
+    '📞 ASSIGNED NUMBER: 9080104284',
+    '✅ STATUS: Online',
+    '⏱ LAST SMS RECEIVED: 05:40 pm | 07-11-2026',
+    'Live SMS pulling is now active.',
+  ].join('\n');
+  const card = tg.parseTelegramNumberCard(cardText);
+  ok(card?.phone === '9080104284', 'HardXotp card: ASSIGNED NUMBER parse hua');
+  ok(/ONLINE/i.test(card?.status || ''), 'HardXotp card: STATUS Online parse hua');
+  ok(tg.parseTelegramNumberCard('🔑 FINDER KEY: CH-HK3D\nLive SMS pulling is now active.') === null, 'HardXotp welcome: finder key ko number nahi samjha');
+
+  // Latest-screen selection: welcome (GET NUMBERS) vs card (NEW NUMBER / VIEW MESSAGES)
+  const welcome = [{
+    text: 'OTP BOT BY CHAUHAN\nCHOOSE AN OPTION BELOW\nID: 6484999726',
+    buttons: ['GET NUMBERS 📱', 'LIVE STATS 📊', 'FIND DEVICE 🔍', 'BACK'],
+  }];
+  const claimWelcome = tg._selectHermesLatestScreenAction(welcome, { mode: 'claim', profileId: 'chauhan' });
+  ok(claimWelcome?.role === 'find' && claimWelcome.buttonText === 'GET NUMBERS 📱',
+    'HardXotp: latest welcome screen par GET NUMBERS click hoga');
+
+  const numberScreen = [{
+    text: cardText,
+    buttons: ['VIEW MESSAGES 💬', 'NEW NUMBER ➕', 'BACK'],
+  }];
+  const claimCard = tg._selectHermesLatestScreenAction(numberScreen, { mode: 'claim', profileId: 'chauhan' });
+  ok(claimCard?.role === 'new' && claimCard.buttonText === 'NEW NUMBER ➕',
+    'HardXotp: number card par NEW NUMBER priority (GET se pehle)');
+  const refreshCard = tg._selectHermesLatestScreenAction(numberScreen, {
+    mode: 'refresh', phone: '9080104284', profileId: 'chauhan',
+  });
+  ok(refreshCard?.role === 'view' && refreshCard.buttonText === 'VIEW MESSAGES 💬',
+    'HardXotp: OTP check par VIEW MESSAGES click hota hai');
+  const refreshOther = tg._selectHermesLatestScreenAction(numberScreen, {
+    mode: 'refresh', phone: '9999999999', profileId: 'chauhan',
+  });
+  ok(refreshOther?.role === '' && refreshOther.reason === 'latest-screen-different-number',
+    'HardXotp: dusre number ki card par VIEW MESSAGES click nahi');
+
+  // Purani (stale) screen ka button ignore — sirf latest screen chalti hai
+  // screens[0] = sabse latest (messages newest-first aate hain)
+  const staleScreens = [
+    { text: 'CONNECTED SUCCESSFULLY!\nLive SMS pulling is now active.', buttons: ['BACK'] },
+    { text: cardText, buttons: ['NEW NUMBER ➕'] },
+  ];
+  const stalePick = tg._selectHermesLatestScreenAction(staleScreens, { mode: 'claim', profileId: 'chauhan' });
+  ok(stalePick?.buttonIndex === -1 && stalePick?.reason === 'no-matching-button-on-latest-screen',
+    'HardXotp: latest screen par claim button na ho to purani screen ka NEW NUMBER click nahi');
+
+  // OTP message (HardXotp live SMS forward)
+  const otpMsg = 'NEW SMS ✅\nNUMBER: 9080104284\nSENDER: SWIGGY\nMESSAGE: 483920 is your Swiggy OTP. Do not share it with anyone.\n07-11-2026 | 05:41 pm';
+  ok(tg.extractTelegramOtpFromText(otpMsg) === '483920', 'HardXotp SMS forward se 6-digit OTP nikala');
+  ok(tg.parseTelegramOtpText(otpMsg)?.phone === '9080104284', 'HardXotp SMS message me number bhi parse hua');
+
+  // Config: profile se bot username badalta hai
+  tg.setActiveOtpBotProfile('chauhan');
+  const cfgChauhan = tg.getTelegramOtpConfig({ TELEGRAM_API_ID: '1', TELEGRAM_API_HASH: 'h', TELEGRAM_SESSION: 's' });
+  ok(cfgChauhan.botUsername === 'HardXotp_Bot', 'config: chauhan profile → @HardXotp_Bot');
+  ok(cfgChauhan.otpBotProfile === 'chauhan', 'config: profile id exposed');
+  tg.setActiveOtpBotProfile('hermes');
+  const cfgHermes = tg.getTelegramOtpConfig({ TELEGRAM_API_ID: '1', TELEGRAM_API_HASH: 'h', TELEGRAM_SESSION: 's' });
+  ok(cfgHermes.botUsername === 'HermeshuOTPROBOT', 'config: hermes profile → @HermeshuOTPROBOT');
+  ok(tg.getTelegramOtpStatus({ TELEGRAM_API_ID: '1', TELEGRAM_API_HASH: 'h', TELEGRAM_SESSION: 's' }).otpBotProfile === 'hermes',
+    'status: otpBotProfile expose hota hai');
+  tg.resetActiveOtpBotProfile();
+
+  // Settings enum
+  const bsMod = await import('./bot-settings.js');
+  ok(bsMod.getSetting('otpBotProfile') === 'hermes', 'settings: default OTP bot Hermes');
+  ok(bsMod.setSetting('otpBotProfile', 'chauhan').ok === true && bsMod.getSetting('otpBotProfile') === 'chauhan',
+    'settings: OTP bot switch save hota hai');
+  ok(bsMod.setSetting('otpBotProfile', 'random').ok === false, 'settings: galat OTP bot reject');
+  ok(bsMod.fmtSetting('otpBotProfile') === 'HardXotp', 'settings: fmt label HardXotp');
+  bsMod.setSetting('otpBotProfile', 'hermes');
+  ok(typeof store.getDb === 'function', 'store available');
+
+  // Live card ka source line chune hue bot ka naam dikhata hai.
+  const engineMod = await import('./autopilot-engine.js');
+  const cardChauhan = engineMod.formatCompactAutopilotCard({
+    sourceMode: 'telegram', running: true, target: 10, fresh: 1, processed: 1,
+    current: { phone: '9080104284' }, elapsedMs: 45_000,
+    otpBotProfile: 'chauhan', otpBotLabel: 'HardXotp',
+  }, { stageText: 'OTP wait' });
+  ok(cardChauhan.includes('HARDXOTP ONLY') && cardChauhan.includes('Firebase'),
+    'compact card HardXotp mode par HARDXOTP ONLY dikhata hai');
+  const cardHermes = engineMod.formatCompactAutopilotCard({
+    sourceMode: 'telegram', running: true, target: 10, fresh: 1,
+    current: { phone: '9876543210' }, elapsedMs: 45_000,
+    otpBotProfile: 'hermes', otpBotLabel: 'Hermes',
+  }, { stageText: 'OTP wait' });
+  ok(cardHermes.includes('HERMES ONLY'), 'compact card Hermes mode par HERMES ONLY dikhata hai');
+}
+
+// ---------------------------------------------------------------------------
+console.log('START source picker + Delete All Firebase:');
+{
+  const srcMod = await import('./firebase-sources.js');
+  const fbMod = await import('./firebase-numbers.js');
+  const store = await import('./store.js');
+  const fsp = await import('node:fs/promises');
+  const freshBotSource = await fsp.readFile(new URL('./fresh-bot.js', import.meta.url), 'utf8');
+  const engineSource = await fsp.readFile(new URL('./autopilot-engine.js', import.meta.url), 'utf8');
+
+  ok(freshBotSource.includes("bot.action(/^ap_start_go_(hermes|chauhan|firebase)$/")
+    && freshBotSource.includes("callback_data: 'ap_start_go_hermes'")
+    && freshBotSource.includes("callback_data: 'ap_start_go_chauhan'")
+    && freshBotSource.includes("callback_data: 'ap_start_go_firebase'"),
+  'START par source picker wiring (Hermes / HardXotp / Firebase)');
+  ok(freshBotSource.includes("callback_data: 'ap_src_delete_all'")
+    && freshBotSource.includes("bot.action('ap_src_delete_all_yes'"),
+  'START/source screen par Delete All Firebase wiring');
+  ok(freshBotSource.includes('otpBot: lockedOtpBot'), 'batch start par OTP bot profile engine ko jata hai');
+  ok(engineSource.includes('setActiveOtpBotProfile(otpBotProfileId)'), 'engine start par active OTP bot set hota hai');
+  ok(engineSource.includes("'firebase-cleared'"), 'engine delete-all ko saaf stop reason deta hai');
+
+  // Puraani state bachao — delete-all test ke baad wapas restore karenge.
+  const dbBefore = store.getDb();
+  const sourcesBefore = JSON.parse(JSON.stringify(dbBefore.firebaseSources || {}));
+  try {
+    ok(srcMod.listSources().length > 0, 'delete-all se pehle sources maujood hain');
+    const beforeCount = srcMod.listSources().length;
+    const res = srcMod.removeAllSources();
+    ok(res.ok === true && res.removed === beforeCount, 'delete all: saare sources hat gaye');
+    ok(srcMod.listSources().length === 0, 'delete all: list khali');
+    ok(srcMod.isFirebaseSourceListCleared() === true, 'delete all: cleared flag set');
+    ok(srcMod.ensureSeeded().list.length === 0, 'delete all: restart/seed par list wapas nahi aati');
+    ok(srcMod.envSeedUrls !== undefined, 'env seed helper available');
+    const applied = srcMod.applyActiveSource();
+    ok(applied === null && fbMod.isFirebaseDisabled() === true, 'delete all: Firebase OFF (env fallback bhi band)');
+    ok(fbMod.isFirebaseConfigured() === false, 'delete all: isFirebaseConfigured false');
+
+    // Vault bhi delete-all yaad rakhta hai
+    const snap = store.buildCloudVaultSnapshot(store.getDb());
+    ok(snap.firebaseSources?.cleared === true && snap.firebaseSources.list.length === 0,
+      'delete all: vault snapshot me cleared state jata hai');
+    const fakeDb = { firebaseSources: { activeId: '', list: [], deleted: [], health: {} }, freshSettings: {} };
+    store.mergeVaultFirebaseState(fakeDb, {
+      firebaseSources: { cleared: true, list: [], deleted: ['https://x-default-rtdb.firebaseio.com'], health: {} },
+    });
+    ok(fakeDb.firebaseSources.cleared === true, 'delete all: vault se cleared state restore hoti hai');
+
+    // Naya source add → Firebase wapas chalu
+    const addBack = srcMod.addSource({ url: 'https://afterdelete-default-rtdb.firebaseio.com' });
+    ok(addBack.ok === true && srcMod.isFirebaseSourceListCleared() === false, 'naya DB add → cleared hat gaya');
+    ok(fbMod.isFirebaseDisabled() === false, 'naya DB add → Firebase dobara ON');
+    ok(srcMod.listSources().length === 1, 'naya DB list me ek hi hai (seeding ne purani list wapas nahi ki)');
+  } finally {
+    const db = store.getDb();
+    db.firebaseSources = sourcesBefore;
+    store.saveDb(db);
+    fbMod.setFirebaseDisabled(false);
+    srcMod.applyActiveSource();
+  }
+  ok(srcMod.listSources().length > 0, 'delete-all test ke baad purane sources restore ho gaye');
 }
 
 console.log(`\n✅ ALL PASSED — ${passed} checks`);

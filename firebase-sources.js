@@ -31,7 +31,12 @@
 import crypto from 'crypto';
 import { getDb, saveDb } from './store.js';
 import * as storeVault from './store.js';
-import { setFirebaseSource, _firebaseErrorMessage } from './firebase-numbers.js';
+import {
+  setFirebaseSource,
+  setFirebaseDisabled,
+  isFirebaseDisabled,
+  _firebaseErrorMessage,
+} from './firebase-numbers.js';
 import { OWNER_FIREBASE_URLS } from './firebase-seed-urls.js';
 
 const DEFAULT_URL = 'https://vuvhbjbi-default-rtdb.firebaseio.com/';
@@ -324,7 +329,10 @@ export function ensureSeeded() {
     }
   }
 
-  if (!state.list.length) {
+  if (!Array.isArray(state.deleted)) state.deleted = [];
+  const deletedUrls = new Set((state.deleted || []).map(normalizeSourceUrl));
+
+  if (!state.list.length && !state.cleared) {
     const url = String(process.env.FIREBASE_DB_URL || DEFAULT_URL).trim();
     const src = {
       id: newSourceId(state),
@@ -339,12 +347,12 @@ export function ensureSeeded() {
       enabled: true,
       addedAt: new Date().toISOString(),
     };
-    state.list.push(src);
-    state.activeId = src.id;
+    if (!deletedUrls.has(normalizeSourceUrl(url))) {
+      state.list.push(src);
+      state.activeId = src.id;
+    }
     changed = true;
   }
-
-  if (!Array.isArray(state.deleted)) state.deleted = [];
 
   // Seed sources do baar se aate hain:
   //   1) code wali built-in list (owner ki ROLEX VIP list) — seedVersion
@@ -353,7 +361,6 @@ export function ensureSeeded() {
   //   2) env FIREBASE_DB_URLS — har boot par missing URLs add hoti hain
   //      (Render env kabhi mitta nahi), deleted list inhe bhi rok deti hai.
   const knownUrls = new Set(state.list.map((s) => normalizeSourceUrl(s.url)));
-  const deletedUrls = new Set((state.deleted || []).map(normalizeSourceUrl));
   const seedOnce = (Number(state.seedVersion) || 0) < BUILTIN_SEED_VERSION;
   const envUrls = envSeedUrls();
   const pendingSeed = [
@@ -637,10 +644,14 @@ export function addSourcesBulk(input, {
     }
   }
 
+  if (addedRefs.length) state.cleared = false;
   if (addedRefs.length && (setFirstAsPrimary || !state.list.some((s) => s.id === state.activeId))) {
     state.activeId = addedRefs[0].id;
   }
-  if (addedRefs.length) persist(state);
+  if (addedRefs.length) {
+    persist(state);
+    setFirebaseDisabled(false);
+  }
   if (addedRefs.length && applyReader) applyActiveSource();
 
   const finalState = ensureSeeded();
@@ -673,6 +684,8 @@ export function addSource(input, { activate = true } = {}) {
     const di = state.deleted.indexOf(normalizeSourceUrl(src.url));
     if (di !== -1) state.deleted.splice(di, 1);
   }
+  state.cleared = false;
+  setFirebaseDisabled(false);
   // Legacy `activate` ka ab matlab sirf first-try banana hai; naya source
   // har haal me ACTIVE add hota hai aur purane sources bhi ACTIVE rehte hain.
   if (activate || !getActiveSource()) state.activeId = src.id;
@@ -740,8 +753,44 @@ export function toggleSource(id) {
 // source lag sakta hai. Ye usi first-try ko apply karta hai (boot/ADD par).
 export function applyActiveSource() {
   const src = getActiveSource();
+  // list khali + owner ne delete-all kiya tha → env fallback bhi band.
+  const cleared = !src && isFirebaseSourceListCleared();
+  setFirebaseDisabled(cleared);
   setFirebaseSource(src); // null = env fallback
-  return src;
+  return cleared ? null : src;
+}
+
+// Delete All ka permanent nishaan. Naya source add karte hi ye khud hat
+// jata hai, isliye "delete all" ke baad user phir se list bana sakta hai.
+export function isFirebaseSourceListCleared() {
+  const state = loadState();
+  return Boolean(state.cleared) && !(Array.isArray(state.list) && state.list.length);
+}
+
+// Owner ka "Delete All Firebase": poori list saaf + Delete-memory me saari
+// built-in/env URLs — taaki restart/redeploy par seeding wapas na le aaye.
+// Firebase tab tak OFF rehta hai jab tak naya source add na ho.
+export function removeAllSources() {
+  const state = ensureSeeded();
+  const urls = new Set();
+  for (const src of state.list) urls.add(normalizeSourceUrl(src.url));
+  for (const url of BUILTIN_FIREBASE_SOURCE_URLS) urls.add(normalizeSourceUrl(url));
+  for (const url of envSeedUrls()) urls.add(normalizeSourceUrl(url));
+  urls.add(normalizeSourceUrl(DEFAULT_URL));
+  urls.add(normalizeSourceUrl(String(process.env.FIREBASE_DB_URL || '')));
+  urls.delete('');
+
+  const removed = state.list.length;
+  state.list = [];
+  state.health = {};
+  state.activeId = '';
+  state.deleted = [...new Set([...(Array.isArray(state.deleted) ? state.deleted : []), ...urls])];
+  state.cleared = true;
+  state.seedVersion = BUILTIN_SEED_VERSION;
+  persist(state);
+  setFirebaseDisabled(true);
+  setFirebaseSource(null);
+  return { ok: true, removed, remembered: urls.size };
 }
 
 // Batch ke andar agle ACTIVE source ko reader par lagao — saved first-try

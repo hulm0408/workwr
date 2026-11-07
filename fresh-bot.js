@@ -54,6 +54,7 @@ const {
   poolExhaustedReasonText,
   resolveAutopilotNumberSource,
   formatCompactAutopilotCard,
+  numberDecisionWindowMs,
 } = await import('./autopilot-engine.js');
 const { isFirebaseConfigured, firebaseSetupHintLines, listPoolNumbers, _countDeviceOnlineStates } = await import('./firebase-numbers.js');
 const telegramOtp = await import('./telegram-otp-source.js');
@@ -1106,7 +1107,15 @@ async function diagCard() {
       lines.push(field('🔀 Proxies', ps.enabled ? `✅ ${ps.enabledCount}/${ps.total} ON` : '⚠️ OFF (ek hi IP — rukna pad sakta hai)'));
     }
   } catch { lines.push(field('🔀 Proxies', '—')); }
+  // Ek number = ek hi baar (owner rule): number park/queue nahi hota.
+  try {
+    const win = Math.round(numberDecisionWindowMs() / 1000);
+    lines.push(field('⛔ Number rule', `${mono('1 NUMBER = 1 BAAR')} — ${win}s me attempt start, warna chhod do; queue me park nahi`));
+  } catch { lines.push(field('⛔ Number rule', 'ek number = ek hi baar')); }
   const snap = getAutopilotSnapshot();
+  if (Number(snap.consumedNumbers)) {
+    lines.push(field('🔒 Consumed', `${mono(String(snap.consumedNumbers))} unique number(s) is run me lock — dobara try nahi`));
+  }
   lines.push(field('▶️ Batch', snap.running ? `● RUNNING — ${snap.fresh}/${snap.target} fresh` : (snap.finishedAt ? `⏹ last: ${snap.fresh} fresh · ${esc(snap.stopReason || 'done')}${snap.lastError ? ` · last error: ${esc(String(snap.lastError).slice(0, 100))}` : ''}` : 'ready')));
   return section('🩺 Diagnose — kya toota hai?', [
     ...lines,

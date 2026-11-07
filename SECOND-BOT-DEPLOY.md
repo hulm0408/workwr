@@ -298,31 +298,38 @@ limit lagti hai, isliye 1 ID / minute ka target nahi milta — realistic ~1 ID p
 3-5 min, din bhar me ~100-200 attempts. Proxy pool ke bina isse zyada possible
 hi nahi, chahe koi kuch bhi bole.
 
-## 4️⃣f "Account creating — rate limit queue" (5 second wapas)
+## 4️⃣f Ek number = ek hi baar (1 minute decision window)
 
-Doosre bots jo dikhate hain — *"account creating queue me chala gaya rate limit
-ki wajah se"* — wo asal me yahi hai:
+**Rule (owner):** number milne ke **60 seconds ke andar attempt start** hona chahiye;
+warna number chhod do. Number ko **queue me park karke baad me try karna allowed nahi**.
 
-- Swiggy per-IP limit lagti hai → number **queue** me jata hai (delete nahi hota)
-- **~5 second** me bot khud wapas try karta hai (8s → 12s, chhat 15s)
-- **Run stop nahi hota** — baaki lanes chalti rehti hain
-- Card par: `⏳ QUEUE 4 · rate-limit · 5s me wapas`
-- Message: **"⏳ Account Creating — Rate Limit Queue"**
+Isliye code me:
 
-Purana behaviour: 15s → 30s wait, aur 3 strike par run band. Ab wo nahi.
+- Number retry queue/selector hata diya — koi `deferNumber()` ya `retryLater`
+  nahi; purana number baad me pick nahi hota.
+- Number milte hi **60s decision clock** start hoti hai. WAF warm-up/preflight me 60s nikal jaaye to number attempt kiye baghair chhod diya jata hai.
+- Pehla actual attempt number ko lock/consume karta hai; generic failure ya exception ke baad bhi dobara pick nahi hota (same process me agle batches samet). Process/redeploy restart par in-memory lock reset hoti hai.
+- Rate-limit / WAF / security challenge / 5xx par number **retire** hota hai
+  (`retireNumber()`) — same process me wapas nahi uthta.
+- Lane turant **NAYA number** leti hai. Lane ka wait 5s → 8s → 12s (chhat 15s)
+  aur hamesha 1-minute window ke andar.
+- Run **stop nahi hota** (sirf 40 rate-limit outcomes par safety stop).
 
-| Env | Default | Matlab |
-|---|---|---|
-| `PREMIUM_RATE_LIMIT_RETRY_MS` | `5000` | pehla retry (min 1s, max 15s) |
+Decision window fixed **60s** hai; is rule ko env se lamba nahi kiya ja sakta.
+`PREMIUM_RATE_LIMIT_RETRY_MS=5000` rate-limit par lane ka pehla cooldown hai; cooldown ke baad lane **naya number** legi.
 
-Safety: agar lagatar **40** queue rounds me bhi sirf rate-limit mile (matlab IP
-poora jal chuka hai), tab run `rate_limited` par band hota hai — warna bot
-ghanton bekaar queue me ghoomta rehta. Ye limit `RATE_LIMIT_QUEUE_SAFETY_LIMIT`
-(constant) hai.
+Dikhne me:
 
-**Sach:** 5s retry se "turant" nahi hota — Swiggy ki limit minutes me hoti hai,
-isliye kai queue rounds lagte hain. Faayda ye hai ki bot **rukta nahi** aur
-naya number bhi leta rehta hai.
+- Card title: `⏳ Rate Limit — Ye Number Khatam`
+- Card line: *"ye number khatam (one-shot). Queue me park nahi hota, dobara
+  try nahi hoga"* · `5s me lane naya number legi`
+- Compact chip: `⏳ RATE-LIMIT #4 · ye number khatam · agla naya 5s me`
+- `/diag` → `⛔ Number rule: 1 NUMBER = 1 BAAR — 60s me attempt start`
+  aur `🔒 Consumed: N unique numbers is run me lock`
+
+**Sach:** 5s me kaam "turant" nahi hota — Swiggy ki per-IP limit minutes me
+hoti hai. Faayda: bot **rukta nahi**, same number par OTP **burn nahi hota**,
+aur har number par pehla attempt maximum 1 minute ke andar start hota hai. Lock process memory me rehta hai, redeploy tak.
 
 ## 5️⃣ Kya kabhi nahi karna
 

@@ -419,10 +419,9 @@ Jo 403 challenge pehle poora batch maar deta tha, ab uska tod:
    attempt par 5xx/network dene wali route 60s transient cooldown par jati
    hai (token burn kiye baghair).
 5. **15-second route recovery waits** — engine WAF wait 5s→10s→**15s cap** hai;
-   pehla direct rate-limit bhi max 15s rukta hai, dusra 30s. Global WAF
-   circuit-breaker bhi ab 15s/30s/60s hai. Matlab garam IP par number
-   minutes tak queue me nahi fasa rehta — route badli, fresh proxies
-   background me refill aur kaam aage.
+   rate-limit par lane 5s→8s→12s (15s cap) ruk kar NAYA number leti hai.
+   Global WAF circuit-breaker bhi ab 15s/30s/60s hai. Number queue me park
+   nahi hota; garam IP par route recovery ke baad bhi purana number repeat nahi hota.
 
 ## 🔀 Proxies — "rukna hi na pare" ka asli tod (IP rotation)
 
@@ -498,8 +497,8 @@ chalta rehta hai; temporary error par number failed nahi gina jata.
 | `PREMIUM_BATCH_CONCURRENCY` | 10 | Ek saath kitni parallel lanes (1–10); asal lanes distinct proxy/direct routes tak limited |
 | `PREMIUM_BATCH_MAX_MINUTES` | 120 | Max run time |
 | `PREMIUM_BATCH_GAP_MS` | 6000 | Ek hi lane/IP par do numbers ke beech gap |
-| `PREMIUM_RATE_LIMIT_BACKOFF_MS` | 900000 | Purana backoff — ab fast ladder se cap hota hai (max 15s) |
-| `PREMIUM_RATE_LIMIT_RETRY_MS` | 5000 | Rate-limit **queue** ka pehla retry (5s → 8s → 12s, chhat 15s); run stop nahi hota |
+| `PREMIUM_RATE_LIMIT_BACKOFF_MS` | 900000 | Fallback lane cooldown — fast ladder se cap hota hai (max 15s) |
+| `PREMIUM_RATE_LIMIT_RETRY_MS` | 5000 | Rate-limit par lane ka pehla wait (5s → 8s → 12s, chhat 15s) |
 | `PREMIUM_OTP_WAIT_MS` | 3000 | OTP bhejne ke baad poll shuru karne se pehle chhota wait (snapshot purane codes se bachata hai, jaldi poll safe hai) |
 | `PREMIUM_OTP_TIMEOUT_MS` | 90000 | OTP inbox poll budget |
 | `PREMIUM_DEVICE_ACTIVE_WINDOW_MS` | 60000 | **Last-seen base window**: pehle is window ki SMS activity wala device, phir doubling ladder. Sakht: `10000`, band: `0` |

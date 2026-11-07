@@ -2861,6 +2861,21 @@ console.log('Doosra bot / doosra instance (INSTANCE_LABEL):');
   ok(workflow.includes('timeout -s SIGTERM'), 'workflow: clean SIGTERM stop (state save)');
   ok(guide.includes('bot-live.yml') && guide.includes('6 ghante'),
     'guide: GitHub Actions route + 6-ghante gap likha hai');
+
+  // Ek-page deploy card + 1-click button (friction kam).
+  const deployNow = await fsp.readFile(new URL('./DEPLOY-NOW.md', import.meta.url), 'utf8');
+  ok(deployNow.includes('settings/secrets/actions/new') && deployNow.includes('Bot live'),
+    'DEPLOY-NOW: Actions route ke exact links');
+  ok(deployNow.includes('render.com/deploy?repo=') && deployNow.includes('render.second.yaml'),
+    'DEPLOY-NOW: Render 1-click + free blueprint dono');
+  ok(deployNow.includes('BOT_TOKEN_3') && deployNow.includes('bot-vault-3'),
+    'DEPLOY-NOW: bot3/bot4 ki label + secret table');
+  ok(deployNow.includes('Vercel') && deployNow.includes('409'),
+    'DEPLOY-NOW: Vercel + duplicate-token warning');
+  const readme = await fsp.readFile(new URL('./README.md', import.meta.url), 'utf8');
+  ok(readme.includes('render.com/deploy?repo=https://github.com/hulm0408/workwr')
+    && readme.includes('DEPLOY-NOW.md'),
+  'README: deploy button + DEPLOY-NOW link');
 }
 
 console.log(`\n✅ ALL PASSED — ${passed} checks`);

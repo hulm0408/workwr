@@ -2793,4 +2793,55 @@ console.log('START source picker + Delete All Firebase:');
   ok(srcMod.listSources().length > 0, 'delete-all test ke baad purane sources restore ho gaye');
 }
 
+// ---------------------------------------------------------------------------
+console.log('Doosra bot / doosra instance (INSTANCE_LABEL):');
+{
+  const inst = await import('./instance-info.js');
+  const fsp = await import('node:fs/promises');
+
+  // Purana behaviour: label nahi diya to kuch bhi extra nahi.
+  ok(inst.getInstanceLabel({}) === 'main', 'instance: default label main');
+  ok(inst.isSecondaryInstance({}) === false, 'instance: default secondary nahi');
+  ok(inst.instanceSuffix({}) === '' && inst.instanceTitle('🆕 Swiggy Fresh Bot', {}) === '🆕 Swiggy Fresh Bot',
+    'instance: default title bilkul purana (koi suffix nahi)');
+  ok(inst.instanceTitle('🆕 Swiggy Fresh Bot', { INSTANCE_LABEL: '   ' }) === '🆕 Swiggy Fresh Bot',
+    'instance: khali/space label bhi purana title deta hai');
+
+  // Doosra bot: label title + badge me.
+  ok(inst.getInstanceLabel({ INSTANCE_LABEL: 'bot2' }) === 'bot2', 'instance: INSTANCE_LABEL padha jata hai');
+  ok(inst.isSecondaryInstance({ INSTANCE_LABEL: 'bot2' }) === true, 'instance: bot2 secondary hai');
+  ok(inst.instanceTitle('🆕 Swiggy Fresh Bot', { INSTANCE_LABEL: 'bot2' }) === '🆕 Swiggy Fresh Bot · bot2',
+    'instance: title me "· bot2" lagta hai');
+
+  // Sanitization — HTML/newline/atishay lamba label UI na tode.
+  ok(inst.normalizeInstanceLabel('  bot2   extra  ') === 'bot2 extra', 'instance: extra spaces collapse');
+  ok(inst.normalizeInstanceLabel('<b>bot2</b>') === 'bbot2/b', 'instance: angle brackets strip (HTML injection nahi)');
+  ok(inst.normalizeInstanceLabel('bot2\nsecond') === 'bot2 second', 'instance: newline space ban jata hai');
+  ok(inst.normalizeInstanceLabel('x'.repeat(50)).length === inst.INSTANCE_LABEL_MAX, 'instance: label 20 chars par cut');
+  ok(inst.normalizeInstanceLabel(null) === '' && inst.getInstanceLabel({ INSTANCE_LABEL: null }) === 'main',
+    'instance: null label safe');
+
+  // fresh-bot.js wiring — health/deeplink/log/START sab label use karein.
+  const freshBotSource = await fsp.readFile(new URL('./fresh-bot.js', import.meta.url), 'utf8');
+  ok(freshBotSource.includes("await import('./instance-info.js')"), 'instance: fresh-bot instance-info load karta hai');
+  ok(freshBotSource.includes('instance: instanceInfo.getInstanceLabel()'), 'instance: /health payload me instance');
+  ok(freshBotSource.includes("instanceInfo.instanceTitle('🆕 Swiggy Fresh Bot')"),
+    'instance: START card title label ke saath');
+  ok(freshBotSource.includes("field('🏷 Instance'"), 'instance: /diag me instance line');
+  ok(freshBotSource.includes('🏷 Instance:'), 'instance: boot log me instance');
+
+  // Doosra deployment blueprint bhi repo me hai (free web service route).
+  const secondYaml = await fsp.readFile(new URL('./render.second.yaml', import.meta.url), 'utf8');
+  ok(secondYaml.includes('plan: free') && secondYaml.includes('type: web'),
+    'render.second.yaml: free web service (card ke bina)');
+  ok(secondYaml.includes('healthCheckPath: /health'), 'render.second.yaml: health check /health par');
+  ok(secondYaml.includes('INSTANCE_LABEL') && secondYaml.includes('GITHUB_VAULT_BRANCH'),
+    'render.second.yaml: instance label + alag vault branch');
+
+  const guide = await fsp.readFile(new URL('./SECOND-BOT-DEPLOY.md', import.meta.url), 'utf8');
+  ok(guide.includes('Vercel') && guide.includes('409'),
+    'guide: Vercel limitation + ek token ek instance rule likha hai');
+  ok(guide.includes('GITHUB_VAULT_BRANCH'), 'guide: vault branch alag rakhne ki hidayat');
+}
+
 console.log(`\n✅ ALL PASSED — ${passed} checks`);

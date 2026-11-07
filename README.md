@@ -227,6 +227,25 @@ persistent disk** (`/app/data`) set hai — yahi sahi combo hai:
 > `npm start` mat chalana — dono ek token se polling karenge to
 > **409 Conflict** aayega aur ek band ho jayega.
 
+## 🧬 Doosra bot (naya BOT_TOKEN) + doosri hosting
+
+Same codebase se **doosra bot** chalana ho — naya @BotFather token, alag
+account, purana bot jaisa hai waisa — to poori step-by-step guide:
+**[`SECOND-BOT-DEPLOY.md`](SECOND-BOT-DEPLOY.md)**. Repo me
+`render.second.yaml` (free web service, bina card) bhi ready hai.
+
+Chhota summary:
+
+- Doosre instance me `INSTANCE_LABEL=bot2` set karo → START card
+  (`🆕 Swiggy Fresh Bot · bot2`), `/diag` aur `/health` me label dikhega
+  (`"instance":"bot2"`), taaki dono bots me confusion na ho. Purane bot par
+  label khali rakhne se UI bilkul pehle jaisi rehti hai.
+- **Har instance ka apna token aur apna Telegram account** — ek token/ek
+  session do jagah = 409 Conflict / session revoke.
+- Cloud vault ka branch alag: `GITHUB_VAULT_BRANCH=bot-vault-2`.
+- **Vercel par ye bot nahi chalega** (long polling, Chrome, disk) — Render
+  ke 750 free hours account-wise hote hain, isliye doosra Render account.
+
 ## ⚙️ Settings — user ki azadi (env chhedni ki zaroorat nahi)
 
 `/start` → **⚙️ Settings**:
@@ -453,6 +472,7 @@ chalta rehta hai; temporary error par number failed nahi gina jata.
 | `firebase-sources.js` | **Multiple Firebase sources** — bulk add (1000)/verify/health; sab Delete tak ACTIVE (db-backed + vault) |
 | `firebase-seed-urls.js` | Owner ki ROLEX VIP Firebase list (400+ DBs) — boot par permanently seed hoti hai |
 | `otp-bot-profiles.js` | **OTP bot profiles** — Hermes / Hathi / HardXotp ke buttons, card labels aur UI labels (pure, tested) |
+| `instance-info.js` | **Doosra deployment label** — `INSTANCE_LABEL` se title/diag/health me `· bot2` (default `main` = purana look) |
 | `bot-settings.js` | **Batch knobs** — target/parallel lanes/time/gap (UI se, validated + clamped) |
 | `proxy-pool.js` | **Proxy pool** — lane reservations, IP rotation, per-proxy WAF token + cooldown |
 | `swiggy-bridge.js` | Swiggy automation + WAF token injection + **lane-local proxy routing** |
@@ -474,6 +494,8 @@ chalta rehta hai; temporary error par number failed nahi gina jata.
 | `PREMIUM_DEVICE_ACTIVE_WINDOW_MS` | 60000 | **Last-seen base window**: pehle is window ki SMS activity wala device, phir doubling ladder. Sakht: `10000`, band: `0` |
 | `PREMIUM_DEVICE_SCAN_BUDGET_MS` | 12000 | Ek refill me quick scan ka hard time budget; iske baad probed sample ka best ya clients-ONLINE device process hota hai |
 | `PREMIUM_ALLOW_OFFLINE_DEVICES` | — | `1` = offline devices bhi try |
+| `INSTANCE_LABEL` | `main` | Doosre bot/hosting par `bot2` — UI, `/diag` aur `/health` me pehchan |
+| `GITHUB_VAULT_BRANCH` | `bot-vault` | Doosre instance ke liye `bot-vault-2` (warna vault overwrite hoga) |
 
 ## Timing expectation
 

@@ -163,6 +163,35 @@ vault branch — aur (free plan par) **alag Render account**.
 > Har bot ka `BOT_TOKEN` sirf uske apne hosting ke env me rahe — chat,
 > screenshot, GitHub me kabhi nahi.
 
+## 4️⃣c GitHub Actions se FREE (bina card, bina Render account) — 3 bots ke liye
+
+Render par 1 account = 1 bot (750 free hours per account). Agar 3 aur bots
+chahiye aur 3 accounts nahi banane, to **GitHub Actions** route available hai:
+public repo ke runner minutes free hain aur runner image me **Chrome pehle se**
+hota hai. Workflow repo me ready hai: **`.github/workflows/bot-live.yml`**.
+
+Kaise:
+1. GitHub → repo → **Settings → Secrets and variables → Actions → New repository secret**
+   - `BOT_TOKEN` = bot2 ka token
+   - `OWNER_IDS` = bot2 ka owner id
+   - (bot3: `BOT_TOKEN_3` + `OWNER_IDS_3`, bot4: `BOT_TOKEN_4` + `OWNER_IDS_4`)
+   - recommended: `GITHUB_VAULT_TOKEN`, `VAULT_ENCRYPTION_KEY` (state survive kare)
+   - Telegram mode: `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, `TELEGRAM_SESSION`
+2. **Actions → Bot live → Run workflow** → `instance` = `bot2` → Run.
+3. Logs me `🏷 Instance: bot2` + `Chrome: Google Chrome ...` + `Telegram ✅ @...`
+   dikhe to bot live hai.
+
+Imaandaar limits (Render se kam reliable):
+- Job max **6 ghante** chalti hai → har **6 ghante par ~5 min ka gap** (polling rukti hai).
+- Runner **ephemeral** hai: `data/` har run me khali → state **cloud vault** se
+  aata/jata hai (`GITHUB_VAULT_TOKEN` + `VAULT_ENCRYPTION_KEY` ke bina accounts
+  reset ho jayenge).
+- Har run ka **IP badalta** hai (proxy pool phir bhi kaam karta hai, par direct
+  route badalta rehta hai).
+- GitHub 60 din repo inactivity par scheduled workflow **disable** kar deta hai
+  (Actions tab se dobara enable karna padta hai).
+- 24×7 reliability chahiye to **Render/VPS** hi sahi hai; Actions "free jugaad" hai.
+
 ## 5️⃣ Kya kabhi nahi karna
 
 - ❌ Ek `BOT_TOKEN` do jagah — **409 Conflict**, dono me se ek mar jata hai.

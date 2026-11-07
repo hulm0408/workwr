@@ -2848,6 +2848,19 @@ console.log('Doosra bot / doosra instance (INSTANCE_LABEL):');
     'guide: har bot ke liye alag Render account (750h per account)');
   ok(guide.includes('40 lanes'), 'guide: 4 bots = shared Firebase pool par 40 lanes ka warning');
   ok(guide.includes('spare Telegram account'), 'guide: har bot ko apna spare Telegram account');
+
+  // GitHub Actions route (free, bina card) — workflow + guide dono maujood.
+  const workflow = await fsp.readFile(new URL('./.github/workflows/bot-live.yml', import.meta.url), 'utf8');
+  ok(workflow.includes('name: Bot live') && workflow.includes('workflow_dispatch'),
+    'workflow: bot-live manual dispatch se chalta hai');
+  ok(workflow.includes("cron: '0 */6 * * *'") && workflow.includes('cancel-in-progress: true'),
+    'workflow: 6-ghante schedule + purane run ko cancel (409 se bachne ke liye)');
+  ok(workflow.includes('INSTANCE_LABEL') && workflow.includes('GITHUB_VAULT_BRANCH'),
+    'workflow: per-instance label + alag vault branch');
+  ok(workflow.includes("if [ -z \"$BOT_TOKEN\" ]"), 'workflow: token missing ho to skip (noise nahi)');
+  ok(workflow.includes('timeout -s SIGTERM'), 'workflow: clean SIGTERM stop (state save)');
+  ok(guide.includes('bot-live.yml') && guide.includes('6 ghante'),
+    'guide: GitHub Actions route + 6-ghante gap likha hai');
 }
 
 console.log(`\n✅ ALL PASSED — ${passed} checks`);

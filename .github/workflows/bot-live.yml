@@ -1,0 +1,116 @@
+# ===== 🤖 Bot live (GitHub Actions runner) =====
+#
+# KYUN ye file? Render free par 1 account = 1 bot. GitHub Actions par PUBLIC
+# repo ke minutes FREE hain, runner image me Chrome pehle se hota hai, aur
+# bot yahan bina card ke chalta hai.
+#
+# KAISE CHALTA HAI:
+#   • Ek job ~5h30m chalti hai (max 360 min limit), phir agla scheduled run
+#     aata hai aur `concurrency: cancel-in-progress` purani job ko cleanly
+#     band kar deta hai → 24x7 ke qareeb.
+#   • Har job ke beech ~5-10 min ka gap rehta hai (polling ruk jati hai).
+#     Ye limitation hai — Render/VPS par ye gap nahi hota.
+#
+# ZAROORI (Settings → Secrets and variables → Actions):
+#   secrets.BOT_TOKEN      = bot2 ka token       (bot3 ke liye BOT_TOKEN_3, bot4: BOT_TOKEN_4)
+#   secrets.OWNER_IDS      = bot2 ka owner id    (bot3: OWNER_IDS_3, bot4: OWNER_IDS_4)
+#   optional (recommended, warna har 6 ghante me accounts/settings reset):
+#     secrets.GITHUB_VAULT_TOKEN, secrets.VAULT_ENCRYPTION_KEY
+#   optional (Telegram mode — durable session):
+#     secrets.TELEGRAM_API_ID, secrets.TELEGRAM_API_HASH, secrets.TELEGRAM_SESSION
+#
+# NOTE: runner ephemeral hai — `data/` har run me khali. Isliye state cloud
+# vault se aata/jata hai. Telegram session ke liye `TELEGRAM_SESSION` env
+# route use karo (local PC par `npm run telegram:login`).
+
+name: Bot live
+
+on:
+  workflow_dispatch:
+    inputs:
+      instance:
+        description: 'Kaun sa bot chalana hai?'
+        type: choice
+        options: [bot2, bot3, bot4]
+        default: bot2
+  schedule:
+    - cron: '0 */6 * * *'    # bot2 — har 6 ghante
+    - cron: '20 */6 * * *'   # bot3 — 20 min offset (overlap na ho)
+    - cron: '40 */6 * * *'   # bot4
+
+# Ek instance ka ek hi runner — naya run purane ko band karta hai (409 se bachne ke liye).
+concurrency:
+  group: bot-live-${{ github.event.inputs.instance || (github.event.schedule == '20 */6 * * *' && 'bot3' || (github.event.schedule == '40 */6 * * *' && 'bot4' || 'bot2')) }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - name: Instance chuno
+        id: pick
+        run: |
+          INST="${{ github.event.inputs.instance }}"
+          if [ -z "$INST" ]; then
+            case "${{ github.event.schedule }}" in
+              '20 */6 * * *') INST=bot3 ;;
+              '40 */6 * * *') INST=bot4 ;;
+              *) INST=bot2 ;;
+            esac
+          fi
+          echo "instance=$INST" >> "$GITHUB_OUTPUT"
+          echo "Chal raha hai: $INST"
+
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Node setup
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Dependencies
+        run: npm ci --omit=dev --no-audit --no-fund
+
+      - name: Chrome check (WAF solver ke liye)
+        run: |
+          if command -v google-chrome >/dev/null 2>&1; then
+            echo "Chrome: $(google-chrome --version)"
+          elif command -v chromium-browser >/dev/null 2>&1; then
+            echo "Chromium: $(chromium-browser --version)"
+          else
+            echo "::warning::Runner par Chrome nahi mila — WAF solve fail hoga (PUPPETEER_EXECUTABLE_PATH check karo)"
+          fi
+
+      - name: Bot chalao (5h30m, phir clean stop)
+        timeout-minutes: 340
+        env:
+          BOT_TOKEN: ${{ steps.pick.outputs.instance == 'bot3' && secrets.BOT_TOKEN_3 || steps.pick.outputs.instance == 'bot4' && secrets.BOT_TOKEN_4 || secrets.BOT_TOKEN }}
+          OWNER_IDS: ${{ steps.pick.outputs.instance == 'bot3' && secrets.OWNER_IDS_3 || steps.pick.outputs.instance == 'bot4' && secrets.OWNER_IDS_4 || secrets.OWNER_IDS }}
+          INSTANCE_LABEL: ${{ steps.pick.outputs.instance }}
+          GITHUB_VAULT_BRANCH: ${{ steps.pick.outputs.instance == 'bot3' && 'bot-vault-3' || steps.pick.outputs.instance == 'bot4' && 'bot-vault-4' || 'bot-vault-2' }}
+          GITHUB_VAULT_TOKEN: ${{ secrets.GITHUB_VAULT_TOKEN }}
+          VAULT_ENCRYPTION_KEY: ${{ secrets.VAULT_ENCRYPTION_KEY }}
+          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+          TELEGRAM_SESSION: ${{ secrets.TELEGRAM_SESSION }}
+          FIREBASE_DB_URL: ${{ vars.FIREBASE_DB_URL || 'https://vuvhbjbi-default-rtdb.firebaseio.com/' }}
+          HEADLESS: '1'
+          DATA_DIR: ${{ runner.temp }}/bot-data
+        run: |
+          if [ -z "$BOT_TOKEN" ]; then
+            echo "::notice::BOT_TOKEN secret set nahi hai — Settings → Secrets → Actions me daalo. Run skip."
+            exit 0
+          fi
+          mkdir -p "$DATA_DIR"
+          # SIGTERM par bot apna state save karke band hota hai (vault push ke liye 120s).
+          timeout -s SIGTERM --kill-after=120 19800 node fresh-bot.js
+
+      - name: Aakhri logs (debug)
+        if: always()
+        run: echo "Job khatam — agla scheduled run naye runner par shuru hoga."

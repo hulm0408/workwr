@@ -352,7 +352,9 @@ function settingsCard() {
   const ps = proxyPool.proxySummary();
   return section('⚙️ Settings', [
     activeSourceLine(),
-    field('🔀 Proxies', ps.enabled ? `${ps.enabledCount}/${ps.total} ON — ${ps.rotation}` : 'OFF (rukna pad sakta hai)'),
+    field('🔀 Proxies', ps.direct
+      ? `${mono('DIRECT')} — bina proxy (PROXY_MODE=direct)`
+      : (ps.enabled ? `${ps.enabledCount}/${ps.total} ON — ${ps.rotation}` : 'OFF (rukna pad sakta hai)')),
     ``,
     field('🎯 Target', `${bs.getSetting('target')} fresh`),
     field('⚡ Parallel lanes', `${bs.getSetting('concurrency')} numbers/IPs ek saath`),
@@ -384,7 +386,11 @@ const settingsRows = () => [
     { text: `⏳ OTP wait: ${bs.fmtSetting('telegramOtpTimeoutMs')}`, callback_data: 'ap_pick_telegram_wait' },
     { text: `🔄 Refresh: ${bs.fmtSetting('telegramOtpRefreshMs')}`, callback_data: 'ap_pick_telegram_refresh' },
   ]] : []),
-  [{ text: `🔀 Proxies: ${proxyPool.proxySummary().enabledCount}`, callback_data: 'ap_proxies', style: 'primary' }],
+  [{
+    text: proxyPool.proxySummary().direct ? '🔀 Proxies: DIRECT' : `🔀 Proxies: ${proxyPool.proxySummary().enabledCount}`,
+    callback_data: 'ap_proxies',
+    style: 'primary',
+  }],
   [{ text: `🎯 Target: ${bs.getSetting('target')}`, callback_data: 'ap_pick_target' }],
   [{ text: `⚡ Parallel: ${bs.getSetting('concurrency')} lanes`, callback_data: 'ap_pick_parallel' }],
   [{ text: `⏱ Max: ${bs.getSetting('maxMinutes')}m`, callback_data: 'ap_pick_time' }],
@@ -1093,7 +1099,12 @@ async function diagCard() {
   // Proxies
   try {
     const ps = proxyPool.proxySummary();
-    lines.push(field('🔀 Proxies', ps.enabled ? `✅ ${ps.enabledCount}/${ps.total} ON` : '⚠️ OFF (ek hi IP — rukna pad sakta hai)'));
+    if (ps.direct) {
+      lines.push(field('🔀 Proxies', `🔀 ${mono('DIRECT MODE')} — koi proxy nahi, ek IP, 1 lane`));
+      lines.push(sub('Slow par predictable: proxy fetch/WAF-solve ka time bachta hai, par Swiggy ki per-IP rate-limit seedha lagti hai.'));
+    } else {
+      lines.push(field('🔀 Proxies', ps.enabled ? `✅ ${ps.enabledCount}/${ps.total} ON` : '⚠️ OFF (ek hi IP — rukna pad sakta hai)'));
+    }
   } catch { lines.push(field('🔀 Proxies', '—')); }
   const snap = getAutopilotSnapshot();
   lines.push(field('▶️ Batch', snap.running ? `● RUNNING — ${snap.fresh}/${snap.target} fresh` : (snap.finishedAt ? `⏹ last: ${snap.fresh} fresh · ${esc(snap.stopReason || 'done')}${snap.lastError ? ` · last error: ${esc(String(snap.lastError).slice(0, 100))}` : ''}` : 'ready')));

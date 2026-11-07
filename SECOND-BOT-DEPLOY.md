@@ -264,6 +264,40 @@ deta tha — sirf "connection error" dikhta tha. Ab:
    session restart par ud jata hai — isliye account ka `TELEGRAM_SESSION` **env
    me** rakho, tabhi wo hamesha zinda rahega.
 
+## 4️⃣e Proxy ka jhameela band karo — DIRECT mode
+
+Proxy ke liye ladai ki asli wajah: **har instance apni free-proxy list khud
+fetch karta hai aur har proxy par alag Chrome WAF solve karta hai.** 4 bots par
+ye 4× kaam hai, aur 0.1 CPU (Render free) par ek-ek solve minute leta hai.
+Isi liye "bahut time waste" hota hai.
+
+Agar proxy ka jhameela nahi chahiye — **ek env aur sab band**:
+
+```
+PROXY_MODE=direct
+```
+
+Iske baad:
+
+| Cheez | Direct mode me |
+|---|---|
+| Free-proxy fetch | ❌ bilkul nahi (sabse bada time-saver) |
+| Per-proxy Chrome WAF solve | ❌ nahi |
+| Proxy rotation / cooldown / aapas ki ladai | ❌ nahi |
+| Lanes | **1** (ek IP — zyada lanes sirf rate-limit bulati hain) |
+| Speed | slow par **predictable**; rate-limit par fast ladder (15-30s) ruk kar agla number |
+| `/diag` | `🔀 Proxies: DIRECT MODE — koi proxy nahi, ek IP, 1 lane` |
+| Live card | `🔀 DIRECT · bina proxy, ek IP` |
+
+**Kab direct sahi hai:** 2+ bots, free proxies, ya jab "result consistent
+chahiye, bas chalna chahiye". **Kab proxy better hai:** ek hi bot aur speed
+chahiye (tab `PROXY_MODE=auto` rakho aur sticky proxies daalo).
+
+**Speed ka sach (imeandaari se):** direct mode me ek IP par Swiggy ki per-IP
+limit lagti hai, isliye 1 ID / minute ka target nahi milta — realistic ~1 ID per
+3-5 min, din bhar me ~100-200 attempts. Proxy pool ke bina isse zyada possible
+hi nahi, chahe koi kuch bhi bole.
+
 ## 5️⃣ Kya kabhi nahi karna
 
 - ❌ Ek `BOT_TOKEN` do jagah — **409 Conflict**, dono me se ek mar jata hai.

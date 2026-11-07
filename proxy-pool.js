@@ -152,7 +152,27 @@ function ensureSeeded() {
   return state;
 }
 
+// ---------------------------------------------------------------------------
+// DIRECT MODE — "bina proxy chalana hai"
+// ---------------------------------------------------------------------------
+// PROXY_MODE=direct  → proxy pool poori tarah band:
+//   • koi free-proxy fetch nahi (ye hi sabse zyada time khaata tha)
+//   • koi per-proxy Chrome WAF solve nahi (free CPU par ye minutes leta hai)
+//   • koi proxy rotation/cooldown/ladai nahi — sirf ek direct IP
+// Trade-off saaf: ek IP = 1 lane, aur Swiggy per-IP rate-limit seedha lagti
+// hai. Slow par predictable. Default 'auto' = jaisa aaj tak chalta aaya.
+export function proxyMode(env = process.env) {
+  const raw = String(env?.PROXY_MODE ?? env?.PREMIUM_PROXY_MODE ?? 'auto').trim().toLowerCase();
+  if (['direct', 'none', 'off', 'no', '0', 'disabled'].includes(raw)) return 'direct';
+  return 'auto';
+}
+
+export function isDirectMode(env = process.env) {
+  return proxyMode(env) === 'direct';
+}
+
 export function isEnabled() {
+  if (isDirectMode()) return false;
   const state = ensureSeeded();
   return Boolean(state.enabled && state.list.some((p) => p.enabled));
 }
@@ -1050,6 +1070,7 @@ export function usableProxyCount(now = Date.now()) {
 // Kabhi throw nahi karta — fail ho to purana direct-mode hi chalega.
 export async function ensureFreeProxies({ min = 1, want = 24 } = {}) {
   try {
+    if (isDirectMode()) return { skipped: true, reason: 'direct-mode', count: 0, usableCount: 0 };
     const state = ensureSeeded();
     const enabledCount = state.list.filter((p) => p.enabled).length;
     const usableCount = usableProxyCount();
@@ -1087,6 +1108,22 @@ export async function ensureFreeProxies({ min = 1, want = 24 } = {}) {
 // Summary (bot UI + engine ke liye)
 // ---------------------------------------------------------------------------
 export function proxySummary() {
+  const mode = proxyMode();
+  if (mode === 'direct') {
+    // Direct mode me list/health ginne ka koi matlab nahi — UI ko saaf
+    // "DIRECT" dikhana hai, warna user samajhta hai proxies chal rahi hain.
+    return {
+      mode,
+      direct: true,
+      enabled: false,
+      enabledCount: 0,
+      usableCount: 0,
+      reservedCount: 0,
+      tokenReadyCount: 0,
+      autoFree: false,
+      list: [],
+    };
+  }
   const state = ensureSeeded();
   const enabled = state.list.filter((p) => p.enabled).length;
   const autoCount = state.list.filter((p) => p.auto && p.enabled).length;
@@ -1108,6 +1145,8 @@ export function proxySummary() {
   const usableCount = usableProxyCount(now);
   const reservedCount = state.list.filter((p) => proxyReservations.has(p.id)).length;
   return {
+    mode,
+    direct: false,
     enabled: Boolean(state.enabled),
     total: state.list.length,
     enabledCount: enabled,

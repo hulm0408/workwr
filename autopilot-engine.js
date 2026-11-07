@@ -914,6 +914,7 @@ export function formatCompactAutopilotCard(snap = state, { stageText = '', final
     `📱 ${mono(phoneText)} · ⏱ ${mono(fmtDuration(compactElapsedMs(s)))}${rateText(s) ? ` · ${rateText(s)}` : ''}${s.sourceMode !== 'telegram' && (s.concurrency || 1) > 1 ? ` · ⚡ ${mono(`${Number(s.activeWorkers) || active.length}/${Number(s.concurrency) || 1}`)}` : ''}`,
     compactSourceLine(s),
     s.shardEnabled ? `🧩 ${mono(`SHARE ${s.shardShare || ''}`)} <i>· pool ka apna hissa, koi ladai nahi</i>` : '',
+    s.proxyMode === 'direct' ? `🔀 ${mono('DIRECT')} <i>· bina proxy, ek IP — slow par predictable</i>` : '',
     `✅ ${mono(`FRESH ${fresh}`)} · ⚙ ${mono(`DONE ${Number(s.processed) || 0}`)} · × ${mono(`FAIL ${Number(s.failed) || 0}`)}${retries ? ` · ↻ ${mono(`RETRY ${retries}`)}` : ''}${Number(s.manualSkips) ? ` · ⏭ ${mono(`SKIP ${Number(s.manualSkips) || 0}`)}` : ''}${fresh ? ` · 🏠 ${mono(`ADDR ${Number(s.addressAdded) || 0}/${fresh}`)}` : ''}`,
     final
       ? (fresh ? sub('Fresh JSON chat me bhej diye hain.') : sub('Is run me fresh session nahi bana.'))
@@ -1141,6 +1142,7 @@ export async function startAutopilot(opts = {}) {
     rateStrikes: 0, wafStrikes: 0, wafCooldowns: 0, serverErrors: 0, transientStrikes: 0,
     consecutiveFails: 0, proxyRotations: 0,
     routeMode: 'direct', proxyChallenges: 0, directChallenges: 0, deferredQueue: 0,
+    proxyMode: proxyPool.proxyMode?.() || 'auto',
     current: null, activeNumbers: [], history: [], freshAccounts: [], lastError: '',
     sourceMode,
     otpBotProfile: telegramMode ? otpBotProfile.id : '',
@@ -1402,6 +1404,12 @@ export async function startAutopilot(opts = {}) {
     // behavior, koi rukawat nahi.
     const freePromise = (async () => {
       try {
+        // Direct mode: proxy fetch/solve bilkul nahi — yahi wo cheez thi jo
+        // free CPU par minute kha jati thi aur 4 bots me aapas me ladti thi.
+        if (proxyPool.isDirectMode?.()) {
+          console.log('[Autopilot] 🔀 Proxy mode: DIRECT — koi proxy fetch/WAF-solve nahi (1 lane, ek IP).');
+          return { skipped: true, reason: 'direct-mode' };
+        }
         const r = await proxyPool.ensureFreeProxies({
           // Telegram me lane 1 hai, phir bhi WAF/rate-limit se bachne ke
           // liye sequential backup IPs chahiye. Sirf lane-count ginna pool
@@ -3057,9 +3065,11 @@ export async function startAutopilot(opts = {}) {
           state.workerRecoveries = (state.workerRecoveries || 0) + 1;
         }
         const backoff = rateLimitRecoveryWaitMs(state.rateStrikes, backoffMs);
-        void proxyPool.ensureFreeProxies?.({ min: 12, want: FREE_PROXY_TARGET_COUNT }).then((r) => {
-          if (r?.added) ps = proxyPool.proxySummary();
-        }).catch(() => {});
+        if (!proxyPool.isDirectMode?.()) {
+          void proxyPool.ensureFreeProxies?.({ min: 12, want: FREE_PROXY_TARGET_COUNT }).then((r) => {
+            if (r?.added) ps = proxyPool.proxySummary();
+          }).catch(() => {});
+        }
         await push(progressCard(section('🚦 Swiggy Rate Limit — 15s Fast Recovery', [
           `› Sirf lane ${lane.id} ~${Math.max(1, Math.round(backoff / 1000))}s ruk kar nayi IP/token se aage badhegi (strike ${state.rateStrikes}/3); baaki lanes chalti rahengi.`,
           sub('⚠️ Proxies add karne se ye wait bhi hat jayegi (⚙️ Settings → 🔀 Proxies).'),

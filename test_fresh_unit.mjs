@@ -3152,4 +3152,46 @@ console.log('Telegram accounts: health classify + multi-account roster:');
   ok(dupRoster[0].tag === dupRoster[1].tag, 'roster: duplicate session same tag deti hai (detect ho jata hai)');
 }
 
+// ---------------------------------------------------------------------------
+console.log('Direct mode (bina proxy):');
+{
+  const pool = await import('./proxy-pool.js');
+  const fsp = await import('node:fs/promises');
+
+  ok(pool.proxyMode({}) === 'auto', 'direct: default mode auto (purana behaviour)');
+  ok(pool.proxyMode({ PROXY_MODE: 'direct' }) === 'direct', 'direct: PROXY_MODE=direct padha jata hai');
+  ok(pool.proxyMode({ PROXY_MODE: 'off' }) === 'direct', 'direct: "off" bhi direct hai');
+  ok(pool.proxyMode({ PREMIUM_PROXY_MODE: 'direct' }) === 'direct', 'direct: purana naam bhi chalta hai');
+  ok(pool.isDirectMode({}) === false && pool.isDirectMode({ PROXY_MODE: 'direct' }) === true,
+    'direct: isDirectMode flag');
+
+  const saved = process.env.PROXY_MODE;
+  process.env.PROXY_MODE = 'direct';
+  try {
+    ok(pool.isEnabled() === false, 'direct: proxy pool OFF (koi pick nahi)');
+    ok(pool.pickProxy() === null, 'direct: pickProxy null deta hai (crash nahi)');
+    const summary = pool.proxySummary();
+    ok(summary.direct === true && summary.mode === 'direct' && summary.enabled === false,
+      'direct: summary DIRECT dikhata hai');
+    const free = await pool.ensureFreeProxies({ min: 12, want: 24 });
+    ok(free.skipped === true && free.reason === 'direct-mode',
+      'direct: free proxy fetch bilkul skip (yahi time bachata hai)');
+    process.env.PROXY_MODE = saved;
+  } finally {
+    if (saved === undefined) delete process.env.PROXY_MODE; else process.env.PROXY_MODE = saved;
+  }
+
+  const engineSrc = await fsp.readFile(new URL('./autopilot-engine.js', import.meta.url), 'utf8');
+  const fbSrc = await fsp.readFile(new URL('./fresh-bot.js', import.meta.url), 'utf8');
+  ok(engineSrc.includes('proxyPool.isDirectMode?.()'), 'direct: engine direct mode check karta hai');
+  ok(engineSrc.includes('Proxy mode: DIRECT'), 'direct: boot par saaf log');
+  ok(engineSrc.includes("proxyMode: proxyPool.proxyMode?.()"), 'direct: snapshot me proxyMode');
+  ok(engineSrc.includes("mono('DIRECT')"), 'direct: live card par DIRECT chip');
+  ok(fbSrc.includes('DIRECT MODE'), 'direct: /diag me DIRECT mode line');
+  ok(fbSrc.includes("'🔀 Proxies: DIRECT'"), 'direct: settings/menu label DIRECT');
+  const deployDoc = await fsp.readFile(new URL('./SECOND-BOT-DEPLOY.md', import.meta.url), 'utf8');
+  ok(deployDoc.includes('PROXY_MODE=direct') && deployDoc.includes('1 ID per'),
+    'docs: direct mode + imaandaar speed expectation likha hai');
+}
+
 console.log(`\n✅ ALL PASSED — ${passed} checks`);

@@ -508,6 +508,7 @@ chalta rehta hai; temporary error par number failed nahi gina jata.
 | `INSTANCE_COUNT` | `1` | Kai bots ek hi pool/proxy par → kul bots ki ginti (4). Numbers + proxies ka apna hissa, lanes capped |
 | `JSON_TEXT_FALLBACK` | — | `1` = `.json` file attach fail ho to raw JSON text me bhejo (default: saaf message + `/session`) |
 | `TELEGRAM_CALL_TIMEOUT_MS` | `20000` | Boot ke getMe/deleteWebhook ka hard timeout (hang = fail → retry) |
+| `TELEGRAM_SESSION_2…_8` | — | Extra spare accounts. Ek account flood/dead ho to bot **khud agla** uthata hai (`npm run telegram:audit` se check) |
 | `GITHUB_VAULT_BRANCH` | `bot-vault` | Doosre instance ke liye `bot-vault-2` (warna vault overwrite hoga) |
 
 ## Timing expectation

@@ -218,6 +218,52 @@ Imaandaar limits (Render se kam reliable):
   (Actions tab se dobara enable karna padta hai).
 - 24×7 reliability chahiye to **Render/VPS** hi sahi hai; Actions "free jugaad" hai.
 
+## 4️⃣d Ek bot chal raha, baaki accounts kaam nahi kar rahe?
+
+Ye 100% account-level problem hoti hai (bot/numbers ka dosh nahi). Har spare
+account ki apni sehat hoti hai, aur pehle app use **chup-chaap** side par kar
+deta tha — sirf "connection error" dikhta tha. Ab:
+
+1. **`/diag`** kholo → `👥 Accounts` section:
+   ```
+   👥 Accounts: 2/4 READY · active #1
+   ✅ account 1 · 3445d362
+   ⏳ account 2 · 58bf9ca5 · FLOOD_WAIT_900 · 12m baaki
+   ⛔ account 3 · e36fa7c0 · PEER_FLOOD (PEER_FLOOD — bots ko message block)
+   ✅ account 4 · 9aa41b02
+   ```
+2. Har line ka matlab:
+
+| Line | Matlab | Kya karo |
+|---|---|---|
+| `✅ ready` | account theek | kuch nahi |
+| `⏳ FLOOD_WAIT_… · Xm baaki` | Telegram ne us account par rate-limit lagaya | us account ko X min chhodo — bot khud doosra uthayega |
+| `⛔ PEER_FLOOD` | ye account bots ko **message bhej hi nahi sakta** (naya/spammy account) | 1-2 din warm-up, ya naya spare account |
+| `⛔ AUTH_KEY_* / SESSION_REVOKED` | session mar gaya | Add Telegram Account se dobara login |
+| `⛔ CHAT_WRITE_FORBIDDEN` | OTP bot ne us account ko block kiya | doosra account |
+| `⛔ SESSION_INVALID` | session string adhuri paste hui | poora string dobara paste |
+| `🌐 NETWORK` | network/restart ka jhatka, account theek hai | 15s me khud retry |
+
+3. **Sabse tez jaanch** (laptop par, session wahi ke wahi):
+   ```
+   TELEGRAM_API_ID=... TELEGRAM_API_HASH=... \
+   TELEGRAM_SESSION=<a1> TELEGRAM_SESSION_2=<a2> TELEGRAM_SESSION_3=<a3> \
+   npm run telegram:audit
+   ```
+   Har account ka jawab: connect → authorize → kaun sa account → OTP bot ke
+   buttons. Jo account fail, uski wajah + fix wahi line me.
+
+4. **Multi-account auto-rotation** (naya): env me
+   `TELEGRAM_SESSION`, `TELEGRAM_SESSION_2`, `TELEGRAM_SESSION_3`, `TELEGRAM_SESSION_4`
+   daal do. Bot claim ke waqt **healthy** account chunta hai; kharab account
+   cooldown me chala jata hai aur baaki kaam karte rehte hain — batch rukta
+   nahi. (Number mil jane ke baad account **nahi** badalta — OTP usi account ke
+   chat me aata hai; isliye pinning hai.)
+
+5. **Ek chhoti si trap:** Render free par disk nahi. Bot ke andar se login kiya
+   session restart par ud jata hai — isliye account ka `TELEGRAM_SESSION` **env
+   me** rakho, tabhi wo hamesha zinda rahega.
+
 ## 5️⃣ Kya kabhi nahi karna
 
 - ❌ Ek `BOT_TOKEN` do jagah — **409 Conflict**, dono me se ek mar jata hai.

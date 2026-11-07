@@ -31,7 +31,7 @@ services:
         sync: false # @BotFather wala NAYA token (purana revoke kar diya hoga — README dekho)
       - key: OWNER_IDS
         sync: false # Aapki Telegram user ID (bot ko /start karne par dikh jati hai)
-      # --- Defaults (aise hi rehne do) ---
+      # --- Apna RTDB URL do (koi hardcoded default nahi) ---
       - key: FIREBASE_DB_URL
         sync: false # apna RTDB URL; koi hardcoded default nahi
       - key: HEADLESS

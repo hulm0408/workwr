@@ -28,7 +28,7 @@ services:
         sync: false # aapki Telegram ID (default 6484999726)
       - key: INSTANCE_LABEL
         value: bot2 # UI/log me "· bot2" — dono bots alag pehchane jayein
-      # --- Defaults ---
+      # --- Apna RTDB URL do (koi hardcoded default nahi) ---
       - key: FIREBASE_DB_URL
         sync: false # apna RTDB URL; koi hardcoded default nahi
       - key: HEADLESS

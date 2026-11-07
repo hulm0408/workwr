@@ -28,7 +28,8 @@ import dotenv from 'dotenv';
 dotenv.config();
 
 // OTP + numbers kisi bhi configured Firebase source se aate hain. No hardcoded
-// project fallback: FIREBASE_DB_URL (or Settings > Firebase Sources) is required.
+// project fallback: set FIREBASE_DB_URL (or Settings > Firebase Sources);
+// otherwise the built-in third-party source list is used.
 
 // Dynamic import — defaults set karne KE BAAD hi modules load ho, warna
 // firebase-numbers.js env ko call-time par hi padhta hai, phir bhi safe side.

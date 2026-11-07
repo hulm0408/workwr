@@ -41,6 +41,7 @@ import {
 } from './firebase-numbers.js';
 import { esc, section, sub, field } from './rich-text.js';
 import { normalizeIndianMobileNumber } from './phone-utils.js';
+import { getOtpBotProfile } from './otp-bot-profiles.js';
 import {
   snapshotTelegramOtpState,
   waitForTelegramOtpCode,
@@ -418,7 +419,7 @@ export async function processSingleNumber({
   const telegramBotLabel = `@${String(entry?.telegramBotUsername || 'HermeshuOTPROBOT').replace(/^@+/, '')}`;
   // HardXotp me REFRESH button nahi hota — wahan "VIEW MESSAGES" hi naya SMS
   // dekhta hai. UI wahi naam bole jo asal me click hoga.
-  const telegramRefreshLabel = String(entry?.otpBotProfile || '') === 'chauhan' ? 'VIEW MESSAGES' : 'REFRESH';
+  const telegramRefreshLabel = getOtpBotProfile(entry?.otpBotProfile || '').refreshLabel || 'REFRESH';
   const sourceLabel = telegramMode ? telegramBotLabel : 'Firebase SMS inbox';
 
   const telegramTimeoutMs = Number(otpCfg.telegramOtpTimeoutMs ?? otpCfg.hermesOtpTimeoutMs ?? 20_000);

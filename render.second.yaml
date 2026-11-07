@@ -1,0 +1,42 @@
+# ===== Render Blueprint — DOOSRA instance (same codebase, naya bot) =====
+# Pehla bot `render.yaml` se chalta hai. Ye file doosre bot ke liye hai:
+#   Render (doosre account me) → New → Blueprint → repo → Blueprint Path:
+#   `render.second.yaml` → Apply → BOT_TOKEN bharna.
+#
+# Yahan `type: web` + `plan: free` kyun?
+#   Free **worker** available nahi hai; free **web service** milti hai aur
+#   bot khud PORT kholta hai (`/health`, `/health/ready`) + Render ke
+#   RENDER_EXTERNAL_URL par self-ping karke 15-min neend rokta hai.
+#   Card/payment ke bina yahi route chalta hai.
+#
+# DISK nahi hai (free plan par disk allowed nahi) — accounts restart par
+# cloud vault se hydrate hote hain, isliye `GITHUB_VAULT_TOKEN` +
+# `VAULT_ENCRYPTION_KEY` + alag `GITHUB_VAULT_BRANCH` set karo.
+services:
+  - type: web
+    name: swiggy-fresh-bot-2
+    runtime: docker
+    region: singapore
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    envVars:
+      # --- Zaroori ---
+      - key: BOT_TOKEN
+        sync: false # doosre @BotFather bot ka NAYA token
+      - key: OWNER_IDS
+        sync: false # aapki Telegram ID (default 6484999726)
+      - key: INSTANCE_LABEL
+        value: bot2 # UI/log me "· bot2" — dono bots alag pehchane jayein
+      # --- Defaults ---
+      - key: FIREBASE_DB_URL
+        value: https://vuvhbjbi-default-rtdb.firebaseio.com/
+      - key: HEADLESS
+        value: "1"
+      # --- Optional: cloud vault (doosre instance ka alag branch!) ---
+      - key: GITHUB_VAULT_TOKEN
+        sync: false
+      - key: VAULT_ENCRYPTION_KEY
+        sync: false
+      - key: GITHUB_VAULT_BRANCH
+        value: bot-vault-2

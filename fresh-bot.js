@@ -71,6 +71,7 @@ const wafPool = await import('./waf-pool.js');
 const { esc, section, sub, field, mono, statusCard } = await import('./rich-text.js');
 const { createServer } = await import('node:http');
 const { startKeepAlive } = await import('./keep-alive.js');
+const instanceInfo = await import('./instance-info.js');
 
 // ---------------------------------------------------------------------------
 // Process guards — ek stray async error poore bot ko NA maare.
@@ -114,6 +115,7 @@ function buildHealthPayload() {
     ok: true,
     ready: runtimeHealth.telegramReady,
     service: 'swiggy-fresh-bot',
+    instance: instanceInfo.getInstanceLabel(),
     now: new Date().toISOString(),
     uptimeSec: Math.floor((Date.now() - runtimeHealth.bootAt) / 1000),
     batchRunning: Boolean(snap.running),
@@ -302,7 +304,7 @@ function startCard() {
   const telegram = isTelegramNumberSource();
   const target = Number(bs.getSetting('target')) || 100;
   const maxMin = Number(bs.getSetting('maxMinutes')) || 120;
-  return statusCard('🆕 Swiggy Fresh Bot', [
+  return statusCard(instanceInfo.instanceTitle('🆕 Swiggy Fresh Bot'), [
     mono(telegram ? '[NEW] › OTP › REFRESH › VERIFY › ADDR › FRESH' : '[POOL] › OTP › INBOX › VERIFY › ADDR › FRESH'),
     '<b>Abhi:</b> START ka wait hai',
     telegram
@@ -919,6 +921,7 @@ bot.help((ctx) => ctx.reply('/start — menu · /status — current batch · /di
 async function diagCard() {
   const lines = [];
   lines.push(field('Node', process.version));
+  lines.push(field('🏷 Instance', instanceInfo.getInstanceLabel()));
   lines.push(field('⏰ Uptime', fmtDuration(Date.now() - runtimeHealth.bootAt)));
   {
     const ka = keepAliveHandle?.getState?.() || { enabled: false, reason: 'not-started' };
@@ -2444,6 +2447,7 @@ process.once('SIGTERM', () => shutdown('SIGTERM'));
 // Startup self-check — console me pehli nazar me sab dikh jaye
 {
   const nodeMajor = Number(String(process.versions.node).split('.')[0]) || 0;
+  console.log(`[FreshBot] 🏷 Instance: ${instanceInfo.getInstanceLabel()}${instanceInfo.isSecondaryInstance() ? ' (doosra bot — INSTANCE_LABEL env se)' : ''}`);
   console.log(`[FreshBot] Node ${process.version}${nodeMajor < 20 ? '  ⚠️ Node 20+ chahiye — nodejs.org se update karo, warna kuch bhi kabhi bhi toot sakta hai!' : ''}`);
   try {
     const c = getChromeStatus();

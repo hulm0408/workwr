@@ -2909,6 +2909,17 @@ console.log('Doosra bot / doosra instance (INSTANCE_LABEL):');
   const monitorReadme = await fsp.readFile(new URL('./vercel-monitor/README.md', import.meta.url), 'utf8');
   ok(monitorReadme.includes('Root Directory') && monitorReadme.includes('vercel-monitor'),
     'monitor: deploy steps me Root Directory=vercel-monitor');
+  // ---- Telegram getMe hang guard (Render: health 200 par ready:false stuck) ----
+  const fbSrc = await fsp.readFile(new URL('./fresh-bot.js', import.meta.url), 'utf8');
+  ok(fbSrc.includes('function withTelegramTimeout('), 'guard: getMe ke liye timeout helper hai');
+  ok(fbSrc.includes('TELEGRAM_CALL_TIMEOUT_MS'), 'guard: timeout env se tunable (default 20s)');
+  ok(fbSrc.includes("withTelegramTimeout(bot.telegram.getMe(), 'getMe')"),
+    'guard: preflight getMe timeout ke andar');
+  ok(!/const me = await bot\.telegram\.getMe\(\)/.test(fbSrc),
+    'guard: preflight me bina timeout wala getMe nahi bacha');
+  ok(fbSrc.includes("'deleteWebhook')"), 'guard: deleteWebhook bhi timeout ke andar');
+  ok(fbSrc.includes("'getMe (watchdog)'"), 'guard: watchdog bhi wahi helper use karta hai');
+
   const vercelDoc = await fsp.readFile(new URL('./VERCEL.md', import.meta.url), 'utf8');
   ok(vercelDoc.includes('vercel-monitor') && vercelDoc.includes('300s'),
     'VERCEL.md: kya chalta hai + function limit likha hai');

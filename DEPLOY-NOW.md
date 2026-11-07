@@ -55,6 +55,22 @@ free. 2–3 bots ke liye 2–3 accounts, ya Raasta A.
 
 ---
 
+## 🅲 Raasta C — Vercel (dashboard, 2 min)
+
+Bot Vercel par nahi chalta (polling + Chrome + disk), par **uska live status
+dashboard** Vercel par chal sakta hai — repo me ready hai: `vercel-monitor/`.
+
+1. [vercel.com/new](https://vercel.com/new) → import `hulm0408/workwr`
+2. **Root Directory** → Edit → `vercel-monitor`
+3. Env: `BOT_HEALTH_URLS` = `https://<bot>.onrender.com/health`
+   (2–3 bots: comma se alag karo)
+4. **Deploy** → URL khul jayega: up/down, instance, telegram, uptime, lanes,
+   fresh count, latency. `/status` par wahi data JSON me.
+
+Poora sach (kya chalta hai / kya nahi): [`VERCEL.md`](VERCEL.md)
+
+---
+
 ## 🧩 Teesra bot (bot3, bot4) kaise
 
 Wahi code, bas naya token + alag label:

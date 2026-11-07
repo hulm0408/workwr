@@ -7,6 +7,8 @@
 > **Free plan / doosra bot** chahiye to button ki jagah
 > `render.second.yaml` se Blueprint banao (guide: [`SECOND-BOT-DEPLOY.md`](SECOND-BOT-DEPLOY.md)).
 > Har cheez ki ek-page list: [`DEPLOY-NOW.md`](DEPLOY-NOW.md).
+> **Vercel** par bot nahi chalta, par uska live status dashboard chalta hai —
+> `vercel-monitor/` (2 min deploy) · kya-kya possible hai: [`VERCEL.md`](VERCEL.md).
 
 **Ek START dabao — phone chhod ke aa jao.** Bot khud:
 

@@ -58,6 +58,7 @@ const {
 const { isFirebaseConfigured, firebaseSetupHintLines, listPoolNumbers, _countDeviceOnlineStates } = await import('./firebase-numbers.js');
 const telegramOtp = await import('./telegram-otp-source.js');
 const sources = await import('./firebase-sources.js');
+const otpBotProfiles = await import('./otp-bot-profiles.js');
 const bs = await import('./bot-settings.js');
 const proxyPool = await import('./proxy-pool.js');
 const {
@@ -288,6 +289,12 @@ function activeSourceLine() {
   }
 }
 
+// Abhi ka OTP bot label (Hermes / HardXotp) — UI me hamesha wahi dikhao jo
+// batch chalayega.
+function activeOtpBotLabel() {
+  try { return otpBotProfiles.getOtpBotProfile(bs.getSetting('otpBotProfile')).label; } catch { return 'Hermes'; }
+}
+
 function startCard() {
   const snap = getAutopilotSnapshot();
   if (snap.running) return runningCard(snap);
@@ -299,12 +306,12 @@ function startCard() {
     mono(telegram ? '[NEW] › OTP › REFRESH › VERIFY › ADDR › FRESH' : '[POOL] › OTP › INBOX › VERIFY › ADDR › FRESH'),
     '<b>Abhi:</b> START ka wait hai',
     telegram
-      ? `📨 ${mono('HERMES ONLY')} · 🔥 Firebase ${mono('OFF')}`
+      ? `📨 ${mono(`${activeOtpBotLabel().toUpperCase()} ONLY`)} · 🔥 Firebase ${mono('OFF')}`
       : activeSourceLine(),
     `🎯 ${mono(`${target} fresh`)} · ⏱ ${mono(`${maxMin} min`)}`,
     '⏭ Running card par <b>SKIP NUMBER</b> bhi rahega — sirf current number chhodega, batch nahi rukega.',
     telegram
-      ? '<b>Next:</b> START dabao — NEW NUMBER se kaam shuru hoga'
+      ? '<b>Next:</b> START dabao — bot chuno, phir new number aayega'
       : '<b>Next:</b> START dabao — live card par har step dikhega',
   ]);
 }
@@ -349,10 +356,11 @@ function settingsCard() {
     field('⏳ OTP wait', bs.fmtSetting('otpWaitMs')),
     field('📴 Offline devices', bs.getSetting('allowOffline') ? 'ON (try bhi karenge)' : 'OFF (sirf online)'),
     ``,
-    field('📨 Hermes mode', bs.fmtSetting('telegramOtpMode')),
+    field('📨 Telegram mode', bs.fmtSetting('telegramOtpMode')),
+    field('🤖 OTP bot', `${esc(bs.fmtSetting('otpBotProfile'))} — <code>@${esc(String(telegramProviderStatus().botUsername || ''))}</code>`),
     numberSourceLine(),
     isTelegramNumberSource()
-      ? field('⏳ Hermes OTP', `${bs.fmtSetting('telegramOtpTimeoutMs')} REFRESH budget · har ${bs.fmtSetting('telegramOtpRefreshMs')}`)
+      ? field('⏳ OTP wait', `${bs.fmtSetting('telegramOtpTimeoutMs')} budget · har ${bs.fmtSetting('telegramOtpRefreshMs')}`)
       : '',
     ``,
     sub(isTelegramNumberSource()
@@ -363,7 +371,8 @@ function settingsCard() {
 
 const settingsRows = () => [
   [{ text: `🔥 Firebase Sources${isTelegramNumberSource() ? ' · fallback OFF' : ''}`, callback_data: 'ap_sources', style: 'primary' }],
-  [{ text: `📨 Hermes mode: ${bs.fmtSetting('telegramOtpMode')}`, callback_data: 'ap_toggle_telegram', style: 'primary' }],
+  [{ text: `📨 Telegram mode: ${bs.fmtSetting('telegramOtpMode')}`, callback_data: 'ap_toggle_telegram', style: 'primary' }],
+  [{ text: `🤖 OTP bot: ${bs.fmtSetting('otpBotProfile')}`, callback_data: 'ap_pick_otp_bot', style: 'primary' }],
   [{ text: '👤 Add Telegram Account', callback_data: 'ap_telegram_account', style: 'success' }],
   [{ text: '🧪 Test Hermes', callback_data: 'ap_test_hermes' }, { text: '🗑 Remove Telegram', callback_data: 'ap_remove_telegram', style: 'danger' }],
   ...(isTelegramNumberSource() ? [[
@@ -467,6 +476,7 @@ function sourcesCard(requestedPage = 0) {
     rows.push(nav);
   }
   rows.push([{ text: '➕ Add Firebase (Bulk)', callback_data: 'ap_src_add', style: 'success' }]);
+  rows.push([{ text: '🗑 Delete All Firebase', callback_data: 'ap_src_delete_all', style: 'danger' }]);
   rows.push([{ text: '↩️ Settings', callback_data: 'ap_settings', style: 'primary' }]);
 
   return {
@@ -478,6 +488,7 @@ function sourcesCard(requestedPage = 0) {
       `isi batch me auto-try hoti hai.`,
       ``,
       `Total: <b>${list.length} ACTIVE</b> sources · Page <b>${page + 1}/${totalPages}</b>`,
+      list.length ? '' : sub('Abhi koi Firebase add nahi — Delete All ke baad aisa hota hai. Add Firebase se naya DB daalo.'),
       primary ? `⭐ First-try: <b>${esc(primary.name)}</b> (baaki sab bhi ACTIVE)` : '⭐ First-try: —',
       health ? `🩺 Live <b>${health.live}</b> · untried <b>${health.neverTried}</b> · quarantine <b>${health.quarantined}</b> <i>(dead DB 30 min peeche)</i>` : '',
       ``,
@@ -729,7 +740,68 @@ async function deliverSessionJson(chatId, { phone, accountKey, kind, account, no
   return sentChunks === chunks.length;
 }
 
-async function launchBatch(ctx) {
+// ---------------------------------------------------------------------------
+// 🚀 START → source chuno
+// Owner ka rule: START dabane par poochho — Hermes bot, HardXotp bot, ya
+// Firebase. Isi screen par "Delete All Firebase" bhi hai taaki purani 400+
+// list ek tap me saaf ho jaye.
+// ---------------------------------------------------------------------------
+function otpBotChoiceRows() {
+  const status = telegramProviderStatus();
+  const fbCount = (() => { try { return sources.listSources().length; } catch { return 0; } })();
+  const ready = status.configured ? '✅' : '⚙️';
+  const activeProfile = bs.getSetting('otpBotProfile');
+  return [
+    [{
+      text: `${ready} 📨 Hermes bot${activeProfile === 'hermes' ? ' ✓' : ''}`,
+      callback_data: 'ap_start_go_hermes',
+      style: 'success',
+    }],
+    [{
+      text: `${ready} 🔐 HardXotp bot${activeProfile === 'chauhan' ? ' ✓' : ''}`,
+      callback_data: 'ap_start_go_chauhan',
+      style: 'success',
+    }],
+    [{ text: `🔥 Firebase (${fbCount})`, callback_data: 'ap_start_go_firebase', style: 'primary' }],
+    [{ text: '🗑 Delete All Firebase', callback_data: 'ap_src_delete_all', style: 'danger' }],
+    [{ text: '↩️ Back', callback_data: 'ap_home' }],
+  ];
+}
+
+function startSourceCard() {
+  const status = telegramProviderStatus();
+  const fbCount = (() => { try { return sources.listSources().length; } catch { return 0; } })();
+  const hermes = otpBotProfiles.getOtpBotProfile('hermes');
+  const chauhan = otpBotProfiles.getOtpBotProfile('chauhan');
+  return section('🚀 Batch Kahan Se Chalega?', [
+    `${status.configured ? '✅' : '⚙️'} <b>📨 Hermes bot</b> — <code>@${esc(hermes.username)}</code>`,
+    sub(`NEW NUMBER → otp → wait → REFRESH`),
+    '',
+    `${status.configured ? '✅' : '⚙️'} <b>🔐 HardXotp bot</b> — <code>@${esc(chauhan.username)}</code>`,
+    sub(`GET NUMBERS → assigned number → otp khud aata hai → VIEW MESSAGES`),
+    '',
+    `${fbCount ? '✅' : '⚙️'} <b>🔥 Firebase</b> — ${fbCount} ACTIVE source`,
+    sub('Pool/device scan + SMS inbox'),
+    '',
+    `⏱ OTP wait ${bs.fmtSetting('telegramOtpTimeoutMs')} · OTP na aaye to number skip`,
+    sub('Jo yahan chunoge wahi is batch ka source lock hoga. Telegram bots ke liye wahi spare account use hota hai.'),
+  ].join('\n'));
+}
+
+async function showStartSourcePicker(ctx) {
+  if (!(await gate(ctx))) return;
+  if (isAutopilotRunning()) {
+    await ctx.answerCbQuery('Pehle se chal raha hai!', { show_alert: true }).catch(() => {});
+    return;
+  }
+  await ctx.answerCbQuery().catch(() => {});
+  const text = startSourceCard();
+  const rows = otpBotChoiceRows();
+  await ctx.editMessageText(text, kb(rows))
+    .catch(async () => { await ctx.reply(text, kb(rows)).catch(() => {}); });
+}
+
+async function launchBatch(ctx, opts = {}) {
   // Pehle yahan owner-gate tha hi nahi — koi bhi START daba kar batch chala
   // sakta tha (bot username janna hi kaafi tha).
   if (!(await gate(ctx))) return;
@@ -737,6 +809,17 @@ async function launchBatch(ctx) {
     await ctx.answerCbQuery('Pehle se chal raha hai!').catch(() => {});
     return;
   }
+
+  // START picker se aaya source: settings yahin lock karo taaki engine,
+  // pipeline aur UI — teeno ek hi source par rahein.
+  const chosen = String(opts.source || '').trim().toLowerCase();
+  if (chosen === 'hermes' || chosen === 'chauhan') {
+    try { bs.setSetting('otpBotProfile', chosen); } catch {}
+    try { bs.setSetting('telegramOtpMode', true); } catch {}
+  } else if (chosen === 'firebase') {
+    try { bs.setSetting('telegramOtpMode', false); } catch {}
+  }
+
   if (isTelegramNumberSource()) {
     const status = telegramProviderStatus();
     if (telegramLoginFlow || status.loginInProgress) {
@@ -795,15 +878,24 @@ async function launchBatch(ctx) {
     },
   };
 
-  const lockedSourceMode = resolvedNumberSourceMode();
+  // START picker ne jo chuna woh env NUMBER_SOURCE ko bhi override karta hai
+  // (user ka explicit choice). Khali ho to purana resolve logic chalta hai.
+  const explicitMode = (chosen === 'hermes' || chosen === 'chauhan')
+    ? 'telegram'
+    : (chosen === 'firebase' ? 'firebase' : '');
+  const lockedSourceMode = explicitMode || resolvedNumberSourceMode();
+  const lockedOtpBot = lockedSourceMode === 'telegram'
+    ? otpBotProfiles.normalizeOtpBotProfileId(chosen || bs.getSetting('otpBotProfile'))
+    : '';
   startAutopilot({
     userId: String(ctx.from.id),
     telegramSetting: telegramSettingEnabled(),
-    // Is run ka source yahin lock kar do. Hermes ON ho to stale env ya
-    // beech-run setting is batch ko Firebase par nahi ghuma sakti.
+    // Is run ka source yahin lock kar do. Hermes/HardXotp ON ho to stale env
+    // ya beech-run setting is batch ko Firebase par nahi ghuma sakti.
     sourceMode: lockedSourceMode,
     numberSource: lockedSourceMode,
     source: lockedSourceMode,
+    otpBot: lockedOtpBot,
     ui,
   }).catch((e) => console.error('[FreshBot] autopilot:', e?.stack || e?.message));
 }
@@ -1046,9 +1138,59 @@ bot.command('session', async (ctx) => {
   }
 });
 
-bot.action('ap_start', launchBatch);
+// START → pehle source chuno (Hermes bot / HardXotp bot / Firebase).
+bot.action('ap_start', showStartSourcePicker);
 // Engine ke rows premium callback names bhi bhejta hai — same kaam, same handler
-bot.action('prem_batch_start', launchBatch);
+bot.action('prem_batch_start', showStartSourcePicker);
+bot.action(/^ap_start_go_(hermes|chauhan|firebase)$/, async (ctx) => {
+  await launchBatch(ctx, { source: ctx.match[1] });
+});
+
+// 🗑 Delete All Firebase — pehle confirm, phir poori list saaf + delete-memory
+// (restart par seeding wapas na laaye). Batch chal raha ho to pehle STOP.
+bot.action('ap_src_delete_all', async (ctx) => {
+  if (!(await gate(ctx))) return;
+  if (await blockSourceChangeWhileRunning(ctx)) return;
+  const count = (() => { try { return sources.listSources().length; } catch { return 0; } })();
+  await ctx.answerCbQuery().catch(() => {});
+  const text = section('🗑 Delete All Firebase?', [
+    `Abhi <b>${count} ACTIVE Firebase</b> sources hain.`,
+    ``,
+    `› Sab delete ho jayenge aur <b>Firebase mode OFF</b> rahega.`,
+    `› Delete yaad rahega — restart/redeploy par seeding inhe wapas <b>nahi</b> laayegi.`,
+    `› Hermes / HardXotp bot isse bilkul affect nahi hote.`,
+    ``,
+    sub('Wapas chahiye to naya DB add karo (Settings → Firebase Sources → Add Firebase).'),
+  ].join('\n'));
+  const rows = [
+    [{ text: `🗑 Haan, Sab Delete Karo (${count})`, callback_data: 'ap_src_delete_all_yes', style: 'danger' }],
+    [{ text: '↩️ Cancel', callback_data: 'ap_start', style: 'primary' }],
+  ];
+  await ctx.editMessageText(text, kb(rows))
+    .catch(async () => { await ctx.reply(text, kb(rows)).catch(() => {}); });
+});
+
+bot.action('ap_src_delete_all_yes', async (ctx) => {
+  if (!(await gate(ctx))) return;
+  if (await blockSourceChangeWhileRunning(ctx)) return;
+  let result = { removed: 0, remembered: 0 };
+  try { result = sources.removeAllSources(); } catch (e) { console.warn('[FreshBot] delete all firebase:', e?.message || e); }
+  try { sources.applyActiveSource(); } catch {}
+  await ctx.answerCbQuery(`🗑 ${result.removed} Firebase delete ho gaye`).catch(() => {});
+  const text = section('🗑 Firebase Saaf', [
+    `✅ <b>${result.removed}</b> sources delete — ab Firebase mode OFF hai.`,
+    `🧠 ${result.remembered || result.removed} URLs yaad rakhi gayi — restart par wapas nahi aayengi.`,
+    ``,
+    `📨 Hermes / 🔐 HardXotp bot isse untouched hain — START se woh chuno.`,
+    sub('Naya DB add karte hi Firebase dobara chalu ho jayega.'),
+  ].join('\n'));
+  const rows = [
+    [{ text: '▶️ START', callback_data: 'ap_start', style: 'success' }],
+    [{ text: '🔥 Firebase Sources', callback_data: 'ap_sources', style: 'primary' }],
+  ];
+  await ctx.editMessageText(text, kb(rows))
+    .catch(async () => { await ctx.reply(text, kb(rows)).catch(() => {}); });
+});
 
 bot.action('ap_stop', async (ctx) => {
   if (!(await gate(ctx))) return;
@@ -1855,6 +1997,55 @@ bot.action('ap_toggle_offline', async (ctx) => {
 // ---------------------------------------------------------------------------
 // 📨 Telegram Hermes settings — mode, timing, spare-account login/test/remove
 // ---------------------------------------------------------------------------
+// 🤖 Kaunsa OTP bot — Hermes ya HardXotp (dono ek hi spare session se).
+bot.action('ap_pick_otp_bot', async (ctx) => {
+  if (!(await gate(ctx))) return;
+  if (isAutopilotRunning()) {
+    await ctx.answerCbQuery('⏳ Batch chal raha hai — pehle STOP karo.', { show_alert: true }).catch(() => {});
+    return;
+  }
+  await ctx.answerCbQuery().catch(() => {});
+  const current = bs.getSetting('otpBotProfile');
+  const hermes = otpBotProfiles.getOtpBotProfile('hermes');
+  const chauhan = otpBotProfiles.getOtpBotProfile('chauhan');
+  const text = section('🤖 OTP Bot Chuno', [
+    `Abhi: <b>${esc(bs.fmtSetting('otpBotProfile'))}</b>`,
+    ``,
+    `${current === 'hermes' ? '✅' : '▫️'} <b>📨 ${esc(hermes.label)}</b> — <code>@${esc(hermes.username)}</code>`,
+    sub(hermes.hint),
+    '',
+    `${current === 'chauhan' ? '✅' : '▫️'} <b>🔐 ${esc(chauhan.label)}</b> — <code>@${esc(chauhan.username)}</code>`,
+    sub(chauhan.hint),
+    '',
+    sub('Dono same spare Telegram account/session se chalte hain; sirf buttons badalte hain.'),
+  ].join('\n'));
+  const rows = [
+    [{ text: `${current === 'hermes' ? '✅ ' : ''}📨 Hermes`, callback_data: 'ap_set_otp_bot_hermes', style: 'success' }],
+    [{ text: `${current === 'chauhan' ? '✅ ' : ''}🔐 HardXotp`, callback_data: 'ap_set_otp_bot_chauhan', style: 'success' }],
+    [{ text: '↩️ Settings', callback_data: 'ap_settings', style: 'primary' }],
+  ];
+  await ctx.editMessageText(text, kb(rows))
+    .catch(async () => { await ctx.reply(text, kb(rows)).catch(() => {}); });
+});
+
+bot.action(/^ap_set_otp_bot_(hermes|chauhan)$/, async (ctx) => {
+  if (!(await gate(ctx))) return;
+  if (isAutopilotRunning()) {
+    await ctx.answerCbQuery('⏳ Batch chal raha hai — pehle STOP karo.', { show_alert: true }).catch(() => {});
+    return;
+  }
+  const id = ctx.match[1];
+  const r = bs.setSetting('otpBotProfile', id);
+  if (r.ok) {
+    try { bs.setSetting('telegramOtpMode', true); } catch {}
+    try { telegramOtp.setActiveOtpBotProfile(id); } catch {}
+  }
+  await ctx.answerCbQuery(r.ok ? `🤖 OTP bot = ${bs.fmtSetting('otpBotProfile')}` : `❌ ${r.error}`, !r.ok && { show_alert: true }).catch(() => {});
+  const text = settingsCard();
+  await ctx.editMessageText(text, kb(settingsRows()))
+    .catch(async () => { await ctx.reply(text, kb(settingsRows())).catch(() => {}); });
+});
+
 bot.action('ap_toggle_telegram', async (ctx) => {
   if (!(await gate(ctx))) return;
   if (isAutopilotRunning()) {
@@ -1990,8 +2181,11 @@ bot.action('ap_test_hermes', async (ctx) => {
     return;
   }
 
+  // Test se pehle wahi bot active karo jo Settings me chuna hua hai.
+  try { telegramOtp.setActiveOtpBotProfile(bs.getSetting('otpBotProfile')); } catch {}
   await ctx.answerCbQuery('🧪 Hermes test…').catch(() => {});
-  await editOrSend(ctx, section('🧪 Hermes Test', [
+  const testBotLabel = status.otpBotProfileLabel || activeOtpBotLabel();
+  await editOrSend(ctx, section(`🧪 ${testBotLabel} Test`, [
     `Spare Telegram account se Hermes connect karke latest card/buttons check kar raha hoon…`,
   ].join('\n')), [[{ text: '↩️ Settings', callback_data: 'ap_settings', style: 'primary' }]]);
   try {
@@ -2411,6 +2605,17 @@ try {
   if (hydrated) console.log(`[FreshBot] Cloud vault hydrate: ${hydrated.restored}/${hydrated.total} accounts wapas aaye.`);
 } catch (e) {
   console.warn('[FreshBot] Cloud vault hydrate skipped:', e?.message || e);
+}
+
+// Saved OTP bot (Hermes / HardXotp) boot par hi apply karo — taaki /diag,
+// Test Hermes aur batch — teeno ek hi bot dikhayen/chalayen.
+try {
+  const savedOtpBot = bs.getSetting('otpBotProfile');
+  if (savedOtpBot && savedOtpBot !== 'hermes') telegramOtp.setActiveOtpBotProfile(savedOtpBot);
+  else telegramOtp.setActiveOtpBotProfile(savedOtpBot || 'hermes');
+  console.log(`[FreshBot] 🤖 OTP bot: ${otpBotProfiles.getOtpBotProfile(savedOtpBot).username}`);
+} catch (e) {
+  console.warn('[FreshBot] OTP bot apply skipped:', e?.message || e);
 }
 
 // Vault se owner ki Firebase list wapas aayi ho to reader par turant lagao —

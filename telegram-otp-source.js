@@ -17,8 +17,52 @@ import { existsSync, readFileSync, mkdirSync, writeFileSync, chmodSync, rmSync }
 import { dirname } from 'node:path';
 import { normalizeIndianMobileNumber } from './phone-utils.js';
 import { parseForwarderDateTime, _extractSixDigitCode } from './firebase-numbers.js';
+import {
+  DEFAULT_OTP_BOT_PROFILE_ID,
+  OTP_BOT_PROFILES,
+  getOtpBotProfile,
+  normalizeOtpBotProfileId,
+  otpBotButtonRole,
+  otpBotProfileForUsername,
+  selectOtpBotScreenAction,
+} from './otp-bot-profiles.js';
 
-export const DEFAULT_TELEGRAM_OTP_BOT_USERNAME = 'HermeshuOTPROBOT';
+export const DEFAULT_TELEGRAM_OTP_BOT_USERNAME = OTP_BOT_PROFILES[DEFAULT_OTP_BOT_PROFILE_ID].username;
+
+// ---------------------------------------------------------------------------
+// Kaunsa OTP bot — Hermes (@HermeshuOTPROBOT) ya HardXotp (@HardXotp_Bot).
+// START par owner source chunta hai; us waqt yahan explicit profile set hoti
+// hai. Boot par default Hermes rehta hai (ya env ka custom bot).
+// ---------------------------------------------------------------------------
+let activeOtpBotProfileId = '';
+let activeOtpBotExplicit = false;
+
+export function setActiveOtpBotProfile(profileOrId = '') {
+  const raw = String(profileOrId || '').trim();
+  if (!raw) {
+    activeOtpBotProfileId = '';
+    activeOtpBotExplicit = false;
+    return getOtpBotProfile('');
+  }
+  activeOtpBotProfileId = normalizeOtpBotProfileId(raw);
+  activeOtpBotExplicit = true;
+  entityRef = null;
+  entityCacheKey = '';
+  return getOtpBotProfile(activeOtpBotProfileId);
+}
+
+export function getActiveOtpBotProfile() {
+  if (activeOtpBotProfileId) return getOtpBotProfile(activeOtpBotProfileId);
+  const envBot = firstEnv(process.env, ['TELEGRAM_OTP_BOT_USERNAME', 'TELEGRAM_OTP_BOT', 'HERMES_BOT_USERNAME']);
+  const known = otpBotProfileForUsername(envBot);
+  if (known) return known;
+  return getOtpBotProfile(DEFAULT_OTP_BOT_PROFILE_ID);
+}
+
+export function resetActiveOtpBotProfile() {
+  activeOtpBotProfileId = '';
+  activeOtpBotExplicit = false;
+}
 
 function firstEnv(env, keys) {
   for (const key of keys) {
@@ -120,12 +164,27 @@ export function getTelegramOtpConfig(env = process.env) {
     } catch {}
   }
 
-  const botUsername = (firstEnv(env, [
+  // Bot ka faisla: owner ka START selection > env ka custom bot > Hermes.
+  // `activeOtpBotExplicit` sirf START/UI selection par true hota hai, isliye
+  // operator ka env override tab tak chalta hai jab tak owner khud koi
+  // source na chune (uske baad UI ka choice hi final hai).
+  const envBotUsername = firstEnv(env, [
     'TELEGRAM_OTP_BOT_USERNAME',
     'TELEGRAM_OTP_BOT',
     'HERMES_BOT_USERNAME',
     'Hermeshu_BOT_USERNAME',
-  ]) || DEFAULT_TELEGRAM_OTP_BOT_USERNAME).replace(/^@+/, '').trim();
+  ]).replace(/^@+/, '').trim();
+  const live = env === process.env;
+  const knownEnvProfile = otpBotProfileForUsername(envBotUsername);
+  // Owner ne UI se koi bot chuna (explicit) → wahi final. Warna env ka bot:
+  // agar woh Hermes/HardXotp hai to uski profile, warna custom-bot mode me
+  // selected profile ke buttons + env ka username.
+  const profile = (activeOtpBotExplicit && live)
+    ? getOtpBotProfile(activeOtpBotProfileId)
+    : (knownEnvProfile || getActiveOtpBotProfile());
+  const botUsername = ((activeOtpBotExplicit && live) || !envBotUsername
+    ? profile.username
+    : envBotUsername).replace(/^@+/, '').trim();
 
   const missing = [];
   if (!apiId) missing.push('TELEGRAM_API_ID');
@@ -144,6 +203,11 @@ export function getTelegramOtpConfig(env = process.env) {
     sessionFile,
     sessionSource,
     botUsername: botUsername || DEFAULT_TELEGRAM_OTP_BOT_USERNAME,
+    otpBotProfile: profile.id,
+    otpBotProfileLabel: profile.label,
+    otpBotTitle: profile.uiLabel,
+    otpBotHint: profile.hint,
+    otpBotExplicit: activeOtpBotExplicit && env === process.env,
     findButtonText: firstEnv(env, ['TELEGRAM_FIND_BUTTON_TEXT', 'Hermeshu_FIND_BUTTON_TEXT']),
     refreshButtonText: firstEnv(env, ['TELEGRAM_REFRESH_BUTTON_TEXT', 'Hermeshu_REFRESH_BUTTON_TEXT']),
     newButtonText: firstEnv(env, ['TELEGRAM_NEW_BUTTON_TEXT', 'Hermeshu_NEW_BUTTON_TEXT']),
@@ -211,15 +275,9 @@ function searchText(text = '') {
     .trim();
 }
 
-export function telegramButtonRole(text = '') {
-  const n = searchText(text);
-  if (!n) return '';
-  if (/\b(refresh|reload|check otp|get otp|update)\b/.test(n)) return 'refresh';
-  if (/\b(new|change|another|next)\b.*\bnumber\b/.test(n)) return 'new';
-  // SEARCH NUMBER / ACTIVE NUMBERS ko FIND samajhna dangerous hai — FIND ke
-  // liye find/get/show/my/your me se koi verb lazmi hona chahiye.
-  if (/\b(find|get|show|my|your)\s+number\b/.test(n)) return 'find';
-  return '';
+export function telegramButtonRole(text = '', profileOrId = null) {
+  const profile = profileOrId || getActiveOtpBotProfile();
+  return otpBotButtonRole(text, profile);
 }
 
 function extractPhoneFromSegment(segment = '') {
@@ -356,52 +414,18 @@ export function extractTelegramOtpFromText(text = '') {
 export function _selectHermesLatestScreenAction(screens = [], {
   mode = 'claim',
   phone = '',
+  profileId = null,
 } = {}) {
-  const wantedPhone = String(phone || '').replace(/\D/g, '').slice(-10);
-  for (let screenIndex = 0; screenIndex < (Array.isArray(screens) ? screens.length : 0); screenIndex++) {
-    const screen = screens[screenIndex] || {};
-    const rawButtons = Array.isArray(screen.buttons) ? screen.buttons : [];
-    const buttons = rawButtons.map((button) => String(
-      typeof button === 'string' ? button : button?.text || button?.button?.text || ''
-    )).filter(Boolean);
-    if (!buttons.length) continue;
-
-    const roles = buttons.map((text, index) => String(
-      screen.buttonRoles?.[index] || telegramButtonRole(text) || ''
-    ));
-    const card = parseTelegramNumberCard(screen.text || screen.message || '');
-    const base = {
-      screenIndex,
-      buttons,
-      roles,
-      cardPhone: card?.phone || '',
-      role: '',
-      buttonIndex: -1,
-      buttonText: '',
-      reason: 'no-matching-button-on-latest-screen',
-    };
-
-    if (mode === 'refresh') {
-      if (wantedPhone && base.cardPhone && base.cardPhone !== wantedPhone) {
-        return { ...base, reason: 'latest-screen-different-number' };
-      }
-      const buttonIndex = roles.indexOf('refresh');
-      return buttonIndex >= 0
-        ? { ...base, role: 'refresh', buttonIndex, buttonText: buttons[buttonIndex], reason: 'latest-screen' }
-        : base;
-    }
-
-    const newIndex = roles.indexOf('new');
-    if (newIndex >= 0) {
-      return { ...base, role: 'new', buttonIndex: newIndex, buttonText: buttons[newIndex], reason: 'latest-screen-new' };
-    }
-    const findIndex = roles.indexOf('find');
-    if (findIndex >= 0) {
-      return { ...base, role: 'find', buttonIndex: findIndex, buttonText: buttons[findIndex], reason: 'latest-screen-find' };
-    }
-    return base;
-  }
-  return null;
+  // Dono OTP bots (Hermes / HardXotp) ke liye ek hi strict rule: sirf
+  // sabse latest button-screen dekho — NEW ho to NEW, warna FIND
+  // (HardXotp me GET NUMBERS). Purani screens ke stale buttons kabhi
+  // click nahi hote.
+  return selectOtpBotScreenAction(screens, {
+    mode,
+    phone,
+    profileId: profileId || getActiveOtpBotProfile().id,
+    cardPhoneOf: (text) => parseTelegramNumberCard(text)?.phone || '',
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -743,11 +767,16 @@ function buttonMatchesRole(button, role, config) {
     const b = searchText(custom);
     if (a && b && (a.includes(b) || b.includes(a))) return true;
   }
-  return telegramButtonRole(text) === role;
+  const profileId = config?.otpBotProfile || null;
+  // 'view' HardXotp ka messages button hai; Hermes profile me ye role kabhi
+  // nahi milta, isliye purana behaviour safe rehta hai.
+  return telegramButtonRole(text, profileId) === role;
 }
 
 function roleForHermesButton(button, config) {
-  for (const role of ['refresh', 'new', 'find']) {
+  // Kisi bhi profile me claim/find/new/refresh/view ho sakta hai (HardXotp
+  // me "VIEW MESSAGES" hi refresh ka kaam karta hai).
+  for (const role of ['refresh', 'view', 'new', 'find']) {
     if (buttonMatchesRole(button, role, config)) return role;
   }
   return '';
@@ -984,18 +1013,21 @@ async function obtainCardUnlocked({
 
 function entryFromCard(result, config) {
   const { card, message } = result;
+  const profile = getOtpBotProfile(config?.otpBotProfile || '');
   return {
     phone: card.phone,
-    deviceId: `hermes:${card.device || card.phone}`,
+    deviceId: `${profile.id}:${card.device || card.phone}`,
     telegramDevice: card.device || '',
     online: /^(ACTIVE|ONLINE)$/i.test(card.status || '') ? true : undefined,
-    label: card.device ? `Hermes ${card.device}` : 'Hermes Telegram',
+    label: card.device ? `${profile.label} ${card.device}` : `${profile.label} Telegram`,
     joined: '',
     status: '',
     childKey: `telegram:${messageId(message)}`,
     noPatch: true,
     source: 'telegram',
     otpProvider: 'telegram',
+    otpBotProfile: profile.id,
+    otpBotLabel: profile.label,
     telegramBotUsername: config.botUsername,
     telegramMessageId: messageId(message),
   };
@@ -1244,6 +1276,9 @@ export function getTelegramOtpStatus(env = process.env) {
     apiCredentialsFile: config.apiCredentialsFile || '',
     sessionPresent: Boolean(config.sessionPresent),
     botUsername: config.botUsername,
+    otpBotProfile: config.otpBotProfile || '',
+    otpBotProfileLabel: config.otpBotProfileLabel || '',
+    otpBotTitle: config.otpBotTitle || '',
     sessionFile: config.sessionFile,
     sessionSource: config.sessionSource,
     connected: providerState.connected,

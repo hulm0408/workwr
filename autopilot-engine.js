@@ -22,6 +22,7 @@ import { isFirebaseConfigured, firebaseSetupHintLines, listPoolNumbers, scanFres
 import {
   applyActiveSource,
   applySourceForRun,
+  isFirebaseSourceListCleared,
   listRunSources,
   recordSourceResult,
   sourceHealthSummary,
@@ -49,7 +50,9 @@ import {
   getNextTelegramNumber,
   verifyTelegramOtpConnection,
   telegramOtpSetupHintLines,
+  setActiveOtpBotProfile,
 } from './telegram-otp-source.js';
+import { getOtpBotProfile, normalizeOtpBotProfileId } from './otp-bot-profiles.js';
 import * as wafPool from './waf-pool.js';
 import * as proxyPool from './proxy-pool.js';
 import { esc, section, sub, field, mono, progressBar, statusCard } from './rich-text.js';
@@ -276,6 +279,8 @@ const state = {
   consecutiveFails: 0,
   current: null,          // backward-compat: pehli active lane ka { phone, startedAt }
   sourceMode: 'firebase', // 'firebase' | 'telegram'
+  otpBotProfile: '',      // 'hermes' | 'chauhan' (telegram mode)
+  otpBotLabel: '',
   telegramBotUsername: '',
   telegramOtpTimeoutMs: 20_000,
   telegramOtpRefreshMs: 2_500,
@@ -376,6 +381,8 @@ export function getAutopilotSnapshot() {
       : (getBridgeProxy()?.label || ''),
     current: state.current ? { ...state.current } : null,
     sourceMode: state.sourceMode || 'firebase',
+    otpBotProfile: state.otpBotProfile || '',
+    otpBotLabel: state.otpBotLabel || '',
     telegramBotUsername: state.telegramBotUsername || '',
     telegramOtpTimeoutMs: state.telegramOtpTimeoutMs || 20_000,
     telegramOtpRefreshMs: state.telegramOtpRefreshMs || 2_500,
@@ -837,7 +844,8 @@ function compactStepInfo(snap = {}, stageText = '') {
 
 function compactSourceLine(snap = {}) {
   if (snap.sourceMode === 'telegram') {
-    return `📨 ${mono('HERMES ONLY')} · 🔥 Firebase ${mono('OFF')}`;
+    const botLabel = String(snap.otpBotLabel || getOtpBotProfile(snap.otpBotProfile || '').label || 'Hermes').toUpperCase();
+    return `📨 ${mono(`${botLabel} ONLY`)} · 🔥 Firebase ${mono('OFF')}`;
   }
   const source = truncateUiText(snap.poolSourceHost || snap.poolSourceName || 'Firebase', 28);
   return `🔥 ${mono(source)} · Pool ${mono(`${Number(snap.poolFresh) || 0} fresh`)}`;
@@ -884,7 +892,8 @@ export function formatCompactAutopilotCard(snap = state, { stageText = '', final
     manual: 'Aapne STOP kiya',
     stopped: 'STOP kiya gaya',
     'pool-exhausted': s.sourceMode === 'telegram' ? 'Hermes number nahi mila' : 'Firebase pool khatam',
-    'telegram-setup': 'Hermes account setup pending',
+    'telegram-setup': s.otpBotLabel ? `${s.otpBotLabel} account setup pending` : 'Hermes account setup pending',
+    'firebase-cleared': 'Saare Firebase delete ho gaye',
     telegram: 'Hermes connection error',
     firebase: s.sourceMode === 'telegram' ? 'Hermes connection error' : 'Firebase error',
     rate_limited: 'Swiggy rate-limit',
@@ -1052,6 +1061,16 @@ export async function startAutopilot(opts = {}) {
     ...opts,
     telegramSetting,
   });
+  // Kaunsa OTP bot: START par owner ka selection > bot setting > Hermes.
+  // Config isi active profile se banega, isliye setActiveOtpBotProfile()
+  // getTelegramOtpConfig() se PEHLE chalta hai.
+  const otpBotProfileId = normalizeOtpBotProfileId(
+    opts.otpBot || opts.otpBotProfile || s('otpBotProfile', 'hermes')
+  );
+  const otpBotProfile = getOtpBotProfile(otpBotProfileId);
+  if (sourceMode === 'telegram') {
+    try { setActiveOtpBotProfile(otpBotProfileId); } catch {}
+  }
   const telegramCfg = (() => {
     try { return getTelegramOtpConfig(); } catch { return null; }
   })();
@@ -1114,7 +1133,9 @@ export async function startAutopilot(opts = {}) {
     routeMode: 'direct', proxyChallenges: 0, directChallenges: 0, deferredQueue: 0,
     current: null, activeNumbers: [], history: [], freshAccounts: [], lastError: '',
     sourceMode,
-    telegramBotUsername: telegramMode ? (telegramCfg?.botUsername || telegramStatus.botUsername || '') : '',
+    otpBotProfile: telegramMode ? otpBotProfile.id : '',
+    otpBotLabel: telegramMode ? otpBotProfile.label : '',
+    telegramBotUsername: telegramMode ? (telegramCfg?.botUsername || otpBotProfile.username) : '',
     telegramOtpTimeoutMs,
     telegramOtpRefreshMs,
     telegramConfigured: telegramMode ? Boolean(telegramCfg?.configured) : false,
@@ -1295,17 +1316,31 @@ export async function startAutopilot(opts = {}) {
       } else {
         applyActiveSource();
         markRunSourceState(null);
+        // Owner ne Delete All Firebase dabaya hai → env FIREBASE_DB_URL par
+        // chup-chaap fallback nahi. Saaf message ke saath ruk jao.
+        if (isFirebaseSourceListCleared()) {
+          endReason = 'firebase-cleared';
+          state.stopReason = 'firebase-cleared';
+          state.lastError = 'Saare Firebase delete ho gaye — Settings → Firebase Sources me naya DB add karo (ya START se Hermes/HardXotp chuno).';
+          state.poolStatus = 'error';
+          state.poolLoaded = true;
+          await push(progressCard(section('🔥 Firebase Delete Ho Gaye', [
+            esc(state.lastError),
+            ``,
+            sub('Naya DB add karte hi seeding/health wapas chalega; Hermes ya HardXotp mode Firebase ke bina chalta hai.'),
+          ].join('\n'))), stopRows());
+        }
       }
     }
 
     if (telegramMode && !telegramCfg?.configured) {
       endReason = 'telegram-setup';
       state.stopReason = 'telegram-setup';
-      state.lastError = 'Telegram Hermes setup pending';
+      state.lastError = `${otpBotProfile.label} account setup pending`;
       state.telegramConfigured = false;
       state.telegramMissing = [...(telegramCfg?.missing || [])];
       await push(section(
-        '⚙️ Telegram Hermes Setup Pending',
+        `⚙️ ${otpBotProfile.label} Setup Pending`,
         telegramOtpSetupHintLines(telegramCfg || undefined).join('\n')
       ), [
         [{ text: '👤 Add Telegram Account', callback_data: 'ap_telegram_account', style: 'primary' }],
@@ -1475,9 +1510,9 @@ export async function startAutopilot(opts = {}) {
           if (!state.telegramConnected) state.telegramConnected = true;
           if (!state.telegramAuthorized) state.telegramAuthorized = true;
           state.lastError = '';
-          await push(progressCard(section('📨 Telegram Hermes Ready', [
-            `› @${esc(String(state.telegramBotUsername || telegramCfg?.botUsername || 'HermeshuOTPROBOT').replace(/^@+/, ''))} connected hai${state.telegramMe ? ` (${esc(state.telegramMe)})` : ''}.`,
-            `› Har naya number NEW NUMBER se aayega; OTP ${Math.round(telegramOtpTimeoutMs / 1000)}s tak REFRESH karunga.`,
+          await push(progressCard(section(`📨 ${otpBotProfile.label} Ready`, [
+            `› @${esc(String(state.telegramBotUsername || telegramCfg?.botUsername || otpBotProfile.username).replace(/^@+/, ''))} connected hai${state.telegramMe ? ` (${esc(state.telegramMe)})` : ''}.`,
+            `› ${otpBotProfile.id === 'chauhan' ? 'GET NUMBERS se number, phir VIEW MESSAGES se OTP' : 'Har naya number NEW NUMBER se aayega'}; OTP ${Math.round(telegramOtpTimeoutMs / 1000)}s tak check karunga.`,
             sub('Firebase pool/device scan bypass hai — Telegram only mode me fallback OFF hai.'),
           ].join('\n'))), stopRows());
           return pool;

@@ -2,8 +2,9 @@
 
 **Ek START dabao — phone chhod ke aa jao.** Bot khud:
 
-1. Selected source se number uthata hai — Hermes mode me **NEW NUMBER**, Firebase mode me pool (`clients/`, online devices pehle)
-2. Swiggy par OTP bhejta hai → Hermes par **REFRESH** ya Firebase **OTP inbox** (`messages/`) se code padh kar paste karta hai
+0. **START dabao → source chuno**: 📨 **Hermes bot** (`@HermeshuOTPROBOT`), 🔐 **HardXotp bot** (`@HardXotp_Bot`) ya 🔥 **Firebase**. Isi screen par 🗑 **Delete All Firebase** bhi hai.
+1. Selected source se number uthata hai — Hermes me **NEW NUMBER (warna FIND)**, HardXotp me **NEW NUMBER (warna GET NUMBERS)**, Firebase me pool (`clients/`, online devices pehle)
+2. Swiggy par OTP bhejta hai → bot ke card par **REFRESH** (Hermes) / **VIEW MESSAGES** (HardXotp) ya Firebase **OTP inbox** (`messages/`) se code padh kar paste karta hai. OTP **20s** (configurable) me na aaye to wahi number chhod kar agla number.
 3. Har number ko FRESH banata hai:
    - 🆕 **Naya number** → register + session JSON save
    - ♻️ **Purana number** → login → **Delete Account** flow → delete success par purge → **usi number se fresh registration**
@@ -17,7 +18,23 @@ SKIP sirf current number ko chhodta hai — batch nahi rukti, agli claim turant
 naye number ki hoti hai. STOP poore batch ko current safe point par rokta
 hai.
 
-> Ek run me source **locked** rehta hai: Hermes ON ho to numbers + OTP sirf @HermeshuOTPROBOT se aate hain aur Firebase bilkul try nahi hota; Firebase mode deliberately select ho tabhi saved ACTIVE Firebase sources use hotay hain.
+> Ek run me source **locked** rehta hai: START par jo chuna (Hermes / HardXotp) wahi numbers + OTP deta hai aur Firebase bilkul try nahi hota; Firebase mode deliberately select ho tabhi saved ACTIVE Firebase sources use hotay hain.
+
+### 🔐 HardXotp (@HardXotp_Bot) — naya OTP bot
+
+Dono OTP bots ek hi spare Telegram account (usi MTProto session) se chalte hain,
+sirf buttons badalte hain:
+
+| | Hermes | HardXotp |
+|---|---|---|
+| Naya number | `NEW NUMBER` → warna `FIND NUMBER` | `NEW NUMBER` → warna `GET NUMBERS` |
+| Number card | `NUMBER: 98…` | `ASSIGNED NUMBER: 98…` |
+| OTP check | `REFRESH` | `VIEW MESSAGES` |
+| Skip | `NEW NUMBER` | `NEW NUMBER` |
+
+Owner ka rule dono par same hai: **OTP bhejo → 20s wait → OTP aaya to process,
+nahi aaya to wahi number chhod do (one-shot) — naya number lo.**
+
 
 ## Zaroori cheezein (warna bot "work nahi karega")
 
@@ -105,7 +122,7 @@ asal clicked **NEW/FIND** button ya latest-screen ki exact rukawat dikhegi.
 Bot ke andar **Hermes mode ON** ho to wahi is run ka locked source hai —
 Render par purana `NUMBER_SOURCE=firebase` reh jaye tab bhi Hermes batch
 Firebase numbers, pool, device scan ya Firebase OTP try nahi karega. Live card
-par `HERMES ONLY · Firebase OFF` saaf dikhta hai. Ek spare account ki ek hi
+par `HERMES ONLY` / `HARDXOTP ONLY` + `Firebase OFF` saaf dikhta hai. Ek spare account ki ek hi
 Hermeshu chat serialized state hoti hai, isliye Telegram mode safety ke liye
 **1 lane** par rehta hai; Firebase mode ki 10-lane behavior unchanged hai.
 
@@ -230,6 +247,11 @@ persistent disk** (`/app/data`) set hai — yahi sahi combo hai:
   me peeche aata hai). Isliye 400+ DBs ke pool me har run pehle **zinda**
   DBs try karta hai, dead URLs par 10-10 second nahi jalte — live card par
   `⚡ IDs/min · ETA` bhi isi liye dikhta hai.
+- **🤖 OTP bot** — Hermes ya HardXotp (dono same spare session; START par bhi
+  chuna ja sakta hai aur choice save rehti hai)
+- **🗑 Delete All Firebase** — poori list ek tap me saaf; delete yaad rehti hai
+  (restart/redeploy par seeding wapas nahi laati) aur Firebase tab tak OFF
+  rehta hai jab tak naya DB add na karo
 - **🎯 Target** — presets (10/50/100/200/500) ya custom number text me likho
 - **⏱ Max time** — 15m se 480m tak
 - **🚦 Gap** — do numbers ke beech 0s–60s
@@ -427,6 +449,7 @@ chalta rehta hai; temporary error par number failed nahi gina jata.
 | `firebase-numbers.js` | Firebase reader — pool + OTP inbox + **dynamic source override** |
 | `firebase-sources.js` | **Multiple Firebase sources** — bulk add (1000)/verify/health; sab Delete tak ACTIVE (db-backed + vault) |
 | `firebase-seed-urls.js` | Owner ki ROLEX VIP Firebase list (400+ DBs) — boot par permanently seed hoti hai |
+| `otp-bot-profiles.js` | **OTP bot profiles** — Hermes / HardXotp ke buttons, card labels aur labels (pure, tested) |
 | `bot-settings.js` | **Batch knobs** — target/parallel lanes/time/gap (UI se, validated + clamped) |
 | `proxy-pool.js` | **Proxy pool** — lane reservations, IP rotation, per-proxy WAF token + cooldown |
 | `swiggy-bridge.js` | Swiggy automation + WAF token injection + **lane-local proxy routing** |

@@ -456,7 +456,22 @@ function normalizeVaultSourceUrl(url) {
 // jaati hain aur boot par wapas merge hoti hain.
 function buildVaultFirebaseSources(data = null) {
   const src = data?.firebaseSources;
-  if (!src || !Array.isArray(src.list) || !src.list.length) return null;
+  if (!src) return null;
+  // Delete-all ke baad bhi ye record jaana chahiye — warna vault me purani
+  // list reh jati aur restart par woh wapas aa jati.
+  if (!Array.isArray(src.list) || !src.list.length) {
+    if (!src.cleared && !(Array.isArray(src.deleted) && src.deleted.length)) return null;
+    return {
+      version: 1,
+      updatedAt: new Date().toISOString(),
+      activeId: '',
+      seedVersion: Number(src.seedVersion) || 0,
+      deleted: Array.isArray(src.deleted) ? [...src.deleted] : [],
+      health: {},
+      cleared: Boolean(src.cleared),
+      list: [],
+    };
+  }
   const list = src.list
     .filter((s) => s && normalizeVaultSourceUrl(s.url))
     .map((s) => ({
@@ -481,6 +496,7 @@ function buildVaultFirebaseSources(data = null) {
     seedVersion: Number(src.seedVersion) || 0,
     deleted: Array.isArray(src.deleted) ? [...src.deleted] : [],
     health: (src.health && typeof src.health === 'object') ? { ...src.health } : {},
+    cleared: Boolean(src.cleared),
     list,
   };
 }
@@ -495,7 +511,29 @@ export function mergeVaultFirebaseState(db, remote = {}) {
   let restoredSettings = 0;
 
   const remoteSources = remote?.firebaseSources;
-  if (remoteSources && Array.isArray(remoteSources.list) && remoteSources.list.length) {
+  // Vault ka delete-all bhi respect hota hai: remote cleared aur local par
+  // koi source nahi → cleared + deleted merge, purani list wapas nahi.
+  if (remoteSources && remoteSources.cleared && !(Array.isArray(db.firebaseSources?.list) && db.firebaseSources.list.length)) {
+    if (!db.firebaseSources || typeof db.firebaseSources !== 'object') {
+      db.firebaseSources = { activeId: '', list: [] };
+    }
+    if (!Array.isArray(db.firebaseSources.deleted)) db.firebaseSources.deleted = [];
+    for (const d of (remoteSources.deleted || [])) {
+      const key = normalizeVaultSourceUrl(d);
+      if (key && !db.firebaseSources.deleted.includes(key)) {
+        db.firebaseSources.deleted.push(key);
+        mutated = true;
+      }
+    }
+    if (!db.firebaseSources.cleared) {
+      db.firebaseSources.cleared = true;
+      db.firebaseSources.list = [];
+      db.firebaseSources.health = {};
+      db.firebaseSources.activeId = '';
+      mutated = true;
+    }
+  }
+  if (remoteSources && Array.isArray(remoteSources.list) && remoteSources.list.length && !remoteSources.cleared) {
     if (!db.firebaseSources || typeof db.firebaseSources !== 'object') {
       db.firebaseSources = { activeId: '', list: [] };
     }

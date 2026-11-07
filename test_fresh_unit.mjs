@@ -3195,63 +3195,91 @@ console.log('Direct mode (bina proxy):');
 }
 
 // ---------------------------------------------------------------------------
-console.log('Rate-limit queue (account creating queue, ~5s me wapas):');
+console.log('Ek number = ek hi baar (1-minute decision window, koi parking nahi):');
 {
   const engine = await import('./autopilot-engine.js');
   const fsp = await import('node:fs/promises');
+  const src = await fsp.readFile(new URL('./autopilot-engine.js', import.meta.url), 'utf8');
 
-  ok(engine.RATE_LIMIT_QUEUE_RETRY_MS === 5_000, 'queue: default retry 5s');
-  ok(engine.rateLimitQueueRetryMs({}) === 5_000, 'queue: env nahi to 5s');
-  ok(engine.rateLimitQueueRetryMs({ PREMIUM_RATE_LIMIT_RETRY_MS: '3000' }) === 3_000,
-    'queue: env se retry badla ja sakta hai');
-  ok(engine.rateLimitQueueRetryMs({ PREMIUM_RATE_LIMIT_RETRY_MS: '200' }) === 5_000,
-    'queue: bahut chhoti value ignore (min 1s)');
-  ok(engine.rateLimitQueueRetryMs({ PREMIUM_RATE_LIMIT_RETRY_MS: '999999' }) === 15_000,
-    'queue: bahut badi value cap (15s)');
+  // --- 1 minute ka decision window ---
+  ok(engine.NUMBER_DECISION_WINDOW_MS === 60_000, 'rule: number decision window 1 minute');
+  ok(engine.numberDecisionWindowMs() === 60_000, 'rule: deadline fixed exactly 60s');
+  ok(!src.includes('PREMIUM_NUMBER_DECISION_WINDOW_MS'), 'rule: one-minute deadline cannot be configured past 60s');
+  ok(src.includes('picked.decisionDeadlineAt = picked.claimedAtMs + NUMBER_DECISION_WINDOW_MS'),
+    'rule: decision clock starts on number pickup');
+  ok(src.includes('Date.now() >= Number(picked.decisionDeadlineAt || 0)'),
+    'rule: expired number skipped before starting attempt');
+  ok(src.includes("retireNumber(entry, 'decision_window_expired')"),
+    'rule: expired number permanently consumed for this run');
+  ok(src.includes('attemptedThisRun.add(entry.phone)'), 'rule: first actual attempt locks number');
+  ok(src.includes('|| attemptedThisRun.has(phone)'), 'rule: failed attempted number cannot be re-picked');
+  ok(src.includes('const consumedPhonesThisProcess = new Set();'), 'rule: lock lasts across batches in same process');
+  ok(src.includes('consumedPhonesThisProcess.add(entry.phone)'), 'rule: attempted number added to process lock');
+  ok(src.includes("if (outcome === 'decision_expired') continue;"),
+    'rule: expired number does not fall through to retry/recovery');
 
-  // 15s/30s wala purana slow ladder gaya — 5s → 8s → 12s
-  ok(engine.rateLimitRecoveryWaitMs(1, 0) === 5_000, 'queue: pehla retry 5s (5 second wala behaviour)');
-  ok(engine.rateLimitRecoveryWaitMs(2, 0) === 8_000, 'queue: doosra retry 8s');
-  ok(engine.rateLimitRecoveryWaitMs(3, 0) === 12_000, 'queue: teesra retry 12s');
-  ok(engine.rateLimitRecoveryWaitMs(9, 0) === 12_000, 'queue: ladder 12s par ruk jati hai');
-  ok(engine.rateLimitRecoveryWaitMs(1, 900_000) === 5_000,
-    'queue: Settings ka 15-min backoff bhi fast ladder se cap hota hai');
-  ok(engine.rateLimitRecoveryWaitMs(1, 0, { PREMIUM_RATE_LIMIT_RETRY_MS: '4000' }) === 4_000,
-    'queue: env retry ladder ka base badalta hai');
-  ok(engine.RATE_LIMIT_QUEUE_SAFETY_LIMIT === 40, 'queue: safety limit 40 (ghanton ghoomna nahi)');
+  // --- lane wait kabhi window se lambi nahi ---
+  ok(engine.rateLimitRecoveryWaitMs(1, 900_000) === 5_000, 'rule: rate-limit ka pehla wait 5s');
+  ok(engine.rateLimitRecoveryWaitMs(3, 900_000) === 12_000, 'rule: teesra wait 12s');
+  ok(engine.rateLimitRecoveryWaitMs(3, 900_000)
+    <= engine.numberDecisionWindowMs({}), 'rule: wait hamesha 1-minute window ke andar');
+  ok(src.includes('numberDecisionWindowMs(),'), 'rule: rate-limit branch window se cap karta hai');
 
-  // Live card par queue chip
+  // --- parking khatam ---
+  ok(src.includes('const retireNumber = (entry, why) => {'), 'rule: retireNumber() maujood hai');
+  ok(!src.includes('retryLater') && !src.includes('deferNumber'), 'rule: number ko defer/park karne wala code nahi');
+  ok((src.match(/retireNumber\(entry, '(rate_limited|waf_cooldown|security_challenge|swiggy_transient)'\)/g) || []).length === 4,
+    'rule: chaaron infra outcomes (rate-limit/WAF/security/5xx) number retire karte hain');
+  ok(!/deferNumber\(entry, '(rate_limited|waf_cooldown|security_challenge|swiggy_transient)'\)/.test(src),
+    'rule: koi infra outcome ab park nahi karta');
+  ok(src.includes('consumedThisRun.has(phone)'),
+    'rule: consumed/retired number pick filter se block hota hai');
+  ok(src.includes('retiredNumbers: 0'), 'rule: state me retiredNumbers counter');
+  ok(src.includes('consumedNumbers: 0'), 'rule: state me all consumed numbers counter');
+
+  // --- messaging imaandaar ---
   const card = engine.formatCompactAutopilotCard({
     sourceMode: 'firebase', running: true, target: 100, fresh: 2, processed: 3,
     rateLimitQueued: 4, rateLimitRetryMs: 5_000, proxyMode: 'direct',
     current: { phone: '9876543210' }, concurrency: 1,
   });
-  ok(card.includes('QUEUE 4'), 'queue: live card par QUEUE count');
-  ok(card.includes('5s me wapas'), 'queue: card par "5s me wapas"');
-  const cardNoQueue = engine.formatCompactAutopilotCard({
+  ok(card.includes('RATE-LIMIT #4'), 'msg: card par rate-limit count');
+  ok(card.includes('ye number khatam'), 'msg: card saaf kehta hai number khatam');
+  ok(card.includes('agla naya 5s me'), 'msg: card par "agla naya 5s me"');
+  ok(!card.includes('QUEUE'), 'msg: purana confusing QUEUE chip gaya');
+  ok(!/wapas aayega/.test(card), 'msg: "wapas aayega" (parking) wali line nahi');
+
+  const cardNo = engine.formatCompactAutopilotCard({
     sourceMode: 'firebase', running: true, target: 10, fresh: 0, processed: 0, concurrency: 1,
   });
-  ok(!cardNoQueue.includes('QUEUE'), 'queue: bina queue chip nahi (card saaf rehta hai)');
+  ok(!cardNo.includes('RATE-LIMIT'), 'msg: bina rate-limit card saaf rehta hai');
 
-  // Stage text: direct mode me "nayi IP" jhooth nahi bolta
-  const stageCard = engine.formatCompactAutopilotCard({
+  const stage = engine.formatCompactAutopilotCard({
     sourceMode: 'firebase', running: true, target: 10, fresh: 1, processed: 1,
     rateLimitQueued: 2, rateLimitRetryMs: 5_000, proxyMode: 'direct', concurrency: 1,
   }, { stageText: '🚦 Rate Limit — naya number' });
-  ok(stageCard.includes('Rate-limit queue') && stageCard.includes('5s me wapas'),
-    'queue: direct mode card "Rate-limit queue — 5s me wapas" kehta hai');
-  const proxyCard = engine.formatCompactAutopilotCard({
+  ok(stage.includes('ye number khatam') && stage.includes('5s me naya'),
+    'msg: direct mode "ye number khatam, 5s me naya"');
+  const stageProxy = engine.formatCompactAutopilotCard({
     sourceMode: 'firebase', running: true, target: 10, fresh: 1, processed: 1, proxyMode: 'auto',
   }, { stageText: '🚦 Rate Limit — naya number' });
-  ok(proxyCard.includes('nayi IP'), 'queue: proxy mode me rotation wali purani line');
+  ok(stageProxy.includes('nayi IP'), 'msg: proxy mode me nayi IP + naya number');
 
-  // Wiring
-  const src = await fsp.readFile(new URL('./autopilot-engine.js', import.meta.url), 'utf8');
-  ok(src.includes('Account Creating — Rate Limit Queue'), 'queue: card title "Account Creating — Rate Limit Queue"');
-  ok(src.includes('queue me</b> chala gaya'), 'queue: "number queue me chala gaya" line');
-  ok(/queuedTotal >= RATE_LIMIT_QUEUE_SAFETY_LIMIT/.test(src),
-    'queue: run sirf safety limit par rukta hai (3 strike par nahi)');
-  ok(src.includes('rateLimitQueued'), 'queue: state me counter');
+  ok(src.includes('Rate Limit — Ye Number Khatam'), 'msg: card title "Rate Limit — Ye Number Khatam"');
+
+  // docs + diag sach bolte hain
+  const docs = await fsp.readFile(new URL('./SECOND-BOT-DEPLOY.md', import.meta.url), 'utf8');
+  const envExample = await fsp.readFile(new URL('./.env.example', import.meta.url), 'utf8');
+  const readme = await fsp.readFile(new URL('./README.md', import.meta.url), 'utf8');
+  ok(docs.includes('Ek number = ek hi baar'), 'docs: 4f rule ka naam');
+  ok(docs.includes('queue me park karke baad me try karna allowed nahi')
+    || docs.includes('park karke baad me try karna allowed nahi'), 'docs: parking allowed nahi');
+  ok(!envExample.includes('PREMIUM_NUMBER_DECISION_WINDOW_MS'), 'docs: 60s rule hard-coded (no env override)');
+  ok(!readme.includes('PREMIUM_NUMBER_DECISION_WINDOW_MS'), 'docs: README no misleading override');
+  const botSrc = await fsp.readFile(new URL('./fresh-bot.js', import.meta.url), 'utf8');
+  ok(botSrc.includes('1 NUMBER = 1 BAAR'), 'diag: number rule line');
+  ok(botSrc.includes('attempt start, warna chhod do'), 'diag: precise 60s rule');
+  ok(botSrc.includes('🔒 Consumed'), 'diag: consumed count line');
 }
 
 console.log(`\n✅ ALL PASSED — ${passed} checks`);

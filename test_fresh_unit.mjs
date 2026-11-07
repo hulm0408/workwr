@@ -2842,6 +2842,12 @@ console.log('Doosra bot / doosra instance (INSTANCE_LABEL):');
   ok(guide.includes('Vercel') && guide.includes('409'),
     'guide: Vercel limitation + ek token ek instance rule likha hai');
   ok(guide.includes('GITHUB_VAULT_BRANCH'), 'guide: vault branch alag rakhne ki hidayat');
+  ok(guide.includes('bot-vault-3') && guide.includes('bot-vault-4'),
+    'guide: 3 naye bots (bot2/bot3/bot4) ke alag vault branches');
+  ok(guide.includes('750 free hours') && guide.includes('per account'),
+    'guide: har bot ke liye alag Render account (750h per account)');
+  ok(guide.includes('40 lanes'), 'guide: 4 bots = shared Firebase pool par 40 lanes ka warning');
+  ok(guide.includes('spare Telegram account'), 'guide: har bot ko apna spare Telegram account');
 }
 
 console.log(`\n✅ ALL PASSED — ${passed} checks`);

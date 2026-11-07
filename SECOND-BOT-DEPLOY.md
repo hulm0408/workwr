@@ -122,6 +122,47 @@ har 5–10 min (timeout 120s).
 
 ---
 
+## 4️⃣b Ek saath 3 naye bots (bot2 · bot3 · bot4)
+
+Ek hi codebase se **teen aur bots**. Har bot ko alag token, alag label, alag
+vault branch — aur (free plan par) **alag Render account**.
+
+| Bot | `INSTANCE_LABEL` | `OWNER_IDS` | `GITHUB_VAULT_BRANCH` | Render account | Service name |
+|---|---|---|---|---|---|
+| bot2 | `bot2` | jo us bot ka owner hai | `bot-vault-2` | account #2 (email-2) | `swiggy-fresh-bot-2` |
+| bot3 | `bot3` | jo us bot ka owner hai | `bot-vault-3` | account #3 (email-3) | `swiggy-fresh-bot-3` |
+| bot4 | `bot4` | jo us bot ka owner hai | `bot-vault-4` | account #4 (email-4) | `swiggy-fresh-bot-4` |
+
+**Har bot ke liye wahi 5 step** (guide ka section 3):
+
+1. @BotFather → `/newbot` → **naya** token (kisi chat me paste mat karo).
+2. Naya Render account (naya email, free, card nahi) → **New → Blueprint**
+   → repo `hulm0408/workwr` → Blueprint Path `render.second.yaml` → Apply.
+3. Render me service ka naam badlo (`swiggy-fresh-bot-3` etc.) aur env me
+   `INSTANCE_LABEL` + `GITHUB_VAULT_BRANCH` + `BOT_TOKEN` + `OWNER_IDS` bharo.
+4. `/health` kholo → `"instance":"bot3"` dikhe to deployment sahi hai.
+5. Telegram me `/start` → title `🆕 Swiggy Fresh Bot · bot3` → `/diag` sab ✅.
+
+**Teen cheezein jo 3 bots ke saath badal jati hain:**
+
+- **Instance hours:** Render ke 750 free hours **per account** hote hain. Ek
+  account = ek 24×7 free service. 3 aur bots = 3 aur accounts (ya paid
+  worker+disk). Ek hi account me 4 free services daalne par total hours
+  khatam hokar kuch services suspend ho jayengi.
+- **Telegram account:** har bot ko **apna** spare Telegram account. Teen bots
+  ke liye teen spare accounts. Warna us bot ko **Firebase-only** mode me
+  chalao (Telegram login ki zaroorat nahi).
+- **Firebase pool (sabse important):** saare bots ek hi Firebase DB se number
+  uthayenge. 4 instances × 10 lanes = **40 lanes** ek hi pool par → numbers
+  jaldi khatam, Swiggy rate-limit, aur accounts ke naam par collisions.
+  Isliye multi-bot setup me:
+  - har instance me **Settings → 🚦 Parallel lanes** ghatakar 3–4 karo, ya
+  - har bot ko **alag Firebase DB** do (Settings → 🔥 Firebase), ya
+  - bots ko **alag-alag time window** me chalao (ek subah, ek raat).
+
+> Har bot ka `BOT_TOKEN` sirf uske apne hosting ke env me rahe — chat,
+> screenshot, GitHub me kabhi nahi.
+
 ## 5️⃣ Kya kabhi nahi karna
 
 - ❌ Ek `BOT_TOKEN` do jagah — **409 Conflict**, dono me se ek mar jata hai.

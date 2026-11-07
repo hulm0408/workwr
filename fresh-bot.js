@@ -2512,10 +2512,24 @@ if (!lockState.ok) {
 // Token + internet pehle test karo (getMe) — network par retry, token galat
 // ho to turant saaf wajah. Bina is test ke bot chup-chaap "launch failed"
 // bolkar mar jata tha.
+// getMe ka HARD timeout. Telegraf/undici kabhi kabhi reply ke intezaar me
+// latak jate hain (Render par dekha gaya: /health par 200, ready:false, aur
+// process na aage badha na restart hua). Isliye har network call khud band
+// karo — hang = fail, phir normal retry.
+const TELEGRAM_CALL_TIMEOUT_MS = Number(process.env.TELEGRAM_CALL_TIMEOUT_MS) || 20_000;
+function withTelegramTimeout(promise, label = 'telegram call', ms = TELEGRAM_CALL_TIMEOUT_MS) {
+  let timer = null;
+  const guard = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timeout (${Math.round(ms / 1000)}s)`)), ms);
+    timer.unref?.();
+  });
+  return Promise.race([promise, guard]).finally(() => { if (timer) clearTimeout(timer); });
+}
+
 async function preflight() {
   for (let attempt = 1; attempt <= 6; attempt++) {
     try {
-      const me = await bot.telegram.getMe();
+      const me = await withTelegramTimeout(bot.telegram.getMe(), 'getMe');
       runtimeHealth.telegramUsername = me.username || '';
       runtimeHealth.telegramApiOkAt = Date.now();
       runtimeHealth.telegramApiFailures = 0;
@@ -2524,7 +2538,8 @@ async function preflight() {
       // Agar is token par kahin webhook laga ho (purana server, ya token
       // leak hone par kisi aur ne lagaya ho) to polling 409 marega aur bot
       // kabhi chalega hi nahi — isliye shuru me webhook saaf kar do.
-      await bot.telegram.deleteWebhook({ drop_pending_updates: true }).catch(() => {});
+      await withTelegramTimeout(bot.telegram.deleteWebhook({ drop_pending_updates: true }), 'deleteWebhook')
+        .catch((e) => console.warn('[FreshBot] deleteWebhook skip:', e?.message || e));
       return me;
     } catch (e) {
       runtimeHealth.telegramApiFailures++;
@@ -2559,10 +2574,7 @@ function startTelegramWatchdog() {
   telegramWatchdogTimer = setInterval(async () => {
     if (shuttingDown || !runtimeHealth.telegramReady) return;
     try {
-      const me = await Promise.race([
-        bot.telegram.getMe(),
-        sleepMs(15_000).then(() => { throw new Error('Telegram getMe timeout (15s)'); }),
-      ]);
+      const me = await withTelegramTimeout(bot.telegram.getMe(), 'getMe (watchdog)', 15_000);
       runtimeHealth.telegramUsername = me?.username || runtimeHealth.telegramUsername;
       runtimeHealth.telegramApiOkAt = Date.now();
       runtimeHealth.telegramApiFailures = 0;

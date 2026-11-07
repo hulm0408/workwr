@@ -280,7 +280,9 @@ function activeSourceLine() {
     const src = sources.getActiveSource();
     if (!src) return field('🔥 Firebase', '— (koi source nahi)');
     const list = sources.listSources();
-    return field('🔥 Firebase', `${esc(src.name)} first-try  ·  ${list.length} ACTIVE source${list.length === 1 ? '' : 's'} (sab batch me auto-try)`);
+    let health = null;
+    try { health = sources.sourceHealthSummary(list); } catch {}
+    return field('🔥 Firebase', `${esc(src.name)} first-try  ·  ${list.length} ACTIVE source${list.length === 1 ? '' : 's'}${health ? ` · 🩺 live ${health.live} / quarantine ${health.quarantined}` : ''}`);
   } catch {
     return field('🔥 Firebase', '—');
   }
@@ -448,6 +450,8 @@ function sourcesCard(requestedPage = 0) {
   const start = page * SOURCES_PER_PAGE;
   const pageItems = list.slice(start, start + SOURCES_PER_PAGE);
   const primary = list.find((s) => s.primary);
+  let health = null;
+  try { health = sources.sourceHealthSummary(list); } catch {}
 
   const rows = pageItems.map((s) => [
     {
@@ -475,6 +479,7 @@ function sourcesCard(requestedPage = 0) {
       ``,
       `Total: <b>${list.length} ACTIVE</b> sources · Page <b>${page + 1}/${totalPages}</b>`,
       primary ? `⭐ First-try: <b>${esc(primary.name)}</b> (baaki sab bhi ACTIVE)` : '⭐ First-try: —',
+      health ? `🩺 Live <b>${health.live}</b> · untried <b>${health.neverTried}</b> · quarantine <b>${health.quarantined}</b> <i>(dead DB 30 min peeche)</i>` : '',
       ``,
       ...pageItems.map((s, i) =>
         `${start + i + 1}. ✅ <b>${esc(s.name)}</b> (ACTIVE)${s.primary ? ' ⭐' : ''} — <code>${esc(s.url.replace('https://', ''))}</code>${s.auth ? ' 🔑' : ''}`
@@ -1630,7 +1635,8 @@ bot.action('ap_src_add', async (ctx) => {
     `<code>&lt;url&gt; | &lt;DB_AUTH_secret&gt;</code>`,
     ``,
     `✅ Add hote hi <b>saare ACTIVE</b> ho jayenge aur Delete tak ACTIVE rahenge.`,
-    sub('Duplicate URLs khud skip ho jayenge. Cancel ke liye /start dabao.'),
+    `📦 Ek message me <b>${sources.MAX_BULK_FIREBASE_SOURCES}</b> tak URLs. Duplicate khud skip.`,
+    sub('Ye list cloud vault me bhi save hoti hai — Render restart/redeploy par gayab nahi hogi. Cancel ke liye /start dabao.'),
   ].join('\n')), [[{ text: '↩️ Cancel', callback_data: 'ap_sources', style: 'primary' }]]);
 });
 
@@ -2405,6 +2411,16 @@ try {
   if (hydrated) console.log(`[FreshBot] Cloud vault hydrate: ${hydrated.restored}/${hydrated.total} accounts wapas aaye.`);
 } catch (e) {
   console.warn('[FreshBot] Cloud vault hydrate skipped:', e?.message || e);
+}
+
+// Vault se owner ki Firebase list wapas aayi ho to reader par turant lagao —
+// warna first-try purani env DB reh jati hai aur 400+ saved sources bekaar.
+try {
+  const applied = sources.applyActiveSource();
+  const all = sources.listSources();
+  console.log(`[FreshBot] 🔥 Firebase sources ready: ${all.length} ACTIVE · first-try ${applied?.name || 'env'}`);
+} catch (e) {
+  console.warn('[FreshBot] Firebase sources apply skipped:', e?.message || e);
 }
 
 // Health server upar bot bante hi start ho chuka hai (Render ko port

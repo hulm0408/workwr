@@ -17,22 +17,35 @@
 // Default: agar list khali hai to env FIREBASE_DB_URL (ya vuvhbjbi default)
 // se ek "Default" source seed hota hai — pehla run bina setup ke chalta hai.
 //
+// PERMANENT (2026-11-07): owner ki poori ROLEX VIP list ab code me hai
+// (firebase-seed-urls.js) aur env `FIREBASE_DB_URLS` se bhi feed ho sakti
+// hai. Free Render par data/db.json restart me mit jata hai, isliye:
+//   • boot par hi list seed hoti hai (env/file dono se independent), aur
+//   • sources + settings cloud vault me bhi jaate hain (store.js).
+// Ek baar kisi source ko Delete kiya to wo `state.deleted` me yaad rehta
+// hai aur seeding use dobara wapas nahi laati.
+//
 // applyActiveSource() — first-try source ko reader (firebase-numbers.js)
 // par set karta hai; batch/start se PEHLE aur ADD ke baad call hota hai.
 
 import crypto from 'crypto';
 import { getDb, saveDb } from './store.js';
+import * as storeVault from './store.js';
 import { setFirebaseSource, _firebaseErrorMessage } from './firebase-numbers.js';
+import { OWNER_FIREBASE_URLS } from './firebase-seed-urls.js';
 
 const DEFAULT_URL = 'https://vuvhbjbi-default-rtdb.firebaseio.com/';
-export const MAX_BULK_FIREBASE_SOURCES = 200;
+// Ek message me itni URLs add ho sakti hain. Pehle 200 thi — owner ki list
+// 400+ ki hai, isliye 1000. Dedupe phir bhi hota hai.
+export const MAX_BULK_FIREBASE_SOURCES = 1000;
 
 // Owner ke diye hue Firebase DBs — pehli baar is seed-version ke saath bot
 // chalne par ye sab Settings → Firebase Sources me auto-add ho jate hain.
 // seedVersion save rehta hai, isliye baad me koi source delete karne par
 // woh restart par zabardasti wapas nahi aata.
-const BUILTIN_SEED_VERSION = 1;
-export const BUILTIN_FIREBASE_SOURCE_URLS = [
+// v3 (2026-11-07): ROLEX VIP list add — purane installs par bhi ek baar seed.
+const BUILTIN_SEED_VERSION = 3;
+const LEGACY_BUILTIN_FIREBASE_URLS = [
   'https://admin143-dab82-default-rtdb.firebaseio.com',
   'https://albart-new-feed-default-rtdb.firebaseio.com',
   'https://allahmohammad-5f389-default-rtdb.firebaseio.com',
@@ -90,8 +103,158 @@ export const BUILTIN_FIREBASE_SOURCE_URLS = [
   'https://do-admin-v21-default-rtdb.firebaseio.com',
 ];
 
+// Purani 55 owner URLs + nayi ROLEX VIP list — duplicate hata kar, order
+// preserve karke. Isi list se `ensureSeeded()` boot par sources banata hai.
+export const BUILTIN_FIREBASE_SOURCE_URLS = (() => {
+  const out = [];
+  const seen = new Set();
+  for (const raw of [...LEGACY_BUILTIN_FIREBASE_URLS, ...OWNER_FIREBASE_URLS]) {
+    const url = String(raw || '').trim().replace(/\/+$/, '');
+    const key = url.toLowerCase();
+    if (!url || seen.has(key)) continue;
+    seen.add(key);
+    out.push(url);
+  }
+  return out;
+})();
+
 function normalizeSourceUrl(url) {
   return String(url || '').trim().replace(/\/+$/, '').toLowerCase();
+}
+
+// ---- Env se poori list (Render restart-proof) -----------------------------
+// FIREBASE_DB_URLS me newline/comma separated jitni chaho URLs daal do;
+// boot par jo missing hongi woh auto-add ho jayengi. Aliases bhi chalte hain
+// taaki purane env naam kaam karte rahein.
+export const FIREBASE_ENV_URL_KEYS = ['FIREBASE_DB_URLS', 'FIREBASE_URLS', 'FIREBASE_DB_URL_LIST'];
+
+let _envSeedCache = { raw: '', urls: [] };
+export function envSeedUrls(env = process.env) {
+  const raw = FIREBASE_ENV_URL_KEYS.map((k) => String(env?.[k] || '').trim()).filter(Boolean).join('\n');
+  if (raw === _envSeedCache.raw) return _envSeedCache.urls.slice();
+  const urls = raw
+    ? parseFirebaseSourceBulkInput(raw).entries.map((e) => e.url)
+    : [];
+  _envSeedCache = { raw, urls };
+  return urls.slice();
+}
+
+// ---- Source health (400+ DBs me se zinda wale pehle) ----------------------
+// Har DB ka result yaad rakhte hain taaki har batch/rotation dead URL par
+// 10s barbaad na kare. 2 lagatar failure par source 30 min quarantine me
+// chala jata hai, phir apne aap wapas try hota hai. Koi source kabhi
+// delete/disable nahi hota — sirf try-order badalta hai.
+export const SOURCE_HEALTH_FAIL_THRESHOLD = 2;
+export const SOURCE_HEALTH_QUARANTINE_MS = 30 * 60 * 1000;
+
+function loadHealth(state) {
+  if (!state.health || typeof state.health !== 'object') state.health = {};
+  return state.health;
+}
+
+export function getSourceHealth(id, state = null) {
+  const st = state || loadState();
+  const h = loadHealth(st)[id];
+  if (!h || typeof h !== 'object') {
+    return { id, failStreak: 0, emptyStreak: 0, okCount: 0, failCount: 0, lastOkAt: 0, lastFailAt: 0, lastError: '', latencyMs: 0, quarantinedUntil: 0 };
+  }
+  return { id, ...h };
+}
+
+export function isSourceQuarantined(srcOrId, now = Date.now()) {
+  const id = typeof srcOrId === 'string' ? srcOrId : srcOrId?.id;
+  if (!id) return false;
+  const h = getSourceHealth(id);
+  return Number(h.quarantinedUntil) > now;
+}
+
+// ok=true → streak reset. ok=false → streak++, threshold par quarantine.
+// `empty` = DB reachable hai magar usme usable number nahi (aisa DB bhi
+// 30 min ke liye peeche chala jata hai, warna 400+ sources ka scan bekaar
+// hota rehta hai).
+export function recordSourceResult(id, { ok = false, error = '', ms = 0, empty = false } = {}) {
+  if (!id) return null;
+  // getDb() disk se padhta hai — isliye ek hi db object ko mutate karke
+  // saveDb karo, warna saveDb naya (bina health wala) snapshot likh dega.
+  const db = getDb();
+  if (!db.firebaseSources || typeof db.firebaseSources !== 'object') {
+    db.firebaseSources = { activeId: '', list: [] };
+  }
+  const state = db.firebaseSources;
+  const health = loadHealth(state);
+  const now = Date.now();
+  const prev = health[id] && typeof health[id] === 'object' ? health[id] : {};
+  const next = {
+    failStreak: Number(prev.failStreak) || 0,
+    emptyStreak: Number(prev.emptyStreak) || 0,
+    okCount: Number(prev.okCount) || 0,
+    failCount: Number(prev.failCount) || 0,
+    lastOkAt: Number(prev.lastOkAt) || 0,
+    lastFailAt: Number(prev.lastFailAt) || 0,
+    lastError: String(prev.lastError || ''),
+    latencyMs: Number(prev.latencyMs) || 0,
+    quarantinedUntil: Number(prev.quarantinedUntil) || 0,
+  };
+  if (ok) {
+    next.okCount += 1;
+    next.failStreak = 0;
+    next.emptyStreak = 0;
+    next.lastOkAt = now;
+    next.lastError = '';
+    if (Number(ms) > 0) next.latencyMs = Number(ms);
+    next.quarantinedUntil = 0;
+  } else {
+    next.failCount += 1;
+    next.lastFailAt = now;
+    next.lastError = String(error || (empty ? 'khali pool' : 'fail')).slice(0, 160);
+    if (empty) {
+      next.emptyStreak += 1;
+      next.failStreak = 0;
+      if (next.emptyStreak >= SOURCE_HEALTH_FAIL_THRESHOLD) next.quarantinedUntil = now + SOURCE_HEALTH_QUARANTINE_MS;
+    } else {
+      next.failStreak += 1;
+      next.emptyStreak = 0;
+      if (next.failStreak >= SOURCE_HEALTH_FAIL_THRESHOLD) next.quarantinedUntil = now + SOURCE_HEALTH_QUARANTINE_MS;
+    }
+  }
+  health[id] = next;
+  saveDb(db);
+  return { id, ...next };
+}
+
+export function resetSourceHealth(ids = null) {
+  const db = getDb();
+  if (!db.firebaseSources || typeof db.firebaseSources !== 'object') {
+    db.firebaseSources = { activeId: '', list: [] };
+  }
+  const state = db.firebaseSources;
+  if (!ids) {
+    state.health = {};
+  } else {
+    const health = loadHealth(state);
+    for (const id of [].concat(ids)) delete health[id];
+  }
+  saveDb(db);
+  return true;
+}
+
+// UI ke liye chhota summary: kitne live, kitne quarantine me.
+export function sourceHealthSummary(list = null) {
+  const state = loadState();
+  const sources = Array.isArray(list) ? list : state.list;
+  const now = Date.now();
+  let live = 0;
+  let quarantined = 0;
+  let neverTried = 0;
+  let failed = 0;
+  for (const s of sources) {
+    const h = state.health?.[s.id];
+    if (Number(h?.quarantinedUntil) > now) quarantined += 1;
+    else if (Number(h?.failCount) > 0 && !Number(h?.okCount)) failed += 1;
+    else if (!h) neverTried += 1;
+    else live += 1;
+  }
+  return { total: sources.length, live, failed, quarantined, neverTried };
 }
 
 // Har saved source public roop me hamesha ACTIVE hai. `primary` sirf
@@ -138,6 +301,12 @@ function persist(state) {
   const db = getDb();
   db.firebaseSources = state;
   saveDb(db);
+  // Free Render ki disk ephemeral hai — list aur health cloud vault me bhi
+  // bhejo taaki restart/redeploy ke baad seed+settings wapas mil jayein.
+  try {
+    const { scheduleCloudVaultSync, buildCloudVaultSnapshot } = storeVault;
+    scheduleCloudVaultSync(() => buildCloudVaultSnapshot(getDb()));
+  } catch {}
 }
 
 // Pehli baar list khali ho to env/default se seed + owner-ki built-in list
@@ -175,12 +344,27 @@ export function ensureSeeded() {
     changed = true;
   }
 
-  if ((Number(state.seedVersion) || 0) < BUILTIN_SEED_VERSION) {
-    const knownUrls = new Set(state.list.map((s) => normalizeSourceUrl(s.url)));
+  if (!Array.isArray(state.deleted)) state.deleted = [];
+
+  // Seed sources do baar se aate hain:
+  //   1) code wali built-in list (owner ki ROLEX VIP list) — seedVersion
+  //      badalne par ek hi baar merge hoti hai, isliye Delete ki hui URL
+  //      restart par wapas nahi aati.
+  //   2) env FIREBASE_DB_URLS — har boot par missing URLs add hoti hain
+  //      (Render env kabhi mitta nahi), deleted list inhe bhi rok deti hai.
+  const knownUrls = new Set(state.list.map((s) => normalizeSourceUrl(s.url)));
+  const deletedUrls = new Set((state.deleted || []).map(normalizeSourceUrl));
+  const seedOnce = (Number(state.seedVersion) || 0) < BUILTIN_SEED_VERSION;
+  const envUrls = envSeedUrls();
+  const pendingSeed = [
+    ...(seedOnce ? BUILTIN_FIREBASE_SOURCE_URLS : []),
+    ...envUrls,
+  ];
+  if (pendingSeed.length) {
     const addedAt = new Date().toISOString();
-    for (const url of BUILTIN_FIREBASE_SOURCE_URLS) {
+    for (const url of pendingSeed) {
       const key = normalizeSourceUrl(url);
-      if (knownUrls.has(key)) continue;
+      if (!key || knownUrls.has(key) || deletedUrls.has(key)) continue;
       state.list.push({
         id: newSourceId(state),
         name: builtinSourceName(url),
@@ -196,7 +380,10 @@ export function ensureSeeded() {
         addedAt,
       });
       knownUrls.add(key);
+      changed = true;
     }
+  }
+  if (seedOnce) {
     state.seedVersion = BUILTIN_SEED_VERSION;
     changed = true;
   }
@@ -240,7 +427,7 @@ export function getSource(id) {
 // value kisi source ko bahar nahi karti — source sirf Delete se hatega.
 // Ek source khali/error/exhaust ho to engine isi order se agla ACTIVE
 // source try karta hai; duplicate URL par ek hi DB dobara load nahi hota.
-export function orderSourcesForRun(sources = [], activeId = '') {
+export function orderSourcesForRun(sources = [], activeId = '', opts = {}) {
   const present = (Array.isArray(sources) ? sources : []).filter(
     (s) => s && String(s.url || '').trim()
   );
@@ -251,19 +438,39 @@ export function orderSourcesForRun(sources = [], activeId = '') {
   const ordered = primary
     ? [primary, ...present.filter((s) => s !== primary)]
     : present;
+
+  // Health ranking: jo DB abhi fail/quarantine me hai wo pool ke aakhir me
+  // jata hai, taaki 400+ sources waale pool me har run pehle zinda DBs try
+  // kare (ek ID/minute ke liye zaroori). Koi source hatta nahi — sirf order
+  // badalta hai.
+  const healthMap = opts.health || (() => { try { return loadState().health || {}; } catch { return {}; } })();
+  const now = Date.now();
+  const rankOf = (s) => {
+    const h = healthMap?.[s.id];
+    if (!h || typeof h !== 'object') return 1; // never tried → beech me
+    if (Number(h.quarantinedUntil) > now) return 2; // quarantine → sabse aakhir
+    if (Number(h.lastOkAt) > 0) return 0; // proven live → sabse pehle
+    return 1;
+  };
+  const ranked = ordered
+    .map((s, i) => ({ s, i, rank: rankOf(s) }))
+    .sort((a, b) => (a.rank - b.rank) || (a.i - b.i))
+    .map((x) => x.s);
+
   const seenUrls = new Set();
-  return ordered
+  return ranked
     .filter((s) => {
       const key = normalizeSourceUrl(s.url);
       if (!key || seenUrls.has(key)) return false;
       seenUrls.add(key);
       return true;
     })
-    .map((s) => ({
+    .map((s, idx) => ({
       ...s,
       enabled: true,
       active: true,
-      primary: primary ? s === primary : Boolean(s.primary),
+      // `primary` sirf "is run me pehle try hoga" ka marker hai.
+      primary: idx === 0,
     }));
 }
 
@@ -422,6 +629,12 @@ export function addSourcesBulk(input, {
     state.list.push(src);
     byUrl.set(key, src);
     addedRefs.push(src);
+    // Manual re-add → delete-memory se hata do taaki seeding bhi isse
+    // dobara na roke.
+    if (Array.isArray(state.deleted)) {
+      const di = state.deleted.indexOf(key);
+      if (di !== -1) state.deleted.splice(di, 1);
+    }
   }
 
   if (addedRefs.length && (setFirstAsPrimary || !state.list.some((s) => s.id === state.activeId))) {
@@ -456,6 +669,10 @@ export function addSource(input, { activate = true } = {}) {
     addedAt: new Date().toISOString(),
   };
   state.list.push(src);
+  if (Array.isArray(state.deleted)) {
+    const di = state.deleted.indexOf(normalizeSourceUrl(src.url));
+    if (di !== -1) state.deleted.splice(di, 1);
+  }
   // Legacy `activate` ka ab matlab sirf first-try banana hai; naya source
   // har haal me ACTIVE add hota hai aur purane sources bhi ACTIVE rehte hain.
   if (activate || !getActiveSource()) state.activeId = src.id;
@@ -469,7 +686,15 @@ export function removeSource(id) {
   const idx = state.list.findIndex((s) => s.id === id);
   if (idx === -1) return { ok: false, error: 'Source nahi mila.' };
   if (state.list.length === 1) return { ok: false, error: 'Aakhri source delete nahi ho sakta — pehle naya add karein.' };
-  state.list.splice(idx, 1);
+  const [removed] = state.list.splice(idx, 1);
+  // Delete ki hui URL ko yaad rakho — warna boot seeding (built-in/env)
+  // usko dobara add kar deti hai aur user ka Delete bekaar jata hai.
+  if (removed?.url) {
+    if (!Array.isArray(state.deleted)) state.deleted = [];
+    const key = normalizeSourceUrl(removed.url);
+    if (key && !state.deleted.includes(key)) state.deleted.push(key);
+  }
+  if (state.health && removed?.id) delete state.health[removed.id];
   if (state.activeId === id) {
     const next = state.list.find((s) => s.enabled) || state.list[0];
     state.activeId = next ? next.id : '';
@@ -538,14 +763,21 @@ export async function verifySource(id) {
     const ms = Date.now() - t0;
     if (!res.ok) {
       const txt = await res.text().catch(() => '');
-      return { ok: false, error: `HTTP ${res.status} ${txt.slice(0, 100)}` };
+      const err = `HTTP ${res.status} ${txt.slice(0, 100)}`;
+      recordSourceResult(id, { ok: false, error: err });
+      return { ok: false, error: err };
     }
     const json = await res.json().catch(() => null);
     const firebaseError = _firebaseErrorMessage(json);
-    if (firebaseError) return { ok: false, error: firebaseError.slice(0, 160) };
+    if (firebaseError) {
+      recordSourceResult(id, { ok: false, error: firebaseError });
+      return { ok: false, error: firebaseError.slice(0, 160) };
+    }
     const topKeys = json && typeof json === 'object' ? Object.keys(json).slice(0, 8) : [];
+    recordSourceResult(id, { ok: true, ms });
     return { ok: true, ms, topKeys };
   } catch (e) {
+    recordSourceResult(id, { ok: false, error: e?.message || 'network error' });
     return { ok: false, error: e?.message || 'network error' };
   }
 }

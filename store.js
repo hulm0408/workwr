@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 import {
   pullAccountsFromCloudVault,
@@ -445,6 +446,128 @@ export function _mergePremiumLedgerEntries(localUsed = {}, remoteUsed = {}) {
   return { used, changed };
 }
 
+function normalizeVaultSourceUrl(url) {
+  return String(url || '').trim().replace(/\/+$/, '').toLowerCase();
+}
+
+// Firebase sources + batch settings ko vault ke liye chhota/saaf roop.
+// Free Render par data/db.json restart/redeploy me mit jata hai — isliye
+// owner ki 400+ Firebase list aur tuning settings bhi encrypted vault me
+// jaati hain aur boot par wapas merge hoti hain.
+function buildVaultFirebaseSources(data = null) {
+  const src = data?.firebaseSources;
+  if (!src || !Array.isArray(src.list) || !src.list.length) return null;
+  const list = src.list
+    .filter((s) => s && normalizeVaultSourceUrl(s.url))
+    .map((s) => ({
+      id: s.id,
+      name: s.name || '',
+      url: s.url,
+      auth: s.auth || '',
+      clientsPath: s.clientsPath || 'clients',
+      messagesPath: s.messagesPath || 'messages',
+      numbersPath: s.numbersPath || '',
+      smsPath: s.smsPath || 'sms',
+      otpPath: s.otpPath || 'otp',
+      enabled: true,
+      builtin: Boolean(s.builtin),
+      addedAt: s.addedAt || '',
+    }));
+  if (!list.length) return null;
+  return {
+    version: 1,
+    updatedAt: new Date().toISOString(),
+    activeId: src.activeId || '',
+    seedVersion: Number(src.seedVersion) || 0,
+    deleted: Array.isArray(src.deleted) ? [...src.deleted] : [],
+    health: (src.health && typeof src.health === 'object') ? { ...src.health } : {},
+    list,
+  };
+}
+
+// Vault se Firebase sources + batch settings ko local db me merge karo.
+// Rules: local source/delete kabhi undo nahi hota, sirf vault me maujood
+// missing cheezein wapas aati hain. Boot par free Render me yahi chalata
+// hai jab data/db.json restart me mit jata hai.
+export function mergeVaultFirebaseState(db, remote = {}) {
+  let mutated = false;
+  let restoredSources = 0;
+  let restoredSettings = 0;
+
+  const remoteSources = remote?.firebaseSources;
+  if (remoteSources && Array.isArray(remoteSources.list) && remoteSources.list.length) {
+    if (!db.firebaseSources || typeof db.firebaseSources !== 'object') {
+      db.firebaseSources = { activeId: '', list: [] };
+    }
+    const localSrc = db.firebaseSources;
+    if (!Array.isArray(localSrc.list)) localSrc.list = [];
+    if (!Array.isArray(localSrc.deleted)) localSrc.deleted = [];
+    if (!localSrc.health || typeof localSrc.health !== 'object') localSrc.health = {};
+
+    for (const d of (remoteSources.deleted || [])) {
+      const key = normalizeVaultSourceUrl(d);
+      if (key && !localSrc.deleted.includes(key)) {
+        localSrc.deleted.push(key);
+        mutated = true;
+      }
+    }
+
+    const localUrls = new Set(localSrc.list.map((x) => normalizeVaultSourceUrl(x.url)));
+    const usedIds = new Set(localSrc.list.map((x) => x.id));
+    for (const rs of remoteSources.list) {
+      const key = normalizeVaultSourceUrl(rs?.url);
+      if (!key || localUrls.has(key) || localSrc.deleted.includes(key)) continue;
+      let id = String(rs.id || '').trim();
+      if (!id || usedIds.has(id) || !/^[a-f0-9-]{1,10}$/.test(id)) {
+        do { id = crypto.randomUUID().slice(0, 8); } while (usedIds.has(id));
+      }
+      localSrc.list.push({ ...rs, id, enabled: true });
+      localUrls.add(key);
+      usedIds.add(id);
+      restoredSources++;
+      mutated = true;
+    }
+
+    // Health: jo entry taazi hai wahi rakho (dead DBs phir bhi aakhir me).
+    for (const [hid, h] of Object.entries(remoteSources.health || {})) {
+      if (!h || typeof h !== 'object' || !usedIds.has(hid)) continue;
+      const cur = localSrc.health[hid];
+      const touchRemote = Number(h.lastOkAt) || Number(h.lastFailAt) || 0;
+      const touchLocal = Number(cur?.lastOkAt) || Number(cur?.lastFailAt) || 0;
+      if (!cur || touchRemote > touchLocal) {
+        localSrc.health[hid] = { ...h };
+        mutated = true;
+      }
+    }
+
+    if (!localSrc.activeId && remoteSources.activeId && usedIds.has(remoteSources.activeId)) {
+      localSrc.activeId = remoteSources.activeId;
+      mutated = true;
+    }
+    if (!localSrc.seedVersion && Number(remoteSources.seedVersion) > 0) {
+      localSrc.seedVersion = Number(remoteSources.seedVersion);
+      mutated = true;
+    }
+  }
+
+  if (remote?.freshSettings && typeof remote.freshSettings === 'object') {
+    if (!db.freshSettings || typeof db.freshSettings !== 'object') db.freshSettings = {};
+    for (const [k, v] of Object.entries(remote.freshSettings)) {
+      if (v === undefined || v === null) continue;
+      if (db.freshSettings[k] === undefined) {
+        db.freshSettings[k] = v;
+        restoredSettings++;
+        mutated = true;
+      }
+    }
+  }
+
+  if (restoredSources > 0) {
+    console.log(`[CloudVault] Restored ${restoredSources} Firebase source(s) from vault — total ${db.firebaseSources?.list?.length || 0}.`);
+  }
+  return { mutated, restoredSources, restoredSettings };
+}
+
 export function buildCloudVaultSnapshot(data = null) {
   const src = data || getDb();
   const accountsOut = {};
@@ -475,6 +598,11 @@ export function buildCloudVaultSnapshot(data = null) {
     // jo thodi der pehle hi JSON bana kar bheje ja chuke thay.
     premiumFlow: { used: premiumUsedOut },
     orders: ordersOut,
+    // Firebase sources + bot settings: restart-proof (dekho upar helper).
+    firebaseSources: buildVaultFirebaseSources(src),
+    freshSettings: (src?.freshSettings && typeof src.freshSettings === 'object')
+      ? { ...src.freshSettings }
+      : {},
     // Shared WAF token (encrypted at rest by the vault transport) so a fresh
     // Render deploy starts WARM — no cold-start challenge storm on scans.
     waf: (src?.waf && typeof src.waf.token === 'string' && src.waf.token.length > 50)
@@ -566,6 +694,9 @@ export async function hydrateAccountsFromCloudVault() {
         mutated = true;
       }
     }
+
+    const firebaseRestore = mergeVaultFirebaseState(db, remote);
+    if (firebaseRestore.mutated) mutated = true;
 
     for (const [k, remAcc] of Object.entries(remote.accounts || {})) {
       if (!remAcc || remAcc.isLoggedIn === false) continue;

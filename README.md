@@ -498,7 +498,8 @@ chalta rehta hai; temporary error par number failed nahi gina jata.
 | `PREMIUM_BATCH_CONCURRENCY` | 10 | Ek saath kitni parallel lanes (1–10); asal lanes distinct proxy/direct routes tak limited |
 | `PREMIUM_BATCH_MAX_MINUTES` | 120 | Max run time |
 | `PREMIUM_BATCH_GAP_MS` | 6000 | Ek hi lane/IP par do numbers ke beech gap |
-| `PREMIUM_RATE_LIMIT_BACKOFF_MS` | 900000 | Rate-limit par rukna (15 min) |
+| `PREMIUM_RATE_LIMIT_BACKOFF_MS` | 900000 | Purana backoff — ab fast ladder se cap hota hai (max 15s) |
+| `PREMIUM_RATE_LIMIT_RETRY_MS` | 5000 | Rate-limit **queue** ka pehla retry (5s → 8s → 12s, chhat 15s); run stop nahi hota |
 | `PREMIUM_OTP_WAIT_MS` | 3000 | OTP bhejne ke baad poll shuru karne se pehle chhota wait (snapshot purane codes se bachata hai, jaldi poll safe hai) |
 | `PREMIUM_OTP_TIMEOUT_MS` | 90000 | OTP inbox poll budget |
 | `PREMIUM_DEVICE_ACTIVE_WINDOW_MS` | 60000 | **Last-seen base window**: pehle is window ki SMS activity wala device, phir doubling ladder. Sakht: `10000`, band: `0` |

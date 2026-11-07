@@ -298,6 +298,32 @@ limit lagti hai, isliye 1 ID / minute ka target nahi milta — realistic ~1 ID p
 3-5 min, din bhar me ~100-200 attempts. Proxy pool ke bina isse zyada possible
 hi nahi, chahe koi kuch bhi bole.
 
+## 4️⃣f "Account creating — rate limit queue" (5 second wapas)
+
+Doosre bots jo dikhate hain — *"account creating queue me chala gaya rate limit
+ki wajah se"* — wo asal me yahi hai:
+
+- Swiggy per-IP limit lagti hai → number **queue** me jata hai (delete nahi hota)
+- **~5 second** me bot khud wapas try karta hai (8s → 12s, chhat 15s)
+- **Run stop nahi hota** — baaki lanes chalti rehti hain
+- Card par: `⏳ QUEUE 4 · rate-limit · 5s me wapas`
+- Message: **"⏳ Account Creating — Rate Limit Queue"**
+
+Purana behaviour: 15s → 30s wait, aur 3 strike par run band. Ab wo nahi.
+
+| Env | Default | Matlab |
+|---|---|---|
+| `PREMIUM_RATE_LIMIT_RETRY_MS` | `5000` | pehla retry (min 1s, max 15s) |
+
+Safety: agar lagatar **40** queue rounds me bhi sirf rate-limit mile (matlab IP
+poora jal chuka hai), tab run `rate_limited` par band hota hai — warna bot
+ghanton bekaar queue me ghoomta rehta. Ye limit `RATE_LIMIT_QUEUE_SAFETY_LIMIT`
+(constant) hai.
+
+**Sach:** 5s retry se "turant" nahi hota — Swiggy ki limit minutes me hoti hai,
+isliye kai queue rounds lagte hain. Faayda ye hai ki bot **rukta nahi** aur
+naya number bhi leta rehta hai.
+
 ## 5️⃣ Kya kabhi nahi karna
 
 - ❌ Ek `BOT_TOKEN` do jagah — **409 Conflict**, dono me se ek mar jata hai.

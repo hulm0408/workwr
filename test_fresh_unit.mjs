@@ -1166,10 +1166,10 @@ console.log('Swiggy temporary 5xx/network — one-shot OTP number consumed, retr
     && engine.transientSwiggyRetryWaitMs(3) === 45_000
     && engine.transientSwiggyRetryWaitMs(99) === 45_000,
   'engine: transient cool-off ladder 15s→30s→45s cap');
-  ok(engine.rateLimitRecoveryWaitMs(1, 10 * 60_000) === 15_000
-    && engine.rateLimitRecoveryWaitMs(2, 10 * 60_000) === 30_000
+  ok(engine.rateLimitRecoveryWaitMs(1, 10 * 60_000) === 5_000
+    && engine.rateLimitRecoveryWaitMs(2, 10 * 60_000) === 8_000
     && engine.fastRouteRecoveryCapMs(10 * 60_000) === 15_000,
-  'engine: rate-limit/WAF pehli recovery max 15s (number queue me fasa nahi)');
+  'engine: rate-limit recovery 5s→8s (15s chhat), number queue me fasa nahi');
   ok(engine.telegramInfraRetryDecision({
     telegramMode: true, willRetry: true, phone: '9876543210', stage: 'otp_send',
   }) === false, 'Hermes: OTP-send fail par same-number retry hamesha OFF');
@@ -3192,6 +3192,66 @@ console.log('Direct mode (bina proxy):');
   const deployDoc = await fsp.readFile(new URL('./SECOND-BOT-DEPLOY.md', import.meta.url), 'utf8');
   ok(deployDoc.includes('PROXY_MODE=direct') && deployDoc.includes('1 ID per'),
     'docs: direct mode + imaandaar speed expectation likha hai');
+}
+
+// ---------------------------------------------------------------------------
+console.log('Rate-limit queue (account creating queue, ~5s me wapas):');
+{
+  const engine = await import('./autopilot-engine.js');
+  const fsp = await import('node:fs/promises');
+
+  ok(engine.RATE_LIMIT_QUEUE_RETRY_MS === 5_000, 'queue: default retry 5s');
+  ok(engine.rateLimitQueueRetryMs({}) === 5_000, 'queue: env nahi to 5s');
+  ok(engine.rateLimitQueueRetryMs({ PREMIUM_RATE_LIMIT_RETRY_MS: '3000' }) === 3_000,
+    'queue: env se retry badla ja sakta hai');
+  ok(engine.rateLimitQueueRetryMs({ PREMIUM_RATE_LIMIT_RETRY_MS: '200' }) === 5_000,
+    'queue: bahut chhoti value ignore (min 1s)');
+  ok(engine.rateLimitQueueRetryMs({ PREMIUM_RATE_LIMIT_RETRY_MS: '999999' }) === 15_000,
+    'queue: bahut badi value cap (15s)');
+
+  // 15s/30s wala purana slow ladder gaya — 5s → 8s → 12s
+  ok(engine.rateLimitRecoveryWaitMs(1, 0) === 5_000, 'queue: pehla retry 5s (5 second wala behaviour)');
+  ok(engine.rateLimitRecoveryWaitMs(2, 0) === 8_000, 'queue: doosra retry 8s');
+  ok(engine.rateLimitRecoveryWaitMs(3, 0) === 12_000, 'queue: teesra retry 12s');
+  ok(engine.rateLimitRecoveryWaitMs(9, 0) === 12_000, 'queue: ladder 12s par ruk jati hai');
+  ok(engine.rateLimitRecoveryWaitMs(1, 900_000) === 5_000,
+    'queue: Settings ka 15-min backoff bhi fast ladder se cap hota hai');
+  ok(engine.rateLimitRecoveryWaitMs(1, 0, { PREMIUM_RATE_LIMIT_RETRY_MS: '4000' }) === 4_000,
+    'queue: env retry ladder ka base badalta hai');
+  ok(engine.RATE_LIMIT_QUEUE_SAFETY_LIMIT === 40, 'queue: safety limit 40 (ghanton ghoomna nahi)');
+
+  // Live card par queue chip
+  const card = engine.formatCompactAutopilotCard({
+    sourceMode: 'firebase', running: true, target: 100, fresh: 2, processed: 3,
+    rateLimitQueued: 4, rateLimitRetryMs: 5_000, proxyMode: 'direct',
+    current: { phone: '9876543210' }, concurrency: 1,
+  });
+  ok(card.includes('QUEUE 4'), 'queue: live card par QUEUE count');
+  ok(card.includes('5s me wapas'), 'queue: card par "5s me wapas"');
+  const cardNoQueue = engine.formatCompactAutopilotCard({
+    sourceMode: 'firebase', running: true, target: 10, fresh: 0, processed: 0, concurrency: 1,
+  });
+  ok(!cardNoQueue.includes('QUEUE'), 'queue: bina queue chip nahi (card saaf rehta hai)');
+
+  // Stage text: direct mode me "nayi IP" jhooth nahi bolta
+  const stageCard = engine.formatCompactAutopilotCard({
+    sourceMode: 'firebase', running: true, target: 10, fresh: 1, processed: 1,
+    rateLimitQueued: 2, rateLimitRetryMs: 5_000, proxyMode: 'direct', concurrency: 1,
+  }, { stageText: '🚦 Rate Limit — naya number' });
+  ok(stageCard.includes('Rate-limit queue') && stageCard.includes('5s me wapas'),
+    'queue: direct mode card "Rate-limit queue — 5s me wapas" kehta hai');
+  const proxyCard = engine.formatCompactAutopilotCard({
+    sourceMode: 'firebase', running: true, target: 10, fresh: 1, processed: 1, proxyMode: 'auto',
+  }, { stageText: '🚦 Rate Limit — naya number' });
+  ok(proxyCard.includes('nayi IP'), 'queue: proxy mode me rotation wali purani line');
+
+  // Wiring
+  const src = await fsp.readFile(new URL('./autopilot-engine.js', import.meta.url), 'utf8');
+  ok(src.includes('Account Creating — Rate Limit Queue'), 'queue: card title "Account Creating — Rate Limit Queue"');
+  ok(src.includes('queue me</b> chala gaya'), 'queue: "number queue me chala gaya" line');
+  ok(/queuedTotal >= RATE_LIMIT_QUEUE_SAFETY_LIMIT/.test(src),
+    'queue: run sirf safety limit par rukta hai (3 strike par nahi)');
+  ok(src.includes('rateLimitQueued'), 'queue: state me counter');
 }
 
 console.log(`\n✅ ALL PASSED — ${passed} checks`);

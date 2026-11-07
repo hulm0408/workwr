@@ -268,6 +268,10 @@ const state = {
   skipRequestedAt: 0,
   lastSkippedPhone: '',
   rateStrikes: 0,
+  rateLimitQueued: 0,     // is run me kitne numbers rate-limit queue me gaye
+  rateLimitRetryMs: 0,    // aakhri queue ka retry wait
+  rateLimitQueueUntil: 0, // kab wapas aayega
+  rateLimitLastAt: 0,
   wafStrikes: 0,
   wafCooldowns: 0,
   serverErrors: 0,        // Swiggy/proxy temporary 5xx/network — number failed nahi gina jata
@@ -368,6 +372,10 @@ export function getAutopilotSnapshot() {
     skipRequestedAt: state.skipRequestedAt || 0,
     lastSkippedPhone: state.lastSkippedPhone || '',
     rateStrikes: state.rateStrikes,
+    rateLimitQueued: state.rateLimitQueued || 0,
+    rateLimitRetryMs: state.rateLimitRetryMs || 0,
+    rateLimitQueueUntil: state.rateLimitQueueUntil || 0,
+    rateLimitLastAt: state.rateLimitLastAt || 0,
     wafStrikes: state.wafStrikes,
     wafCooldowns: state.wafCooldowns,
     serverErrors: state.serverErrors || 0,
@@ -547,6 +555,21 @@ export function nextNumberGapMs({
 // User ka fast-recovery rule: rate-limit/WAF par number minuteon queue me
 // na fase — pehli recovery koshish 15 second ke andar nayi IP/token se ho.
 export const FAST_ROUTE_RECOVERY_MS = 15_000;
+
+// Rate-limit = "account creating queue" (jaise doosre bots dikhate hain).
+// Number queue me jaata hai aur ~5 second me khud wapas aata hai — 15-30s
+// ka wait pehle bahut slow lagta tha. Env se badla ja sakta hai.
+export const RATE_LIMIT_QUEUE_RETRY_MS = 5_000;
+export const RATE_LIMIT_QUEUE_MAX_RETRY_MS = 15_000;
+// Itne queue rounds ke baad bhi sirf rate-limit mile to run band (safety) —
+// warna bot ghanton "queue" me ghoomta rehta hai.
+export const RATE_LIMIT_QUEUE_SAFETY_LIMIT = 40;
+
+export function rateLimitQueueRetryMs(env = process.env) {
+  const raw = Number(env?.PREMIUM_RATE_LIMIT_RETRY_MS);
+  if (Number.isFinite(raw) && raw >= 1_000) return Math.min(Math.round(raw), RATE_LIMIT_QUEUE_MAX_RETRY_MS);
+  return RATE_LIMIT_QUEUE_RETRY_MS;
+}
 export const FREE_PROXY_TARGET_COUNT = 30;
 
 export function fastRouteRecoveryCapMs(requestedMs, fallbackMs = FAST_ROUTE_RECOVERY_MS) {
@@ -555,13 +578,17 @@ export function fastRouteRecoveryCapMs(requestedMs, fallbackMs = FAST_ROUTE_RECO
   return Math.max(0, Math.min(base, FAST_ROUTE_RECOVERY_MS));
 }
 
-export function rateLimitRecoveryWaitMs(consecutiveStrikes = 1, configuredBackoffMs = 0) {
+export function rateLimitRecoveryWaitMs(consecutiveStrikes = 1, configuredBackoffMs = 0, env = process.env) {
   const strikes = Math.max(1, Number(consecutiveStrikes) || 1);
-  const fastLadder = strikes <= 1 ? FAST_ROUTE_RECOVERY_MS : 30_000;
+  const base = rateLimitQueueRetryMs(env);
+  // 1st = ~5s (queue se turant wapas), 2nd = 8s, 3rd+ = 12s — phir bhi
+  // 15s se zyada nahi. Configured backoff (Settings) kitna bhi lamba ho,
+  // ye chhat lagti hai taaki number minuteon queue me na fase.
+  const ladder = [base, Math.round(base * 1.6), Math.round(base * 2.4)];
+  const idx = Math.min(strikes, ladder.length) - 1;
+  const fastLadder = Math.min(ladder[idx], FAST_ROUTE_RECOVERY_MS);
   const configured = Number(configuredBackoffMs) || fastLadder;
-  // Configured backoff kitna bhi lamba ho, pehli do recoveries fast hongi;
-  // third strike par engine pehle ki tarah run ko rok sakta hai.
-  return Math.min(configured, fastLadder);
+  return Math.max(1_000, Math.min(configured, fastLadder));
 }
 
 // Security challenge ke baad IP ko sirf chhota sa saans do, phir nayi
@@ -727,7 +754,15 @@ function compactStepInfo(snap = {}, stageText = '') {
     now = 'Swiggy me address add ho raha hai';
   } else if (/route ready|waf|token|security|proxy|direct ip|rate limit/.test(text)) {
     step = telegram ? 'NEW' : 'POOL';
-    now = /rate limit/.test(text) ? 'Rate-limit — nayi IP le raha hoon' : 'Route/WAF ready ho raha hai';
+    if (/rate limit/.test(text)) {
+      // Direct mode me "nayi IP" jhooth hai — wahan number queue me jata hai.
+      const retrySec = Math.max(1, Math.round((Number(snap.rateLimitRetryMs) || 5000) / 1000));
+      now = snap.proxyMode === 'direct'
+        ? `Rate-limit queue — ${retrySec}s me wapas`
+        : 'Rate-limit — nayi IP le raha hoon';
+    } else {
+      now = 'Route/WAF ready ho raha hai';
+    }
   } else if (/otp wait|refresh|otp.*intezaar|otp.*wait/.test(text)) {
     step = telegram ? 'REFRESH' : 'INBOX';
     now = telegram ? 'REFRESH par OTP aa raha hai' : 'OTP inbox check ho raha hai';
@@ -915,6 +950,7 @@ export function formatCompactAutopilotCard(snap = state, { stageText = '', final
     compactSourceLine(s),
     s.shardEnabled ? `🧩 ${mono(`SHARE ${s.shardShare || ''}`)} <i>· pool ka apna hissa, koi ladai nahi</i>` : '',
     s.proxyMode === 'direct' ? `🔀 ${mono('DIRECT')} <i>· bina proxy, ek IP — slow par predictable</i>` : '',
+    Number(s.rateLimitQueued) ? `⏳ ${mono(`QUEUE ${Number(s.rateLimitQueued)}`)} <i>· rate-limit · ${Math.max(1, Math.round((Number(s.rateLimitRetryMs) || 5000) / 1000))}s me wapas</i>` : '',
     `✅ ${mono(`FRESH ${fresh}`)} · ⚙ ${mono(`DONE ${Number(s.processed) || 0}`)} · × ${mono(`FAIL ${Number(s.failed) || 0}`)}${retries ? ` · ↻ ${mono(`RETRY ${retries}`)}` : ''}${Number(s.manualSkips) ? ` · ⏭ ${mono(`SKIP ${Number(s.manualSkips) || 0}`)}` : ''}${fresh ? ` · 🏠 ${mono(`ADDR ${Number(s.addressAdded) || 0}/${fresh}`)}` : ''}`,
     final
       ? (fresh ? sub('Fresh JSON chat me bhej diye hain.') : sub('Is run me fresh session nahi bana.'))
@@ -1140,6 +1176,7 @@ export async function startAutopilot(opts = {}) {
     manualSkips: 0, manualSkipRequests: 0, otpFailures: 0,
     skipRequestedPhone: '', skipRequestedLaneId: 0, skipRequestedAt: 0, lastSkippedPhone: '',
     rateStrikes: 0, wafStrikes: 0, wafCooldowns: 0, serverErrors: 0, transientStrikes: 0,
+    rateLimitQueued: 0, rateLimitRetryMs: 0, rateLimitQueueUntil: 0, rateLimitLastAt: 0,
     consecutiveFails: 0, proxyRotations: 0,
     routeMode: 'direct', proxyChallenges: 0, directChallenges: 0, deferredQueue: 0,
     proxyMode: proxyPool.proxyMode?.() || 'auto',
@@ -3056,23 +3093,34 @@ export async function startAutopilot(opts = {}) {
           }
         }
 
-        // Direct mode (koi proxy nahi) — fast recovery: pehla retry 15s,
-        // doosra 30s. Number minuteon queue me nahi fasega. Hermes mode me
-        // 3 strikes sirf recovery checkpoint hai — batch force-stop nahi.
+        // Direct mode (koi proxy nahi) — "account creating queue":
+        // number queue me jata hai aur ~5s (phir 8s, 12s) me khud wapas —
+        // 15-30s ka rukaawat pehle bahut slow lagta tha. Run stop NAHI hota;
+        // sirf safety ke liye bahut zyada lagatar rate-limits par rukta hai.
+        const queuedTotal = (state.rateLimitQueued || 0) + 1;
+        state.rateLimitQueued = queuedTotal;
+        state.rateLimitLastAt = Date.now();
         if (state.rateStrikes >= 3) {
-          if (!telegramMode) { requestRunEnd('rate_limited'); break; }
+          // 3 strike = ek recovery checkpoint, run ka end nahi.
           state.rateStrikes = 1;
           state.workerRecoveries = (state.workerRecoveries || 0) + 1;
+          if (!telegramMode && queuedTotal >= RATE_LIMIT_QUEUE_SAFETY_LIMIT) {
+            requestRunEnd('rate_limited');
+            break;
+          }
         }
         const backoff = rateLimitRecoveryWaitMs(state.rateStrikes, backoffMs);
+        state.rateLimitRetryMs = backoff;
+        state.rateLimitQueueUntil = Date.now() + backoff;
         if (!proxyPool.isDirectMode?.()) {
           void proxyPool.ensureFreeProxies?.({ min: 12, want: FREE_PROXY_TARGET_COUNT }).then((r) => {
             if (r?.added) ps = proxyPool.proxySummary();
           }).catch(() => {});
         }
-        await push(progressCard(section('🚦 Swiggy Rate Limit — 15s Fast Recovery', [
-          `› Sirf lane ${lane.id} ~${Math.max(1, Math.round(backoff / 1000))}s ruk kar nayi IP/token se aage badhegi (strike ${state.rateStrikes}/3); baaki lanes chalti rahengi.`,
-          sub('⚠️ Proxies add karne se ye wait bhi hat jayegi (⚙️ Settings → 🔀 Proxies).'),
+        await push(progressCard(section('⏳ Account Creating — Rate Limit Queue', [
+          `› Ye number <b>queue me</b> chala gaya (Swiggy per-IP limit) — ${mono(`${Math.max(1, Math.round(backoff / 1000))}s`)} me khud wapas aayega.`,
+          `› Queue: ${mono(`#${queuedTotal}`)} · strike ${mono(`${state.rateStrikes}/3`)} · lane ${mono(String(lane.id))} · baaki lanes chalti rahengi.`,
+          sub('Kuch nahi karna — bot khud retry karega (proxy ho to rotation, warna 5s fast ladder).'),
         ].join('\n'))), stopRows());
         await sleep(backoff, () => state.stopRequested);
         if (state.stopRequested) { endReason = state.stopReason || 'manual'; break; }

@@ -1,0 +1,10 @@
+{
+  "name": "swiggy-bot-monitor",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Vercel par chalta hai — Render/VPS par chal rahe bot(s) ka live status dashboard",
+  "engines": {
+    "node": ">=20"
+  }
+}

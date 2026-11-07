@@ -2876,6 +2876,48 @@ console.log('Doosra bot / doosra instance (INSTANCE_LABEL):');
   ok(readme.includes('render.com/deploy?repo=https://github.com/hulm0408/workwr')
     && readme.includes('DEPLOY-NOW.md'),
   'README: deploy button + DEPLOY-NOW link');
+
+  // ---- Vercel monitor (jo Vercel par ASAL ME chalta hai) ----
+  const monitor = await import('./vercel-monitor/lib/health.js');
+  ok(monitor.escapeHtml('<b>x</b>') === '&lt;b&gt;x&lt;/b&gt;', 'monitor: HTML escape');
+  const targets = monitor.healthTargets({
+    BOT_HEALTH_URLS: 'https://bot-a.onrender.com/health, https://bot-b.onrender.com/health , galat-url',
+  });
+  ok(targets.length === 2, 'monitor: comma-separated URLs parse (galat URL chhoot jata hai)');
+  ok(targets[0].name === 'bot-a' && targets[0].url === 'https://bot-a.onrender.com/health',
+    'monitor: hostname se naam');
+  ok(monitor.healthTargets({}).length === 0, 'monitor: URL nahi to khali list (setup page)');
+  ok(monitor.healthTargets({ BOT_HEALTH_URL: 'https://x.onrender.com/health' }).length === 1,
+    'monitor: purana single-URL naam bhi chalta hai');
+
+  const down = await monitor.fetchTarget({ url: 'http://127.0.0.1:1/health', name: 'down-bot', label: 'down-bot' });
+  ok(down.up === false && Boolean(down.error), 'monitor: down bot par error set, crash nahi');
+
+  const monitorIndex = await fsp.readFile(new URL('./vercel-monitor/api/index.js', import.meta.url), 'utf8');
+  const monitorLib = await fsp.readFile(new URL('./vercel-monitor/lib/health.js', import.meta.url), 'utf8');
+  ok(monitorIndex.includes('DASH_KEY') && monitorIndex.includes('401'),
+    'monitor: optional DASH_KEY gate');
+  ok(monitorIndex.includes('escapeHtml(bot.label)'), 'monitor: label escape (XSS safe)');
+  ok(monitorLib.includes('AbortSignal.timeout'), 'monitor: fetch timeout (ek down bot poora page nahi atkata)');
+  ok(monitorIndex.includes('Content-Type'), 'monitor: HTML content type');
+
+  const monitorPkg = JSON.parse(await fsp.readFile(new URL('./vercel-monitor/package.json', import.meta.url), 'utf8'));
+  ok(monitorPkg.type === 'module', 'monitor: ESM package (Vercel Node functions)');
+  const vercelJson = JSON.parse(await fsp.readFile(new URL('./vercel-monitor/vercel.json', import.meta.url), 'utf8'));
+  ok(vercelJson.rewrites.some((r) => r.destination === '/api/index'),
+    'monitor: vercel.json "/" ko dashboard par bhejta hai');
+  const monitorReadme = await fsp.readFile(new URL('./vercel-monitor/README.md', import.meta.url), 'utf8');
+  ok(monitorReadme.includes('Root Directory') && monitorReadme.includes('vercel-monitor'),
+    'monitor: deploy steps me Root Directory=vercel-monitor');
+  const vercelDoc = await fsp.readFile(new URL('./VERCEL.md', import.meta.url), 'utf8');
+  ok(vercelDoc.includes('vercel-monitor') && vercelDoc.includes('300s'),
+    'VERCEL.md: kya chalta hai + function limit likha hai');
+  ok(vercelDoc.includes('Upstash') && vercelDoc.includes('QStash'),
+    'VERCEL.md: poora rewrite ke 5 steps');
+  const deployNow2 = await fsp.readFile(new URL('./DEPLOY-NOW.md', import.meta.url), 'utf8');
+  ok(deployNow2.includes('vercel-monitor') && deployNow2.includes('VERCEL.md'),
+    'DEPLOY-NOW: Vercel dashboard route ka link');
+  if (passed % 1 === 0) { /* keep counter */ }
 }
 
 console.log(`\n✅ ALL PASSED — ${passed} checks`);

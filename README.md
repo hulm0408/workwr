@@ -533,7 +533,12 @@ ki ek wajah yahi ho sakti hai).
 
 Aur: `vuvhbjbi` Firebase ke **rules open** hain — bina auth ke koi bhi isko
 padh/sakta hai. Number pool + OTP inbox dono public hain. Rules lagwa lena
-(ya kam se kam write band karwa lo) — warna koi bhi aapke OTP padh sakta hai.
+(ya kam se kam write band karwa lo) - warna koi bhi aapke OTP padh sakta hai.
+
+Poora actionable checklist: [`SECURITY.md`](SECURITY.md) - token ke saare
+consumers (GitHub Actions / Render / local `.env`), gitleaks pre-commit +
+full-history scan, RTDB rules deploy/verify, aur 402 third-party Firebase
+URLs ka review.
 
 ## 🩺 Troubleshooting — "bot work nahi kar raha"
 

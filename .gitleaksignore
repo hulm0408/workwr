@@ -1,0 +1,6 @@
+# Historical leak: .env with a live BOT_TOKEN was committed in ec6f5e5 and
+# removed from HEAD in 70320b8, but it is still present in git history.
+# Revoke the token (see SECURITY.md) - this fingerprint only keeps the
+# full-history scan green until the history is purged. Delete this line
+# after git filter-repo/BFG + force-push.
+ec6f5e5977f8864276871e61452ede36d44ce616:.env:telegram-bot-token:1

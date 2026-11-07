@@ -1,0 +1,30 @@
+#!/bin/sh
+# Blocks commits that contain secrets.
+#
+# Install once per clone:
+#   npm run hooks:install        (sets core.hooksPath=.githooks)
+#
+# Requires gitleaks on PATH:
+#   Windows: winget install Gitleaks.Gitleaks
+#   macOS:   brew install gitleaks
+#   Linux:   https://github.com/gitleaks/gitleaks/releases
+set -eu
+
+if ! command -v gitleaks >/dev/null 2>&1; then
+  echo "gitleaks not found - refusing to commit without a secret scan." >&2
+  echo "Install it, then retry. See SECURITY.md." >&2
+  exit 1
+fi
+
+# .env files must never be tracked (only .env.example is allowed).
+staged_env=$(git diff --cached --name-only --diff-filter=ACM \
+  | grep -E '(^|/)\.env($|\.)' \
+  | grep -v '\.env\.example$' || true)
+if [ -n "$staged_env" ]; then
+  echo "Refusing to commit .env file(s):" >&2
+  echo "$staged_env" >&2
+  echo "Use .env.example for placeholders; real values stay in .env (gitignored)." >&2
+  exit 1
+fi
+
+gitleaks git --pre-commit --staged --redact --no-banner

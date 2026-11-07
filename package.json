@@ -11,6 +11,9 @@
     "start": "node fresh-bot.js",
     "test": "node test_fresh_unit.mjs",
     "inspect": "node scratch/firebase-inspect.mjs",
+    "hooks:install": "node scripts/install-git-hooks.mjs",
+    "scan:secrets": "gitleaks git --redact --no-banner --log-opts=\"--all\"",
+    "verify:firebase-rules": "node scripts/verify-firebase-rules.mjs",
     "telegram:login": "node telegram-login.js",
     "telegram:check": "node telegram-login.js --check",
     "telegram:audit": "node scratch/telegram-audit.mjs"

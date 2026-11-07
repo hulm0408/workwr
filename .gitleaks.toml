@@ -1,0 +1,20 @@
+# Gitleaks config for workwr.
+#
+# The default gitleaks ruleset does NOT detect Telegram Bot API tokens
+# (verified with gitleaks 8.30.1 against a fake token), so this config
+# extends the defaults with an explicit rule. Keep this file at the repo
+# root: gitleaks discovers it automatically for `gitleaks git` / `gitleaks dir`.
+title = "workwr secret scan"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "telegram-bot-token"
+description = "Telegram Bot API token (BOT_TOKEN / BOT_TOKEN_3 / BOT_TOKEN_4)"
+regex = '''(?i)\b[0-9]{8,10}:[a-z0-9_-]{35}\b'''
+entropy = 3.0
+keywords = [
+  "bot_token",
+  "telegram",
+]

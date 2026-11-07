@@ -1,5 +1,13 @@
 # 🆕 Swiggy Fresh Bot
 
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/hulm0408/workwr)
+
+> **1-click deploy?** Upar wala button Render par blueprint (`render.yaml`) ke saath
+> seedha deploy khol deta hai — sirf `BOT_TOKEN` + `OWNER_IDS` bharna hai.
+> **Free plan / doosra bot** chahiye to button ki jagah
+> `render.second.yaml` se Blueprint banao (guide: [`SECOND-BOT-DEPLOY.md`](SECOND-BOT-DEPLOY.md)).
+> Har cheez ki ek-page list: [`DEPLOY-NOW.md`](DEPLOY-NOW.md).
+
 **Ek START dabao — phone chhod ke aa jao.** Bot khud:
 
 0. **START dabao → source chuno**: 📨 **Hermes bot** (`@HermeshuOTPROBOT`), 🐘 **Hathi bot** (`@Hathi_otp_bot`), 🔐 **HardXotp bot** (`@HardXotp_Bot`) ya 🔥 **Firebase**. Isi screen par 🗑 **Delete All Firebase** bhi hai.

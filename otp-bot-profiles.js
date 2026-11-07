@@ -1,32 +1,51 @@
-// ===== 📨 OTP BOT PROFILES — ek hi session, do (ya zyada) OTP bots =====
+// ===== 📨 OTP BOT PROFILES — ek hi session, kai OTP bots =====
 //
-// Owner ke paas do OTP bots hain:
+// Owner ke paas ye OTP bots hain:
 //   1) @HermeshuOTPROBOT  — FIND NUMBER → number card → (NEW NUMBER) → REFRESH
-//   2) @HardXotp_Bot      — GET NUMBERS → "ASSIGNED NUMBER" card →
+//   2) @Hathi_otp_bot     — Hermes jaisa hi (FIND/NEW NUMBER card → REFRESH)
+//   3) @HardXotp_Bot      — GET NUMBERS → "ASSIGNED NUMBER" card →
 //                            VIEW MESSAGES / NEW NUMBER (SMS khud aata hai)
 //
-// Dono ka mehnat ek hi hai (number lo → Swiggy OTP bhejo → 20s wait →
+// Sabka mehnat ek hi hai (number lo → Swiggy OTP bhejo → 20s wait →
 // OTP aaya to use karo, warna NEW NUMBER se agla lo), sirf button ke naam
 // aur card ke labels badalte hain. Isliye yahan sirf woh cheezein rakhi
 // hain: username, button → role mapping, aur UI labels. Baaki saara
-// claim/OTP logic (telegram-otp-source.js) dono ke liye same rehta hai.
+// claim/OTP logic (telegram-otp-source.js) sabke liye same rehta hai.
 //
 // YE FILE PURE HAI (network/session nahi) — isliye test karna aasan hai.
 
-export const OTP_BOT_PROFILE_IDS = ['hermes', 'chauhan'];
+export const OTP_BOT_PROFILE_IDS = ['hermes', 'hathi', 'chauhan'];
 
 export const OTP_BOT_PROFILES = {
   hermes: {
     id: 'hermes',
     label: 'Hermes',
     uiLabel: '📨 Hermeshu',
+    emoji: '📨',
     username: 'HermeshuOTPROBOT',
     // Claim par ye order: latest screen par NEW NUMBER ho to woh, warna
     // FIND NUMBER. Owner ka exact instruction.
     claimPreference: ['new', 'find'],
     // Refresh ke liye sirf REFRESH button (Hermes card sabse upar).
     refreshRoles: ['refresh'],
+    refreshLabel: 'REFRESH',
     // Welcome/card buttons jo kuch bhi karte hon unhe ignore karo.
+    ignoreRolePatterns: [],
+    startCommand: '/start',
+    hint: 'FIND NUMBER → card → OTP SHOWN → REFRESH',
+  },
+  // @Hathi_otp_bot — Hermeshu wale bot jaisa hi card/buttons (owner ka
+  // instruction: "same hermeshu wale bot ki tarah work kare"). Isliye isme
+  // sirf username badla hai; claim/refresh ka behaviour bilkul same hai.
+  hathi: {
+    id: 'hathi',
+    label: 'Hathi',
+    uiLabel: '🐘 Hathi OTP',
+    emoji: '🐘',
+    username: 'Hathi_otp_bot',
+    claimPreference: ['new', 'find'],
+    refreshRoles: ['refresh'],
+    refreshLabel: 'REFRESH',
     ignoreRolePatterns: [],
     startCommand: '/start',
     hint: 'FIND NUMBER → card → OTP SHOWN → REFRESH',
@@ -35,11 +54,13 @@ export const OTP_BOT_PROFILES = {
     id: 'chauhan',
     label: 'HardXotp',
     uiLabel: '🔐 HardXotp (Chauhan)',
+    emoji: '🔐',
     username: 'HardXotp_Bot',
     claimPreference: ['new', 'find'],
     // Chauhan bot me alag REFRESH button nahi hota — "VIEW MESSAGES" hi
     // naya SMS dekhne/refresh karne ka rasta hai.
     refreshRoles: ['refresh', 'view'],
+    refreshLabel: 'VIEW MESSAGES',
     // GET NUMBERS = naya number maango (FIND NUMBER jaisa hi).
     extraRoleMatchers: [
       { role: 'view', re: /\b(view|show|check)\s+(messages?|sms|inbox)\b|\bmessages?\b|\binbox\b/ },
@@ -61,12 +82,24 @@ export function normalizeOtpBotProfileId(value = '') {
     if (key === String(profile.username).toLowerCase()) return profile.id;
   }
   if (/hard\s*x?\s*otp|chauhan/.test(key)) return 'chauhan';
+  if (/hathi|haathi|elephant/.test(key)) return 'hathi';
   if (/hermes/.test(key)) return 'hermes';
   return DEFAULT_OTP_BOT_PROFILE_ID;
 }
 
+// UI ke liye ordered list — START picker aur Settings dono isi se bante hain,
+// taaki naya bot add karne par dono jagah khud aa jaye.
+export function listOtpBotProfiles() {
+  return OTP_BOT_PROFILE_IDS.map((id) => OTP_BOT_PROFILES[id]).filter(Boolean);
+}
+
 export function getOtpBotProfile(value = '') {
   return OTP_BOT_PROFILES[normalizeOtpBotProfileId(value)] || OTP_BOT_PROFILES[DEFAULT_OTP_BOT_PROFILE_ID];
+}
+
+// Profile id/username hi valid choice hai (START picker ki whitelist).
+export function isOtpBotProfileId(value = '') {
+  return OTP_BOT_PROFILE_IDS.includes(String(value || '').trim().toLowerCase());
 }
 
 export function otpBotProfileForUsername(username = '') {

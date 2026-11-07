@@ -279,7 +279,7 @@ const state = {
   consecutiveFails: 0,
   current: null,          // backward-compat: pehli active lane ka { phone, startedAt }
   sourceMode: 'firebase', // 'firebase' | 'telegram'
-  otpBotProfile: '',      // 'hermes' | 'chauhan' (telegram mode)
+  otpBotProfile: '',      // 'hermes' | 'hathi' | 'chauhan' (telegram mode)
   otpBotLabel: '',
   telegramBotUsername: '',
   telegramOtpTimeoutMs: 20_000,
@@ -1512,7 +1512,9 @@ export async function startAutopilot(opts = {}) {
           state.lastError = '';
           await push(progressCard(section(`📨 ${otpBotProfile.label} Ready`, [
             `› @${esc(String(state.telegramBotUsername || telegramCfg?.botUsername || otpBotProfile.username).replace(/^@+/, ''))} connected hai${state.telegramMe ? ` (${esc(state.telegramMe)})` : ''}.`,
-            `› ${otpBotProfile.id === 'chauhan' ? 'GET NUMBERS se number, phir VIEW MESSAGES se OTP' : 'Har naya number NEW NUMBER se aayega'}; OTP ${Math.round(telegramOtpTimeoutMs / 1000)}s tak check karunga.`,
+            `› ${otpBotProfile.id === 'chauhan'
+              ? 'GET NUMBERS se number, phir VIEW MESSAGES se OTP'
+              : `Har naya number NEW NUMBER (warna FIND NUMBER) se aayega; OTP ${otpBotProfile.refreshLabel || 'REFRESH'} se check hoga`}; OTP ${Math.round(telegramOtpTimeoutMs / 1000)}s tak dekhunga.`,
             sub('Firebase pool/device scan bypass hai — Telegram only mode me fallback OFF hai.'),
           ].join('\n'))), stopRows());
           return pool;

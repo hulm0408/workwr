@@ -2662,13 +2662,55 @@ console.log('OTP bot profiles (Hermes + HardXotp) — buttons/cards/latest-scree
     'status: otpBotProfile expose hota hai');
   tg.resetActiveOtpBotProfile();
 
+  // ---- @Hathi_otp_bot — Hermeshu jaisa hi behaviour ----
+  ok(profiles.getOtpBotProfile('hathi').username === 'Hathi_otp_bot', 'Hathi: username @Hathi_otp_bot');
+  ok(profiles.normalizeOtpBotProfileId('@Hathi_otp_bot') === 'hathi', 'Hathi: username se profile milti hai');
+  ok(profiles.normalizeOtpBotProfileId('hathi') === 'hathi', 'Hathi: id se profile milti hai');
+  ok(profiles.OTP_BOT_PROFILE_IDS.includes('hathi'), 'Hathi: profile list me shamil');
+  ok(profiles.listOtpBotProfiles().map((x) => x.id).join(',') === 'hermes,hathi,chauhan',
+    'OTP bot list order: hermes, hathi, chauhan (UI isi se banti hai)');
+  {
+    const h = profiles.getOtpBotProfile('hermes');
+    const a = profiles.getOtpBotProfile('hathi');
+    ok(a.claimPreference.join(',') === h.claimPreference.join(','), 'Hathi: claim order Hermes jaisa (NEW → FIND)');
+    ok(a.refreshRoles.join(',') === h.refreshRoles.join(','), 'Hathi: refresh roles Hermes jaise');
+    ok(a.refreshLabel === 'REFRESH', 'Hathi: OTP check REFRESH button se');
+    ok(a.ignoreRolePatterns.length === h.ignoreRolePatterns.length, 'Hathi: ignore patterns Hermes jaise');
+    for (const label of ['FIND NUMBER', 'NEW NUMBER', 'REFRESH', 'SEARCH NUMBER', 'ACTIVE NUMBERS']) {
+      ok(profiles.otpBotButtonRole(label, 'hathi') === profiles.otpBotButtonRole(label, 'hermes'),
+        `Hathi: "${label}" ka role Hermes jaisa hi hai`);
+    }
+  }
+  // Hathi card = Hermes jaisa number card
+  const hathiCard = '👤 NUMBER: 9876543210\n✅ STATUS: ACTIVE\n📱 DEVICE: CH-AB12\nLAST SMS: [SWIGGY] OTP: 123456 | 07-11-2026 | 05:41 pm';
+  const hathiParsed = tg.parseTelegramNumberCard(hathiCard);
+  ok(hathiParsed?.phone === '9876543210', 'Hathi card: NUMBER parse hua');
+  ok(tg.extractTelegramOtpFromText(hathiCard) === '123456', 'Hathi card: OTP parse hua');
+  const hathiWelcome = [{ text: 'WELCOME', buttons: ['SEARCH NUMBER', 'ACTIVE NUMBERS', 'FIND NUMBER'] }];
+  const hathiClaim = tg._selectHermesLatestScreenAction(hathiWelcome, { mode: 'claim', profileId: 'hathi' });
+  ok(hathiClaim?.role === 'find' && hathiClaim.buttonText === 'FIND NUMBER',
+    'Hathi: welcome par FIND NUMBER hi click hota hai (SEARCH/ACTIVE nahi)');
+  const hathiNumScreen = [{ text: hathiCard, buttons: ['NEW NUMBER', 'REFRESH'] }];
+  const hathiNew = tg._selectHermesLatestScreenAction(hathiNumScreen, { mode: 'claim', profileId: 'hathi' });
+  ok(hathiNew?.role === 'new' && hathiNew.buttonText === 'NEW NUMBER', 'Hathi: number card par NEW NUMBER priority');
+  const hathiRefresh = tg._selectHermesLatestScreenAction(hathiNumScreen, { mode: 'refresh', phone: '9876543210', profileId: 'hathi' });
+  ok(hathiRefresh?.role === 'refresh' && hathiRefresh.buttonText === 'REFRESH', 'Hathi: OTP check par REFRESH click');
+  tg.setActiveOtpBotProfile('hathi');
+  const cfgHathi = tg.getTelegramOtpConfig({ TELEGRAM_API_ID: '1', TELEGRAM_API_HASH: 'h', TELEGRAM_SESSION: 's' });
+  ok(cfgHathi.botUsername === 'Hathi_otp_bot' && cfgHathi.otpBotProfile === 'hathi',
+    'Hathi: config usi bot ka username deta hai');
+  tg.resetActiveOtpBotProfile();
+
   // Settings enum
   const bsMod = await import('./bot-settings.js');
   ok(bsMod.getSetting('otpBotProfile') === 'hermes', 'settings: default OTP bot Hermes');
   ok(bsMod.setSetting('otpBotProfile', 'chauhan').ok === true && bsMod.getSetting('otpBotProfile') === 'chauhan',
     'settings: OTP bot switch save hota hai');
   ok(bsMod.setSetting('otpBotProfile', 'random').ok === false, 'settings: galat OTP bot reject');
-  ok(bsMod.fmtSetting('otpBotProfile') === 'HardXotp', 'settings: fmt label HardXotp');
+  ok(bsMod.setSetting('otpBotProfile', 'hathi').ok === true && bsMod.fmtSetting('otpBotProfile') === 'Hathi',
+    'settings: Hathi bhi valid OTP bot hai');
+  ok(bsMod.setSetting('otpBotProfile', 'chauhan').ok === true && bsMod.fmtSetting('otpBotProfile') === 'HardXotp',
+    'settings: fmt label HardXotp');
   bsMod.setSetting('otpBotProfile', 'hermes');
   ok(typeof store.getDb === 'function', 'store available');
 
@@ -2699,11 +2741,10 @@ console.log('START source picker + Delete All Firebase:');
   const freshBotSource = await fsp.readFile(new URL('./fresh-bot.js', import.meta.url), 'utf8');
   const engineSource = await fsp.readFile(new URL('./autopilot-engine.js', import.meta.url), 'utf8');
 
-  ok(freshBotSource.includes("bot.action(/^ap_start_go_(hermes|chauhan|firebase)$/")
-    && freshBotSource.includes("callback_data: 'ap_start_go_hermes'")
-    && freshBotSource.includes("callback_data: 'ap_start_go_chauhan'")
-    && freshBotSource.includes("callback_data: 'ap_start_go_firebase'"),
-  'START par source picker wiring (Hermes / HardXotp / Firebase)');
+  ok(freshBotSource.includes('ap_start_go_${profile.id}')
+    && freshBotSource.includes("callback_data: 'ap_start_go_firebase'")
+    && freshBotSource.includes('otpBotProfiles.OTP_BOT_PROFILE_IDS.join'),
+  'START par source picker wiring (saare OTP bots + Firebase, list se auto)');
   ok(freshBotSource.includes("callback_data: 'ap_src_delete_all'")
     && freshBotSource.includes("bot.action('ap_src_delete_all_yes'"),
   'START/source screen par Delete All Firebase wiring');

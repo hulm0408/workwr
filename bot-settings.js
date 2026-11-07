@@ -19,10 +19,11 @@ const SPECS = {
   telegramOtpMode:   { bool: true, dflt: false, label: '📨 Telegram Hermes mode (number + OTP Telegram bot se)' },
   telegramOtpTimeoutMs: { min: 5000, max: 180000, dflt: 20000, label: 'Hermes OTP Refresh budget (ms)' },
   telegramOtpRefreshMs: { min: 1000, max: 15000, dflt: 2500, label: 'Hermes Refresh interval (ms)' },
-  // Kaunsa OTP bot — 'hermes' (@HermeshuOTPROBOT) ya 'chauhan' (@HardXotp_Bot).
-  // START par owner jo chunta hai wahi yahan save ho jata hai.
-  otpBotProfile:     { dflt: 'hermes', label: '📨 OTP bot (hermes = @HermeshuOTPROBOT, chauhan = @HardXotp_Bot)',
-                       enum: ['hermes', 'chauhan'] },
+  // Kaunsa OTP bot — 'hermes' (@HermeshuOTPROBOT), 'hathi' (@Hathi_otp_bot)
+  // ya 'chauhan' (@HardXotp_Bot). START par owner jo chunta hai wahi yahan
+  // save ho jata hai.
+  otpBotProfile:     { dflt: 'hermes', label: '📨 OTP bot (hermes = @HermeshuOTPROBOT, hathi = @Hathi_otp_bot, chauhan = @HardXotp_Bot)',
+                       enum: ['hermes', 'hathi', 'chauhan'] },
 };
 
 const ENV_MAP = {
@@ -114,7 +115,7 @@ export function settingsSpecs() {
 export function fmtSetting(key) {
   const v = getSetting(key);
   if (key === 'allowOffline' || key === 'telegramOtpMode') return v ? 'ON' : 'OFF';
-  if (key === 'otpBotProfile') return v === 'chauhan' ? 'HardXotp' : 'Hermes';
+  if (key === 'otpBotProfile') return { hermes: 'Hermes', hathi: 'Hathi', chauhan: 'HardXotp' }[v] || 'Hermes';
   if (key === 'gapMs' || key === 'backoffMs' || key === 'otpWaitMs' || key === 'otpTimeoutMs' || key === 'telegramOtpTimeoutMs' || key === 'telegramOtpRefreshMs') {
     return v >= 60000 ? `${Math.round(v / 60000)} min` : `${Math.round(v / 1000)}s`;
   }

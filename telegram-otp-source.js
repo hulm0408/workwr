@@ -1,9 +1,10 @@
-// ===== 📨 TELEGRAM Hermes NUMBER + OTP SOURCE =====
+// ===== 📨 TELEGRAM OTP BOT NUMBER + OTP SOURCE =====
 //
 // Hamara normal Telegraf/Bot API bot kisi doosre Telegram bot ko message
-// ya callback-click nahi bhej sakta. Isliye @HermeshuOTPROBOT ko automate
-// karne ke liye ek SPARE Telegram user account ko MTProto (Teleproto) se
-// connect karna padta hai:
+// ya callback-click nahi bhej sakta. Isliye OTP bots (@HermeshuOTPROBOT,
+// @Hathi_otp_bot, @HardXotp_Bot — profiles: otp-bot-profiles.js) ko
+// automate karne ke liye ek SPARE Telegram user account ko MTProto
+// (Teleproto) se connect karna padta hai:
 //
 //   Find Number → number parse → Swiggy OTP send (pipeline) →
 //   Refresh (default 20s) → OTP mile to wahi purana verify/register flow →

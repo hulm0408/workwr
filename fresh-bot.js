@@ -374,7 +374,7 @@ const settingsRows = () => [
   [{ text: `📨 Telegram mode: ${bs.fmtSetting('telegramOtpMode')}`, callback_data: 'ap_toggle_telegram', style: 'primary' }],
   [{ text: `🤖 OTP bot: ${bs.fmtSetting('otpBotProfile')}`, callback_data: 'ap_pick_otp_bot', style: 'primary' }],
   [{ text: '👤 Add Telegram Account', callback_data: 'ap_telegram_account', style: 'success' }],
-  [{ text: '🧪 Test Hermes', callback_data: 'ap_test_hermes' }, { text: '🗑 Remove Telegram', callback_data: 'ap_remove_telegram', style: 'danger' }],
+  [{ text: `🧪 Test ${activeOtpBotLabel()}`, callback_data: 'ap_test_hermes' }, { text: '🗑 Remove Telegram', callback_data: 'ap_remove_telegram', style: 'danger' }],
   ...(isTelegramNumberSource() ? [[
     { text: `⏳ OTP wait: ${bs.fmtSetting('telegramOtpTimeoutMs')}`, callback_data: 'ap_pick_telegram_wait' },
     { text: `🔄 Refresh: ${bs.fmtSetting('telegramOtpRefreshMs')}`, callback_data: 'ap_pick_telegram_refresh' },
@@ -751,17 +751,14 @@ function otpBotChoiceRows() {
   const fbCount = (() => { try { return sources.listSources().length; } catch { return 0; } })();
   const ready = status.configured ? '✅' : '⚙️';
   const activeProfile = bs.getSetting('otpBotProfile');
+  // Rows profile list se banti hain — naya bot add karte hi yahan khud aata hai.
+  const botRows = otpBotProfiles.listOtpBotProfiles().map((profile) => [{
+    text: `${ready} ${profile.emoji || '📨'} ${profile.label} bot${activeProfile === profile.id ? ' ✓' : ''}`,
+    callback_data: `ap_start_go_${profile.id}`,
+    style: 'success',
+  }]);
   return [
-    [{
-      text: `${ready} 📨 Hermes bot${activeProfile === 'hermes' ? ' ✓' : ''}`,
-      callback_data: 'ap_start_go_hermes',
-      style: 'success',
-    }],
-    [{
-      text: `${ready} 🔐 HardXotp bot${activeProfile === 'chauhan' ? ' ✓' : ''}`,
-      callback_data: 'ap_start_go_chauhan',
-      style: 'success',
-    }],
+    ...botRows,
     [{ text: `🔥 Firebase (${fbCount})`, callback_data: 'ap_start_go_firebase', style: 'primary' }],
     [{ text: '🗑 Delete All Firebase', callback_data: 'ap_src_delete_all', style: 'danger' }],
     [{ text: '↩️ Back', callback_data: 'ap_home' }],
@@ -771,15 +768,13 @@ function otpBotChoiceRows() {
 function startSourceCard() {
   const status = telegramProviderStatus();
   const fbCount = (() => { try { return sources.listSources().length; } catch { return 0; } })();
-  const hermes = otpBotProfiles.getOtpBotProfile('hermes');
-  const chauhan = otpBotProfiles.getOtpBotProfile('chauhan');
+  const botLines = otpBotProfiles.listOtpBotProfiles().flatMap((profile) => ([
+    `${status.configured ? '✅' : '⚙️'} <b>${profile.emoji || '📨'} ${esc(profile.label)} bot</b> — <code>@${esc(profile.username)}</code>`,
+    sub(profile.hint),
+    '',
+  ]));
   return section('🚀 Batch Kahan Se Chalega?', [
-    `${status.configured ? '✅' : '⚙️'} <b>📨 Hermes bot</b> — <code>@${esc(hermes.username)}</code>`,
-    sub(`NEW NUMBER → otp → wait → REFRESH`),
-    '',
-    `${status.configured ? '✅' : '⚙️'} <b>🔐 HardXotp bot</b> — <code>@${esc(chauhan.username)}</code>`,
-    sub(`GET NUMBERS → assigned number → otp khud aata hai → VIEW MESSAGES`),
-    '',
+    ...botLines,
     `${fbCount ? '✅' : '⚙️'} <b>🔥 Firebase</b> — ${fbCount} ACTIVE source`,
     sub('Pool/device scan + SMS inbox'),
     '',
@@ -813,9 +808,10 @@ async function launchBatch(ctx, opts = {}) {
   // START picker se aaya source: settings yahin lock karo taaki engine,
   // pipeline aur UI — teeno ek hi source par rahein.
   const chosen = String(opts.source || '').trim().toLowerCase();
-  if (chosen === 'hermes' || chosen === 'chauhan') {
+  if (otpBotProfiles.isOtpBotProfileId(chosen)) {
     try { bs.setSetting('otpBotProfile', chosen); } catch {}
     try { bs.setSetting('telegramOtpMode', true); } catch {}
+    try { telegramOtp.setActiveOtpBotProfile(chosen); } catch {}
   } else if (chosen === 'firebase') {
     try { bs.setSetting('telegramOtpMode', false); } catch {}
   }
@@ -880,7 +876,7 @@ async function launchBatch(ctx, opts = {}) {
 
   // START picker ne jo chuna woh env NUMBER_SOURCE ko bhi override karta hai
   // (user ka explicit choice). Khali ho to purana resolve logic chalta hai.
-  const explicitMode = (chosen === 'hermes' || chosen === 'chauhan')
+  const explicitMode = otpBotProfiles.isOtpBotProfileId(chosen)
     ? 'telegram'
     : (chosen === 'firebase' ? 'firebase' : '');
   const lockedSourceMode = explicitMode || resolvedNumberSourceMode();
@@ -1142,7 +1138,7 @@ bot.command('session', async (ctx) => {
 bot.action('ap_start', showStartSourcePicker);
 // Engine ke rows premium callback names bhi bhejta hai — same kaam, same handler
 bot.action('prem_batch_start', showStartSourcePicker);
-bot.action(/^ap_start_go_(hermes|chauhan|firebase)$/, async (ctx) => {
+bot.action(new RegExp(`^ap_start_go_(${otpBotProfiles.OTP_BOT_PROFILE_IDS.join('|')}|firebase)$`), async (ctx) => {
   await launchBatch(ctx, { source: ctx.match[1] });
 });
 
@@ -1997,7 +1993,7 @@ bot.action('ap_toggle_offline', async (ctx) => {
 // ---------------------------------------------------------------------------
 // 📨 Telegram Hermes settings — mode, timing, spare-account login/test/remove
 // ---------------------------------------------------------------------------
-// 🤖 Kaunsa OTP bot — Hermes ya HardXotp (dono ek hi spare session se).
+// 🤖 Kaunsa OTP bot — Hermes / Hathi / HardXotp (sab ek hi spare session se).
 bot.action('ap_pick_otp_bot', async (ctx) => {
   if (!(await gate(ctx))) return;
   if (isAutopilotRunning()) {
@@ -2006,29 +2002,30 @@ bot.action('ap_pick_otp_bot', async (ctx) => {
   }
   await ctx.answerCbQuery().catch(() => {});
   const current = bs.getSetting('otpBotProfile');
-  const hermes = otpBotProfiles.getOtpBotProfile('hermes');
-  const chauhan = otpBotProfiles.getOtpBotProfile('chauhan');
+  const botLines = otpBotProfiles.listOtpBotProfiles().flatMap((profile) => ([
+    `${current === profile.id ? '✅' : '▫️'} <b>${profile.emoji || '📨'} ${esc(profile.label)}</b> — <code>@${esc(profile.username)}</code>`,
+    sub(profile.hint),
+    '',
+  ]));
   const text = section('🤖 OTP Bot Chuno', [
     `Abhi: <b>${esc(bs.fmtSetting('otpBotProfile'))}</b>`,
     ``,
-    `${current === 'hermes' ? '✅' : '▫️'} <b>📨 ${esc(hermes.label)}</b> — <code>@${esc(hermes.username)}</code>`,
-    sub(hermes.hint),
-    '',
-    `${current === 'chauhan' ? '✅' : '▫️'} <b>🔐 ${esc(chauhan.label)}</b> — <code>@${esc(chauhan.username)}</code>`,
-    sub(chauhan.hint),
-    '',
-    sub('Dono same spare Telegram account/session se chalte hain; sirf buttons badalte hain.'),
+    ...botLines,
+    sub('Sab same spare Telegram account/session se chalte hain; sirf buttons badalte hain.'),
   ].join('\n'));
   const rows = [
-    [{ text: `${current === 'hermes' ? '✅ ' : ''}📨 Hermes`, callback_data: 'ap_set_otp_bot_hermes', style: 'success' }],
-    [{ text: `${current === 'chauhan' ? '✅ ' : ''}🔐 HardXotp`, callback_data: 'ap_set_otp_bot_chauhan', style: 'success' }],
+    ...otpBotProfiles.listOtpBotProfiles().map((profile) => [{
+      text: `${current === profile.id ? '✅ ' : ''}${profile.emoji || '📨'} ${profile.label}`,
+      callback_data: `ap_set_otp_bot_${profile.id}`,
+      style: 'success',
+    }]),
     [{ text: '↩️ Settings', callback_data: 'ap_settings', style: 'primary' }],
   ];
   await ctx.editMessageText(text, kb(rows))
     .catch(async () => { await ctx.reply(text, kb(rows)).catch(() => {}); });
 });
 
-bot.action(/^ap_set_otp_bot_(hermes|chauhan)$/, async (ctx) => {
+bot.action(new RegExp(`^ap_set_otp_bot_(${otpBotProfiles.OTP_BOT_PROFILE_IDS.join('|')})$`), async (ctx) => {
   if (!(await gate(ctx))) return;
   if (isAutopilotRunning()) {
     await ctx.answerCbQuery('⏳ Batch chal raha hai — pehle STOP karo.', { show_alert: true }).catch(() => {});

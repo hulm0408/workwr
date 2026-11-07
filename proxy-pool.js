@@ -1,3 +1,4 @@
+import * as instanceShard from './instance-shard.js';
 // ===== 🔀 PROXY POOL — "rukna hi na pare" ka asli tod (IP rotation) =====
 //
 // Asli problem: Swiggy ka WAF / rate-limit IP ko block karta hai, number ko
@@ -236,8 +237,14 @@ export function pickProxy({ excludeIds = [], requireToken = false, reserveFor = 
   if (!state.enabled) return null;
   const now = Date.now();
   const reserveOwner = String(reserveFor || '');
+  // Multi-instance: har instance ko proxies ka apna slice. Warna 4 bots ek hi
+  // IP par Swiggy ko hit karte hain aur per-IP rate-limit sabko ek saath lagta
+  // hai. INSTANCE_COUNT unset ho to filter kuch nahi karta (purana behaviour).
+  const shardEnough = state.list.filter((p) => p.enabled && instanceShard.ownsProxy(p)).length;
+  const shardActive = instanceShard.shardConfig().enabled && shardEnough > 0;
   const baseCandidates = state.list.filter(
-    (p) => p.enabled && !excludeIds.includes(p.id) &&
+    (p) => (!shardActive || instanceShard.ownsProxy(p)) &&
+      p.enabled && !excludeIds.includes(p.id) &&
       (!proxyReservations.has(p.id) || proxyReservations.get(p.id) === reserveOwner) &&
       !((Number(runtime.get(p.id)?.cooldownUntil) || 0) > now) &&
       (Number(runtime.get(p.id)?.consecutiveErrors) || 0) < 3 &&

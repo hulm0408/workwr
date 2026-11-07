@@ -72,6 +72,7 @@ const { esc, section, sub, field, mono, statusCard } = await import('./rich-text
 const { createServer } = await import('node:http');
 const { startKeepAlive } = await import('./keep-alive.js');
 const instanceInfo = await import('./instance-info.js');
+const instanceShard = await import('./instance-shard.js');
 
 // ---------------------------------------------------------------------------
 // Process guards — ek stray async error poore bot ko NA maare.
@@ -116,6 +117,7 @@ function buildHealthPayload() {
     ready: runtimeHealth.telegramReady,
     service: 'swiggy-fresh-bot',
     instance: instanceInfo.getInstanceLabel(),
+    shard: instanceShard.shardSummary(),
     now: new Date().toISOString(),
     uptimeSec: Math.floor((Date.now() - runtimeHealth.bootAt) / 1000),
     batchRunning: Boolean(snap.running),
@@ -129,6 +131,7 @@ function buildHealthPayload() {
       apiOkAt: runtimeHealth.telegramApiOkAt || 0,
       apiFailures: runtimeHealth.telegramApiFailures || 0,
       lastError: runtimeHealth.lastTelegramError || '',
+      sessionTag: (() => { try { return telegramOtp.telegramSessionTag(); } catch { return ''; } })(),
       updates: runtimeHealth.telegramUpdates || 0,
       lastUpdateAt: runtimeHealth.lastTelegramUpdateAt || 0,
     },
@@ -711,35 +714,69 @@ async function deliverSessionJson(chatId, { phone, accountKey, kind, account, no
 
   const jsonText = JSON.stringify(exportData, null, 2);
   const filename = `${phone || accountKey || 'session'}.json`;
-  let lastDocumentError = null;
+  const sent = await sendSessionFile(chatId, { jsonText, filename, caption });
+  if (sent.ok) return true;
 
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    try {
-      await bot.telegram.sendDocument(chatId,
-        { source: Buffer.from(jsonText, 'utf8'), filename },
-        { caption, parse_mode: 'HTML' });
-      return true;
-    } catch (e) {
-      lastDocumentError = e;
-      console.warn(`[FreshBot] session file send (try ${attempt}/3):`, e?.message);
-      if (attempt < 3) await new Promise((resolve) => setTimeout(resolve, attempt * 800));
+  // Document attach nahi hua. Pehle owner ne bola tha "JSON turant chat me" —
+  // lekin raw JSON ke 4 tukde bikhar kar aana padhne layak nahi tha. Isliye
+  // ab saaf message + retry ka rasta, aur text-fallback sirf opt-in.
+  console.warn(`[FreshBot] session file attach fail: ${sent.error || 'unknown'}`);
+  const reason = esc(String(sent.error || 'unknown error').slice(0, 160));
+  if (String(process.env.JSON_TEXT_FALLBACK || '') === '1') {
+    const chunks = splitJsonForTelegram(jsonText);
+    let okChunks = 0;
+    for (let i = 0; i < chunks.length; i++) {
+      const heading = i === 0
+        ? `${caption}\n\n<i>File attach fail (${reason}) — JSON neeche ${chunks.length} hissoun me.</i>`
+        : `<b>${esc(filename)}</b> — hissa ${i + 1}/${chunks.length}`;
+      const msg = await bot.telegram.sendMessage(chatId, `${heading}\n\n<pre>${esc(chunks[i])}</pre>`, { parse_mode: 'HTML' })
+        .catch((e) => { console.warn(`[FreshBot] session JSON chunk ${i + 1}/${chunks.length}:`, e?.message); return null; });
+      if (msg) okChunks++;
+    }
+    return okChunks === chunks.length;
+  }
+
+  await bot.telegram.sendMessage(chatId, [
+    `⚠️ <b>Session ban gaya, par .json file attach nahi hui</b>`,
+    `📱 ${mono(phone || '')} · 👤 ${mono(accountKey || '')}`,
+    `<i>Telegram error: ${reason}</i>`,
+    ``,
+    `<b>JSON lo:</b> /session ${esc(phone || accountKey || '')}`,
+    '<i>(session bot DB me safe hai — kuch loss nahi hua)</i>',
+  ].join('\n'), { parse_mode: 'HTML' }).catch(() => {});
+  return false;
+}
+
+// -----------------------------------------------------------------------------
+// .json file delivery — teen payload shapes + plain-caption retry.
+// Pehle sirf ek shape try hoti thi; wo fail hote hi JSON text ke 4 tukde
+// chat me bikhar jate the ("JSON hissa 3/4"). Ab har shape try hoti hai aur
+// aakhri fallback saaf message hai (raw text nahi, jab tak
+// JSON_TEXT_FALLBACK=1 na ho).
+// -----------------------------------------------------------------------------
+async function sendSessionFile(chatId, { jsonText = '', filename = 'session.json', caption = '' } = {}) {
+  const buffer = Buffer.from(String(jsonText || ''), 'utf8');
+  const attempts = [
+    { label: 'buffer+filename', doc: buffer, extra: { filename } },
+    { label: 'source+filename', doc: { source: buffer, filename }, extra: {} },
+    { label: 'value+filename', doc: { value: buffer, filename }, extra: {} },
+  ];
+  let lastError = '';
+  for (const attempt of attempts) {
+    for (const withHtml of [true, false]) {
+      try {
+        await bot.telegram.sendDocument(chatId, attempt.doc, {
+          ...attempt.extra,
+          ...(caption ? { caption, ...(withHtml ? { parse_mode: 'HTML' } : {}) } : {}),
+        });
+        return { ok: true, shape: attempt.label, html: withHtml };
+      } catch (e) {
+        lastError = `${attempt.label}${withHtml ? ' (html)' : ' (plain)'}: ${String(e?.message || e).slice(0, 160)}`;
+        console.warn(`[FreshBot] sendDocument ${lastError}`);
+      }
     }
   }
-
-  const chunks = splitJsonForTelegram(jsonText);
-  let sentChunks = 0;
-  for (let i = 0; i < chunks.length; i++) {
-    const heading = i === 0
-      ? `${caption}\n\n<i>Document send fail (${esc(String(lastDocumentError?.message || 'unknown error').slice(0, 160))}) — JSON neeche hissa ${i + 1}/${chunks.length} me bhej raha hoon.</i>`
-      : `<b>${esc(filename)}</b> — JSON hissa ${i + 1}/${chunks.length}`;
-    const sent = await bot.telegram.sendMessage(
-      chatId,
-      `${heading}\n\n<pre>${esc(chunks[i])}</pre>`,
-      { parse_mode: 'HTML' }
-    ).catch((e) => console.warn(`[FreshBot] session JSON chunk ${i + 1}/${chunks.length}:`, e?.message));
-    if (sent) sentChunks++;
-  }
-  return sentChunks === chunks.length;
+  return { ok: false, error: lastError };
 }
 
 // ---------------------------------------------------------------------------
@@ -921,7 +958,15 @@ bot.help((ctx) => ctx.reply('/start — menu · /status — current batch · /di
 async function diagCard() {
   const lines = [];
   lines.push(field('Node', process.version));
-  lines.push(field('🏷 Instance', instanceInfo.getInstanceLabel()));
+  {
+    const shard = instanceShard.shardSummary();
+    lines.push(field('🏷 Instance', shard.enabled
+      ? `${shard.label} · pool ka hissa ${shard.share}`
+      : `${shard.label} · akela (INSTANCE_COUNT set nahi)`));
+    if (shard.enabled) {
+      lines.push(field('🧩 Shard', `pool ${shard.count} hisson me · ye #${shard.index + 1} · proxies bhi isi hisse ki`));
+    }
+  }
   lines.push(field('⏰ Uptime', fmtDuration(Date.now() - runtimeHealth.bootAt)));
   {
     const ka = keepAliveHandle?.getState?.() || { enabled: false, reason: 'not-started' };
@@ -954,6 +999,8 @@ async function diagCard() {
     const runSnap = getAutopilotSnapshot();
     const botName = String(status.botUsername || 'HermeshuOTPROBOT').replace(/^@+/, '');
     lines.push(field('📨 Number source', `Telegram only — Hermes @${esc(botName)}`));
+    const tag = (() => { try { return telegramOtp.telegramSessionTag(); } catch { return ''; } })();
+    if (tag) lines.push(field('🔑 Session tag', `${mono(tag)} <i>(do bots par same tag = ek hi account → conflict)</i>`));
     lines.push(field('👤 Telegram account', status.configured
       ? `✅ configured${status.me ? ` — ${esc(status.me)}` : ''} · API ${status.apiIdPresent && status.apiHashPresent ? '✅' : '❌'} · session ${status.sessionPresent ? '✅' : '❌'}`
       : `❌ setup pending${status.missing?.length ? ` — missing ${esc(status.missing.join(', '))}` : ''} · Settings → Add Telegram Account`));
@@ -2448,6 +2495,20 @@ process.once('SIGTERM', () => shutdown('SIGTERM'));
 {
   const nodeMajor = Number(String(process.versions.node).split('.')[0]) || 0;
   console.log(`[FreshBot] 🏷 Instance: ${instanceInfo.getInstanceLabel()}${instanceInfo.isSecondaryInstance() ? ' (doosra bot — INSTANCE_LABEL env se)' : ''}`);
+  {
+    const shard = instanceShard.shardSummary();
+    if (shard.enabled) {
+      console.log(`[FreshBot] 🧩 Shard: pool/proxies ko ${shard.count} hisson me baanta — ye hissa ${shard.share} (INSTANCE_COUNT=${shard.count}, INSTANCE_INDEX=${shard.index})`);
+    } else if (instanceInfo.isSecondaryInstance()) {
+      console.warn('[FreshBot] ⚠️ INSTANCE_LABEL set hai par INSTANCE_COUNT nahi — agar kai bots ek hi Firebase pool/proxy par chal rahe hain to wo ek doosre se ladenge (same numbers, same IPs, same OTP). Fix: har instance me INSTANCE_COUNT=<kul bots> daalo (e.g. 4).');
+    }
+  }
+  {
+    try {
+      const tag = telegramOtp.telegramSessionTag();
+      if (tag) console.log(`[FreshBot] 🔑 Telegram session tag: ${tag} — DOOSRE bot par bhi yahi tag dikhe to wo ek hi spare account hai (OTP races + session conflict). Har bot ka apna account chahiye.`);
+    } catch {}
+  }
   console.log(`[FreshBot] Node ${process.version}${nodeMajor < 20 ? '  ⚠️ Node 20+ chahiye — nodejs.org se update karo, warna kuch bhi kabhi bhi toot sakta hai!' : ''}`);
   try {
     const c = getChromeStatus();

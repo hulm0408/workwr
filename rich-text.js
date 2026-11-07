@@ -32,13 +32,15 @@ export function mono(value) {
   return `<code>${esc(value)}</code>`;
 }
 
-export function progressBar(done = 0, total = 0, width = 12) {
+// Reference-style bar: soft blocks + percentage, numbers chhote rakho.
+export function progressBar(done = 0, total = 0, width = 10) {
   const safeTotal = Math.max(0, Number(total) || 0);
   const safeDone = Math.max(0, Number(done) || 0);
-  const filled = safeTotal > 0
-    ? Math.min(width, Math.round((Math.min(safeDone, safeTotal) / safeTotal) * width))
-    : 0;
-  return mono(`${'█'.repeat(filled)}${'░'.repeat(Math.max(0, width - filled))} ${safeDone}/${safeTotal}`);
+  const ratio = safeTotal > 0 ? Math.min(safeDone, safeTotal) / safeTotal : 0;
+  const filled = Math.min(width, Math.round(ratio * width));
+  const percent = Math.round(ratio * 100);
+  const bar = `${'▰'.repeat(filled)}${'▱'.repeat(Math.max(0, width - filled))}`;
+  return `${mono(`${bar} ${percent}%`)} <i>${safeDone}/${safeTotal}</i>`;
 }
 
 // Ek hi compact status card: title + flow + abhi kya ho raha hai + progress.

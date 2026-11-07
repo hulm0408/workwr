@@ -152,13 +152,39 @@ vault branch — aur (free plan par) **alag Render account**.
 - **Telegram account:** har bot ko **apna** spare Telegram account. Teen bots
   ke liye teen spare accounts. Warna us bot ko **Firebase-only** mode me
   chalao (Telegram login ki zaroorat nahi).
-- **Firebase pool (sabse important):** saare bots ek hi Firebase DB se number
-  uthayenge. 4 instances × 10 lanes = **40 lanes** ek hi pool par → numbers
-  jaldi khatam, Swiggy rate-limit, aur accounts ke naam par collisions.
-  Isliye multi-bot setup me:
-  - har instance me **Settings → 🚦 Parallel lanes** ghatakar 3–4 karo, ya
-  - har bot ko **alag Firebase DB** do (Settings → 🔥 Firebase), ya
-  - bots ko **alag-alag time window** me chalao (ek subah, ek raat).
+- **Firebase pool + proxies (sabse important):** saare bots ek hi Firebase DB
+  aur ek hi proxy list par chalenge. 4 instances × 10 lanes = **40 lanes** ek
+  hi pool/IP par → numbers jaldi khatam, per-IP Swiggy rate-limit, aur wahi
+  numbers do bots me. **Iska code-level fix sharding hai** (neeche), warna
+  "4 bot milkar 1 bot se bhi kam" hi hota hai.
+
+### 🧩 Multi-bot sharding (zaroori — warna bots aapas me ladte hain)
+
+Har instance me bas **do** env:
+
+```
+INSTANCE_LABEL=bot2     # ya bot3 / bot4 / main
+INSTANCE_COUNT=4        # kul kitne bots ek saath chal rahe hain
+```
+
+Iske baad (automatically):
+
+- **Numbers:** pool 4 hisson me baant diya jata hai — har bot apna hissa uthata
+  hai, koi number do bots ko nahi milta. Slice **stable** hai (restart par wahi
+  hissa), aur chaaron milkar poora pool cover karte hain.
+- **Proxies:** same tarah — har bot ko proxy list ka apna slice. Isse per-IP
+  rate-limit ek bot par lagti hai, poore setup par nahi.
+- **Lanes:** `10 / INSTANCE_COUNT` par cap (4 bots → 3 lanes each), taaki
+  total lanes 40 na ho jayein. Settings se kam kar sakte ho, badha bhi
+  (cap sirf chhat hai).
+- **`/diag`** me `🧩 Shard` line dikhti hai; live card par `🧩 SHARE 2/4`;
+  `/health` JSON me `"shard":{"index":1,"count":4,"share":"2/4"}`.
+
+**Ek aur cheez jo code se fix nahi hoti:** har bot ka **apna spare Telegram
+account** hona chahiye. Do bots ek hi account par = OTP races, `FLOOD_WAIT`,
+session revoke — isi liye "sab larre" wali feeling aati hai. Ab `/diag` me
+**`🔑 Session tag`** dikhta hai (10-char fingerprint, session khud nahi):
+do bots par **same tag** = wahi account, turant alag karo.
 
 > Har bot ka `BOT_TOKEN` sirf uske apne hosting ke env me rahe — chat,
 > screenshot, GitHub me kabhi nahi.

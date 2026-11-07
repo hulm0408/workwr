@@ -19,6 +19,7 @@
 // Engine process-singleton hai: dono bots (main + autopilot) isi state ko dekhte hain.
 
 import { isFirebaseConfigured, firebaseSetupHintLines, listPoolNumbers, scanFreshDevices, _countDeviceOnlineStates } from './firebase-numbers.js';
+import * as instanceShard from './instance-shard.js';
 import {
   applyActiveSource,
   applySourceForRun,
@@ -912,6 +913,7 @@ export function formatCompactAutopilotCard(snap = state, { stageText = '', final
     progressBar(fresh, target),
     `📱 ${mono(phoneText)} · ⏱ ${mono(fmtDuration(compactElapsedMs(s)))}${rateText(s) ? ` · ${rateText(s)}` : ''}${s.sourceMode !== 'telegram' && (s.concurrency || 1) > 1 ? ` · ⚡ ${mono(`${Number(s.activeWorkers) || active.length}/${Number(s.concurrency) || 1}`)}` : ''}`,
     compactSourceLine(s),
+    s.shardEnabled ? `🧩 ${mono(`SHARE ${s.shardShare || ''}`)} <i>· pool ka apna hissa, koi ladai nahi</i>` : '',
     `✅ ${mono(`FRESH ${fresh}`)} · ⚙ ${mono(`DONE ${Number(s.processed) || 0}`)} · × ${mono(`FAIL ${Number(s.failed) || 0}`)}${retries ? ` · ↻ ${mono(`RETRY ${retries}`)}` : ''}${Number(s.manualSkips) ? ` · ⏭ ${mono(`SKIP ${Number(s.manualSkips) || 0}`)}` : ''}${fresh ? ` · 🏠 ${mono(`ADDR ${Number(s.addressAdded) || 0}/${fresh}`)}` : ''}`,
     final
       ? (fresh ? sub('Fresh JSON chat me bhej diye hain.') : sub('Is run me fresh session nahi bana.'))
@@ -1050,6 +1052,13 @@ export async function startAutopilot(opts = {}) {
   const requestedConcurrency = normalizeBatchConcurrency(
     opts.concurrency ?? s('concurrency', envInt('PREMIUM_BATCH_CONCURRENCY', MAX_AUTOPILOT_LANES))
   );
+  // Multi-instance: 4 bots × 10 lanes = 40 lanes ek hi pool/proxy/IP par.
+  // Shard on hone par lanes ko pool ke hisse ke hisaab se cap karo (user
+  // Settings se kam/zyada kar sakta hai — cap sirf chhat hai).
+  const shardLanesCap = instanceShard.suggestedConcurrency(process.env, requestedConcurrency);
+  const effectiveConcurrency = normalizeBatchConcurrency(
+    shardLanesCap > 0 && shardLanesCap < requestedConcurrency ? shardLanesCap : requestedConcurrency
+  );
   const maxMinutes = Number(opts.maxMinutes || s('maxMinutes', envInt('PREMIUM_BATCH_MAX_MINUTES', 120)));
   const gapMs = Number.isFinite(Number(opts.gapMs)) && Number(opts.gapMs) >= 0
     ? Number(opts.gapMs)
@@ -1123,7 +1132,8 @@ export async function startAutopilot(opts = {}) {
     running: true, stopRequested: false, stopReason: '',
     startedAt: Date.now(), finishedAt: 0,
     target, maxMinutes, gapMs, backoffMs,
-    concurrency: requestedConcurrency, requestedConcurrency, activeWorkers: 0,
+    concurrency: effectiveConcurrency, requestedConcurrency, activeWorkers: 0,
+    shardShare: instanceShard.shardSummary().share, shardEnabled: instanceShard.shardSummary().enabled,
     processed: 0, fresh: 0, freshNew: 0, freshAfterDelete: 0,
     skipped: 0, deferred: 0, cooldownSkips: 0, staleSkips: 0, failed: 0, aborted: 0,
     manualSkips: 0, manualSkipRequests: 0, otpFailures: 0,
@@ -1795,6 +1805,11 @@ export async function startAutopilot(opts = {}) {
     let freshWaitRounds = 0;
     const pickFreshList = () => {
       let list = preferOnline(freshEntriesFrom(pool))
+        // Multi-instance: har bot pool ka apna hissa uthata hai. Warna 4 bots
+        // ek hi number par girte hain aur OTP/Swiggy rate-limit me sab fas
+        // jate hain ("4 bot milkar 1 bot se kam"). INSTANCE_COUNT unset ho to
+        // ye filter kuch nahi karta.
+        .filter((e) => instanceShard.ownsKey(e.phone))
         .filter(underFailCap)
         .filter(underTransientCap)
         .filter(underInfraCap)
@@ -2655,7 +2670,7 @@ export async function startAutopilot(opts = {}) {
     ps = proxyPool.proxySummary();
     laneCount = effectiveAutopilotLanes({
       sourceMode,
-      requested: requestedConcurrency,
+      requested: effectiveConcurrency,
       proxyEnabled: Boolean(ps.enabled),
       enabledProxyCount: ps.enabledCount || 0,
     });

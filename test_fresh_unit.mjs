@@ -1985,8 +1985,9 @@ console.log('telegram Hermes source + Add Telegram Account primitives:');
   // Compact live UI: mono values + ek chhota flow card. Lambi pool/scan
   // diagnostics is card me wapas nahi ghusni chahiye.
   ok(rich.mono('98765<43210&') === '<code>98765&lt;43210&amp;</code>', 'mono helper value ko escape karke <code> me rakhta hai');
-  ok(rich.progressBar(3, 10).includes('3/10') && rich.progressBar(3, 10).includes('█') && rich.progressBar(3, 10).includes('░'), 'progress bar mono blocks + done/total dikhata hai');
-  ok(rich.progressBar(99, 10).includes('99/10') && !rich.progressBar(99, 10).includes('░'), 'progress bar over-target par full rehta hai, crash nahi');
+  ok(rich.progressBar(3, 10).includes('3/10') && rich.progressBar(3, 10).includes('▰') && rich.progressBar(3, 10).includes('▱'), 'progress bar soft blocks + done/total dikhata hai');
+  ok(rich.progressBar(3, 10).includes('30%'), 'progress bar percentage bhi dikhata hai');
+  ok(rich.progressBar(99, 10).includes('99/10') && !rich.progressBar(99, 10).includes('▱'), 'progress bar over-target par full rehta hai, crash nahi');
   ok(rich.statusCard('LIVE', ['one', '', 'two']).includes('<b>LIVE</b>') && !rich.statusCard('LIVE', ['one', '', 'two']).includes('\n\n'), 'statusCard khali lines hata kar compact card banata hai');
   const compactLive = engine.formatCompactAutopilotCard({
     sourceMode: 'telegram', running: true, target: 10, fresh: 2, processed: 3, failed: 1,
@@ -2929,6 +2930,99 @@ console.log('Doosra bot / doosra instance (INSTANCE_LABEL):');
   ok(deployNow2.includes('vercel-monitor') && deployNow2.includes('VERCEL.md'),
     'DEPLOY-NOW: Vercel dashboard route ka link');
   if (passed % 1 === 0) { /* keep counter */ }
+}
+
+// ---------------------------------------------------------------------------
+console.log('Multi-instance shard + JSON file + card polish:');
+{
+  const shard = await import('./instance-shard.js');
+  const fsp = await import('node:fs/promises');
+
+  // Default: sharding OFF (purana behaviour bilkul waisa).
+  ok(shard.shardConfig({}).enabled === false, 'shard: default off (single bot)');
+  ok(shard.ownsKey('9876543210', {}) === true, 'shard: off hone par har number allowed');
+  ok(shard.shardSummary({}).share === 'all', 'shard: off par share = all');
+
+  // bot2/bot3/bot4 → index 1/2/3 of 4
+  ok(shard.instanceIndexFromLabel('bot2', 4) === 1, 'shard: bot2 → index 1');
+  ok(shard.instanceIndexFromLabel('bot3', 4) === 2, 'shard: bot3 → index 2');
+  ok(shard.instanceIndexFromLabel('bot4', 4) === 3, 'shard: bot4 → index 3');
+  ok(shard.instanceIndexFromLabel('main', 4) === 0, 'shard: main → index 0');
+  ok(shard.instanceIndexFromLabel('', 1) === 0 && shard.instanceIndexFromLabel('bot9', 1) === 0,
+    'shard: single instance par index 0');
+
+  const env4 = { INSTANCE_LABEL: 'bot3', INSTANCE_COUNT: '4' };
+  ok(shard.shardConfig(env4).enabled === true && shard.shardConfig(env4).index === 2,
+    'shard: INSTANCE_COUNT + label se config');
+
+  // Deterministic + disjoint: har phone theek ek instance ka.
+  const phones = Array.from({ length: 400 }, (_, i) => `9${String(700000000 + i * 7).slice(0, 9)}`);
+  const owners = new Map();
+  let disjoint = true;
+  for (const label of ['bot2', 'bot3', 'bot4', 'main']) {
+    const env = { INSTANCE_LABEL: label, INSTANCE_COUNT: '4' };
+    for (const phone of phones) {
+      if (!shard.ownsKey(phone, env)) continue;
+      if (owners.has(phone)) { disjoint = false; break; }
+      owners.set(phone, label);
+    }
+  }
+  ok(disjoint === true, 'shard: koi number do instances ko nahi milta (disjoint slices)');
+  ok(owners.size > 200, 'shard: chaar instances milkar pool ke zyadatar numbers cover karte hain');
+
+  // Restart par wahi hissa (stable hash), random nahi.
+  const a1 = phones.filter((p) => shard.ownsKey(p, env4));
+  const a2 = phones.filter((p) => shard.ownsKey(p, { INSTANCE_LABEL: 'bot3', INSTANCE_COUNT: 4 }));
+  ok(a1.join(',') === a2.join(','), 'shard: slice stable hai (restart par same)');
+
+  // Proxy ownership bhi isi hash par.
+  ok(shard.ownsProxy({ url: 'http://1.2.3.4:8000' }, env4) === shard.ownsKey('http://1.2.3.4:8000', env4),
+    'shard: proxy ownership proxy URL par');
+  ok(shard.ownsProxy(null, env4) === true, 'shard: null proxy safe');
+
+  // Lanes cap: 4 bots par 10 lanes → 3
+  ok(shard.suggestedConcurrency({ INSTANCE_COUNT: '4' }, 10) === 3, 'shard: 4 instances par lanes 10 → 3');
+  ok(shard.suggestedConcurrency({ INSTANCE_COUNT: '2' }, 10) === 5, 'shard: 2 instances par lanes 10 → 5');
+  ok(shard.suggestedConcurrency({}, 10) === 10, 'shard: shard off par lanes na chhedo');
+  ok(shard.suggestedConcurrency({ INSTANCE_COUNT: '4' }, 2) === 2, 'shard: user ki chhoti value respect hoti hai');
+
+  // Wiring — pool pick, proxy pick, lanes, health/diag.
+  const engineSrc = await fsp.readFile(new URL('./autopilot-engine.js', import.meta.url), 'utf8');
+  const freshSrc = await fsp.readFile(new URL('./fresh-bot.js', import.meta.url), 'utf8');
+  const proxySrc = await fsp.readFile(new URL('./proxy-pool.js', import.meta.url), 'utf8');
+  ok(engineSrc.includes('instanceShard.ownsKey(e.phone)'), 'shard: pool picking shard-aware');
+  ok(engineSrc.includes('effectiveConcurrency'), 'shard: lanes shard cap se guzarte hain');
+  ok(proxySrc.includes('instanceShard.ownsProxy(p)'), 'shard: proxy pick shard-aware');
+  ok(freshSrc.includes('shard: instanceShard.shardSummary()'), 'shard: /health me shard');
+  ok(freshSrc.includes('🧩 Shard'), 'shard: /diag me shard line');
+  ok(freshSrc.includes('INSTANCE_COUNT nahi'), 'shard: boot par warning jab count set nahi');
+  ok(freshSrc.includes('telegramSessionTag'), 'shard: shared Telegram session detect hota hai');
+
+  // Telegram session tag — chhota fingerprint, poora session kabhi nahi.
+  const tg = await import('./telegram-otp-source.js');
+  const tagA = tg.telegramSessionTag({ TELEGRAM_API_ID: '1', TELEGRAM_API_HASH: 'h', TELEGRAM_SESSION: 'abc' });
+  const tagB = tg.telegramSessionTag({ TELEGRAM_API_ID: '1', TELEGRAM_API_HASH: 'h', TELEGRAM_SESSION: 'xyz' });
+  ok(tagA.length === 10 && tagA !== tagB, 'sessionTag: 10 chars aur sessions alag');
+  ok(!tagA.includes('abc'), 'sessionTag: session value leak nahi hota');
+  ok(tg.telegramSessionTag({}) === '', 'sessionTag: session na ho to khali');
+
+  // JSON delivery — ab scattered text nahi, layered file send.
+  ok(freshSrc.includes('sendSessionFile'), 'json: dedicated file sender');
+  ok(freshSrc.includes("label: 'buffer+filename'") && freshSrc.includes("label: 'source+filename'")
+    && freshSrc.includes("label: 'value+filename'"),
+  'json: teen payload shapes try hoti hain');
+  ok(freshSrc.includes('JSON_TEXT_FALLBACK'), 'json: text-chunks sirf opt-in (default off)');
+  ok(freshSrc.includes('.json file attach nahi hui'), 'json: fail par saaf message + /session retry');
+  ok(!/JSON hissa \$\{i \+ 1\}/.test(freshSrc), 'json: purana "hissa x/y" spam default path se hata');
+
+  // Card polish — percentage bar.
+  const rt = await import('./rich-text.js');
+  const bar = rt.progressBar(5, 10);
+  ok(bar.includes('50%') && bar.includes('▰') && bar.includes('▱'), 'card: progress bar me percentage + soft blocks');
+  const bar0 = rt.progressBar(0, 100);
+  ok(bar0.includes('0%') && bar0.includes('0/100'), 'card: zero par bhi padhne layak');
+  const cardShard = engineSrc.includes('SHARE ${s.shardShare');
+  ok(cardShard, 'card: shard share live card par dikhta hai');
 }
 
 console.log(`\n✅ ALL PASSED — ${passed} checks`);

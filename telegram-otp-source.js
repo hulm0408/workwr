@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 // ===== 📨 TELEGRAM OTP BOT NUMBER + OTP SOURCE =====
 //
 // Hamara normal Telegraf/Bot API bot kisi doosre Telegram bot ko message
@@ -78,6 +79,20 @@ export function getTelegramSessionFilePath(env = process.env) {
   if (explicit) return explicit;
   const dataDir = String(env?.DATA_DIR || 'data').trim() || 'data';
   return `${dataDir.replace(/\/+$/, '')}/telegram.session`;
+}
+
+// Session ka chhota fingerprint (kabhi poora session nahi). Multi-instance me
+// isi se pata chalta hai ki do bots ek hi spare account par chal rahe hain —
+// wahi cheez OTP races, FLOOD_WAIT aur session revoke ki wajah banti hai.
+export function telegramSessionTag(env = process.env) {
+  try {
+    const cfg = getTelegramOtpConfig(env);
+    const material = String(cfg?.session || '').trim();
+    if (!material) return '';
+    return createHash('sha1').update(material).digest('hex').slice(0, 10);
+  } catch {
+    return '';
+  }
 }
 
 export function getTelegramApiCredentialsFilePath(env = process.env) {

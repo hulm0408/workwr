@@ -505,6 +505,9 @@ chalta rehta hai; temporary error par number failed nahi gina jata.
 | `PREMIUM_DEVICE_SCAN_BUDGET_MS` | 12000 | Ek refill me quick scan ka hard time budget; iske baad probed sample ka best ya clients-ONLINE device process hota hai |
 | `PREMIUM_ALLOW_OFFLINE_DEVICES` | — | `1` = offline devices bhi try |
 | `INSTANCE_LABEL` | `main` | Doosre bot/hosting par `bot2` — UI, `/diag` aur `/health` me pehchan |
+| `INSTANCE_COUNT` | `1` | Kai bots ek hi pool/proxy par → kul bots ki ginti (4). Numbers + proxies ka apna hissa, lanes capped |
+| `JSON_TEXT_FALLBACK` | — | `1` = `.json` file attach fail ho to raw JSON text me bhejo (default: saaf message + `/session`) |
+| `TELEGRAM_CALL_TIMEOUT_MS` | `20000` | Boot ke getMe/deleteWebhook ka hard timeout (hang = fail → retry) |
 | `GITHUB_VAULT_BRANCH` | `bot-vault` | Doosre instance ke liye `bot-vault-2` (warna vault overwrite hoga) |
 
 ## Timing expectation

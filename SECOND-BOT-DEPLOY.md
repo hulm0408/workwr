@@ -331,6 +331,17 @@ Dikhne me:
 hoti hai. Faayda: bot **rukta nahi**, same number par OTP **burn nahi hota**,
 aur har number par pehla attempt maximum 1 minute ke andar start hota hai. Lock process memory me rehta hai, redeploy tak.
 
+### 403 OTP security-challenge safety stop
+
+Agar logs me `WAF solver OK` ke baad OTP send par
+`SWIGGY_SECURITY_CHALLENGE` / HTTP 403 aaye, token solver sirf route token
+ready kar paya—OTP endpoint ne phir bhi request roki. Hermes source ab **3
+lagataar security-challenge outcomes** ke baad current batch gracefully end
+karta hai; iske baad naye numbers claim nahi honge. Final reason `/diag`/summary
+me `Swiggy ne 3 baar OTP security challenge diya — batch safety stop` dikhega.
+Official Swiggy app/site verification ya existing session export hi supported
+next step hai; proxy/WAF verification ko bypass karne ki koshish mat karo.
+
 ## 5️⃣ Kya kabhi nahi karna
 
 - ❌ Ek `BOT_TOKEN` do jagah — **409 Conflict**, dono me se ek mar jata hai.

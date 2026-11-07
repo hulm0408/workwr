@@ -576,6 +576,9 @@ export const RATE_LIMIT_QUEUE_RETRY_MS = 5_000;
 // Queue/park karke baad me try karna allowed nahi (ek number = ek hi baar).
 export const NUMBER_DECISION_WINDOW_MS = 60_000;
 
+// Repeated upstream OTP security challenges must stop consuming new numbers.
+export const SECURITY_CHALLENGE_STOP_LIMIT = 3;
+
 export function numberDecisionWindowMs() {
   return NUMBER_DECISION_WINDOW_MS;
 }
@@ -950,7 +953,7 @@ export function formatCompactAutopilotCard(snap = state, { stageText = '', final
     telegram: 'Hermes connection error',
     firebase: s.sourceMode === 'telegram' ? 'Hermes connection error' : 'Firebase error',
     rate_limited: 'Swiggy rate-limit',
-    security_challenge: 'Security challenge rukawat',
+    security_challenge: 'Swiggy ne 3 baar OTP security challenge diya — batch safety stop',
     waf_stuck: 'WAF rukawat',
     circuit_breaker: 'Lagatar failures par safety stop',
   }[s.stopReason] || (s.stopReason ? `Stop: ${s.stopReason}` : 'Batch complete');
@@ -2696,7 +2699,6 @@ export async function startAutopilot(opts = {}) {
     }));
     for (const lane of lanes) ensureLaneRoute(lane);
     syncRouteSummaryState();
-    const securityStormLimit = Math.max(12, laneCount * 3);
     const rotationLimit = 25 * laneCount;
     const wafCooldownLimit = 60 * laneCount;
     console.log(`[Autopilot] ⚡ Parallel lanes ready: ${laneCount}/${requestedConcurrency} (proxy routes ${ps.enabledCount || 0} + direct 1).`);
@@ -3165,12 +3167,12 @@ export async function startAutopilot(opts = {}) {
         const numberRetryLine = telegramMode
           ? 'Ye Hermes number one-shot rule se khatam — route ready karke NEW NUMBER aayega.'
           : 'Ye number khatam — route recovery ke baad naya number aayega.';
-        if (state.wafStrikes >= securityStormLimit) {
-          if (!telegramMode) { requestRunEnd('security_challenge'); break; }
-          // Hermes lane ke liye security storm bhi recovery checkpoint hai;
-          // route rotation/cooldown neeche chalega, batch force-stop nahi.
-          state.wafStrikes = 1;
-          state.workerRecoveries = (state.workerRecoveries || 0) + 1;
+        if (state.wafStrikes >= SECURITY_CHALLENGE_STOP_LIMIT) {
+          // Same HTTP 403 across routes = upstream verification gate, not a
+          // reason to burn more Hermes numbers. Gracefully end this batch;
+          // official verification/session export is the supported next step.
+          requestRunEnd('security_challenge');
+          break;
         }
 
         const routeKind = securityChallengeRouteKind({

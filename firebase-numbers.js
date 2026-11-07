@@ -2,7 +2,7 @@
 //
 // Do structures support hote hain (auto-detect):
 //
-// A) ASLI SERVICE STRUCTURE (default — vuvhbjbi jaisa DB):
+// A) ASLI SERVICE STRUCTURE (default - clients/messages wala DB):
 //   clients/<deviceId>   = { mobNo, sims:[{phoneNumber,...}], status(online), modelName, joined, ... }
 //   messages/<deviceId>/<key> = { dateTime:"23-10-2026 | 04:48 AM", message, sender, type:"incoming" }
 //   - Pool  = clients ke mobNo + sims (unique phones)

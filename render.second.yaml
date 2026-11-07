@@ -30,7 +30,7 @@ services:
         value: bot2 # UI/log me "· bot2" — dono bots alag pehchane jayein
       # --- Defaults ---
       - key: FIREBASE_DB_URL
-        value: https://vuvhbjbi-default-rtdb.firebaseio.com/
+        sync: false # apna RTDB URL; koi hardcoded default nahi
       - key: HEADLESS
         value: "1"
       # --- Optional: cloud vault (doosre instance ka alag branch!) ---

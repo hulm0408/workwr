@@ -110,7 +110,7 @@ har 5–10 min (timeout 120s).
 | `BOT_TOKEN` | **naya** BotFather token | ✅ |
 | `OWNER_IDS` | `6484999726` | ✅ |
 | `INSTANCE_LABEL` | `bot2` (kuch bhi chhota, e.g. `bot3`) | ✅ recommended |
-| `FIREBASE_DB_URL` | `https://vuvhbjbi-default-rtdb.firebaseio.com/` | default |
+| `FIREBASE_DB_URL` | apna RTDB URL (koi built-in default nahi) | recommended |
 | `HEADLESS` | `1` | ✅ |
 | `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` / `TELEGRAM_SESSION` | doosre spare account ka (ya bot ke andar login) | Telegram mode |
 | `GITHUB_VAULT_TOKEN` | wahi PAT | optional |

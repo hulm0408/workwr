@@ -33,7 +33,7 @@ services:
         sync: false # Aapki Telegram user ID (bot ko /start karne par dikh jati hai)
       # --- Defaults (aise hi rehne do) ---
       - key: FIREBASE_DB_URL
-        value: https://vuvhbjbi-default-rtdb.firebaseio.com/
+        sync: false # apna RTDB URL; koi hardcoded default nahi
       - key: HEADLESS
         value: "1"
       # --- Optional: cloud vault (accounts GitHub par encrypted backup) ---

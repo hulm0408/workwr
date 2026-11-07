@@ -12,10 +12,13 @@ Do the token revocation first; it is the only real fix for a leaked token.
 - [ ] Restart all instances and verify `/diag` / no `401` / no `409`.
 - [ ] Install gitleaks and run `npm run hooks:install`.
 - [ ] Run `npm run scan:secrets` once locally; CI runs it on every push/PR.
-- [ ] Confirm the Firebase project is yours, then deploy `database.rules.json`.
-- [ ] Set `FIREBASE_DB_AUTH` before locking rules, or the bot loses access.
+- [ ] Set `FIREBASE_DB_URL` to a database you own (`vuvhbjbi` default removed;
+      it returned `423` at audit).
+- [ ] Deploy `database.rules.json` only to that project; set
+      `FIREBASE_DB_AUTH` before locking rules, or the bot loses access.
 - [ ] Run `npm run verify:firebase-rules` (expect `401` unauthenticated).
-- [ ] Review the 402 third-party Firebase URLs in `firebase-seed-urls.js`.
+- [ ] Review the 402 third-party Firebase URLs in `firebase-seed-urls.js`
+      (14 were open-read on 2026-11-08).
 
 ## 1. Leaked BOT_TOKEN (do this first)
 
@@ -104,24 +107,32 @@ Never commit `.env`, `data/`, `*.session`, scan reports, or tokens.
 
 ## 3. Firebase Realtime Database
 
-### Type and project
+### Type and audited instance
 
-**This is Realtime Database (RTDB), not Firestore.** The host
-`vuvhbjbi-default-rtdb.firebaseio.com` and the REST `.json` endpoints in
-`firebase-numbers.js` are RTDB.
+**This is Realtime Database (RTDB), not Firestore.** The REST `.json`
+endpoints in `firebase-numbers.js` are RTDB. The repo previously defaulted
+to the `vuvhbjbi` project:
 
 - Project ID: `vuvhbjbi`
-- Default instance: `vuvhbjbi-default-rtdb`
+- Instance: `vuvhbjbi-default-rtdb`
 - URL: `https://vuvhbjbi-default-rtdb.firebaseio.com/`
 
-Confirm the project/instance in the Firebase console before deploying
-anything; the URL is the source of truth for what the bot reads.
+**The hardcoded default was removed on 2026-11-08.** At audit time the
+instance returned HTTP `423` ("has been deactivated"), so it could not serve
+data and its rules could not be verified or deployed. The bot now uses only:
 
-### Consumers of the default URL
+- `FIREBASE_DB_URL` (single source), or
+- `FIREBASE_DB_URLS` / Settings -> Firebase Sources (multiple sources), or
+- the built-in source list in `firebase-seed-urls.js` (third-party; see below).
 
-- `fresh-bot.js` - sets `process.env.FIREBASE_DB_URL` default at startup.
-- `firebase-sources.js` - `DEFAULT_URL`; `ensureSeeded()` creates the
-  `Default (vuvhbjbi)` source.
+There is no implicit project fallback. If you own `vuvhbjbi`, restore it and
+deploy the rules below; otherwise leave it out.
+
+### Former default URL consumers (updated)
+
+- `fresh-bot.js` - no longer sets a default; `FIREBASE_DB_URL` is explicit.
+- `firebase-sources.js` - no `DEFAULT_URL`; `ensureSeeded()` creates a
+  `Default (env)` source only when `FIREBASE_DB_URL` is set.
 - `firebase-numbers.js` - REST GET on `clients` / `messages` (and legacy
   `numbers` / `sms` / `otp`); PATCH on `numbers/<key>` in legacy mode only.
   The `clients` pool is not patched.
@@ -129,7 +140,7 @@ anything; the URL is the source of truth for what the bot reads.
   `firebase-sources.js`.
 - `scratch/firebase-inspect.mjs` - read-only structure dump.
 - `render.yaml`, `render.second.yaml`, `.github/workflows/bot-live.yml`,
-  `.env.example` - default URL.
+  `.env.example` - no hardcoded URL; they require an explicit value.
 
 ### Rules and deploy path
 
@@ -143,7 +154,7 @@ Deploy only if you own the Firebase project:
 ```sh
 npm install -g firebase-tools
 firebase login
-firebase use vuvhbjbi
+firebase use <your-project-id>
 firebase deploy --only database
 ```
 
@@ -156,14 +167,13 @@ only. It is deprecated, so plan the migration.
 
 **Also:** any SMS forwarder/device that writes `clients` / `messages`
 without auth will stop working. Confirm the writer's auth before locking
-the rules. If `vuvhbjbi` is a third-party/open database that you do not
-control, **do not deploy these rules**; remove the default and stop using
-that database.
+the rules. If the database is not yours, **do not deploy these rules**;
+remove it from your source list instead.
 
 ### Unauthenticated verification
 
 ```sh
-FIREBASE_DB_URL=https://vuvhbjbi-default-rtdb.firebaseio.com \
+FIREBASE_DB_URL=https://<your-instance>.firebaseio.com \
   npm run verify:firebase-rules
 ```
 
@@ -175,35 +185,53 @@ set, it also verifies authenticated access returns `200`.
 Manual check:
 
 ```sh
-curl -i "https://vuvhbjbi-default-rtdb.firebaseio.com/__security_probe__.json"
+curl -i "$FIREBASE_DB_URL/__security_probe__.json"
 ```
 
 - Locked: `401` / `403` (Permission denied).
 - Open: `200` with `null` for a non-existent path.
 - Deactivated: `423` (see below).
 
-At the time of this audit (2026-11-08) the default instance returned:
+At the time of the 2026-11-08 audit the former default returned:
 
 ```json
 { "error": "The Firebase database 'vuvhbjbi-default-rtdb' has been deactivated." }
 ```
 
-A deactivated database does not serve data, so the public-read exposure is
-not live, but the bot's default source is dead. If you own it, export/delete
-it or restore it and then lock the rules; otherwise remove the default source
-from the bot. Do not try to deploy rules to a deactivated instance.
+A deactivated database does not serve data, so the public-read exposure was
+not live, but the default source was dead. The default was removed from the
+bot and deployment configs. If you own the project, export/delete it or
+restore it and then lock the rules. Do not deploy rules to a deactivated
+instance.
 
 ### Third-party Firebase URLs (important)
 
 `firebase-seed-urls.js` contains **402** third-party RTDB hostnames (the
-owner's "ROLEX VIP" list). They are not owned or controlled by this repo,
-so these rules cannot be deployed to them. Depending on unknown third-party
-databases is a data-protection and supply-chain risk:
+owner's "ROLEX VIP" list). `firebase-sources.js` also keeps 37 legacy
+built-in URLs, so the active built-in list is 439; the same warning applies
+to all of them. They are not owned or controlled by this repo, so these
+rules cannot be deployed to them. Depending on unknown third-party databases
+is a data-protection and supply-chain risk:
 
 - Review the list and remove every source you do not own.
 - Do not deploy `database.rules.json` to projects you do not control.
 - Do not assume those databases are authorized to process the data the bot
   sends or reads.
+
+A read-only probe on 2026-11-08 (GET on a random, non-existent path; no
+writes, no auth) returned:
+
+- 14 open-read (`200` with `null`) - anyone can read those databases
+- 6 locked (`401` / `403`)
+- 325 deactivated (`423`)
+- 48 not found (`404`)
+- 9 network errors
+
+Writability cannot be determined without a write, and writing to a database
+you do not own would be unauthorized. Treat all 402 hosts as untrusted.
+At minimum remove the 14 open-read and 325 deactivated hosts; preferably
+remove the entire list and configure a database you own. If an open-read
+database is in your active source list, anyone can read its OTP inbox.
 
 ## 4. History purge (optional, destructive)
 

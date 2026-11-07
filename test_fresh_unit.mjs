@@ -3199,7 +3199,9 @@ console.log('Ek number = ek hi baar (1-minute decision window, koi parking nahi)
 {
   const engine = await import('./autopilot-engine.js');
   const fsp = await import('node:fs/promises');
-  const src = await fsp.readFile(new URL('./autopilot-engine.js', import.meta.url), 'utf8');
+  // Normalize CRLF so source-string assertions pass on Windows checkouts too.
+  const src = (await fsp.readFile(new URL('./autopilot-engine.js', import.meta.url), 'utf8'))
+    .replace(/\r\n/g, '\n');
 
   // --- 1 minute ka decision window ---
   ok(engine.NUMBER_DECISION_WINDOW_MS === 60_000, 'rule: number decision window 1 minute');

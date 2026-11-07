@@ -78,7 +78,7 @@ BOT_TOKEN=<BotFather se mila token>
 OWNER_IDS=<aapka Telegram ID>     # optional — warna default boss allow
 ```
 
-FIREBASE_DB_URL ka default hi sahi hai (`https://vuvhbjbi-default-rtdb.firebaseio.com/`) — set karne ki zaroorat nahi.
+FIREBASE_DB_URL apna RTDB URL set karo - koi hardcoded default nahi hai. Bot ke **Settings > Firebase Sources** se bhi source add kar sakte ho.
 
 ## Chalao
 
@@ -531,9 +531,12 @@ ki ek wajah yahi ho sakti hai).
    Purani git history me token ab bhi hai, isliye step 1 (revoke) hi asal
    fix hai — file delete karne se kaam nahi banega.
 
-Aur: `vuvhbjbi` Firebase ke **rules open** hain — bina auth ke koi bhi isko
-padh/sakta hai. Number pool + OTP inbox dono public hain. Rules lagwa lena
-(ya kam se kam write band karwa lo) - warna koi bhi aapke OTP padh sakta hai.
+Aur: `vuvhbjbi` ka hardcoded default **hata diya gaya hai** (2026-11-08 audit
+me DB `423 deactivated` tha, isliye rules verify/lock nahi ho sakte the). Ab
+apna `FIREBASE_DB_URL` do. `firebase-seed-urls.js` me 402 third-party RTDB
+URLs hain - unhe apna na ho to hatao, warna OTP pool public/poisoned ho sakta
+hai. Read-only probe me 14 DBs bina auth ke readable mile the. Details:
+[`SECURITY.md`](SECURITY.md).
 
 Poora actionable checklist: [`SECURITY.md`](SECURITY.md) - token ke saare
 consumers (GitHub Actions / Render / local `.env`), gitleaks pre-commit +

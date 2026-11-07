@@ -14,8 +14,8 @@
 // sources inactive hain; listRunSources() har saved source ko batch ke
 // ACTIVE pool me rakhta hai.
 //
-// Default: agar list khali hai to env FIREBASE_DB_URL (ya vuvhbjbi default)
-// se ek "Default" source seed hota hai — pehla run bina setup ke chalta hai.
+// Default: agar list khali hai to env FIREBASE_DB_URL se ek "Default" source
+// seed hota hai. Koi hardcoded project URL default nahi hai.
 //
 // PERMANENT (2026-11-07): owner ki poori ROLEX VIP list ab code me hai
 // (firebase-seed-urls.js) aur env `FIREBASE_DB_URLS` se bhi feed ho sakti
@@ -39,7 +39,8 @@ import {
 } from './firebase-numbers.js';
 import { OWNER_FIREBASE_URLS } from './firebase-seed-urls.js';
 
-const DEFAULT_URL = 'https://vuvhbjbi-default-rtdb.firebaseio.com/';
+// No hardcoded project default. Configure FIREBASE_DB_URL, FIREBASE_DB_URLS,
+// or Settings > Firebase Sources; unconfigured installs use the built-in list.
 // Ek message me itni URLs add ho sakti hain. Pehle 200 thi — owner ki list
 // 400+ ki hai, isliye 1000. Dedupe phir bhi hota hai.
 export const MAX_BULK_FIREBASE_SOURCES = 1000;
@@ -332,26 +333,30 @@ export function ensureSeeded() {
   if (!Array.isArray(state.deleted)) state.deleted = [];
   const deletedUrls = new Set((state.deleted || []).map(normalizeSourceUrl));
 
+  // Env URL is explicit; there is no hardcoded project default. If the env
+  // is unset, the built-in / Settings source list below is used.
   if (!state.list.length && !state.cleared) {
-    const url = String(process.env.FIREBASE_DB_URL || DEFAULT_URL).trim();
-    const src = {
-      id: newSourceId(state),
-      name: 'Default (vuvhbjbi)',
-      url: url.replace(/\/+$/, ''),
-      auth: String(process.env.FIREBASE_DB_AUTH || '').trim(),
-      clientsPath: String(process.env.FIREBASE_CLIENTS_PATH || 'clients').trim(),
-      messagesPath: String(process.env.FIREBASE_MESSAGES_PATH || 'messages').trim(),
-      numbersPath: '',
-      smsPath: 'sms',
-      otpPath: 'otp',
-      enabled: true,
-      addedAt: new Date().toISOString(),
-    };
-    if (!deletedUrls.has(normalizeSourceUrl(url))) {
-      state.list.push(src);
-      state.activeId = src.id;
+    const url = String(process.env.FIREBASE_DB_URL || '').trim();
+    if (url) {
+      const src = {
+        id: newSourceId(state),
+        name: 'Default (env)',
+        url: url.replace(/\/+$/, ''),
+        auth: String(process.env.FIREBASE_DB_AUTH || '').trim(),
+        clientsPath: String(process.env.FIREBASE_CLIENTS_PATH || 'clients').trim(),
+        messagesPath: String(process.env.FIREBASE_MESSAGES_PATH || 'messages').trim(),
+        numbersPath: '',
+        smsPath: 'sms',
+        otpPath: 'otp',
+        enabled: true,
+        addedAt: new Date().toISOString(),
+      };
+      if (!deletedUrls.has(normalizeSourceUrl(url))) {
+        state.list.push(src);
+        state.activeId = src.id;
+      }
+      changed = true;
     }
-    changed = true;
   }
 
   // Seed sources do baar se aate hain:
@@ -776,7 +781,6 @@ export function removeAllSources() {
   for (const src of state.list) urls.add(normalizeSourceUrl(src.url));
   for (const url of BUILTIN_FIREBASE_SOURCE_URLS) urls.add(normalizeSourceUrl(url));
   for (const url of envSeedUrls()) urls.add(normalizeSourceUrl(url));
-  urls.add(normalizeSourceUrl(DEFAULT_URL));
   urls.add(normalizeSourceUrl(String(process.env.FIREBASE_DB_URL || '')));
   urls.delete('');
 

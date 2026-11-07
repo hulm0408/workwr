@@ -5425,7 +5425,7 @@ export async function logoutSwiggySessionRemote(accountOrKey) {
     ...(token ? { token } : {}),
     ...(deviceId ? { deviceId, swuid: deviceId } : {})
   });
-
+ 
   let csrf = '';
   try {
     csrf = await ensureDeleteCsrfToken(cookieMap, '', deviceProfile);

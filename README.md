@@ -288,6 +288,17 @@ Chhota summary:
 - **⏱ Max time** — 15m se 480m tak
 - **🚦 Gap** — do numbers ke beech 0s–60s
 - **📴 Offline devices** — try karein ya na karein
+- **🔁 Never-stop** — ON (default) matlab batch **rukta nahi**: time cap pura
+  ho to deadline khud badh jaati hai, fail-streak/rate-limit flood/WAF-403
+  storm par saari lanes thoda cool-off lekar nayi IP par wapas aati hain, aur
+  pool khali ho to saare ACTIVE Firebase sources dobara scan hote hain. Batch
+  sirf **TARGET pura** hone ya **⏹ STOP** par khatam hota hai. OFF karne par
+  purana safety-stop behaviour wapas aa jata hai.
+
+- **🔁 Auto-resume** — batch chalte waqt Render deploy/restart, GitHub-Actions
+  runner badalna ya process crash ho jaye to bot boot hone par **wahi batch
+  khud shuru** karta hai (target/source wahi). Manual STOP ya target pura
+  hone par flag clear ho jata hai, isliye ye apne aap repeat nahi hota.
 
 Sab `data/db.json` me save hota hai — restart ke baad bhi yaad rehta hai.
 Free Render par disk ephemeral hoti hai, isliye Firebase list + ye settings
@@ -495,7 +506,8 @@ chalta rehta hai; temporary error par number failed nahi gina jata.
 |---|---|---|
 | `PREMIUM_BATCH_TARGET` | 100 | Kitne fresh sessions tak chale |
 | `PREMIUM_BATCH_CONCURRENCY` | 10 | Ek saath kitni parallel lanes (1–10); asal lanes distinct proxy/direct routes tak limited |
-| `PREMIUM_BATCH_MAX_MINUTES` | 120 | Max run time |
+| `PREMIUM_BATCH_MAX_MINUTES` | 120 | Max run time (Never-stop ON me ye sirf checkpoint hai — deadline khud extend hoti hai) |
+| `PREMIUM_NEVER_STOP` | 1 (ON) | `1` = batch khud na ruke (auto cool-off/reextend/rescan) · `0` = purane safety stops |
 | `PREMIUM_BATCH_GAP_MS` | 6000 | Ek hi lane/IP par do numbers ke beech gap |
 | `PREMIUM_RATE_LIMIT_BACKOFF_MS` | 900000 | Fallback lane cooldown — fast ladder se cap hota hai (max 15s) |
 | `PREMIUM_RATE_LIMIT_RETRY_MS` | 5000 | Rate-limit par lane ka pehla wait (5s → 8s → 12s, chhat 15s) |

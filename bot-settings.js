@@ -16,6 +16,12 @@ const SPECS = {
   otpWaitMs:         { min: 0,    max: 60000, dflt: 3000, label: 'OTP poll shuru karne se pehle wait (ms)' },
   otpTimeoutMs:      { min: 5000, max: 300000, dflt: 90000, label: 'OTP poll budget (ms)' },
   allowOffline:      { bool: true, dflt: false, label: 'Offline devices bhi try karein' },
+  // 🔁 NEVER-STOP — owner ka pakka rule: "batch na ruke yaar".
+  // ON: time-cap / fail-streak / rate-limit / WAF / 403 storm / pool khali
+  //     par batch khatam NAHI hota — cool-off, route recovery, pool rescan
+  //     karke khud aage badhta hai. Sirf TARGET ya manual STOP end karte hain.
+  // OFF: purana behaviour (safety stop cards wapas).
+  autoContinue:      { bool: true, dflt: true, label: '🔁 Never-stop mode (batch khud na ruke)' },
   telegramOtpMode:   { bool: true, dflt: false, label: '📨 Telegram Hermes mode (number + OTP Telegram bot se)' },
   telegramOtpTimeoutMs: { min: 5000, max: 180000, dflt: 20000, label: 'Hermes OTP Refresh budget (ms)' },
   telegramOtpRefreshMs: { min: 1000, max: 15000, dflt: 2500, label: 'Hermes Refresh interval (ms)' },
@@ -35,6 +41,7 @@ const ENV_MAP = {
   otpWaitMs: 'PREMIUM_OTP_WAIT_MS',
   otpTimeoutMs: 'PREMIUM_OTP_TIMEOUT_MS',
   allowOffline: 'PREMIUM_ALLOW_OFFLINE_DEVICES',
+  autoContinue: 'PREMIUM_NEVER_STOP',
   telegramOtpMode: 'PREMIUM_TELEGRAM_OTP_MODE',
   telegramOtpTimeoutMs: 'TELEGRAM_OTP_TIMEOUT_MS',
   telegramOtpRefreshMs: 'TELEGRAM_OTP_REFRESH_MS',
@@ -114,10 +121,47 @@ export function settingsSpecs() {
 
 export function fmtSetting(key) {
   const v = getSetting(key);
-  if (key === 'allowOffline' || key === 'telegramOtpMode') return v ? 'ON' : 'OFF';
+  if (key === 'allowOffline' || key === 'telegramOtpMode' || key === 'autoContinue') return v ? 'ON' : 'OFF';
   if (key === 'otpBotProfile') return { hermes: 'Hermes', hathi: 'Hathi', chauhan: 'HardXotp' }[v] || 'Hermes';
   if (key === 'gapMs' || key === 'backoffMs' || key === 'otpWaitMs' || key === 'otpTimeoutMs' || key === 'telegramOtpTimeoutMs' || key === 'telegramOtpRefreshMs') {
     return v >= 60000 ? `${Math.round(v / 60000)} min` : `${Math.round(v / 1000)}s`;
   }
   return String(v);
+}
+
+// ---------------------------------------------------------------------------
+// 🔁 AUTO-RESUME — process restart / deploy / GitHub-Actions runner badalne par
+// batch khud wapas chale. Render free restart aur Actions ke ~6-ghante wale
+// runner gap me batch yahin "ruk" jata tha; ab wanted flag db (aur cloud
+// vault) me rehta hai aur boot par engine khud batch dobara shuru karta hai.
+// Keys freshSettings ke andar hi rehti hain taaki vault sync (store.js) inhe
+// bina kisi extra plumbing ke copy kare; SPECS me na hone se getSetting()
+// inhe ignore karta hai.
+// ---------------------------------------------------------------------------
+const RESUME_KEY = '_autopilotResume';
+
+export function setAutopilotResume(patch = {}) {
+  const s = load();
+  const cur = (s[RESUME_KEY] && typeof s[RESUME_KEY] === 'object') ? s[RESUME_KEY] : {};
+  s[RESUME_KEY] = { ...cur, ...patch, savedAt: Date.now() };
+  const db = getDb();
+  db.freshSettings = s;
+  saveDb(db);
+  return s[RESUME_KEY];
+}
+
+export function getAutopilotResume() {
+  const s = load();
+  const cur = s[RESUME_KEY];
+  return (cur && typeof cur === 'object') ? { ...cur } : null;
+}
+
+export function clearAutopilotResume() {
+  const s = load();
+  if (!s[RESUME_KEY]) return { ok: true, already: true };
+  delete s[RESUME_KEY];
+  const db = getDb();
+  db.freshSettings = s;
+  saveDb(db);
+  return { ok: true, already: false };
 }

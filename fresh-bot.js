@@ -55,6 +55,7 @@ const {
   resolveAutopilotNumberSource,
   formatCompactAutopilotCard,
   numberDecisionWindowMs,
+  setAutopilotNeverStop,
 } = await import('./autopilot-engine.js');
 const { isFirebaseConfigured, firebaseSetupHintLines, listPoolNumbers, _countDeviceOnlineStates } = await import('./firebase-numbers.js');
 const telegramOtp = await import('./telegram-otp-source.js');
@@ -314,8 +315,11 @@ function startCard() {
     telegram
       ? `📨 ${mono(`${activeOtpBotLabel().toUpperCase()} ONLY`)} · 🔥 Firebase ${mono('OFF')}`
       : activeSourceLine(),
-    `🎯 ${mono(`${target} fresh`)} · ⏱ ${mono(`${maxMin} min`)}`,
+    `🎯 ${mono(`${target} fresh`)} · ⏱ ${mono(`${maxMin} min`)} · 🔁 ${mono(`NEVER-STOP ${bs.getSetting('autoContinue') ? 'ON' : 'OFF'}`)}`,
     '⏭ Running card par <b>SKIP NUMBER</b> bhi rahega — sirf current number chhodega, batch nahi rukega.',
+    bs.getSetting('autoContinue')
+      ? '🔁 Batch <b>rukega nahi</b> — time cap/fail/WAF-403/pool rukawat par khud recovery karega; sirf TARGET ya ⏹ STOP par band.'
+      : '⚠️ Never-stop OFF hai — safety stops batch band kar sakte hain (Settings → 🔁 Never-stop).',
     telegram
       ? '<b>Next:</b> START dabao — bot chuno, phir new number aayega'
       : '<b>Next:</b> START dabao — live card par har step dikhega',
@@ -360,6 +364,9 @@ function settingsCard() {
     field('🎯 Target', `${bs.getSetting('target')} fresh`),
     field('⚡ Parallel lanes', `${bs.getSetting('concurrency')} numbers/IPs ek saath`),
     field('⏱ Max time', `${bs.getSetting('maxMinutes')} min`),
+    field('🔁 Never-stop', bs.getSetting('autoContinue')
+      ? 'ON — time cap/fail/WAF/pool rukawat par batch khud aage badhta hai'
+      : 'OFF — purana safety-stop behaviour'),
     field('🚦 Gap', bs.fmtSetting('gapMs')),
     field('⏳ OTP wait', bs.fmtSetting('otpWaitMs')),
     field('📴 Offline devices', bs.getSetting('allowOffline') ? 'ON (try bhi karenge)' : 'OFF (sirf online)'),
@@ -397,6 +404,7 @@ const settingsRows = () => [
   [{ text: `⏱ Max: ${bs.getSetting('maxMinutes')}m`, callback_data: 'ap_pick_time' }],
   [{ text: `🚦 Gap: ${bs.fmtSetting('gapMs')}`, callback_data: 'ap_pick_gap' }],
   [{ text: `📴 Offline: ${bs.getSetting('allowOffline') ? 'ON' : 'OFF'}`, callback_data: 'ap_toggle_offline' }],
+  [{ text: `🔁 Never-stop: ${bs.getSetting('autoContinue') ? 'ON' : 'OFF'}`, callback_data: 'ap_toggle_neverstop', style: 'success' }],
   [{ text: '🩺 Diagnose (kya toota hai?)', callback_data: 'ap_diag' }],
   [{ text: '↩️ Back', callback_data: 'ap_home', style: 'primary' }],
 ];
@@ -1112,6 +1120,17 @@ async function diagCard() {
     const win = Math.round(numberDecisionWindowMs() / 1000);
     lines.push(field('⛔ Number rule', `${mono('1 NUMBER = 1 BAAR')} — ${win}s me attempt start, warna chhod do; queue me park nahi`));
   } catch { lines.push(field('⛔ Number rule', 'ek number = ek hi baar')); }
+  // 🔁 Never-stop + auto-resume — batch rukne na rukne ka sach.
+  try {
+    const resume = bs.getAutopilotResume();
+    const ns = bs.getSetting('autoContinue') ? 'ON' : 'OFF';
+    const resumeLine = resume?.wanted
+      ? `auto-resume armed (${String(resume.lastEndReason || 'restart')} ke baad wapas chalega)`
+      : 'auto-resume idle';
+    lines.push(field('🔁 Never-stop', bs.getSetting('autoContinue')
+      ? `✅ ${mono(ns)} — time cap/fail-streak/rate-limit/WAF-403/pool khali par batch khud aage badhta hai; sirf TARGET/STOP end. ${esc(resumeLine)}`
+      : `⚠️ ${mono(ns)} — safety stops batch band kar sakte hain. ${esc(resumeLine)}`));
+  } catch { lines.push(field('🔁 Never-stop', '—')); }
   const snap = getAutopilotSnapshot();
   if (Number(snap.consumedNumbers)) {
     lines.push(field('🔒 Consumed', `${mono(String(snap.consumedNumbers))} unique number(s) is run me lock — dobara try nahi`));
@@ -2067,6 +2086,25 @@ bot.action(/^ap_set_gap_(\d+)$/, async (ctx) => {
   await editOrSend(ctx, settingsCard(), settingsRows());
 });
 
+// 🔁 NEVER-STOP — owner ka rule: "batch na ruke". ON hone par engine time
+// cap, fail-streak, rate-limit flood, WAF/403 storm aur khali pool par batch
+// khatam nahi karta; sirf TARGET ya manual STOP end karte hain.
+bot.action('ap_toggle_neverstop', async (ctx) => {
+  if (!(await gate(ctx))) return;
+  const cur = bs.getSetting('autoContinue');
+  const r = bs.setSetting('autoContinue', !cur);
+  if (r.ok) {
+    if (isAutopilotRunning()) {
+      // Chalte batch me setting turant apply kar do — restart ki zaroorat nahi.
+      try { setAutopilotNeverStop(r.value !== false); } catch {}
+    }
+  }
+  await ctx.answerCbQuery(r.ok
+    ? (r.value ? '🔁 Never-stop ON — batch ab khud aage badhega' : '🔁 Never-stop OFF — purana safety-stop behaviour')
+    : `❌ ${r.error}`, { show_alert: true }).catch(() => {});
+  await editOrSend(ctx, settingsCard(), settingsRows());
+});
+
 bot.action('ap_toggle_offline', async (ctx) => {
   if (!(await gate(ctx))) return;
   const cur = bs.getSetting('allowOffline');
@@ -2766,6 +2804,85 @@ const armLiveConfirm = (attempt) => {
   liveTimer.unref?.();
 };
 const disarmLiveConfirm = () => { if (liveTimer) { clearTimeout(liveTimer); liveTimer = null; } };
+
+// ---------------------------------------------------------------------------
+// 🔁 AUTO-RESUME — Render deploy/restart, GitHub-Actions runner badalna ya
+// process crash ke baad WAHI batch khud wapas shuru ho. Flag db (data/db.json)
+// aur cloud vault dono me hota hai; manual STOP aur target pura hone par
+// engine khud flag clear kar deta hai, isliye ye kabhi apne aap repeat nahi
+// hota. Ye hi us "batch ruk gaya" ka tod hai jo restart par hota tha.
+// ---------------------------------------------------------------------------
+function createHeadlessUi(chatId) {
+  let msgId = 0;
+  let lastAt = 0;
+  let lastText = '';
+  return {
+    async update(text, rows) {
+      const now = Date.now();
+      if (!text || text === lastText) return;
+      // Flood se bachao: live card sirf ~15s me ek baar; final summary
+      // ("BATCH KHATAM") hamesha jaati hai.
+      const isFinal = /BATCH KHATAM/.test(text);
+      if (!isFinal && now - lastAt < 15_000) return;
+      lastAt = now;
+      lastText = text;
+      const extra = kb(Array.isArray(rows) ? rows : []);
+      if (msgId) {
+        try { await bot.telegram.editMessageText(chatId, msgId, undefined, text, extra); return; } catch {}
+      }
+      try {
+        const m = await bot.telegram.sendMessage(chatId, text, extra);
+        msgId = m?.message_id || 0;
+      } catch {}
+    },
+    async sendSession(payload) {
+      await deliverSessionJson(chatId, payload);
+    },
+  };
+}
+
+async function maybeAutoResumeBatch() {
+  try {
+    if (shuttingDown || isAutopilotRunning()) return;
+    if (bs.getSetting('autoContinue') === false) return; // Never-stop OFF = koi auto start nahi
+    const resume = bs.getAutopilotResume();
+    if (!resume?.wanted) return;
+    const savedAt = Number(resume.savedAt || resume.startedAt || 0);
+    if (!savedAt || Date.now() - savedAt > 12 * 60 * 60_000) {
+      bs.clearAutopilotResume();
+      return;
+    }
+    const ids = ownerIds();
+    const chatId = ids ? [...ids][0] : '5393396812';
+    if (!chatId) return;
+    const ui = createHeadlessUi(chatId);
+    const mins = Math.max(1, Math.round((Date.now() - savedAt) / 60_000));
+    console.log(`[FreshBot] 🔁 Auto-resume — pichhla batch ${mins} min pehle "${resume.lastEndReason || 'restart'}" par ruka tha; wapas shuru.`);
+    await bot.telegram.sendMessage(chatId, section('🔁 Batch Auto-Resume', [
+      `› Bot restart hua (${mins} min pehle), lekin batch adhura tha — ab <b>khud wapas</b> shuru kar raha hoon.`,
+      `› Pichhla end: <code>${esc(String(resume.lastEndReason || 'restart'))}</code> · target ${Number(resume.target) || 0} fresh · source ${esc(String(resume.sourceMode || 'firebase'))}`,
+      `› Live card /status par milega. Band karna ho to ⏹ STOP dabao.`,
+      sub('Auto-resume Settings → 🔁 Never-stop se off hota hai.'),
+    ].join('\n')), kb([
+      [{ text: '📊 Status', callback_data: 'ap_status' }, { text: '⏹ STOP BATCH', callback_data: 'ap_stop', style: 'danger' }],
+    ])).catch(() => {});
+    void startAutopilot({
+      userId: String(chatId),
+      sourceMode: resume.sourceMode || undefined,
+      numberSource: resume.sourceMode || undefined,
+      source: resume.sourceMode || undefined,
+      otpBot: resume.otp || '',
+      target: Number(resume.target) || undefined,
+      ui,
+      autoResumedAt: Date.now(),
+    }).catch((e) => console.error('[FreshBot] auto-resume:', e?.stack || e?.message));
+  } catch (e) {
+    console.warn('[FreshBot] auto-resume check:', e?.message || e);
+  }
+}
+
+// Telegram ready hone ke ~25s baad ek hi baar check (polling ke saath parallel).
+setTimeout(() => { void maybeAutoResumeBatch(); }, 25_000).unref?.();
 
 let conflictAttempts = 0;
 let transientLaunchAttempts = 0;

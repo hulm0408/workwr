@@ -536,7 +536,35 @@ function messageDateMs(message) {
 }
 
 function messageTextOf(message) {
-  try { return plain(message?.text || message?.message || message?.rawText || ''); } catch { return ''; }
+  // Bot kabhi text ke bajaye photo/caption bhejta hai — pehle sirf text padha
+  // jata tha, isliye "OTP Sent" wala reply "(no text)" ban jata tha.
+  try {
+    const candidates = [
+      message?.text,
+      message?.message,
+      message?.rawText,
+      message?.caption,
+      message?.media?.caption,
+    ];
+    for (const value of candidates) {
+      const text = plain(value || '');
+      if (text) return text;
+    }
+    return '';
+  } catch { return ''; }
+}
+
+// Photo/sticker/voice/media message — text khali ho to bhi bot ne kuch bheja hai.
+function messageHasMedia(message) {
+  try {
+    if (messageHasDocument(message)) return true;
+    if (message?.photo || message?.media?.photo) return true;
+    if (message?.sticker || message?.media?.sticker) return true;
+    const cls = String(message?.media?.className || '');
+    if (/photo|sticker|animation|video|webpage/i.test(cls)) return true;
+    if (message?.media && typeof message.media === 'object') return true;
+  } catch {}
+  return false;
 }
 
 function messageHasDocument(message) {
@@ -552,20 +580,43 @@ function messageHasDocument(message) {
   return false;
 }
 
+// 🧠 Chhota read-cache: bot ka screen 0.4s ke andar do jagah padha jata hai
+// (settle + predicate). Har read Telegram par messages.GetHistory hai, aur
+// owner ke logs me wahi baar-baar "Sleeping for 3s on flood wait (GetHistory)"
+// de raha tha — uske baad read khali aata tha aur step fail ho jata tha.
+const worldReadCache = { at: 0, limit: 0, messages: [] };
+
 async function readWorldMessages(client, entity, limit = WORLD_BOT_DEFAULTS.readLimit) {
   const take = Math.max(1, Number(limit) || 10);
+  if (worldReadCache.messages.length && worldReadCache.limit === take
+    && Date.now() - worldReadCache.at < 400) {
+    return worldReadCache.messages;
+  }
   let lastError = null;
   // Network/TIMEOUT par 2 koshish — ek hiccup se poora number na jaye.
-  for (let attempt = 1; attempt <= 2; attempt += 1) {
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
     try {
       const messages = await client.getMessages(entity, { limit: take });
-      return Array.isArray(messages) ? messages : [...(messages || [])];
+      const list = Array.isArray(messages) ? messages : [...(messages || [])];
+      if (list.length) {
+        worldReadCache.at = Date.now();
+        worldReadCache.limit = take;
+        worldReadCache.messages = list;
+        return list;
+      }
+      // 🤐 Khali jawab = Telegram "flood wait" (GetHistory) ya read fail.
+      // Pehle ise "screen: none" maan kar Login button nahi milta tha aur
+      // number bekaar fail ho jata tha.
+      lastError = new WorldBotError('empty-screen', 'Bot ki chat khali aayi (Telegram flood wait / read fail)');
     } catch (error) {
       lastError = error;
-      if (attempt === 1) await sleep(700);
+    }
+    if (attempt < 3) {
+      console.warn(`[WorldBot] ⏳ chat read khali/fail (try ${attempt}/3) — ${String(lastError?.message || lastError).slice(0, 80)}`);
+      await sleep(900 * attempt);
     }
   }
-  throw lastError;
+  return [];
 }
 
 async function parseScreenMessages(client, entity, limit) {
@@ -577,7 +628,9 @@ async function parseScreenMessages(client, entity, limit) {
       id: messageIdOf(message),
       text: messageTextOf(message),
       dateMs: messageDateMs(message),
+      out: Boolean(message?.out),
       hasDocument: messageHasDocument(message),
+      hasMedia: messageHasMedia(message),
       buttons: buttons.map((button) => ({
         button,
         text: buttonTextOf(button),
@@ -597,12 +650,16 @@ async function parseScreenMessages(client, entity, limit) {
       at: Date.now(),
       phase: state.phase,
       text: String(latest.text || '').replace(/\s+/g, ' ').slice(0, 240),
+      media: Boolean(latest.hasMedia),
+      out: Boolean(latest.out),
       buttons: latest.buttons.map((b) => b.text).slice(0, 10),
     };
     const last = state.recentScreens[0];
-    if (!last || last.text !== entry.text || last.buttons.join('|') !== entry.buttons.join('|')) {
+    if (!last || last.text !== entry.text || last.buttons.join('|') !== entry.buttons.join('|')
+      || Boolean(last.media) !== entry.media) {
       state.recentScreens = [entry, ...state.recentScreens].slice(0, 8);
-      console.log(`[WorldBot] 📺 ${state.phase}: ${entry.text || '(no text)'} · [${entry.buttons.join(' | ') || 'no buttons'}]`);
+      const shown = entry.text || (entry.media ? '(media, no text)' : '(no text)');
+      console.log(`[WorldBot] 📺 ${state.phase}: ${shown} · [${entry.buttons.join(' | ') || 'no buttons'}]`);
     }
   }
   return parsed;
@@ -611,14 +668,14 @@ async function parseScreenMessages(client, entity, limit) {
 function screenSignature(messages = []) {
   const map = new Map();
   for (const m of messages) {
-    map.set(m.id, `${m.text}|${m.buttons.map((b) => b.text).join('|')}|${m.hasDocument ? 'doc' : ''}`);
+    map.set(m.id, `${m.text}|${m.buttons.map((b) => b.text).join('|')}|${m.hasDocument ? 'doc' : ''}${m.hasMedia ? 'media' : ''}${m.out ? 'out' : ''}`);
   }
   return map;
 }
 
 function freshMessages(messages, baseline) {
   return messages.filter((m) => {
-    const sig = `${m.text}|${m.buttons.map((b) => b.text).join('|')}|${m.hasDocument ? 'doc' : ''}`;
+    const sig = `${m.text}|${m.buttons.map((b) => b.text).join('|')}|${m.hasDocument ? 'doc' : ''}${m.hasMedia ? 'media' : ''}${m.out ? 'out' : ''}`;
     if (!baseline.has(m.id)) return true;
     return baseline.get(m.id) !== sig;
   });
@@ -851,9 +908,19 @@ export async function worldBotLogin({
 
         // 2) 🔐 Login → method picker
         setPhase('login-menu');
-        const loginScreen = await settledScreen(client, entity, cfg);
+        let loginScreen = await settledScreen(client, entity, cfg);
         let issueBaseline = screenSignature(loginScreen);
-        const loginHit = roleOnLatest(loginScreen, 'login');
+        let loginHit = roleOnLatest(loginScreen, 'login');
+        if (!loginHit) {
+          // Telegram "flood wait" / khali read me bot ka screen hi nahi milta.
+          // Pehle ise bot ki galti maan kar bot switch ho jata tha — ab ek baar
+          // menu reset karke dobara dekhte hain.
+          console.warn('[WorldBot] ↻ Login button nahi mila — menu reset karke ek aur koshish');
+          await worldResetToMenu(client, entity, cfg).catch(() => {});
+          loginScreen = await settledScreen(client, entity, cfg);
+          issueBaseline = screenSignature(loginScreen);
+          loginHit = roleOnLatest(loginScreen, 'login');
+        }
         if (!loginHit) throw new WorldBotError('no-login-button', `Login button nahi mila — screen: ${(state.lastScreenButtons || []).join(' | ') || 'none'}`);
         await clickOrType({
           client, entity, entry: loginHit.button, cfg, shouldAbort, baseline: issueBaseline,
@@ -863,9 +930,15 @@ export async function worldBotLogin({
 
         // 3) 📲 OTP Login → number maango
         setPhase('otp-login');
-        const otpScreen = await settledScreen(client, entity, cfg);
+        let otpScreen = await settledScreen(client, entity, cfg);
+        let otpBtn = roleOnLatest(otpScreen, 'otpLogin');
+        if (!otpBtn && worldBotAwaitingKind(otpScreen) !== 'number') {
+          // Screen late aayi ho / read choke ho — ek chhoti wait ke baad dobara.
+          await sleep(1_200);
+          otpScreen = await settledScreen(client, entity, cfg);
+          otpBtn = roleOnLatest(otpScreen, 'otpLogin');
+        }
         issueBaseline = screenSignature(otpScreen);
-        const otpBtn = roleOnLatest(otpScreen, 'otpLogin');
         // Button na mile par bot pehle se number maang raha ho → wahi sahi jagah hai.
         if (!otpBtn) {
           if (worldBotAwaitingKind(otpScreen) === 'number') return 'askNumber';
@@ -1187,6 +1260,13 @@ async function waitForOtpSent({ client, entity, baseline, cfg, shouldAbort }) {
   let queueFirstAt = 0;
   let sawQueueText = '';
   let lastAll = [];
+  // 🤖 Bot ka reply kabhi bilkul khali / photo hota hai (text hi nahi). Owner ke
+  // logs me yahi ho raha tha: number jata tha, bot ek blank/media message
+  // bhejta tha, hum use "OTP Sent confirm nahi hua" maan kar Cancel + wahi
+  // number dobara bhejte the → Swiggy "login attempts exceeded" → number jalta
+  // tha aur OTP kabhi type hi nahi hota tha. Ab aisa reply = OTP Sent.
+  let blankReplyAt = 0;
+  let blankReplyMedia = false;
 
   while (true) {
     const limit = queueFirstAt ? queueFirstAt + queueBudget : startedAt + sendBudget;
@@ -1205,6 +1285,15 @@ async function waitForOtpSent({ client, entity, baseline, cfg, shouldAbort }) {
       const kind = worldBotPromptKind(message.text);
       if (kind === 'otpSent') return { ok: true, kind: 'otpSent', message };
       if (kind === 'invalidNumber') return { ok: false, kind: 'invalidNumber', message };
+      // Bot ka jawab aaya par text nahi (photo/blank) — OTP Sent maan lo.
+      if (!message.out && !String(message.text || '').trim()) {
+        if (!blankReplyAt) {
+          blankReplyAt = Date.now();
+          blankReplyMedia = Boolean(message.hasMedia);
+          console.log(`[WorldBot] 🤖 bot ne reply diya (${blankReplyMedia ? 'media, text khali' : 'text khali'}) — OTP Sent maan raha hoon`);
+        }
+        continue;
+      }
       if (worldBotQueueKind(message.text)) {
         if (!queueFirstAt) {
           queueFirstAt = Date.now();
@@ -1213,6 +1302,12 @@ async function waitForOtpSent({ client, entity, baseline, cfg, shouldAbort }) {
           console.log(`[WorldBot] ⏳ bot ne queue bataya — ${Math.round(queueBudget / 1000)}s tak wait: ${sawQueueText}`);
         }
       }
+    }
+    // Blank/media reply ke baad thoda intezaar — ho sakta hai asli text agle
+    // message me aaye. 3s tak kuch na aaye to OTP Sent maan kar OTP fetch par.
+    if (blankReplyAt && Date.now() - blankReplyAt >= 3_000) {
+      console.log('[WorldBot] ✅ OTP Sent confirm (blank/media reply) — ab OTP bot se code');
+      return { ok: true, kind: 'otpSent', confirmedBy: blankReplyMedia ? 'media-reply' : 'blank-reply' };
     }
     await sleep(Math.max(300, Number(cfg?.pollMs) || WORLD_BOT_DEFAULTS.pollMs));
   }
@@ -1348,10 +1443,15 @@ async function clickOrType({
   // 🧘 Action se pehle bot ka pichla jawab poora aane do — warna command burst.
   const before = baseline || screenSignature(await settledScreen(client, entity, cfg));
   const label = String(entry?.text || '').trim();
+  // 🖱 Click ka callback (bot ka apna jawab) — callback aa gaya matlab bot ne
+  // button process kar liya. Tab wahi text DOBARA likhna galat tha (owner ke
+  // logs me "OTP Login" click + text dono jate the aur Swiggy
+  // "login attempts exceeded" deta tha).
+  let clickCallback = '';
 
   if (cfg?.trigger !== 'type') {
     try {
-      await clickWorldButton(entry);
+      clickCallback = (await clickWorldButton(entry)) || '';
       const hit = await waitForReply({
         client, entity, baseline: before, timeoutMs: grace, shouldAbort,
         what: `${what} (click)`, predicate, pollMs: cfg?.pollMs,
@@ -1372,6 +1472,11 @@ async function clickOrType({
           return { clicked: true, screen: afterClick };
         }
       } catch {}
+      if (clickCallback) {
+        console.log(`[WorldBot] ✅ click ka callback aaya ("${clickCallback.slice(0, 60)}") — text trigger skip`);
+        state.lastTrigger = 'click-callback';
+        return { clicked: true, callback: clickCallback };
+      }
       console.warn(`[WorldBot] click se "${label || what}" trigger nahi hua — text se try karunga`);
     }
   }

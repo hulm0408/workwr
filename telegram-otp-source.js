@@ -501,6 +501,9 @@ const providerState = {
   lastClickedRole: '',
   lastCallbackMessage: '',
   claimPhase: '',
+  trackedOtpMessageIds: [],
+  lastOtpText: '',
+  lastOtpScan: null,
 };
 
 export function isTelegramLoginInProgress() {
@@ -1007,8 +1010,11 @@ async function refreshHermesChatUnlocked({ phone = '', attempt = 0 } = {}) {
   let lastReason = 'no-refresh-button';
 
   try {
-    const messages = await fetchIncomingUnlocked(12);
-    for (const message of messages) {
+    const recent = await fetchIncomingUnlocked(12);
+    // Window se bahar gaya number-card bhi dekho — usi par asli REFRESH button
+    // hota hai. Sirf text fallback par depend karna bot ke hisaab se fail tha.
+    const tracked = await fetchTrackedMessagesUnlocked(recent);
+    for (const message of [...recent, ...tracked]) {
       const buttons = await getMessageButtons(message);
       const entries = buttons
         .map((button) => ({
@@ -1408,37 +1414,262 @@ function normalizeBaseline(input) {
     smsTimeMs: Number(base.smsTimeMs || base.ts || 0) || 0,
     messageId: Number(base.messageId || 0) || 0,
     editDateMs: Number(base.editDateMs || 0) || 0,
+    // Watermark: number bhejne ke baad aaya/edited code hamesha naya hai.
+    afterMs: Number(base.afterMs || 0) || 0,
   };
 }
 
+// Kya ye candidate is number ka NAYA OTP hai?
+//   • wahi message + wahi edit jo baseline me tha → purana, chhodo
+//   • watermark ke baad banaya/EDIT kiya gaya message → naya (Hermes/Hathi
+//     card ko edit karke SMS dikhate hain — yahi asli case hai)
+//   • watermark hi nahi tha (koi baseline nahi) → naya
+//   • warna shak ho to purana maano — galat OTP type karke number na jale.
 function candidateIsNew(candidate, baseline) {
   const { parsed, idKey } = candidate;
   if (!parsed?.code) return false;
   if (baseline.ids.has(idKey)) return false;
   if (baseline.signature && parsed.signature === baseline.signature) return false;
-  if (baseline.smsTimeMs && parsed.smsTimeMs && parsed.smsTimeMs > baseline.smsTimeMs) return true;
-  if (baseline.codes.has(parsed.code)) return false;
-  if (baseline.signature && parsed.signature !== baseline.signature) return true;
-  if (baseline.codes.size && !baseline.codes.has(parsed.code)) return true;
-  if (!baseline.signature && !baseline.codes.size && !baseline.ids.size) return true;
-  return false;
+
+  const hasBaseline = Boolean(baseline.ids.size || baseline.codes.size || baseline.afterMs || baseline.messageId);
+  if (!hasBaseline) return true;
+
+  // Telegram ka waqt second me aata hai — 2s ki chhoot.
+  const slackMs = 2_000;
+  const editedOrNewAfterMark = baseline.afterMs > 0
+    && Number(candidate.ts || 0) >= baseline.afterMs - slackMs;
+  const newerMessage = baseline.messageId > 0
+    && Number(candidate.messageId || 0) > Number(baseline.messageId);
+
+  if (!baseline.codes.has(parsed.code)) {
+    // Code pehle kabhi nahi dikha → naya data, le lo (jaldi aaya OTP bhi).
+    if (editedOrNewAfterMark || newerMessage) return true;
+    if (baseline.smsTimeMs && parsed.smsTimeMs && parsed.smsTimeMs > baseline.smsTimeMs) return true;
+    return false;
+  }
+  // Code pehle se dikha tha — sirf naya message / naya edit hi naya OTP hai.
+  return editedOrNewAfterMark || newerMessage;
+}
+
+// ---------------------------------------------------------------------------
+// 🔎 OTP scanning — "OTP aaya hi nahi" ki asli wajah yahi thi
+//
+// 1) Purana code sirf latest 12 messages padhta tha. OTP Sent ke baad hum har
+//    second REFRESH dabate hain (90s tak) — har refresh chat me naye messages
+//    jodta hai, isliye asli SMS/card 12-message window se BAAHAR chala jata tha
+//    aur OTP kabhi "mila" hi nahi. Ab window 30 (env se 12–60) + number card
+//    ki message id se seedha padhna.
+// 2) Bot kabhi OTP ko card ko EDIT karke dikhata hai. Edit ka waqt (editDate)
+//    number bhejne ke baad ka hai → wo naya data hai, use lena hai. Iske liye
+//    "watermark" (number bhejne se thik pehle ka snapshot) use hota hai.
+// 3) Code kabhi "123 456" ya button label me aata hai — strict parse fail
+//    hone par loose parse (4–8 digit, sirf OTP/SMS context me) chalta hai.
+// ---------------------------------------------------------------------------
+function otpScanLimit() {
+  return telegramOtpScanLimit();
+}
+
+function messageButtonsText(message) {
+  try {
+    const rows = message?.buttons;
+    if (!rows) return '';
+    const flat = [];
+    for (const row of rows) {
+      if (Array.isArray(row)) {
+        for (const b of row) flat.push(String(b?.text || b?.button?.text || ''));
+      } else {
+        flat.push(String(row?.text || row?.button?.text || ''));
+      }
+    }
+    return flat.filter(Boolean).join('\n');
+  } catch { return ''; }
+}
+
+// Loose OTP: "OTP: 123 456", "code - 123456", "123456 is your OTP",
+// button "Copy 123456" — sirf tab jab text me OTP/SMS context ho, taaki phone
+// number / device id / date ko galti se OTP na samjhein.
+export function extractLooseOtpCode(text = '') {
+  const src = normalizeTelegramFancyText(String(text ?? ''));
+  if (!src) return '';
+  if (!/(otp|verif|passcode|\bcode\b|\bpin\b|\bsmsh?\b)/i.test(src)) return '';
+  const usable = (value = '') => {
+    const digits = String(value).replace(/\D/g, '');
+    if (digits.length < 4 || digits.length > 8) return '';
+    if (/^(19|20)\d{2}$/.test(digits)) return '';
+    return digits;
+  };
+
+  // 1) Label ke bilkul baad wala group — sabse bharosemand.
+  const labeled = /(?:otp|passcode|\bcode\b|\bpin\b)\s*(?:is|:|-|—|=)?\s*((?:\d[\s\-]?){4,10})(?!\d)/gi;
+  let m;
+  while ((m = labeled.exec(src))) {
+    const digits = usable(m[1]);
+    if (digits) return digits;
+  }
+  // 2) "123 456" jaisa spaced 6-digit code.
+  const spaced = /(?<!\d)(\d{3})[\s\-](\d{3})(?!\d)/g;
+  while ((m = spaced.exec(src))) {
+    const digits = usable(`${m[1]}${m[2]}`);
+    if (digits) return digits;
+  }
+  // 3) Aksar "123456 is your Swiggy OTP" — code pehle, label baad me.
+  const leading = /(?<!\d)(\d{6})(?!\d)\s*(?:is\s+)?(?:your\s+)?(?:swiggy\s+)?(?:otp|code|pin)/i;
+  m = src.match(leading);
+  if (m) {
+    const digits = usable(m[1]);
+    if (digits) return digits;
+  }
+  // 4) Sirf 6-digit plain code (Swiggy always 6) — context already confirmed.
+  const plain = src.match(/(?<!\d)\d{6}(?!\d)/g) || [];
+  for (const value of plain) {
+    const digits = usable(value);
+    if (digits && digits.length === 6) return digits;
+  }
+  return '';
+}
+
+// Ek message se OTP nikalna: strict parse pehle (Hermes/Hathi ka asli format),
+// phir loose (edit/space/button-label wale cases).
+export function parseTelegramOtpMessage(phone = '', message = null) {
+  const text = messageText(message);
+  const strict = parseTelegramOtpText(text);
+  if (strict?.code) {
+    const card = parseTelegramNumberCard(text);
+    return { ...strict, phone: strict.phone || card?.phone || '', via: 'strict' };
+  }
+  const loose = extractLooseOtpCode([text, messageButtonsText(message)].filter(Boolean).join('\n'));
+  if (!loose) return null;
+  const card = parseTelegramNumberCard(text);
+  return {
+    phone: card?.phone || '', code: loose, sender: '', rawTime: '', smsTimeMs: 0,
+    signature: `loose|${loose}`, via: 'loose',
+  };
+}
+
+function trackOtpMessageId(id = 0) {
+  const n = Number(id) || 0;
+  if (!n) return;
+  const list = providerState.trackedOtpMessageIds;
+  if (list.includes(n)) return;
+  list.push(n);
+  while (list.length > 10) list.shift();
+}
+
+// 📌 Window se bahar chale gaye card/OTP messages — id se seedha padho.
+// (Har second refresh chat me naye messages jodta hai, isliye asli SMS card
+//  latest window ke baahar chala jata hai. Pehle wahi card chup-chaap miss hota
+//  tha aur bot ko OTP kabhi nahi milta tha.)
+async function fetchTrackedMessagesUnlocked(knownMessages = []) {
+  const known = new Set((knownMessages || []).map(messageId));
+  const ids = [...new Set([...providerState.trackedOtpMessageIds, providerState.currentMessageId])]
+    .map(Number)
+    .filter((id) => id > 0 && !known.has(id))
+    .slice(-10);
+  if (!ids.length) return [];
+  try {
+    const { client, config } = await ensureClientUnlocked();
+    const entity = await ensureEntityUnlocked(client, config);
+    const extra = await client.getMessages(entity, { ids });
+    const out = [];
+    for (const message of (Array.isArray(extra) ? extra : [...(extra || [])])) {
+      if (message && !known.has(messageId(message))) {
+        out.push(message);
+        known.add(messageId(message));
+      }
+    }
+    return out;
+  } catch (error) {
+    providerState.lastOtpScan = {
+      ...(providerState.lastOtpScan || {}),
+      extraError: String(error?.message || error).slice(0, 80),
+    };
+    return [];
+  }
 }
 
 async function readOtpCandidatesUnlocked(phone) {
-  const messages = await fetchIncomingUnlocked(12);
+  const limit = otpScanLimit();
+  const windowMessages = await fetchIncomingUnlocked(limit);
+  const tracked = await fetchTrackedMessagesUnlocked(windowMessages);
+  const messages = [...(windowMessages || []), ...tracked];
+  const extraIds = tracked.map(messageId);
+
   const out = [];
+  let otpLike = 0;
+  let lastText = '';
   for (const message of messages) {
-    const parsed = parseTelegramOtpText(messageText(message));
+    const text = messageText(message);
+    if (text && !lastText) lastText = text;
+    const digitsText = String(text || '').replace(/\D/g, '');
+    if (/otp|sms|verif|passcode|\bcode\b/i.test(text)
+      || (phone && digitsText.includes(String(phone).replace(/\D/g, '')))) {
+      trackOtpMessageId(messageId(message));
+    }
+    const parsed = parseTelegramOtpMessage(phone, message);
     if (!parsed?.code) continue;
+    otpLike += 1;
+    // Kisi DOOSRE number ka card hai to chhodo. Number likha hi nahi (sirf
+    // "OTP: 123456") to bhi lo — pehle yahan silent drop ho raha tha.
     if (parsed.phone && parsed.phone !== phone) continue;
     if (!parsed.phone && providerState.currentPhone && providerState.currentPhone !== phone) continue;
     out.push({
       message,
       parsed,
+      ts: Math.max(messageDateMs(message), messageEditMs(message)),
+      messageId: messageId(message),
+      phoneMatched: Boolean(parsed.phone && parsed.phone === phone),
       idKey: `telegram:${messageId(message)}:${messageEditMs(message)}:${parsed.signature}`,
     });
   }
+  // Apne number ka card pehle, phir baaki.
+  out.sort((a, b) => Number(b.phoneMatched) - Number(a.phoneMatched));
+  providerState.lastOtpScan = {
+    at: Date.now(),
+    limit,
+    scanned: messages.length,
+    extraIds: extraIds.length,
+    otpLike,
+    tracked: providerState.trackedOtpMessageIds.length,
+    codes: out.map((c) => c.parsed.code).slice(0, 5),
+    lastText: lastText.slice(0, 160),
+  };
+  if (!out.length && lastText) providerState.lastOtpText = lastText.slice(0, 200);
   return out;
+}
+
+// 🔖 Watermark — number bhejne se THIK PEHLE ka OTP state. Iske baad aaya ya
+// edit hua code hi "naya" maana jata hai. Pehle baseline OTP Sent ke baad
+// liya jata tha, isliye jaldi aa gaya OTP "purana" gina jata tha aur 90s
+// tak ignore hota tha.
+export async function captureTelegramOtpWatermark(phone) {
+  return withTelegramLock(async () => {
+    const ts = Date.now();
+    try {
+      const messages = await fetchIncomingUnlocked(otpScanLimit());
+      const codes = new Set();
+      const ids = new Set();
+      let messageIdMax = 0;
+      for (const message of messages || []) {
+        const parsed = parseTelegramOtpMessage(phone, message);
+        ids.add(`telegram:${messageId(message)}:${messageEditMs(message)}:${parsed?.signature || ''}`);
+        if (parsed?.code) codes.add(parsed.code);
+        messageIdMax = Math.max(messageIdMax, messageId(message));
+      }
+      return { codes: [...codes], ids: [...ids], signature: '', ts, afterMs: ts, messageId: messageIdMax };
+    } catch (error) {
+      return { codes: [], ids: [], ts, afterMs: ts, messageId: 0, error: String(error?.message || error).slice(0, 120) };
+    }
+  });
+}
+
+// Tests: scan window + "naya code" ka faisla (network ke bina).
+export function telegramOtpScanLimit(env = process.env) {
+  const n = Number(env.SWIGGY_OTP_SCAN_LIMIT ?? 30);
+  return Math.min(60, Math.max(12, Number.isFinite(n) && n > 0 ? n : 30));
+}
+
+export function _otpCandidateIsNewForTests(candidate, baseline) {
+  return candidateIsNew(candidate || {}, normalizeBaseline(baseline));
 }
 
 export async function waitForTelegramOtpCode(phone, opts = {}) {
@@ -1501,8 +1732,18 @@ export async function waitForTelegramOtpCode(phone, opts = {}) {
             lastError = error;
             setLastError(error);
           }
+          // 🔍 Har 10th refresh par scan summary — owner ko console me saaf
+          // dikhe ki chat me kya mila (kitne messages, kitne OTP-like).
+          if (refreshAttempts % 10 === 0) {
+            const scan = providerState.lastOtpScan || {};
+            console.log(
+              `[Hermes] 👀 scan ${scan.scanned || 0} msgs (limit ${scan.limit || otpScanLimit()})`
+              + ` · otp-like ${scan.otpLike || 0} · tracked ${scan.tracked || 0}`
+              + (scan.lastText ? ` · last: "${String(scan.lastText).replace(/\s+/g, ' ').slice(0, 70)}"` : '')
+            );
+          }
         }
-        await sleepInterruptibly(Math.min(700, Math.max(0, deadline - Date.now())), shouldAbort);
+        await sleepInterruptibly(Math.min(500, Math.max(0, deadline - Date.now())), shouldAbort);
       }
 
       const classified = lastError ? classifyTelegramError(lastError) : null;
@@ -1520,7 +1761,16 @@ export async function waitForTelegramOtpCode(phone, opts = {}) {
           errorCode: classified?.code || '',
           hint: classified?.hint || '',
         }
-        : { code: '' };
+        : {
+          code: '',
+          error: `OTP bot chat me ${Math.round(timeoutMs / 1000)}s tak code nahi mila`
+            + ` (scan: ${providerState.lastOtpScan?.scanned ?? 0} msgs, otp-like ${providerState.lastOtpScan?.otpLike ?? 0}`
+            + `, refresh ${refreshAttempts}x)`
+            + (providerState.lastOtpScan?.lastText
+              ? ` · last message: "${String(providerState.lastOtpScan.lastText).replace(/\s+/g, ' ').slice(0, 100)}"`
+              : ''),
+          otpScan: providerState.lastOtpScan || null,
+        };
     } catch (error) {
       setLastError(error);
       return { code: '', error: `Telegram Hermes OTP wait fail: ${String(error?.message || error).slice(0, 180)}` };
@@ -1564,6 +1814,9 @@ export function getTelegramOtpStatus(env = process.env) {
     lastClickedRole: providerState.lastClickedRole || '',
     lastCallbackMessage: providerState.lastCallbackMessage || '',
     claimPhase: providerState.claimPhase || '',
+    otpScan: providerState.lastOtpScan || null,
+    lastOtpText: providerState.lastOtpText || '',
+    trackedOtpMessages: [...(providerState.trackedOtpMessageIds || [])],
   };
 }
 

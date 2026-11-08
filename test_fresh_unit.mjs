@@ -3397,11 +3397,63 @@ Thanks`)),
   const pipelineRefreshSrc = await fsp.readFile(new URL('./number-pipeline.js', import.meta.url), 'utf8');
   ok(pipelineRefreshSrc.includes('SWIGGY_OTP_REFRESH_MS') && pipelineRefreshSrc.includes('|| 1_000'),
   'worldbot: OTP refresh world-bot flow me 1s (env se override)');
+  ok(pipelineRefreshSrc.includes('captureTelegramOtpWatermark')
+    && pipelineRefreshSrc.includes('const makeOtpWatermark = () => async () =>')
+    && (pipelineRefreshSrc.match(/otpWatermark: makeOtpWatermark\(\)/g) || []).length === 3
+    && pipelineRefreshSrc.includes('ctx?.watermark'),
+  'worldbot: login + delete + fresh login teeno OTP rounds ko watermark milta hai');
   const wbFlowSrc = await fsp.readFile(new URL('./swiggy-world-bot.js', import.meta.url), 'utf8');
   ok(wbFlowSrc.includes('click ne screen badal di') && wbFlowSrc.includes('doosra variant mat bhejo'),
   'worldbot: click ne screen badli to text/variant dobara nahi bhejta (OTP Login do baar nahi)');
+  ok(wbFlowSrc.includes('let otpWatermarkForRound = null')
+    && wbFlowSrc.includes('otpProvider({ watermark: otpWatermarkForRound, phone: cleanPhone })')
+    && wbFlowSrc.includes('otpProvider({ watermark: deleteWatermark, phone: cleanPhone })'),
+  'worldbot: OTP watermark number/delete trigger se pehle set hota hai aur provider ko milta hai');
   ok(wbFlowSrc.includes('async function waitForScreenChange') && wbFlowSrc.includes('fromId: cancelFromId'),
   'worldbot: slow bot par duplicate /cancel nahi (screen-change ka intezaar)');
+
+  // 🎯 "OTP aaya hi nahi" ki asli wajah — window 12 se bahar, jaldi aaya code
+  // "purana" gina jata tha, aur "123 456" jaisa code parse hi nahi hota tha.
+  const tgMod = await import('./telegram-otp-source.js');
+  ok(tgMod.telegramOtpScanLimit({}) === 30
+    && tgMod.telegramOtpScanLimit({ SWIGGY_OTP_SCAN_LIMIT: '50' }) === 50
+    && tgMod.telegramOtpScanLimit({ SWIGGY_OTP_SCAN_LIMIT: '3' }) === 12
+    && tgMod.telegramOtpScanLimit({ SWIGGY_OTP_SCAN_LIMIT: '500' }) === 60,
+  'otp scan: window 30 default (12–60 clamp) — refresh se card bahar nahi jata');
+  ok(typeof tgMod.captureTelegramOtpWatermark === 'function',
+    'otp: watermark (number bhejne se pehle ka state) maujood');
+  ok(tgMod.extractLooseOtpCode('Your Swiggy OTP is 123 456') === '123456'
+    && tgMod.extractLooseOtpCode('OTP: 987654') === '987654'
+    && tgMod.extractLooseOtpCode('code - 4567') === '4567',
+  'otp parse: spaced / labeled code bhi milta hai');
+  ok(tgMod.extractLooseOtpCode('Number: 9876543210 Status ACTIVE') === ''
+    && tgMod.extractLooseOtpCode('no digits here') === ''
+    && tgMod.extractLooseOtpCode('Date 08/11/2026 | 22:15 OTP abhi nahi aaya') === '',
+  'otp parse: phone number / date ko galti se OTP nahi samajhta');
+  const looseMsg = tgMod.parseTelegramOtpMessage('9876543210', { text: 'Your Swiggy OTP is 123 456' });
+  ok(looseMsg?.code === '123456' && looseMsg.via === 'loose',
+    'otp parse: message se loose code (via: loose)');
+  // Watermark ke baad aaya/edited code = naya; purana code dobara nahi.
+  const markTs = Date.now() - 2_000;
+  ok(tgMod._otpCandidateIsNewForTests(
+    { parsed: { code: '222222', signature: 'x' }, idKey: 'k-new', ts: Date.now() },
+    { afterMs: markTs, codes: ['111111'], ids: [] }) === true,
+  'otp: number bhejne ke baad aaya code naya maana jata hai (jaldi aaya OTP miss nahi)');
+  ok(tgMod._otpCandidateIsNewForTests(
+    { parsed: { code: '111111', signature: 'x' }, idKey: 'k-old', ts: markTs - 60_000 },
+    { afterMs: markTs, codes: ['111111'], ids: [] }) === false,
+  'otp: purana code watermark ke baad bhi accept nahi hota');
+  ok(tgMod._otpCandidateIsNewForTests(
+    { parsed: { code: '111111', signature: 'x' }, idKey: 'k-edit', ts: Date.now() },
+    { afterMs: markTs, codes: ['111111'], ids: [] }) === true,
+  'otp: card EDIT hokar aaya same code bhi naya data hai (edit detect)');
+  ok(tgRefreshSrc.includes('SWIGGY_OTP_SCAN_LIMIT')
+    && tgRefreshSrc.includes('trackedOtpMessageIds')
+    && tgRefreshSrc.includes('client.getMessages(entity, { ids'),
+  'otp scan: window se bahar gaya card id se seedha padha jata hai');
+  ok(tgRefreshSrc.includes('captureTelegramOtpWatermark')
+    && tgRefreshSrc.includes('baseline.afterMs'),
+  'otp scan: watermark ke baad ka code hi naya (afterMs rule)');
   ok(wb.worldBotPromptKind('🆕 New Account Detected!\n\nTell us the name to set on your Swiggy account.') === 'askName',
     'worldbot: asli lamba "New Account Detected… name" prompt detect hota hai');
   ok(wb.worldBotPromptKind('Login JSON\nTap Copy on the code block below\n{"name":"x","mobile":"9"}') === '',

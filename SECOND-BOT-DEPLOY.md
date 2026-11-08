@@ -380,11 +380,13 @@ World bots ka default pool: `@SwiggyByworldBot`, `@SwiggyByworld1Bot` …
 `@SwiggyByworld5Bot` — **saare bilkul same** kaam karte hain. Rules:
 
 - Ek number par **pehla bot hi** chalta hai; jo bot chal jaye wahi **sticky**
-  rehta hai (bina wajah switch nahi).
-- OTP send fail / OTP na aaye / OTP galat / bot flow fail / delete fail →
-  **agla bot** (wrap-around), ek number par max **3 bots** try hote hain.
-- `⏹ STOP`, `SKIP`, invalid-number aur Telegram-setup pending par **switch
-  nahi** hota (ye bot ki galti nahi hai).
+  rehta hai.
+- **Switch sirf do soorat me:** bot `OTP Sent` 20s me confirm na kare, ya bot
+  "queue/wait" me 20s se zyada atka rahe. Tab agla bot, ek number par max 3.
+- **Switch nahi:** OTP 20s me nahi aaya (number skip), OTP galat, delete fail,
+  flow atka, STOP/SKIP, invalid number, Telegram setup pending.
+- OTP ka wait hamesha **20 second** — OTP aane par turant enter hota hai (send
+  confirm hota hai; na jaye to wahi OTP dobara, bot nahi badalta).
 - Pool badalna ho to env: `SWIGGY_WORLD_BOT_USERNAMES=A_bot,B_bot` (CSV).
 
 #### 📦 Shop Bot stock (@its_shop_bot)

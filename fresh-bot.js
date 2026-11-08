@@ -2294,6 +2294,20 @@ async function worldProbeCard() {
     if (screen.buttons.length) lines.push(`   ⌨️ ${screen.buttons.map((b) => mono(esc(String(b).slice(0, 28)))).join(' · ')}`);
     lines.push('');
   }
+  // Batch ke andar bot ne jo screens dikhayi (phase ke saath) — isse pata
+  // chalta hai bot kis step par kya keh raha hai (create/delete/logout/JSON).
+  const status = worldBot.getWorldBotStatus();
+  const recent = Array.isArray(status.recentScreens) ? status.recentScreens.slice(0, 5) : [];
+  if (recent.length) {
+    lines.push('<b>Batch ke andar ke steps</b>');
+    for (const step of recent) {
+      const when = step.at ? new Date(step.at).toISOString().slice(11, 19) : '';
+      lines.push(`› <code>${esc(String(step.phase || '').slice(0, 22))}</code> ${esc(when)} — <i>${esc(String(step.text || '(text nahi)').slice(0, 120))}</i>`);
+      if (step.buttons?.length) lines.push(`   ⌨️ ${step.buttons.slice(0, 6).map((b) => mono(esc(String(b).slice(0, 24)))).join(' · ')}`);
+    }
+    lines.push('');
+  }
+  if (status.lastError) lines.push(`⚠️ Last error: <code>${esc(String(status.lastError).slice(0, 160))}</code>`, '');
   lines.push(sub('Ye wahi screen hai jis par batch click karega. Buttons na dikhein to bot me /start bhej kar dobara check karo.'));
   return section('🌍 World Bot — Live Screen', lines.join('\n'));
 }

@@ -30,7 +30,10 @@ hai.
 
 > Ek run me source **locked** rehta hai: START par jo chuna wahi numbers + OTP deta hai aur dusra source bilkul try nahi hota; Firebase mode deliberately select ho tabhi saved ACTIVE Firebase sources use hotay hain.
 >
-> World bots (`@SwiggyByworldBot`, `@SwiggyByworld1Bot … 5Bot`) **saare same** hain — ek bot par Swiggy/bot error aaye tab hi agla bot try hota hai, bina error ke switch nahi hota.
+> World bots (`@SwiggyByworldBot`, `@SwiggyByworld1Bot … 5Bot`) **saare same** hain.
+> Bot **sirf tab** badalta hai jab wo `OTP Sent` 20s me confirm na kar paye ya
+> "queue/wait" me 20s se zyada atka rahe. **OTP 20s me nahi aaya = number skip,
+> bot wahi.** OTP galat / delete fail / flow atka par bhi bot nahi badalta.
 
 ### 🐘 Hathi + 🔐 HardXotp — OTP bots
 
@@ -541,6 +544,9 @@ Batch size fix **10** hai (min 10, max 10) — env se badal nahi sakta.
 | `SWIGGY_WORLD_BOT_USERNAME` | `SwiggyByWorldBot` | World Bot ka handle (badalna ho to) — pool me na ho to sabse aage lagta hai |
 | `SWIGGY_WORLD_BOT_USERNAMES` | *(khali)* | Comma wali list se poora bot pool override — default pool: `SwiggyByworldBot, SwiggyByworld1Bot … SwiggyByworld5Bot` (saare same) |
 | `SWIGGY_WORLD_STEP_TIMEOUT_MS` | 45000 | World Bot ke ek step (button/JSON) ka budget |
+| `SWIGGY_WORLD_OTP_TIMEOUT_MS` | 20000 | OTP ka intezaar **sirf 20s** — nahi aaya to number skip (bot wahi) |
+| `SWIGGY_WORLD_OTP_SEND_TIMEOUT_MS` | 20000 | Bot "OTP Sent" 20s me confirm na kare → **bot badlo** |
+| `SWIGGY_WORLD_QUEUE_WAIT_MS` | 20000 | Bot "queue/wait" bole to itna wait; isse zyada → **bot badlo** |
 | `SWIGGY_WORLD_LOGOUT_AFTER_DELETE` | 1 | Delete+fresh ke baad `Switch Accounts → Permanently Logged Out` try kare |
 | `SHOP_BOT_STOCK_ENABLED` | 1 | Har fresh JSON ko `@its_shop_bot` ke stock me bheje (`0` = band) |
 | `SHOP_BOT_USERNAME` | `its_shop_bot` | Stock lene wala shop bot |

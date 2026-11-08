@@ -25,3 +25,18 @@ export function extractStandaloneMobileNumber(rawText) {
   if (!match) return null;
   return normalizeIndianMobileNumber(trimmed);
 }
+
+// Swiggy account me type hone wala naam — owner ka rule:
+//   mobile ke PEHLE 5 digit ko alphabetic order me badlo (1→a, 2→b … 9→i)
+//   aur 0 ko "x" likho.   12345 → abcde · 92046 → ibxdg
+// Naam me sirf letters rehte hain, isliye Swiggy ka naam-prompt accept karta hai.
+export function swiggyNameFromPhone(value) {
+  const digits = String(value ?? '').replace(/\D/g, '');
+  const last10 = digits.length > 10 ? digits.slice(-10) : digits;
+  if (!last10) return '';
+  const take = last10.slice(0, 5);
+  const map = { 0: 'x', 1: 'a', 2: 'b', 3: 'c', 4: 'd', 5: 'e', 6: 'f', 7: 'g', 8: 'h', 9: 'i' };
+  let name = '';
+  for (const ch of take) name += map[ch] || '';
+  return name;
+}

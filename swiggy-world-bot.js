@@ -276,9 +276,12 @@ export function pickWorldBotButton(buttons = [], role = '') {
 // "Bot se remove: Haan 💜 (289291349)" wale confirm button ke liye.
 export function pickWorldBotConfirmButton(buttons = []) {
   const list = Array.isArray(buttons) ? buttons : [];
-  return list.find((b) => /^(haan|han|yes|ok|remove|haan\s*💜|haan\s*[^\p{L}\p{N}]*)$/iu.test(norm(b?.text || b)))
-    || list.find((b) => /\b(remove|hata)\b/.test(norm(b?.text || b)))
-    || null;
+  const label = (b) => String(b?.text || b || '').replace(/[^\p{L}\p{N}]+/gu, ' ').trim().toLowerCase();
+  // "Haan 💜", "✅ Yes", "Yes", "Confirm", "Remove" — Cancel/No kabhi nahi.
+  const reject = (b) => /\b(no|nahi|nah|cancel|back)\b/.test(label(b));
+  const exact = list.find((b) => /^(haan|han|yes|yep|ok|okay|confirm|remove|hata)\b/.test(label(b)) && !reject(b));
+  if (exact) return exact;
+  return list.find((b) => /\b(haan|han|yes|confirm|remove|hata)\b/.test(label(b)) && !reject(b)) || null;
 }
 
 export function findWorldBotAccountButton(buttons = [], phone = '') {
@@ -1462,12 +1465,16 @@ async function clickCopyCode({ client, entity, cfg, shouldAbort }) {
 // ---------------------------------------------------------------------------
 async function clickOrType({
   client, entity, entry, cfg, shouldAbort, what,
-  predicate, baseline = null, timeoutMs = null, maxTypedTries = 3,
+  predicate, baseline = null, timeoutMs = null, maxTypedTries = 3, settle = true,
 }) {
   const total = Math.max(5_000, Number(timeoutMs) || Number(cfg?.stepTimeoutMs) || WORLD_BOT_DEFAULTS.stepTimeoutMs);
   const grace = Math.min(total, Math.max(3_000, Number(cfg?.clickGraceMs) || 4_000));
   // 🧘 Action se pehle bot ka pichla jawab poora aane do — warna command burst.
-  const before = baseline || screenSignature(await settledScreen(client, entity, cfg));
+  // (settle:false = owner ka "turant dabao" case, jaise delete-success ke baad
+  // Main Menu — wahan 1.5s quiet wait hi "late" ban raha tha.)
+  const before = baseline || screenSignature(
+    settle ? await settledScreen(client, entity, cfg) : await parseScreenMessages(client, entity)
+  );
   const label = String(entry?.text || '').trim();
   // 🖱 Click ka callback (bot ka apna jawab) — callback aa gaya matlab bot ne
   // button process kar liya. Tab wahi text DOBARA likhna galat tha (owner ke
@@ -1891,7 +1898,9 @@ export async function worldBotDeleteAccount({
           }
           return null;
         },
-        pollMs: cfg.pollMs,
+        // ⚡ Owner: "successful jaise hi ho delete ... turant Main Menu" —
+        // isliye delete result ka poll tez (500ms), 1.5s ka gap nahi.
+        pollMs: Math.min(500, Number(cfg.pollMs) || 500),
       });
 
       if (result.kind === 'blocked') return await handleDeleteBlocked(result.message);
@@ -1899,46 +1908,48 @@ export async function worldBotDeleteAccount({
         return { ok: false, kind: 'delete_otp_rejected', phone: cleanPhone, reason: 'World Bot ne delete OTP accept nahi kiya' };
       }
 
-      // "Account Deleted Successfully" ke saath bot kabhi "Bot se remove: Haan"
-      // confirm maangta hai (screenshot) — best-effort click.
-      try {
+      // 🏠 Owner: "successful jaise hi ho delete and bot response kare, usko
+      // Main Menu bhejna hai" — koi settle-wait nahi. Jo screen delete-success
+      // ke saath aayi hai usi ke button par TURANT click hota hai.
+      //  1) usi screen par "🏠 Main Menu" ho → seedha wahi
+      //  2) warna "Haan 💜" (bot se remove) confirm → phir Main Menu
+      setPhase('delete-main-menu');
+      let atMenu = Boolean(roleOnLatest([result.message], 'login'));
+      let menuHit = findRoleOnScreens([result.message], 'mainMenu');
+
+      if (!menuHit) {
         const confirm = pickWorldBotConfirmButton(result.message?.buttons || []);
         if (confirm) {
           setPhase('delete-remove-confirm');
+          console.log(`[WorldBot] 🖱 delete success → "${confirm.text}" (bot se remove)`);
           await clickOrType({
-            client, entity, entry: confirm, cfg, shouldAbort, timeoutMs: 10_000,
+            client, entity, entry: confirm, cfg, shouldAbort, timeoutMs: 12_000, settle: false,
             what: 'delete remove confirm',
             predicate: (fresh) => (fresh && fresh.length ? true : null),
           }).catch(() => {});
+          const afterConfirm = await parseScreenMessages(client, entity).catch(() => []);
+          menuHit = findRoleOnScreens(afterConfirm, 'mainMenu');
+          atMenu = Boolean(roleOnLatest(afterConfirm, 'login'));
         }
-      } catch (e) {
-        console.warn('[WorldBot] delete remove-confirm:', e?.message);
       }
 
-      // 🏠 Owner ka pakka step: delete hone ke baad **Main Menu** dabana hai —
-      // na `/start`, na seedha Login. Phir hi pipeline fresh login chalayega
-      // (Login → OTP Login → wahi number → OTP → naam → JSON).
-      setPhase('delete-main-menu');
-      let atMenu = false;
-      try {
-        const afterDelete = await settledScreen(client, entity, cfg).catch(() => parseScreenMessages(client, entity));
-        atMenu = Boolean(roleOnLatest(afterDelete, 'login'));
-        const menuHit = findRoleOnScreens(afterDelete, 'mainMenu');
-        if (menuHit) {
-          console.log(`[WorldBot] 🏠 delete ke baad "${menuHit.button.text}" dabaya — Main Menu par ja raha hoon`);
-          await clickOrType({
-            client, entity, entry: menuHit.button, cfg, shouldAbort,
-            what: 'Main Menu (delete ke baad)',
-            timeoutMs: Math.min(20_000, Number(cfg?.stepTimeoutMs) || 20_000),
-            predicate: (freshList, all) => roleOnLatest(freshList, 'login') || roleOnLatest(all, 'login') || null,
-          }).catch((e) => console.warn(`[WorldBot] Main Menu click: ${e?.message || e}`));
-          const menuScreen = await settledScreen(client, entity, cfg).catch(() => parseScreenMessages(client, entity));
-          atMenu = Boolean(roleOnLatest(menuScreen, 'login'));
-        } else if (!atMenu) {
-          console.log('[WorldBot] ℹ️ delete screen par Main Menu button nahi mila — Login button ka intezaar');
+      if (menuHit) {
+        console.log(`[WorldBot] 🏠 delete success → "${menuHit.button.text}" dabaya — Main Menu`);
+        const ack = await clickOrType({
+          client, entity, entry: menuHit.button, cfg, shouldAbort, settle: false,
+          what: 'Main Menu (delete ke baad)',
+          timeoutMs: Math.min(15_000, Number(cfg?.stepTimeoutMs) || 15_000),
+          predicate: (freshList, all) => roleOnLatest(freshList, 'login') || roleOnLatest(all, 'login') || null,
+        }).catch((e) => {
+          console.warn(`[WorldBot] Main Menu click: ${e?.message || e}`);
+          return null;
+        });
+        if (ack) atMenu = true;
+        if (!atMenu) {
+          atMenu = Boolean(roleOnLatest(await parseScreenMessages(client, entity).catch(() => []), 'login'));
         }
-      } catch (error) {
-        console.warn(`[WorldBot] Main Menu step: ${String(error?.message || error).slice(0, 90)}`);
+      } else if (!atMenu) {
+        console.log('[WorldBot] ℹ️ delete screen par Main Menu button nahi mila — Login button ka intezaar');
       }
 
       state.lastOkAt = Date.now();
@@ -2050,11 +2061,50 @@ async function logoutAccountUnlocked(client, entity, cfg, cleanPhone, { shouldAb
   // 4) Permanently Logged Out
   const logoutHit = await waitFor((msgs) => roleOnLatest(msgs, 'permanentLogout'), 15_000);
   if (!logoutHit) return { ok: false, kind: 'logout_button_missing', phone: cleanPhone, reason: 'Permanently Logged Out button nahi mila' };
+
+  const logoutClickId = Number((await latest(1))[0]?.id) || 0;
   await clickBtn(logoutHit.button, (fresh) => (fresh && fresh.length ? true : null), 'Permanently Logged Out');
+
+  // ✅ Owner: logout par bot DO confirmation maangta hai —
+  //   1) "konsa account" (account button)
+  //   2) "Yes / Cancel"  →  YES dabana hai (Cancel kabhi nahi).
+  const loggedOutRe = /(logged\s*out|log\s*out\s*(success|ho)|successfully\s*log)/i;
+  let confirms = 0;
+  let sawLoggedOut = false;
+  for (let round = 1; round <= 4; round += 1) {
+    const prompt = await waitFor((msgs) => {
+      const fresh = msgs.filter((m) => Number(m.id) > logoutClickId);
+      for (const message of fresh) {
+        if (loggedOutRe.test(String(message.text || ''))) { sawLoggedOut = true; return null; }
+      }
+      for (const message of fresh) {
+        const yes = pickWorldBotConfirmButton(message.buttons || []);
+        if (yes) return { kind: 'yes', entry: yes, message };
+        const acct = findWorldBotAccountButton(message.buttons || [], cleanPhone);
+        if (acct) return { kind: 'account', entry: acct, message };
+      }
+      if (sawLoggedOut) return null;
+      return null;
+    }, round === 1 ? 12_000 : 6_000);
+    if (sawLoggedOut || !prompt) break;
+    confirms += 1;
+    setPhase(`logout-confirm-${confirms}`);
+    console.log(`[WorldBot] ✅ logout confirmation ${confirms}${prompt.kind === 'account' ? ' (account)' : ''}: "${prompt.entry.text}" dabaya`);
+    await clickBtn(prompt.entry, (fresh) => (fresh && fresh.length ? true : null), `logout confirm ${confirms}`, 12_000);
+    await sleep(step);
+  }
+
   state.lastOkAt = Date.now();
   setPhase('logout-done');
-  console.log(`[WorldBot] 🚪 ${cleanPhone} — Permanently Logged Out`);
-  return { ok: true, kind: 'logged_out', phone: cleanPhone };
+  const okOut = sawLoggedOut || confirms >= 2;
+  console.log(`[WorldBot] 🚪 ${cleanPhone} — Permanently Logged Out${confirms ? ` (${confirms} confirmation)` : ''}${okOut ? '' : ' ⚠️ confirm nahi mila'}`);
+  return {
+    ok: okOut,
+    kind: okOut ? 'logged_out' : 'logout_not_confirmed',
+    phone: cleanPhone,
+    confirms,
+    reason: okOut ? '' : 'logout confirmation (Yes) nahi aaya — account shayad abhi bhi logged-in hai',
+  };
 }
 
 export async function worldBotPermanentLogout({

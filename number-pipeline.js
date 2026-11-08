@@ -43,7 +43,7 @@ import {
   doubledWidenWindowMs,
 } from './firebase-numbers.js';
 import { esc, section, sub, field } from './rich-text.js';
-import { normalizeIndianMobileNumber } from './phone-utils.js';
+import { normalizeIndianMobileNumber, swiggyNameFromPhone } from './phone-utils.js';
 import { getOtpBotProfile } from './otp-bot-profiles.js';
 import {
   snapshotTelegramOtpState,
@@ -898,6 +898,8 @@ export async function processSingleNumberViaWorldBot({
   const db = getDb();
   const existingKey = findAccountKeyByPhone(db.config?.accounts || {}, phone) || '';
   const existingName = existingKey ? (db.config.accounts[existingKey]?.name || existingKey) : '';
+  // 🅰️ Owner ka naam rule: mobile ke pehle 5 digit → alphabetic (0 → x).
+  const autoName = swiggyNameFromPhone(phone);
 
   const saveWorldSession = async (result, kind) => {
     const imported = importSessionJson(result.jsonText);
@@ -1030,7 +1032,8 @@ export async function processSingleNumberViaWorldBot({
       phone,
       otpProvider: makeOtpProvider(),
       otpWatermark: makeOtpWatermark(),
-      nameProvider: async () => existingName || getNextAutoUserName(),
+      // 🅰️ Owner ka naam rule: mobile ke pehle 5 digit → alphabetic (1→a … 9→i, 0→x).
+      nameProvider: async () => swiggyNameFromPhone(phone) || existingName || getNextAutoUserName(),
       report: say,
       shouldAbort,
       config: cfg,
@@ -1128,13 +1131,15 @@ export async function processSingleNumberViaWorldBot({
     await say(section('✅ World Bot — Delete Ho Gaya — Fresh Login', [
       `📱 <code>${esc(phone)}</code> · @${esc(botUsername)}`,
       '→ Main Menu → Login → OTP Login → wahi number → OTP → naam (is baar naya account banega).',
+      autoName ? `📛 Naam: <code>${esc(autoName)}</code> (number ke pehle 5 digit → a–i, 0 → x)` : '',
       '→ JSON aa gaya to seedha bhej denge — beech me kuch nahi.',
     ].join('\n')));
     const again = await worldBotLogin({
       phone,
       otpProvider: makeOtpProvider(),
       otpWatermark: makeOtpWatermark(),
-      nameProvider: async () => existingName || getNextAutoUserName(),
+      // 🅰️ Owner ka naam rule: mobile ke pehle 5 digit → alphabetic (1→a … 9→i, 0→x).
+      nameProvider: async () => swiggyNameFromPhone(phone) || existingName || getNextAutoUserName(),
       report: say,
       shouldAbort,
       config: cfg,

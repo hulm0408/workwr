@@ -3432,7 +3432,7 @@ Thanks`)),
     && wb.worldBotButtonRole('Cancel') === 'cancel',
   'worldbot: "Main Menu" ka apna role (Cancel/Back se alag)');
   ok(wbFlowSrc.includes('delete-main-menu')
-    && wbFlowSrc.includes('delete ke baad \"${menuHit.button.text}\" dabaya')
+    && wbFlowSrc.includes('delete success → \"${menuHit.button.text}\" dabaya')
     && wbFlowSrc.includes('atMenu'),
   'worldbot: delete success ke baad Main Menu dabta hai, seedha Login/start nahi');
   ok(wbFlowSrc.includes("findRoleOnScreens(settled, 'mainMenu')")
@@ -3468,6 +3468,31 @@ Thanks`)),
   'pipeline: delete blocked = number skipped, naya number (bot switch nahi)');
   ok(src.includes('Delete Blocked (Charges) — Naya Number'),
     'engine: card par "Delete Blocked (Charges) — Naya Number"');
+
+  // 🅰️ Owner ka naam rule: mobile ke pehle 5 digit → alphabetic (1→a … 9→i)
+  // aur 0 → x.  12345 → abcde · 92046 → ibxdf
+  const phoneUtils = await import('./phone-utils.js');
+  ok(phoneUtils.swiggyNameFromPhone('1234567890') === 'abcde',
+    'name: 12345 → abcde (pehle 5 digit alphabetic)');
+  ok(phoneUtils.swiggyNameFromPhone('9204652951') === 'ibxdf'
+    && phoneUtils.swiggyNameFromPhone('9001234567') === 'ixxab',
+  'name: 0 ke liye x (92046 → ibxdf · 90012 → ixxab)');
+  ok(phoneUtils.swiggyNameFromPhone('') === '' && phoneUtils.swiggyNameFromPhone('+91 98765 43210') === 'ihgfe',
+    'name: khali/invalid par khali, +91 ke baad bhi wahi 10 digit');
+  ok(pipelineCharges.includes("swiggyNameFromPhone(phone) || existingName || getNextAutoUserName()")
+    && (pipelineCharges.match(/nameProvider: async \(\) => swiggyNameFromPhone\(phone\)/g) || []).length === 2,
+  'pipeline: world bot ko naam phone ke digit se milta hai (login + fresh login)');
+
+  // ⚡ Delete success = turant Main Menu + logout ke DO confirmation.
+  ok(wbFlowSrc.includes('settle = true') && wbFlowSrc.includes('settle: false')
+    && wbFlowSrc.includes('pollMs: Math.min(500'),
+  'worldbot: delete success ke baad Main Menu turant (settle skip + 500ms poll)');
+  ok(wbFlowSrc.includes("prompt.kind === 'account'") && wbFlowSrc.includes('logout confirmation')
+    && wbFlowSrc.includes("kind: okOut ? 'logged_out' : 'logout_not_confirmed'"),
+  'worldbot: logout par do confirmation (account + Yes) aur Yes dabta hai');
+  ok(wb.pickWorldBotConfirmButton([{ text: '❌ Cancel' }, { text: '✅ Yes' }])?.text === '✅ Yes'
+    && wb.pickWorldBotConfirmButton([{ text: 'Cancel' }, { text: 'No' }]) === null,
+  'worldbot: "Yes" milta hai, Cancel/No kabhi nahi');
   ok(wbFlowSrc.includes('let otpWatermarkForRound = null')
     && wbFlowSrc.includes('otpProvider({ watermark: otpWatermarkForRound, phone: cleanPhone })')
     && wbFlowSrc.includes('otpProvider({ watermark: deleteWatermark, phone: cleanPhone })'),

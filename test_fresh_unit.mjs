@@ -3236,15 +3236,64 @@ console.log('Ek number = ek hi baar (1-minute decision window, koi parking nahi)
     'rule: consumed/retired number pick filter se block hota hai');
   ok(src.includes('retiredNumbers: 0'), 'rule: state me retiredNumbers counter');
   ok(src.includes('consumedNumbers: 0'), 'rule: state me all consumed numbers counter');
-  ok(engine.SECURITY_CHALLENGE_STOP_LIMIT === 3, 'safety: 3 consecutive security challenges stop batch');
+  ok(engine.SECURITY_CHALLENGE_STOP_LIMIT === 3, 'safety: 3 consecutive security challenges = checkpoint');
   ok(src.includes('if (state.wafStrikes >= SECURITY_CHALLENGE_STOP_LIMIT)'),
     'safety: security challenge threshold checked');
-  ok(src.includes("requestRunEnd('security_challenge');\n          break;"),
-    'safety: repeated 403 gracefully ends batch for every source');
-  ok(!/if \(!telegramMode\) \{ requestRunEnd\('security_challenge'\)/.test(src),
-    'safety: Hermes no longer loops forever after repeated security blocks');
+  ok(src.includes("requestRunEnd('security_challenge');"),
+    'safety: never-stop OFF par repeated 403 batch gracefully end karta hai');
+  ok(src.includes('🌊 Security Storm — Batch Jaari'),
+    'never-stop: 403 storm par batch jaari rehta hai (cool-off + continue)');
+  ok(src.includes('state.wafStrikes = 0;') && src.includes('state.securityStorms'),
+    'never-stop: storm counter reset + ladder');
   ok(src.includes('Swiggy ne 3 baar OTP security challenge diya — batch safety stop'),
-    'safety: final status explains 403 stop');
+    'safety: never-stop OFF wale stop ki wajah card par saaf hai');
+
+  // --- 🔁 NEVER-STOP: batch sirf target/manual STOP par rukta hai ---
+  ok(engine.INFRA_PAUSE_LADDER_MS.length === 4, 'never-stop: infra cool-off ladder maujood');
+  ok(engine.infraPauseMs(1) === 60_000 && engine.infraPauseMs(9) === 600_000,
+    'never-stop: cool-off ladder 60s se 600s tak capped');
+  ok(engine.poolEmptyWaitMs(1) === 20_000 && engine.poolEmptyWaitMs(9) === 180_000,
+    'never-stop: khali pool wait ladder 20s se 180s');
+  ok(src.includes('if (!neverStop) { requestRunEnd(\'circuit_breaker\'); break; }'),
+    'never-stop: fail-streak sirf OFF par run end karta hai');
+  ok(src.includes('↻ Fail-Streak Checkpoint — Batch Jaari'),
+    'never-stop: fail-streak checkpoint card');
+  ok(src.includes('if (!neverStop) { requestRunEnd(\'pool-exhausted\'); break; }'),
+    'never-stop: khali pool sirf OFF mode me run end karta hai');
+  ok(src.includes('🕳 Number Nahi Mila — Batch Jaari'),
+    'never-stop: pool khali par sources dobara scan + batch jaari');
+  ok(src.includes('⏱ Time Cap Pura — Batch Jaari'),
+    'never-stop: time cap par deadline auto-extend');
+  ok(src.includes('runDeadlineAt = Date.now() + addMs'), 'never-stop: deadline asal me aage badhti hai');
+  ok(src.includes('⏳ Rate-Limit Flood — Batch Jaari'),
+    'never-stop: rate-limit flood par batch jaari');
+  ok(src.includes('🛡 WAF Storm — Batch Jaari'), 'never-stop: WAF cooldown storm par batch jaari');
+  ok(src.includes('export function setAutopilotNeverStop'),
+    'never-stop: live toggle (Settings se ON/OFF) maujood');
+  ok(src.includes('const neverStop = opts.neverStop === undefined'),
+    'never-stop: setting/opts se resolve hota hai (default ON)');
+  const neverCard = engine.formatCompactAutopilotCard({
+    sourceMode: 'firebase', running: true, target: 100, fresh: 5, processed: 9,
+    neverStop: true, timeExtensions: 2, poolWaits: 0, concurrency: 1,
+  });
+  ok(neverCard.includes('NEVER-STOP') && neverCard.includes('+2 extend'),
+    'never-stop: live card par NEVER-STOP + extend count');
+  ok(src.includes("if (String(reason) === 'manual')"),
+    'auto-resume: manual STOP turant resume flag clear karta hai');
+  ok(src.includes('clearAutopilotResume()') && src.includes('setAutopilotResume({'),
+    'auto-resume: engine flag persist + clear karta hai');
+  ok(src.includes("'SIGTERM'") || src.includes('lastEndReason'),
+    'auto-resume: infra/process end par flag wanted rehta hai');
+  const bs = await import('./bot-settings.js');
+  ok(bs.getSetting('autoContinue') === true,
+    'never-stop: bot setting default ON (Settings/ PREMIUM_NEVER_STOP=0 se off)');
+  ok(typeof bs.getAutopilotResume === 'function' && typeof bs.setAutopilotResume === 'function',
+    'auto-resume: settings store me resume helpers maujood');
+  const autoResumeSrc = await fsp.readFile(new URL('./fresh-bot.js', import.meta.url), 'utf8');
+  ok(autoResumeSrc.includes('maybeAutoResumeBatch'),
+    'auto-resume: boot par batch khud wapas shuru hota hai');
+  ok(autoResumeSrc.includes('ap_toggle_neverstop'),
+    'never-stop: Settings me ON/OFF toggle maujood');
 
   // --- messaging imaandaar ---
   const card = engine.formatCompactAutopilotCard({

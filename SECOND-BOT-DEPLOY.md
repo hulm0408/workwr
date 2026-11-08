@@ -313,7 +313,9 @@ Isliye code me:
   (`retireNumber()`) — same process me wapas nahi uthta.
 - Lane turant **NAYA number** leti hai. Lane ka wait 5s → 8s → 12s (chhat 15s)
   aur hamesha 1-minute window ke andar.
-- Run **stop nahi hota** (sirf 40 rate-limit outcomes par safety stop).
+- Run **stop nahi hota**: Never-stop ON (default) me 40 rate-limit outcomes
+  sirf ek recovery checkpoint hain — saari lanes cool-off lekar nayi IP par
+  wapas aati hain. OFF karne par purana safety stop wapas.
 
 Decision window fixed **60s** hai; is rule ko env se lamba nahi kiya ja sakta.
 `PREMIUM_RATE_LIMIT_RETRY_MS=5000` rate-limit par lane ka pehla cooldown hai; cooldown ke baad lane **naya number** legi.
@@ -331,16 +333,48 @@ Dikhne me:
 hoti hai. Faayda: bot **rukta nahi**, same number par OTP **burn nahi hota**,
 aur har number par pehla attempt maximum 1 minute ke andar start hota hai. Lock process memory me rehta hai, redeploy tak.
 
-### 403 OTP security-challenge safety stop
+### 🔁 Never-stop + auto-resume (batch na ruke)
+
+Owner ka pakka rule: **batch khud na ruke**. Engine me do layer hain:
+
+1. **In-run never-stop** (Settings → 🔁 Never-stop, default ON;
+   `PREMIUM_NEVER_STOP=1`) — time cap pura ho to deadline usi run me aage
+   badh jaati hai; lagatar fails, 40 rate-limit outcomes, WAF cooldown storm
+   aur 403 storm par saari lanes 60s → 120s → 300s → 600s ka cool-off le kar
+   nayi IP/token se wapas aati hain; pool khali ho to 20s → 180s ke gap se
+   saare ACTIVE Firebase sources dobara scan hote hain. **Sirf TARGET pura
+   hona ya ⏹ STOP** run khatam karta hai. Ek fresh session milte hi recovery
+   ladder reset ho jaati hai.
+2. **Auto-resume** (restart ke baad) — Render deploy/restart, GitHub-Actions
+   runner badalna (har ~6 ghante) ya crash ke baad `data/db.json` + cloud vault
+   me `wanted` flag rehta hai, aur boot ke ~25s baad bot **wahi batch** (wahi
+   target/source/OTP bot) khud shuru kar deta hai. Manual STOP ya target pura
+   hone par flag clear ho jata hai.
+
+Recovery cards `BATCH KHATAM` nahi kehte — wo `↻ Fail-Streak Checkpoint —
+Batch Jaari`, `⏳ Rate-Limit Flood — Batch Jaari`, `🛡 WAF Storm — Batch Jaari`,
+`🌊 Security Storm — Batch Jaari`, `🕳 Number Nahi Mila — Batch Jaari` ya
+`⏱ Time Cap Pura — Batch Jaari` hote hain. Live card par `🔁 NEVER-STOP` chip
+dikhta hai.
+
+### 403 OTP security-challenge — never-stop vs safety stop
 
 Agar logs me `WAF solver OK` ke baad OTP send par
 `SWIGGY_SECURITY_CHALLENGE` / HTTP 403 aaye, token solver sirf route token
-ready kar paya—OTP endpoint ne phir bhi request roki. Hermes source ab **3
-lagataar security-challenge outcomes** ke baad current batch gracefully end
-karta hai; iske baad naye numbers claim nahi honge. Final reason `/diag`/summary
-me `Swiggy ne 3 baar OTP security challenge diya — batch safety stop` dikhega.
+ready kar paya—OTP endpoint ne phir bhi request roki.
+
+- **Never-stop ON (default):** **3 lagataar security-challenge outcomes**
+  ek storm checkpoint hain — batch band nahi hota, saari lanes lamba cool-off
+  (60s → 600s) le kar proxies refresh karke nayi IP/token par wapas try karti
+  hain. Naye numbers tab tak claim nahi hote jab tak cool-off khatam na ho.
+- **Never-stop OFF:** wahi 3 outcomes current batch ko gracefully end karte
+  hain aur final reason `/diag`/summary me `Swiggy ne 3 baar OTP security
+  challenge diya — batch safety stop` dikhta hai.
+
 Official Swiggy app/site verification ya existing session export hi supported
 next step hai; proxy/WAF verification ko bypass karne ki koshish mat karo.
+Baar-baar 403 aaye to Never-stop off karke manual verification karna behtar
+hai (warna numbers sirf cool-off me jaate rahenge).
 
 ## 5️⃣ Kya kabhi nahi karna
 

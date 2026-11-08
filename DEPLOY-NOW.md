@@ -30,6 +30,11 @@ hota hai, minutes free hain.
 
 **Kami:** har 6 ghante me ~5 min ka gap, runner ephemeral (vault zaroori)।
 
+**Batch ka kya?** Gap ke waqt process band hota hai, lekin chalta hua batch
+`data/db.json` + cloud vault me nishan chhodta hai — naya runner boot hote hi
+bot **wahi batch khud shuru** kar deta hai (Settings → 🔁 Never-stop ON hone
+par). Manual ⏹ STOP ya target pura hone par ye nishan clear ho jata hai.
+
 ---
 
 ## 🅱️ Raasta B — Render (24×7, gap nahi, koi bhi email)

@@ -28,7 +28,7 @@ import {
   recordSourceResult,
   sourceHealthSummary,
 } from './firebase-sources.js';
-import { getSetting } from './bot-settings.js';
+import { getSetting, setAutopilotResume, clearAutopilotResume } from './bot-settings.js';
 import {
   processSingleNumber,
   freshEntriesFrom,
@@ -308,6 +308,15 @@ const state = {
   telegramInfraRetries: 0,
   telegramClaimRetries: 0,
   workerRecoveries: 0,
+  // 🔁 Never-stop bookkeeping (UI + resume card ke liye)
+  neverStop: true,
+  timeExtensions: 0,
+  infraPauses: 0,
+  infraPauseUntil: 0,
+  poolWaits: 0,
+  securityStorms: 0,
+  wafStorms: 0,
+  autoResumedAt: 0,
   addressAdded: 0,
   addressFailed: 0,
   telegramLastCheckedAt: 0,
@@ -424,6 +433,14 @@ export function getAutopilotSnapshot() {
     telegramClaimPhase: telegramLive.claimPhase || '',
     telegramLastActionAt: Number(telegramLive.lastActionAt) || 0,
     workerRecoveries: state.workerRecoveries || 0,
+    neverStop: Boolean(state.neverStop),
+    timeExtensions: state.timeExtensions || 0,
+    infraPauses: state.infraPauses || 0,
+    infraPauseUntil: state.infraPauseUntil || 0,
+    poolWaits: state.poolWaits || 0,
+    securityStorms: state.securityStorms || 0,
+    wafStorms: state.wafStorms || 0,
+    autoResumedAt: state.autoResumedAt || 0,
     addressAdded: state.addressAdded || 0,
     addressFailed: state.addressFailed || 0,
     telegramLastCheckedAt: state.telegramLastCheckedAt || 0,
@@ -480,10 +497,26 @@ export function isAutopilotRunning() {
   return state.running;
 }
 
+// 🔁 Never-stop ko LIVE batch par badalna (Settings toggle) — restart nahi.
+export function setAutopilotNeverStop(value) {
+  state.neverStop = value !== false;
+  return state.neverStop;
+}
+
+export function isAutopilotNeverStop() {
+  return Boolean(state.neverStop);
+}
+
 export function requestAutopilotStop(reason = 'manual') {
   if (!state.running) return false;
   state.stopRequested = true;
   state.stopReason = reason;
+  // Manual STOP = owner ne khud band kiya → restart ke baad batch wapas na
+  // aaye, isliye auto-resume flag turant clear. SIGTERM/crash/deploy par flag
+  // rehta hai taaki auto-resume batch ko wapas chala sake.
+  if (String(reason) === 'manual') {
+    try { clearAutopilotResume(); } catch {}
+  }
   return true;
 }
 
@@ -578,6 +611,29 @@ export const NUMBER_DECISION_WINDOW_MS = 60_000;
 
 // Repeated upstream OTP security challenges must stop consuming new numbers.
 export const SECURITY_CHALLENGE_STOP_LIMIT = 3;
+
+// ---------------------------------------------------------------------------
+// 🔁 NEVER-STOP (auto-continue) — owner ka pakka rule: "BATCH NA RUKE".
+//
+// Purana behaviour: time-cap, lagatar fails, rate-limit flood, WAF cooldowns,
+// 3x403 storm ya pool khali hone par batch `BATCH KHATAM` dikha kar band ho
+// jata tha. Naye rule me ye sab sirf RECOVERY CHECKPOINT hain: engine thoda
+// cool-off karke, route/proxy badal kar aur pool ko dobara scan karke khud
+// aage badhta hai. Batch sirf TARGET pura hone ya owner ke STOP par rukta hai.
+//
+// Setting: bot Settings → 🔁 Never-stop (env PREMIUM_NEVER_STOP=0 se off).
+// ---------------------------------------------------------------------------
+export const INFRA_PAUSE_LADDER_MS = [60_000, 120_000, 300_000, 600_000];
+export function infraPauseMs(round = 1) {
+  const idx = Math.min(Math.max(1, Number(round) || 1), INFRA_PAUSE_LADDER_MS.length) - 1;
+  return INFRA_PAUSE_LADDER_MS[idx];
+}
+
+export const POOL_EMPTY_WAIT_LADDER_MS = [20_000, 45_000, 90_000, 180_000];
+export function poolEmptyWaitMs(round = 1) {
+  const idx = Math.min(Math.max(1, Number(round) || 1), POOL_EMPTY_WAIT_LADDER_MS.length) - 1;
+  return POOL_EMPTY_WAIT_LADDER_MS[idx];
+}
 
 export function numberDecisionWindowMs() {
   return NUMBER_DECISION_WINDOW_MS;
@@ -970,6 +1026,9 @@ export function formatCompactAutopilotCard(snap = state, { stageText = '', final
     compactSourceLine(s),
     s.shardEnabled ? `🧩 ${mono(`SHARE ${s.shardShare || ''}`)} <i>· pool ka apna hissa, koi ladai nahi</i>` : '',
     s.proxyMode === 'direct' ? `🔀 ${mono('DIRECT')} <i>· bina proxy, ek IP — slow par predictable</i>` : '',
+    !final && s.neverStop
+      ? `🔁 ${mono('NEVER-STOP')} <i>· batch sirf TARGET/STOP par rukega${Number(s.timeExtensions) ? ` · ⏱ +${Number(s.timeExtensions)} extend` : ''}${Number(s.poolWaits) ? ` · 🕳 pool-wait #${Number(s.poolWaits)}` : ''}${Date.now() < Number(s.infraPauseUntil || 0) ? ` · ⏸ ${Math.max(1, Math.round((Number(s.infraPauseUntil) - Date.now()) / 1000))}s cool-off` : ''}</i>`
+      : '',
     Number(s.rateLimitQueued) ? `⏳ ${mono(`RATE-LIMIT #${Number(s.rateLimitQueued)}`)} <i>· ye number khatam · agla naya ${Math.max(1, Math.round((Number(s.rateLimitRetryMs) || 5000) / 1000))}s me</i>` : '',
     `✅ ${mono(`FRESH ${fresh}`)} · ⚙ ${mono(`DONE ${Number(s.processed) || 0}`)} · × ${mono(`FAIL ${Number(s.failed) || 0}`)}${retries ? ` · ↻ ${mono(`RETRY ${retries}`)}` : ''}${Number(s.manualSkips) ? ` · ⏭ ${mono(`SKIP ${Number(s.manualSkips) || 0}`)}` : ''}${fresh ? ` · 🏠 ${mono(`ADDR ${Number(s.addressAdded) || 0}/${fresh}`)}` : ''}`,
     final
@@ -1121,6 +1180,11 @@ export async function startAutopilot(opts = {}) {
     ? Number(opts.gapMs)
     : s('gapMs', envInt('PREMIUM_BATCH_GAP_MS', 6_000));
   const backoffMs = s('backoffMs', envInt('PREMIUM_RATE_LIMIT_BACKOFF_MS', 15 * 60_000));
+  // 🔁 Never-stop: default ON. Owner ka rule — batch sirf target/manual STOP
+  // par rukta hai; baaki har rukawat auto-recovery checkpoint hai.
+  const neverStop = opts.neverStop === undefined
+    ? s('autoContinue', true) !== false
+    : opts.neverStop !== false;
   const allowOffline = s('allowOffline', String(process.env.PREMIUM_ALLOW_OFFLINE_DEVICES || '') === '1') === true;
   const telegramSetting = s('telegramOtpMode', false) === true;
   const sourceMode = resolveAutopilotNumberSource({
@@ -1220,6 +1284,14 @@ export async function startAutopilot(opts = {}) {
     telegramInfraRetries: 0,
     telegramClaimRetries: 0,
     workerRecoveries: 0,
+    neverStop,
+    timeExtensions: 0,
+    infraPauses: 0,
+    infraPauseUntil: 0,
+    poolWaits: 0,
+    securityStorms: 0,
+    wafStorms: 0,
+    autoResumedAt: Number(opts.autoResumedAt) || 0,
     addressAdded: 0,
     addressFailed: 0,
     telegramLastCheckedAt: 0,
@@ -1235,6 +1307,27 @@ export async function startAutopilot(opts = {}) {
   // Pichhli run kisi fatal par ruki ho to stale lane reservations nayi
   // run ki saari IPs ko block na kar dein.
   try { proxyPool._clearProxyReservations(); } catch {}
+
+  // 🔁 AUTO-RESUME flag: Render deploy/restart, GitHub-Actions runner badalna
+  // ya process crash ke baad boot par wahi batch khud shuru ho. Flag db
+  // (data/db.json) me aur cloud vault me bhi jata hai, isliye ephemeral
+  // runner par bhi kaam karta hai. Manual STOP/target par clear hota hai.
+  const resumeRunId = `run-${Date.now()}`;
+  try {
+    setAutopilotResume({
+      wanted: true,
+      runId: resumeRunId,
+      target,
+      maxMinutes,
+      gapMs,
+      sourceMode,
+      otpBot: telegramMode ? otpBotProfileId : '',
+      userId: String(opts.userId || ''),
+      startedAt: Date.now(),
+      lastEndReason: '',
+      lastEndedAt: 0,
+    });
+  } catch (e) { console.warn('[Autopilot] resume flag save:', e?.message || e); }
 
   const userId = opts.userId || 'autopilot';
   let endReason = 'target';
@@ -1816,6 +1909,21 @@ export async function startAutopilot(opts = {}) {
     };
 
     await poolPromise; // pool ready — warm-up abhi bhi background me ho sakta hai
+    // 🔁 Never-stop: Firebase ka ek network error (ya khali source) poori
+    // batch ko na mare — kuch retry ke baad bhi na chale to hi fatal.
+    if (!telegramMode && !pool.length && state.lastError && neverStop) {
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        if (state.stopRequested) break;
+        console.log(`[Autopilot] ↻ Pool load retry ${attempt}/3 — ${String(state.lastError).slice(0, 120)}`);
+        await push(progressCard(section('↻ Firebase Load Retry — Batch Jaari', [
+          `› Pool load nahi hua (<i>${esc(String(state.lastError).slice(0, 120))}</i>) — batch <b>band nahi</b> ho raha.`,
+          `› Retry ${attempt}/3 · thodi der baad dobara try hoga.`,
+        ].join('\n'))), stopRows());
+        await sleep(poolEmptyWaitMs(attempt), () => state.stopRequested);
+        try { await loadPool(); } catch (e) { state.lastError = e?.message || 'pool refresh fail'; }
+        if (pool.length) { state.lastError = ''; break; }
+      }
+    }
     if (!telegramMode && !pool.length && state.lastError) throw new Error(state.lastError); // Firebase error ko fatal hi rakho (pehle wala behavior)
 
     // RUNNING card ab pool ke ASAL numbers ke saath (pehle 0/0 dikhta tha)
@@ -2711,6 +2819,19 @@ export async function startAutopilot(opts = {}) {
       sub('Chromium WAF solver memory safety ke liye ek waqt me ek hi chalega; HTTP/OTP waits parallel rahenge.'),
     ].join('\n'))), stopRows());
 
+    // ⏱ Run deadline. Never-stop ON me ye ek "checkpoint" hai: deadline
+    // poori hone par engine khud extend karta hai (batch khatam nahi hota).
+    let runDeadlineAt = state.startedAt + Math.max(1, maxMinutes) * 60_000;
+
+    // Saari lanes ka ek saath saans lena (403 storm / rate-limit flood me
+    // naye numbers jalne se bachao). STOP is wait ko turant todta hai.
+    const sleepThroughInfraPause = async () => {
+      const left = Number(state.infraPauseUntil || 0) - Date.now();
+      if (!(left > 0)) return false;
+      await sleep(Math.min(left, 5_000), () => state.stopRequested);
+      return true;
+    };
+
     const runWorker = async (lane) => {
       let restartWorker = true;
       while (restartWorker && !state.stopRequested) {
@@ -2721,7 +2842,24 @@ export async function startAutopilot(opts = {}) {
             if (!runEndRequested) endReason = state.stopReason || 'manual';
             break;
           }
-          if (Date.now() - state.startedAt > maxMinutes * 60_000) { requestRunEnd('time'); break; }
+          // 🔁 Never-stop: infra cool-off ke dauran koi naya number na uthao.
+          if (await sleepThroughInfraPause()) continue;
+          if (Date.now() > runDeadlineAt) {
+            if (!neverStop) { requestRunEnd('time'); break; }
+            // ⏱ Checkpoint — batch khatam nahi, deadline aage badh gayi.
+            state.timeExtensions = (state.timeExtensions || 0) + 1;
+            const addMs = Math.max(10, maxMinutes) * 60_000;
+            runDeadlineAt = Date.now() + addMs;
+            state.maxMinutes = Math.max(1, Math.round((runDeadlineAt - state.startedAt) / 60_000));
+            console.log(`[Autopilot] ⏱ Time cap pura — batch jaari (extension #${state.timeExtensions}, total ${state.maxMinutes} min).`);
+            await push(progressCard(section('⏱ Time Cap Pura — Batch Jaari', [
+              `› ${maxMinutes} min ka time cap pura ho gaya, lekin batch <b>band nahi</b> ho raha.`,
+              `› Deadline ${Math.max(10, maxMinutes)} min aage badha di (extension #${state.timeExtensions}, run ki total limit ${state.maxMinutes} min).`,
+              `› Batch sirf <b>TARGET pura</b> hone ya aapke <b>STOP</b> par rukega.`,
+              sub('"Never-stop" off karna ho to Settings → 🔁 Never-stop se band karo.'),
+            ].join('\n'))), stopRows());
+            continue;
+          }
           if (state.fresh >= target) { requestRunEnd('target'); break; }
           // Target ke aakhir me extra numbers start karke overshoot na karo:
           // jitne in-flight hain unke potential fresh count kar lo.
@@ -2746,8 +2884,24 @@ export async function startAutopilot(opts = {}) {
               await sleep(2_000, () => state.stopRequested);
               continue;
             }
-            requestRunEnd('circuit_breaker');
-            break;
+            if (!neverStop) { requestRunEnd('circuit_breaker'); break; }
+            // 🔁 Never-stop: lagatar fails = recovery checkpoint, run ka end
+            // nahi. Sab lanes thoda saans lein, counters reset, phir nayi
+            // route/token ke saath agla number.
+            state.consecutiveFails = 0;
+            lane.consecutiveFails = 0;
+            state.workerRecoveries = (state.workerRecoveries || 0) + 1;
+            state.infraPauses = (state.infraPauses || 0) + 1;
+            const cbWaitMs = infraPauseMs(state.infraPauses);
+            state.infraPauseUntil = Math.max(Number(state.infraPauseUntil) || 0, Date.now() + cbWaitMs);
+            maybeRefillFreeProxies();
+            console.log(`[Autopilot] ↻ Fail-streak checkpoint — batch jaari, ${Math.round(cbWaitMs / 1000)}s cool-off.`);
+            await push(progressCard(section('↻ Fail-Streak Checkpoint — Batch Jaari', [
+              `› Lagatar ${failLimit}+ failures aaye — batch <b>band nahi</b> ho raha.`,
+              `› Saari lanes ${Math.round(cbWaitMs / 1000)}s cool-off lenge, proxies refresh hongi, phir naya number aayega.`,
+              `› Checkpoint #${state.infraPauses}. Sirf TARGET ya STOP batch khatam karega.`,
+            ].join('\n'))), stopRows());
+            continue;
           }
 
           if (!ensureLaneRoute(lane)) {
@@ -2779,10 +2933,29 @@ export async function startAutopilot(opts = {}) {
             continue;
           }
           if (claim.status !== 'picked' || !claim.picked?.entry) {
-            requestRunEnd('pool-exhausted');
-            break;
+            if (!neverStop) { requestRunEnd('pool-exhausted'); break; }
+            // 🔁 Never-stop: pool khali ≠ batch khatam. Saare ACTIVE sources
+            // dobara cycle hote hain (naye numbers/DB me nayi activity aa
+            // sakti hai) aur lane thodi der baad phir try karti hai.
+            state.poolWaits = (state.poolWaits || 0) + 1;
+            const poolWaitMs = poolEmptyWaitMs(state.poolWaits);
+            try { resetPoolScanStateForSourceSwitch(); } catch {}
+            runSourceIndex = -1;
+            triedRunSourceKeys.clear();
+            poolLoadedAt = 0;
+            state.poolStatus = 'loading';
+            console.log(`[Autopilot] 🕳 Pool khali — batch jaari, ${Math.round(poolWaitMs / 1000)}s baad sources dobara scan.`);
+            await push(progressCard(section('🕳 Number Nahi Mila — Batch Jaari', [
+              `› Is waqt pool me koi usable fresh number nahi mila — batch <b>band nahi</b> ho raha.`,
+              `› ${Math.round(poolWaitMs / 1000)}s baad saare ACTIVE Firebase sources dobara scan honge (nayi SMS activity aa sakti hai).`,
+              `› Pool-wait #${state.poolWaits}. Target/STOP hi batch khatam karenge.`,
+              sub('Firebase sources me naya DB add karna ho to Settings → 🔥 Firebase Sources.'),
+            ].join('\n'))), stopRows());
+            await sleep(poolWaitMs, () => state.stopRequested);
+            continue;
           }
           const picked = claim.picked;
+          state.poolWaits = 0;
           // 60s decision clock starts when this lane receives the number.
           // If preflight/WAF warm-up consumes the window, skip it outright.
           picked.claimedAtMs = Date.now();
@@ -2927,6 +3100,15 @@ export async function startAutopilot(opts = {}) {
       if (res.ok && res.phone) {
         extractedThisRun.add(res.phone);
         purgeQueuedPhone(res.phone);
+        // 🔁 Recovery ladder reset — ek fresh session ka matlab hai route,
+        // pool aur token sab kaam kar rahe hain; purane cool-off counters
+        // ab bhaari nahi padne chahiye.
+        state.infraPauses = 0;
+        state.securityStorms = 0;
+        state.wafStorms = 0;
+        state.poolWaits = 0;
+        state.infraPauseUntil = 0;
+        state.consecutiveFails = 0;
       }
       // One-shot OTP / manual SKIP: is phone ko isi run ki har queue aur
       // claim filter se consumed kar do. Neeche wali route recovery ab
@@ -3085,8 +3267,21 @@ export async function startAutopilot(opts = {}) {
           state.rateStrikes = 1;
           state.workerRecoveries = (state.workerRecoveries || 0) + 1;
           if (!telegramMode && queuedTotal >= RATE_LIMIT_QUEUE_SAFETY_LIMIT) {
-            requestRunEnd('rate_limited');
-            break;
+            if (!neverStop) { requestRunEnd('rate_limited'); break; }
+            // 🔁 Never-stop: 40 rate-limit outcomes = Swiggy ki taraf se
+            // global throttle. Batch khatam nahi — saari lanes thodi der
+            // ruk kar nayi IP par wapas aati hain.
+            const rlWaitMs = infraPauseMs((state.infraPauses || 0) + 1);
+            state.infraPauses = (state.infraPauses || 0) + 1;
+            state.rateLimitQueued = 0;
+            state.infraPauseUntil = Math.max(Number(state.infraPauseUntil) || 0, Date.now() + rlWaitMs);
+            console.log(`[Autopilot] ⏳ Rate-limit flood — batch jaari, ${Math.round(rlWaitMs / 1000)}s cool-off.`);
+            await push(progressCard(section('⏳ Rate-Limit Flood — Batch Jaari', [
+              `› Lagatar ${queuedTotal} rate-limit outcomes — Swiggy saari IPs ko thanda kar raha hai.`,
+              `› Batch <b>band nahi</b>: ${Math.round(rlWaitMs / 1000)}s cool-off ke baad nayi IP/token se naye numbers aayenge.`,
+              `› Counter reset ho gaya — agla checkpoint phir se ginega.`,
+            ].join('\n'))), stopRows());
+            continue;
           }
         }
         // 1-minute decision window: lane itni der se zyada nahi rukegi.
@@ -3118,11 +3313,23 @@ export async function startAutopilot(opts = {}) {
       if (outcome === 'waf_cooldown') {
         state.wafCooldowns++;
         if (state.wafCooldowns > wafCooldownLimit) {
-          if (!telegramMode) { requestRunEnd('waf_stuck'); break; }
-          // Cumulative counter Hermes run ko safalta ke baghair bhi sirf
-          // waqt guzarne par maar sakta tha. Ise recovery checkpoint rakho.
+          if (!telegramMode && !neverStop) { requestRunEnd('waf_stuck'); break; }
+          // Cumulative counter run ko safalta ke baghair bhi sirf waqt
+          // guzarne par maar sakta tha. Ise recovery checkpoint rakho —
+          // never-stop ON me batch yahan kabhi khatam nahi hota.
           state.wafCooldowns = 0;
           state.workerRecoveries = (state.workerRecoveries || 0) + 1;
+          state.wafStorms = (state.wafStorms || 0) + 1;
+          const wafStormWaitMs = infraPauseMs(state.wafStorms);
+          state.infraPauseUntil = Math.max(Number(state.infraPauseUntil) || 0, Date.now() + wafStormWaitMs);
+          console.log(`[Autopilot] 🛡 WAF storm — batch jaari, ${Math.round(wafStormWaitMs / 1000)}s cool-off.`);
+          try {
+            await push(progressCard(section('🛡 WAF Storm — Batch Jaari', [
+              `› ${wafCooldownLimit}+ WAF cooldowns ho gaye — batch <b>band nahi</b> ho raha.`,
+              `› Saari lanes ${Math.round(wafStormWaitMs / 1000)}s ka cool-off lengi, phir nayi IP/token se naya number aayega.`,
+              `› Storm #${state.wafStorms}. Target/STOP hi batch khatam karenge.`,
+            ].join('\n'))), stopRows());
+          } catch {}
         }
         if (res.phone && !oneShotOtpFailure) retireNumber(entry, 'waf_cooldown');
 
@@ -3168,11 +3375,34 @@ export async function startAutopilot(opts = {}) {
           ? 'Ye Hermes number one-shot rule se khatam — route ready karke NEW NUMBER aayega.'
           : 'Ye number khatam — route recovery ke baad naya number aayega.';
         if (state.wafStrikes >= SECURITY_CHALLENGE_STOP_LIMIT) {
-          // Same HTTP 403 across routes = upstream verification gate, not a
-          // reason to burn more Hermes numbers. Gracefully end this batch;
-          // official verification/session export is the supported next step.
-          requestRunEnd('security_challenge');
-          break;
+          if (!neverStop) {
+            // Purana behaviour (never-stop OFF): same HTTP 403 across routes
+            // = upstream verification gate, isliye batch gracefully end.
+            requestRunEnd('security_challenge');
+            break;
+          }
+          // 🔁 Never-stop: 403 storm par batch khatam NAHI hota. Saari lanes
+          // ek saath lamba cool-off lengi (naye numbers jalne se bachao),
+          // proxies refresh hongi, phir nayi route/token par wapas try.
+          state.wafStrikes = 0;
+          state.securityStorms = (state.securityStorms || 0) + 1;
+          state.workerRecoveries = (state.workerRecoveries || 0) + 1;
+          state.consecutiveFails = 0;
+          lane.consecutiveFails = 0;
+          const stormWaitMs = infraPauseMs(state.securityStorms);
+          const alreadyPaused = Date.now() < Number(state.infraPauseUntil || 0);
+          state.infraPauseUntil = Math.max(Number(state.infraPauseUntil) || 0, Date.now() + stormWaitMs);
+          maybeRefillFreeProxies();
+          console.log(`[Autopilot] 🌊 Security storm — batch jaari, ${Math.round(stormWaitMs / 1000)}s cool-off (storm #${state.securityStorms}).`);
+          if (!alreadyPaused) {
+            await push(progressCard(section('🌊 Security Storm — Batch Jaari', [
+              `› Swiggy ne lagatar ${SECURITY_CHALLENGE_STOP_LIMIT} security challenges diye — batch <b>band nahi</b> ho raha.`,
+              `› Saari lanes ${Math.round(stormWaitMs / 1000)}s ka cool-off lengi, proxies/token refresh honge, phir nayi IP par naya number aayega.`,
+              `› Storm #${state.securityStorms}. Yeh ek recovery checkpoint hai, batch ka end nahi.`,
+              sub('Bahut lamba block rahe to Settings → 🔁 Never-stop off karke manual verification karo.'),
+            ].join('\n'))), stopRows());
+          }
+          continue;
         }
 
         const routeKind = securityChallengeRouteKind({
@@ -3315,9 +3545,13 @@ export async function startAutopilot(opts = {}) {
           state.consecutiveFails = 0;
           lane.consecutiveFails = 0;
           if (state.proxyRotations > rotationLimit) {
-            if (!telegramMode) { requestRunEnd('circuit_breaker'); break; }
+            if (!telegramMode && !neverStop) { requestRunEnd('circuit_breaker'); break; }
+            // 🔁 Never-stop: rotation cap sirf checkpoint — counter reset aur
+            // poori pool refresh, batch chalta rehta hai.
             state.proxyRotations = 0;
             state.workerRecoveries = (state.workerRecoveries || 0) + 1;
+            state.infraPauses = (state.infraPauses || 0) + 1;
+            maybeRefillFreeProxies();
           }
           await push(progressCard(section('🔀 Fail Streak — Proxy Rotate', [
             `› Lane ${lane.id} par ${laneFailStreak} lagatar failures — IP issue lag raha hai.`,
@@ -3368,7 +3602,7 @@ export async function startAutopilot(opts = {}) {
         restartWorker = Boolean(
           !state.stopRequested
           && state.fresh < target
-          && Date.now() - state.startedAt <= maxMinutes * 60_000
+          && (neverStop || Date.now() <= runDeadlineAt)
         );
         if (restartWorker) {
           try {
@@ -3424,6 +3658,15 @@ export async function startAutopilot(opts = {}) {
     } else {
       state.stopReason = endReason;
     }
+    // 🔁 AUTO-RESUME flag: normal end (target / manual STOP / setup) par
+    // clear. Infra end, crash ya SIGTERM par wanted=true rehta hai — bot
+    // restart (Render deploy, Actions runner badalna) hote hi batch khud
+    // wapas shuru ho jata hai.
+    try {
+      const resumeOffReasons = ['target', 'manual', 'telegram-setup', 'firebase-cleared'];
+      if (resumeOffReasons.includes(endReason)) clearAutopilotResume();
+      else setAutopilotResume({ wanted: true, lastEndReason: endReason, lastEndedAt: Date.now() });
+    } catch (e) { console.warn('[Autopilot] resume flag:', e?.message || e); }
   }
 
   // Final summary (fresh session list ke saath)

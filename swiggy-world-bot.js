@@ -427,10 +427,16 @@ export function worldBotOtpBlockInfo(text = '') {
 // Bot abhi kya maang raha hai (latest screen se): 'otp' | 'number' | 'name' | ''.
 // Isi se tay hota hai ki button ka TEXT bhejna safe hai ya nahi — warna wo text
 // hi OTP/number ban kar "❌ Invalid OTP / Invalid Mobile Number" deta tha.
+// Flow "saaf ho gaya" batane wale messages — inse upar wala purana OTP prompt
+// bhool jao, warna "Cancel" ke baad bhi bot ko OTP par khada samajh liya jata
+// tha aur dobara /cancel chala jata tha.
+const WORLD_TERMINAL_SCREEN = /\b(login cancelled|no account was logged in|pick a feature|main menu|login successful|account deleted successfully|join verified|how to use this bot)\b/;
+
 export function worldBotAwaitingKind(messages = []) {
   const list = Array.isArray(messages) ? messages : [];
-  for (const message of list.slice(0, 3)) {
+  for (const message of list.slice(0, 2)) {
     const text = String(message?.text ?? message ?? '');
+    if (WORLD_TERMINAL_SCREEN.test(text.toLowerCase())) return '';
     const kind = worldBotPromptKind(text);
     if (kind === 'otpSent' || kind === 'deleteSent' || kind === 'otpFail') return 'otp';
     if (kind === 'askNumber') return 'number';
@@ -646,6 +652,37 @@ async function waitForReply({ client, entity, predicate, baseline, timeoutMs, sh
   );
 }
 
+// 🧘 Bot ka jawab poora aane ka intezaar: jab tak latest message ka id na
+// badle, agla command mat bhejo. Owner ki shikayat: "bot response aane se
+// pehle hi 3-4 command de deta hai".
+async function settledScreen(client, entity, cfg = {}, { quietMs = 1_500, maxMs = 10_000 } = {}) {
+  const every = Math.max(250, Number(cfg?.pollMs) || 1_200);
+  const quiet = Math.max(400, Number(quietMs) || 1_500);
+  const deadline = Date.now() + Math.max(quiet, Number(maxMs) || 9_000);
+  let lastId = -1;
+  let lastChange = Date.now();
+  for (;;) {
+    const all = await parseScreenMessages(client, entity, 6);
+    const id = Number(all[0]?.id) || 0;
+    if (id !== lastId) {
+      lastId = id;
+      lastChange = Date.now();
+    } else if (Date.now() - lastChange >= quiet) {
+      return all;
+    }
+    if (Date.now() >= deadline) return all;
+    await sleep(every);
+  }
+}
+
+// Button role sirf LATEST 1-2 messages me dhoondho. Poori chat history dekhne
+// se purane menu ka button "maujood" maan liya jata tha aur bot galat command
+// bhej deta tha ("otp login" → ❌ Invalid Mobile Number).
+function roleOnLatest(messages = [], role = '') {
+  const list = (Array.isArray(messages) ? messages : []).slice(0, 2);
+  return findRoleOnScreens(list, role);
+}
+
 async function sendWorldText(client, entity, text) {
   const payload = String(text);
   for (let attempt = 1; attempt <= 2; attempt += 1) {
@@ -764,18 +801,20 @@ export async function worldBotLogin({
 
       // 1) /start → main menu (pehle pichla adhoora flow saaf: OTP/number prompt)
       setPhase('start');
-      const cleanMenu = await worldResetToMenu(client, entity, cfg);
-      let before = screenSignature(await parseScreenMessages(client, entity));
-      // Reset ne /start bhej diya hota hai — dobara sirf tab jab menu saaf na hua ho.
-      if (!cleanMenu) await sendWorldText(client, entity, '/start').catch(() => {});
+      await worldResetToMenu(client, entity, cfg);
+      let before = screenSignature(await settledScreen(client, entity, cfg));
+      // /start sirf tab jab menu me Login button abhi na ho (duplicate command nahi).
+      if (!roleOnLatest(await parseScreenMessages(client, entity), 'login')) {
+        await sendWorldText(client, entity, '/start').catch(() => {});
+      }
       await waitForReply({
         client, entity, baseline: before, timeoutMs: cfg.startTimeoutMs, shouldAbort,
         what: 'main menu',
-        predicate: (freshList, all) => findRoleOnScreens([...freshList, ...all], 'login'),
+        predicate: (freshList, all) => roleOnLatest(freshList, 'login') || roleOnLatest(all, 'login'),
         pollMs: cfg.pollMs,
       }).catch(async () => {
-        // /start ka jawab na aaya ho to purani screen par Login dhoondho.
-        const hit = findRoleOnScreens(await parseScreenMessages(client, entity), 'login');
+        // /start ka jawab na aaya ho to latest screen par Login dhoondho.
+        const hit = roleOnLatest(await parseScreenMessages(client, entity), 'login');
         if (!hit) throw new WorldBotError('no-login-button', '/start ke baad Login button nahi mila');
         return hit;
       });
@@ -793,22 +832,24 @@ export async function worldBotLogin({
 
         // 2) 🔐 Login → method picker
         setPhase('login-menu');
-        let issueBaseline = screenSignature(await parseScreenMessages(client, entity));
-        const loginHit = findRoleOnScreens(await parseScreenMessages(client, entity), 'login');
+        const loginScreen = await settledScreen(client, entity, cfg);
+        let issueBaseline = screenSignature(loginScreen);
+        const loginHit = roleOnLatest(loginScreen, 'login');
         if (!loginHit) throw new WorldBotError('no-login-button', `Login button nahi mila — screen: ${(state.lastScreenButtons || []).join(' | ') || 'none'}`);
         await clickOrType({
           client, entity, entry: loginHit.button, cfg, shouldAbort, baseline: issueBaseline,
           what: 'login method screen',
-          predicate: (freshList, all) => findRoleOnScreens([...freshList, ...all], 'otpLogin'),
+          predicate: (freshList, all) => roleOnLatest(freshList, 'otpLogin') || roleOnLatest(all, 'otpLogin'),
         });
 
         // 3) 📲 OTP Login → number maango
         setPhase('otp-login');
-        issueBaseline = screenSignature(await parseScreenMessages(client, entity));
-        const otpBtn = findRoleOnScreens(await parseScreenMessages(client, entity), 'otpLogin');
+        const otpScreen = await settledScreen(client, entity, cfg);
+        issueBaseline = screenSignature(otpScreen);
+        const otpBtn = roleOnLatest(otpScreen, 'otpLogin');
         // Button na mile par bot pehle se number maang raha ho → wahi sahi jagah hai.
         if (!otpBtn) {
-          if (worldBotAwaitingKind(await parseScreenMessages(client, entity)) === 'number') return 'askNumber';
+          if (worldBotAwaitingKind(otpScreen) === 'number') return 'askNumber';
           throw new WorldBotError('no-otp-login', 'OTP Login button nahi mila');
         }
 
@@ -819,7 +860,9 @@ export async function worldBotLogin({
           what: 'number prompt',
           timeoutMs: Math.min(20_000, cfg.stepTimeoutMs),
           predicate: (freshList, all) => {
-            const allText = [...freshList, ...all].map((m) => m.text).join('\n');
+            // Sirf naye/top-2 messages ka text — poori purani chat jodne se
+            // "number maango" galat detect ho jata tha.
+            const allText = [...freshList, ...all.slice(0, 2)].map((m) => m.text).join('\n');
             return worldBotPromptKind(allText) === 'askNumber' ? true : null;
           },
         }).then(() => true).catch(() => true); // prompt na mile to bhi number bhej do
@@ -832,7 +875,8 @@ export async function worldBotLogin({
             : '→ /start → Login → OTP Login ho gaya, ab number bhej raha hoon…',
         ].join('\n'));
 
-        issueBaseline = screenSignature(await parseScreenMessages(client, entity));
+        // Number bhejne se pehle bot ka jawab poora aane do (burst nahi).
+        issueBaseline = screenSignature(await settledScreen(client, entity, cfg));
         await sendWorldText(client, entity, cleanPhone);
 
         // ⏱ Owner rule: OTP send ka budget 20s (queue bola ho to +20s).
@@ -1255,8 +1299,9 @@ async function clickOrType({
   predicate, baseline = null, timeoutMs = null, maxTypedTries = 3,
 }) {
   const total = Math.max(5_000, Number(timeoutMs) || Number(cfg?.stepTimeoutMs) || WORLD_BOT_DEFAULTS.stepTimeoutMs);
-  const grace = Math.min(total, Math.max(1_000, Number(cfg?.clickGraceMs) || 4_000));
-  const before = baseline || screenSignature(await parseScreenMessages(client, entity));
+  const grace = Math.min(total, Math.max(3_000, Number(cfg?.clickGraceMs) || 4_000));
+  // 🧘 Action se pehle bot ka pichla jawab poora aane do — warna command burst.
+  const before = baseline || screenSignature(await settledScreen(client, entity, cfg));
   const label = String(entry?.text || '').trim();
 
   if (cfg?.trigger !== 'type') {
@@ -1303,8 +1348,13 @@ async function clickOrType({
     if (['awaiting-otp', 'awaiting-number', 'awaiting-name'].includes(String(e?.code || ''))) throw e;
   }
 
-  const variants = worldButtonTypeVariants(label).slice(0, Math.max(1, maxTypedTries));
+  // 📝 Type sirf jab click se screen na badli ho. Text: plain (bina emoji)
+  // wala pehle — asli bot plain naam hi samajhta hai.
+  const allVariants = worldButtonTypeVariants(label);
+  const ordered = [allVariants[1], allVariants[0], ...allVariants.slice(2)].filter(Boolean);
+  const variants = [...new Set(ordered)].slice(0, Math.max(1, Math.min(2, maxTypedTries + 0)) );
   let lastError = null;
+  await settledScreen(client, entity, cfg).catch(() => {});
   for (const variant of variants) {
     // 🔁 Har variant se PEHLE dobara dekho: pehla variant kaam kar gaya ho to
     // agla text bot ke number/OTP field me chala jata tha ("Invalid Mobile
@@ -1370,7 +1420,10 @@ async function safeCancel(client, entity, cfg = {}) {
     await sendWorldText(client, entity, '/cancel').catch(() => {});
     did = true;
   }
-  await sleep(waitMs);
+  // Bot ka jawab poora aane do ("Cancel" ka reply der se aata hai) — warna
+  // turant /cancel bhi chala jata hai (command burst).
+  await settledScreen(client, entity, cfg, { quietMs: 1_500, maxMs: 5_000 }).catch(() => {});
+  await sleep(Math.min(waitMs, 400));
   // OTP prompt abhi bhi khada hai to bot ka bataya hua command bhejo.
   if (worldBotAwaitingKind(await parseScreenMessages(client, entity)) === 'otp') {
     await sendWorldText(client, entity, '/cancel').catch(() => {});
@@ -1384,15 +1437,22 @@ async function safeCancel(client, entity, cfg = {}) {
 // pichle number ke OTP par khada tha aur naya /start + Login usi me ghus kar
 // "❌ Invalid OTP" de raha tha (aur number waste ho raha tha).
 async function worldResetToMenu(client, entity, cfg = {}) {
-  const pending = worldBotAwaitingKind(await parseScreenMessages(client, entity));
+  const screen = await settledScreen(client, entity, cfg).catch(() => parseScreenMessages(client, entity));
+  const pending = worldBotAwaitingKind(screen);
   if (pending) {
     setPhase('reset-menu');
     console.log(`[WorldBot] 🧹 adhoora flow (${pending}) mila — pehle Cancel, phir /start`);
     await safeCancel(client, entity, cfg).catch(() => {});
   }
+  // Bot pehle se saaf menu par hai to /start dobara mat bhejo (command burst).
+  const settled = await settledScreen(client, entity, cfg).catch(() => parseScreenMessages(client, entity));
+  if (!worldBotAwaitingKind(settled) && roleOnLatest(settled, 'login')) {
+    console.log('[WorldBot] ✅ menu pehle se saaf hai — /start skip');
+    return true;
+  }
   await sendWorldText(client, entity, '/start').catch(() => {});
-  await sleep(Math.max(800, Math.min(2_500, Number(cfg?.pollMs) || 1_500)));
-  const left = worldBotAwaitingKind(await parseScreenMessages(client, entity));
+  const after = await settledScreen(client, entity, cfg).catch(() => parseScreenMessages(client, entity));
+  const left = worldBotAwaitingKind(after);
   if (left) console.warn(`[WorldBot] ⚠️ /start ke baad bhi bot ${left} par khada hai`);
   return !left;
 }

@@ -3644,6 +3644,21 @@ Thanks`)),
     'awaiting: number ka intezaar detect');
   ok(wb.worldBotAwaitingKind([{ text: '🆕 New Account Detected!\nTell us the name' }]) === 'name',
     'awaiting: naam ka intezaar detect');
+  // 🧘 Cancel ke baad bot saaf hai — upar pada purana "OTP Sent" message dekh
+  // kar dobara /cancel nahi bhejna chahiye.
+  ok(wb.worldBotAwaitingKind([{ text: '❌ Login Cancelled\n\nNo account was logged in.' }, { text: '✅ OTP Sent\nSend the 6-digit OTP' }]) === '',
+    'awaiting: cancel ke baad purana OTP prompt ignore hota hai');
+  ok(wb.worldBotAwaitingKind([{ text: '✅ Login Successful\n👤 Test\n👇 Now pick a feature.' }, { text: 'Login JSON' }]) === '',
+    'awaiting: login successful ke baad kuch nahi maangta');
+  // 🚦 Ek command → jawab → agla command (owner: "3-4 command pehle hi de deta hai").
+  ok(wbSrc.includes('async function settledScreen') && wbSrc.includes('function roleOnLatest'),
+    'worldbot: settledScreen + roleOnLatest (latest 2 messages) helpers');
+  ok((wbSrc.match(/settledScreen\(/g) || []).length >= 6,
+    'worldbot: har step se pehle bot ka jawab poora aane ka intezaar');
+  ok(wbSrc.includes("if (!roleOnLatest(await parseScreenMessages(client, entity), 'login'))"),
+    'worldbot: menu par pehle se Login button ho to /start dobara nahi jata');
+  ok(wbSrc.includes('WORLD_TERMINAL_SCREEN'),
+    'worldbot: cancel/menu/ready par state saaf maani jati hai');
   ok(wb.worldBotAwaitingKind([{ text: '🏠 Main Menu\nPick a feature' }]) === '',
     'awaiting: clean menu par kuch nahi');
   ok(wbSrc.includes('awaiting-otp') && wbSrc.includes('worldBotAwaitingKind'),

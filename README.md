@@ -575,6 +575,7 @@ Next: OTP mila to verify · na mila to NEW NUMBER
 * **Patli line** — header ke niche `──────────────`; purani `━━━` / fake table art hamesha ke liye gayi.
 * **Labels fancy, values plain** — `𝗬𝗼𝘂𝗿 𝗡𝘂𝗺𝗯𝗲𝗿:` ke aage number saada rehta hai.
 * **Numbers / OTP / JSON kabhi fancy nahi** — copy-paste aur padhna kharab na ho (`mono()` inhe `<code>` me rakhta hai).
+* **Ek command, phir bot ka jawab** — agla command tab hi jata hai jab bot ka pichla jawab poora aa chuka ho (`settledScreen`), aur button/label sirf **latest 1-2 messages** se padhe jate hain. Isliye `/start` + `Login` + `OTP Login` ek saath nahi jaate aur `❌ Invalid OTP` / `❌ Invalid Mobile Number` ka spam nahi hota.
 * **Process wahi jo ideal flow me hai** — login se pehle bot ka adhoora OTP/number prompt pehle `Cancel` se saaf hota hai, phir `/start` → `Login` → `OTP Login` → number → OTP. Bot jab OTP/number/naam maang raha ho to **button ka text kabhi nahi bhejta** (warna bot usi ko OTP/number samajh kar `❌ Invalid OTP` / `❌ Invalid Mobile Number` deta tha).
 * **OTP hamesha type hota hai** — OTP source se code aate hi bot ko bheja jata hai (sirf tab nahi jab bot saaf-saaf number/naam maang raha ho), aur **ek hi baar**. Code na aaye to card me saaf reason: `OTP source (Hermes/Firebase) me is number ka code hi nahi aaya`.
 * **Do alag budgets** — `20s` sirf "OTP Sent" confirm karne ka; OTP inbox ka intezaar alag (`SWIGGY_WORLD_OTP_INBOX_TIMEOUT_MS`, default 90s). Number 20s me nahi marti.

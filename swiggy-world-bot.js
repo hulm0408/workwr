@@ -73,6 +73,11 @@ export const WORLD_BOT_DEFAULTS = {
   // OTP send confirm na ho (aur bot ne Cancel bhi na bheja ho) to number SKIP
   // nahi hota — wahi number itni baar dobara issue hota hai (Login → 2 → number).
   numberRetries: 1,
+  // ⏱ Telegram flood wait ke baad bot ka jawab late padha jata hai. Step ka
+  // budget khatam hone par turant "fail" na karo — itni der dheemi scan
+  // chalti hai (delete/login result ke liye). Warna delete ho chuka account
+  // bhi "delete fail" gina jata tha aur number bekaar naya le liya jata tha.
+  lateReplyGraceMs: 90_000,
 };
 
 const state = {
@@ -212,6 +217,9 @@ export function worldBotConfig(env = process.env) {
     numberRetries: Math.max(0, Math.min(2, Math.trunc(num('SWIGGY_WORLD_NUMBER_RETRIES', WORLD_BOT_DEFAULTS.numberRetries, 0)))),
     // Delete ke baad "Switch Accounts → Permanently Logged Out" (best-effort).
     logoutAfterDelete: String(env?.SWIGGY_WORLD_LOGOUT_AFTER_DELETE ?? '1') !== '0',
+    // Flood wait ke baad ka aakhri scan (0 = band).
+    lateReplyGraceMs: Math.max(0, Math.min(180_000,
+      num('SWIGGY_WORLD_LATE_REPLY_GRACE_MS', WORLD_BOT_DEFAULTS.lateReplyGraceMs, 0))),
   };
 }
 
@@ -464,7 +472,10 @@ const WORLD_TERMINAL_SCREEN = /\b(login cancelled|no account was logged in|pick 
 
 export function worldBotAwaitingKind(messages = []) {
   const list = Array.isArray(messages) ? messages : [];
-  for (const message of list.slice(0, 2)) {
+  // Apna bheja text (number/OTP/naam) "bot ka sawaal" nahi hai.
+  const inbound = list.filter((m) => !m?.out);
+  const pool = inbound.length >= 2 ? inbound.slice(0, 2) : list.slice(0, 2);
+  for (const message of pool) {
     const text = String(message?.text ?? message ?? '');
     if (WORLD_TERMINAL_SCREEN.test(text.toLowerCase())) return '';
     const kind = worldBotPromptKind(text);
@@ -607,47 +618,133 @@ function messageHasDocument(message) {
   return false;
 }
 
-// 🧠 Chhota read-cache: bot ka screen 0.4s ke andar do jagah padha jata hai
-// (settle + predicate). Har read Telegram par messages.GetHistory hai, aur
-// owner ke logs me wahi baar-baar "Sleeping for 3s on flood wait (GetHistory)"
-// de raha tha — uske baad read khali aata tha aur step fail ho jata tha.
-const worldReadCache = { at: 0, limit: 0, messages: [] };
+// 🧠 READ CACHE — owner ke logs ka asli dushman: "Sleeping for 4s / 16s on
+// flood wait (GetHistory)". Hum har 500ms-1.5s me chat padhte the, Telegram
+// throttle kar deta tha, read 16s ke liye so jata tha — aur usi beech bot ka
+// delete/login jawab aaya hota tha par hum use dekh hi nahi paate the, isliye
+// step "45s me jawab nahi aaya" keh kar number jala deta tha.
+//
+// Ab:
+//   • single-flight — ek hi waqt me EK GetHistory (10 parallel readers bhi ho
+//     to bhi ek call),
+//   • adaptive TTL — read ne X ms liya to agla read X*2 tak cache se (flood
+//     apne aap kam hota hai, kyunki hum throttle ko aur nahi chhidte),
+//   • khali/fail read par purana (aakhri accha) screen wapas — screen kabhi
+//     "blank" nahi hoti, isliye button/role ka faisla aankh band karke nahi
+//     hota.
+const worldReadCache = {
+  at: 0,
+  limit: 0,
+  messages: [],
+  inflight: null,
+  ttlMs: 400,
+  lastReadMs: 0,
+  lastFloodMs: 0,
+  floodUntil: 0,
+  emptyReads: 0,
+};
 
-async function readWorldMessages(client, entity, limit = WORLD_BOT_DEFAULTS.readLimit) {
-  const take = Math.max(1, Number(limit) || 10);
-  if (worldReadCache.messages.length && worldReadCache.limit === take
-    && Date.now() - worldReadCache.at < 400) {
-    return worldReadCache.messages;
-  }
-  let lastError = null;
-  // Network/TIMEOUT par 2 koshish — ek hiccup se poora number na jaye.
-  for (let attempt = 1; attempt <= 3; attempt += 1) {
-    try {
-      const messages = await client.getMessages(entity, { limit: take });
-      const list = Array.isArray(messages) ? messages : [...(messages || [])];
-      if (list.length) {
-        worldReadCache.at = Date.now();
-        worldReadCache.limit = take;
-        worldReadCache.messages = list;
-        return list;
-      }
-      // 🤐 Khali jawab = Telegram "flood wait" (GetHistory) ya read fail.
-      // Pehle ise "screen: none" maan kar Login button nahi milta tha aur
-      // number bekaar fail ho jata tha.
-      lastError = new WorldBotError('empty-screen', 'Bot ki chat khali aayi (Telegram flood wait / read fail)');
-    } catch (error) {
-      lastError = error;
-    }
-    if (attempt < 3) {
-      console.warn(`[WorldBot] ⏳ chat read khali/fail (try ${attempt}/3) — ${String(lastError?.message || lastError).slice(0, 80)}`);
-      await sleep(900 * attempt);
-    }
-  }
-  return [];
+// Screen read me "kha Liya gaya" waqt (flood wait) — step deadlines isse
+// badhayi jaati hain, warna flood hi step ka budget kha jata hai.
+export function worldBotBlockedMs() {
+  return Math.max(0, Number(worldReadCache.lastFloodMs) || 0);
 }
 
-async function parseScreenMessages(client, entity, limit) {
-  const messages = await readWorldMessages(client, entity, limit);
+// 🧪 Tests ke liye — cache reset + asli read/wait functions (fake client par).
+export function _resetWorldBotReadCacheForTests() {
+  worldReadCache.at = 0;
+  worldReadCache.limit = 0;
+  worldReadCache.messages = [];
+  worldReadCache.inflight = null;
+  worldReadCache.ttlMs = 400;
+  worldReadCache.lastReadMs = 0;
+  worldReadCache.lastFloodMs = 0;
+  worldReadCache.floodUntil = 0;
+  worldReadCache.emptyReads = 0;
+}
+
+export const _readWorldMessagesForTests = (client, entity, limit) => readWorldMessages(client, entity, limit);
+export const _waitForReplyForTests = (opts) => waitForReply(opts);
+
+export function worldBotReadInfo() {
+  return {
+    ttlMs: worldReadCache.ttlMs,
+    lastReadMs: worldReadCache.lastReadMs,
+    lastFloodMs: worldReadCache.lastFloodMs,
+    emptyReads: worldReadCache.emptyReads,
+    cached: Boolean(worldReadCache.messages.length),
+  };
+}
+
+async function readWorldMessages(client, entity, limit = WORLD_BOT_DEFAULTS.readLimit, { fresh = false } = {}) {
+  const take = Math.max(1, Number(limit) || 10);
+  // Poll loops ("jawab aaya kya") ko fresh data chahiye — cache unke liye
+  // sirf parallel duplicate reads rokta hai (single-flight), purana screen
+  // serve nahi karta. Warna flood ke baad aaya jawab cache me chhup jata tha.
+  if (!fresh && worldReadCache.messages.length && Date.now() - worldReadCache.at < worldReadCache.ttlMs) {
+    return worldReadCache.limit === take
+      ? worldReadCache.messages
+      : worldReadCache.messages.slice(0, take);
+  }
+  // Single-flight: jo read chal raha hai wahi share karo.
+  if (worldReadCache.inflight) {
+    try { return await worldReadCache.inflight; } catch {}
+    return worldReadCache.messages;
+  }
+
+  worldReadCache.inflight = (async () => {
+    let lastError = null;
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      const startedAt = Date.now();
+      try {
+        const messages = await client.getMessages(entity, { limit: take });
+        const readMs = Date.now() - startedAt;
+        worldReadCache.lastReadMs = readMs;
+        const list = Array.isArray(messages) ? messages : [...(messages || [])];
+        if (readMs > 800) {
+          // Telegram ne andar hi sula diya (flood wait) — agla read door rakho.
+          worldReadCache.lastFloodMs = readMs;
+          worldReadCache.floodUntil = Date.now() + Math.min(30_000, readMs);
+          worldReadCache.ttlMs = Math.min(8_000, Math.max(600, readMs * 2));
+          console.warn(`[WorldBot] 🐢 chat read ${readMs}ms (Telegram flood wait) — agla read ${Math.round(worldReadCache.ttlMs)}ms cache se`);
+        } else {
+          worldReadCache.lastFloodMs = 0;
+          worldReadCache.ttlMs = Math.min(1_500, Math.max(400, readMs * 3));
+        }
+        if (list.length) {
+          worldReadCache.at = Date.now();
+          worldReadCache.limit = take;
+          worldReadCache.messages = list;
+          worldReadCache.emptyReads = 0;
+          return list;
+        }
+        // 🤐 Khali jawab = flood wait / read fail. Purana screen wapas do —
+        // "blank screen" se button dhoondhna band.
+        worldReadCache.emptyReads += 1;
+        lastError = new WorldBotError('empty-screen', 'Bot ki chat khali aayi (Telegram flood wait / read fail)');
+      } catch (error) {
+        worldReadCache.lastReadMs = Date.now() - startedAt;
+        lastError = error;
+      }
+      if (attempt < 2) {
+        console.warn(`[WorldBot] ⏳ chat read khali/fail (try ${attempt}/2) — ${String(lastError?.message || lastError).slice(0, 80)}`);
+        await sleep(1_200);
+      }
+    }
+    // Aakhri accha screen (stale) — blank se behtar.
+    if (worldReadCache.messages.length) return worldReadCache.messages;
+    return [];
+  })();
+
+  try {
+    return await worldReadCache.inflight;
+  } finally {
+    worldReadCache.inflight = null;
+  }
+}
+
+async function parseScreenMessages(client, entity, limit, readOpts = {}) {
+  const messages = await readWorldMessages(client, entity, limit, readOpts);
   const parsed = [];
   for (const message of messages) {
     const buttons = await messageButtons(message);
@@ -667,7 +764,10 @@ async function parseScreenMessages(client, entity, limit) {
     });
   }
   state.lastChatAt = Date.now();
-  const latest = parsed[0] || null;
+  // Latest = bot ka message (apna bheja "/start"/number/OTP nahi) — warna
+  // owner ko card me `📺 start: /start · [no buttons]` jaisa blank screen
+  // dikhta tha aur buttons ka faisla bhi galat jagah se hota tha.
+  const latest = parsed.find((m) => !m.out) || parsed[0] || null;
   if (latest) {
     state.lastScreenText = String(latest.text || '').slice(0, 400);
     state.lastScreenButtons = latest.buttons.map((b) => b.text);
@@ -715,27 +815,82 @@ class WorldBotError extends Error {
   }
 }
 
+// Ek read me flood wait ne kitna waqt kha liya — itna hi step ka budget
+// badhao. Iske bina 16s ka flood 45s ke step me se 16s kha jata tha aur bot
+// ka aaya hua jawab bhi "nahi aaya" gin liya jata tha.
+function readBlockMs(readMs = 0) {
+  const ms = Number(readMs) || 0;
+  // 0.8s se slow read = Telegram ne andar hi roka (normal read 200-400ms).
+  if (ms <= 800) return 0;
+  return Math.min(60_000, ms - 300);
+}
+
+// ⏳ Aakhri mauka: timeout hone par turant fail na karo — dheere-dheere
+// (3s gap) ek aur scan, kyunki flood wait ke baad bot ka jawab aksar thodi
+// der se padha jata hai. Yahan mil gaya to step PASS.
+async function scanForLateReply({
+  client, entity, predicate, baseline, graceMs = 0, shouldAbort, what = 'reply',
+}) {
+  const total = Math.max(0, Number(graceMs) || 0);
+  if (!total) return null;
+  const deadline = Date.now() + total;
+  console.log(`[WorldBot] 🕰 "${what}" ke liye aakhri scan ${Math.round(total / 1000)}s (dheere, flood ke baad ka jawab bhi mile)`);
+  while (Date.now() < deadline) {
+    if (typeof shouldAbort === 'function' && shouldAbort()) return null;
+    const all = await parseScreenMessages(client, entity, undefined, { fresh: true });
+    const fresh = baseline ? freshMessages(all, baseline) : all;
+    const hit = predicate(fresh, all);
+    if (hit) {
+      console.log(`[WorldBot] 🕰 late reply mil gaya — "${what}" PASS`);
+      return hit;
+    }
+    await sleep(3_000);
+  }
+  return null;
+}
+
 // Naya jawab aane tak poll karo. predicate(fresh, all) truthy de to wahi
 // return ho jata hai; timeout par WorldBotError('worldbot-timeout').
-async function waitForReply({ client, entity, predicate, baseline, timeoutMs, shouldAbort, what = 'reply', pollMs }) {
-  const deadline = Date.now() + Math.max(1_000, Number(timeoutMs) || WORLD_BOT_DEFAULTS.stepTimeoutMs);
+async function waitForReply({
+  client, entity, predicate, baseline, timeoutMs, shouldAbort, what = 'reply', pollMs, graceMs,
+}) {
+  const budget = Math.max(1_000, Number(timeoutMs) || WORLD_BOT_DEFAULTS.stepTimeoutMs);
+  // ⏱ Flood wait se kha Liya gaya waqt deadline me wapas jata hai (max 3x).
+  let deadline = Date.now() + budget;
+  let extraMs = 0;
+  const maxExtra = Math.max(30_000, Math.min(180_000, budget * 3));
   const every = Math.max(300, Number(pollMs) || WORLD_BOT_DEFAULTS.pollMs);
   let lastAll = [];
   while (Date.now() < deadline) {
     if (typeof shouldAbort === 'function' && shouldAbort()) {
       throw new WorldBotError('aborted', 'Owner ne STOP/SKIP kiya');
     }
-    const all = await parseScreenMessages(client, entity);
+    const readStartedAt = Date.now();
+    const all = await parseScreenMessages(client, entity, undefined, { fresh: true });
+    const readMs = Date.now() - readStartedAt;
+    const add = readBlockMs(readMs);
+    if (add > 0 && extraMs + add <= maxExtra) {
+      extraMs += add;
+      deadline += add;
+      console.log(`[WorldBot] 🐢 read ne ${Math.round(readMs / 1000)}s liye (flood) — "${what}" ka budget +${Math.round(add / 1000)}s`);
+    }
     lastAll = all;
     const fresh = baseline ? freshMessages(all, baseline) : all;
     const hit = predicate(fresh, all);
     if (hit) return hit;
     await sleep(every);
   }
+  // Deadline khatam — par flood ke baad jawab late aata hai, isliye ek
+  // aakhri dheemi scan (default 45s).
+  const grace = graceMs === undefined ? 45_000 : Number(graceMs) || 0;
+  const late = await scanForLateReply({
+    client, entity, predicate, baseline, graceMs: grace, shouldAbort, what,
+  }).catch(() => null);
+  if (late) return late;
   const tail = lastAll.slice(0, 3).map((m) => String(m.text || '').replace(/\s+/g, ' ').slice(0, 90)).filter(Boolean).join(' || ');
   throw new WorldBotError(
     'worldbot-timeout',
-    `${what} ka jawab ${Math.round((Number(timeoutMs) || WORLD_BOT_DEFAULTS.stepTimeoutMs) / 1000)}s me nahi aaya${tail ? ` — last: ${tail}` : ''}`
+    `${what} ka jawab ${Math.round(budget / 1000)}s (+${Math.round(extraMs / 1000)}s flood) me nahi aaya${tail ? ` — last: ${tail}` : ''}`
   );
 }
 
@@ -745,11 +900,16 @@ async function waitForReply({ client, entity, predicate, baseline, timeoutMs, sh
 async function settledScreen(client, entity, cfg = {}, { quietMs = 1_500, maxMs = 10_000 } = {}) {
   const every = Math.max(250, Number(cfg?.pollMs) || 1_200);
   const quiet = Math.max(400, Number(quietMs) || 1_500);
-  const deadline = Date.now() + Math.max(quiet, Number(maxMs) || 9_000);
+  let deadline = Date.now() + Math.max(quiet, Number(maxMs) || 9_000);
   let lastId = -1;
   let lastChange = Date.now();
   for (;;) {
-    const all = await parseScreenMessages(client, entity, 6);
+    const readStartedAt = Date.now();
+    const all = await parseScreenMessages(client, entity, 6, { fresh: true });
+    // Flood wait ne waqt khaya → deadline bhi badhao (warna adhoori screen
+    // par "settle" maan kar agla command chala jata tha).
+    const add = readBlockMs(Date.now() - readStartedAt);
+    if (add > 0) deadline += Math.min(30_000, add);
     const id = Number(all[0]?.id) || 0;
     if (id !== lastId) {
       lastId = id;
@@ -766,9 +926,12 @@ async function settledScreen(client, entity, cfg = {}, { quietMs = 1_500, maxMs 
 // slow bot par jaldi laut jata hai aur hum duplicate command bhej dete hain).
 async function waitForScreenChange(client, entity, cfg = {}, { fromId = 0, timeoutMs = 5_000 } = {}) {
   const every = Math.max(250, Number(cfg?.pollMs) || 1_200);
-  const deadline = Date.now() + Math.max(1_000, Number(timeoutMs) || 5_000);
+  let deadline = Date.now() + Math.max(1_000, Number(timeoutMs) || 5_000);
   for (;;) {
-    const all = await parseScreenMessages(client, entity, 6);
+    const readStartedAt = Date.now();
+    const all = await parseScreenMessages(client, entity, 6, { fresh: true });
+    const add = readBlockMs(Date.now() - readStartedAt);
+    if (add > 0) deadline += Math.min(30_000, add);
     // Latest message ka id badla = bot ne jawab diya (message count/limit se
     // compare karna galat tha — 6 vs 15 messages par signature hamesha alag).
     if ((Number(all[0]?.id) || 0) !== fromId) return all;
@@ -781,8 +944,14 @@ async function waitForScreenChange(client, entity, cfg = {}, { fromId = 0, timeo
 // se purane menu ka button "maujood" maan liya jata tha aur bot galat command
 // bhej deta tha ("otp login" → ❌ Invalid Mobile Number).
 function roleOnLatest(messages = [], role = '') {
-  const list = (Array.isArray(messages) ? messages : []).slice(0, 2);
-  return findRoleOnScreens(list, role);
+  const list = Array.isArray(messages) ? messages : [];
+  // 📵 Apne bheje hue message (jaise "/start", number, OTP) ke paas button
+  // nahi hota. Pehle wahi "latest screen" banti thi — owner ke logs me
+  // `📺 start: /start · [no buttons]` — aur Login/OTP button "nahi mila"
+  // ho jata tha. Ab latest = bot ka (incoming) message.
+  const inbound = list.filter((m) => !m?.out);
+  const pool = (inbound.length ? inbound : list).slice(0, 3);
+  return findRoleOnScreens(pool, role) || findRoleOnScreens(list.slice(0, 2), role);
 }
 
 async function sendWorldText(client, entity, text) {
@@ -1137,6 +1306,7 @@ export async function worldBotLogin({
       const outcome = await waitForReply({
         client, entity, baseline: before, timeoutMs: cfg.stepTimeoutMs, shouldAbort,
         what: 'login result',
+        graceMs: Number(cfg.lateReplyGraceMs) || 90_000,
         predicate: (freshList) => {
           for (const message of freshList) {
             if (message.hasDocument) return { kind: 'document', message };
@@ -1264,7 +1434,12 @@ export async function worldBotLogin({
         ? 'worldbot_setup'
         : category === 'bot_unreachable'
           ? 'bot_unreachable'
-          : 'failed_world_bot';
+          // ⏱ Bot ka jawab window ke andar nahi aaya — ye bot/number ka
+          // "fail" nahi, sirf late hai. Pipeline ise wahi number par dobara
+          // try karti hai (number jalana galat hoga).
+          : error?.code === 'worldbot-timeout'
+            ? 'login_result_timeout'
+            : 'failed_world_bot';
     return {
       ok: false,
       kind,
@@ -1296,14 +1471,21 @@ async function waitForOtpSent({ client, entity, baseline, cfg, shouldAbort }) {
   // tha aur OTP kabhi type hi nahi hota tha. Ab aisa reply = OTP Sent.
   let blankReplyAt = 0;
   let blankReplyMedia = false;
+  // 🐢 Flood wait se kha Liya gaya waqt 20s ke budget me se nahi jayega —
+  // warna bot ka "OTP Sent" aane se pehle hi hum Cancel + dobara number
+  // bhej dete the (Swiggy: login attempts exceeded).
+  let floodExtraMs = 0;
 
   while (true) {
-    const limit = queueFirstAt ? queueFirstAt + queueBudget : startedAt + sendBudget;
+    const limit = (queueFirstAt ? queueFirstAt + queueBudget : startedAt + sendBudget) + floodExtraMs;
     if (Date.now() >= limit) break;
     if (typeof shouldAbort === 'function' && shouldAbort()) {
       throw new WorldBotError('aborted', 'Owner ne STOP/SKIP kiya');
     }
-    const all = await parseScreenMessages(client, entity);
+    const readStartedAt = Date.now();
+    const all = await parseScreenMessages(client, entity, undefined, { fresh: true });
+    const add = readBlockMs(Date.now() - readStartedAt);
+    if (add > 0) floodExtraMs = Math.min(60_000, floodExtraMs + add);
     lastAll = all;
     const fresh = baseline ? freshMessages(all, baseline) : all;
     for (const message of fresh) {
@@ -1901,6 +2083,9 @@ export async function worldBotDeleteAccount({
         // ⚡ Owner: "successful jaise hi ho delete ... turant Main Menu" —
         // isliye delete result ka poll tez (500ms), 1.5s ka gap nahi.
         pollMs: Math.min(500, Number(cfg.pollMs) || 500),
+        // 🐢 Flood wait ke baad jawab late aata hai — timeout par ek dheemi
+        // scan (90s) taaki delete ka asli jawab miss na ho.
+        graceMs: Number(cfg.lateReplyGraceMs) || 90_000,
       });
 
       if (result.kind === 'blocked') return await handleDeleteBlocked(result.message);
@@ -1967,7 +2152,12 @@ export async function worldBotDeleteAccount({
         ? 'worldbot_setup'
         : category === 'bot_unreachable'
           ? 'bot_unreachable'
-          : 'delete_failed';
+          // ⏱ Delete ka jawab window me nahi aaya (flood wait) — iska matlab
+          // "delete blocked" NAHI. Pipeline wahi number se state check karke
+          // aage badhti hai; number skip nahi hota.
+          : error?.code === 'worldbot-timeout'
+            ? 'delete_result_timeout'
+            : 'delete_failed';
     return {
       ok: false,
       kind,

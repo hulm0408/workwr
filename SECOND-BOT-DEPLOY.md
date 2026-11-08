@@ -428,6 +428,12 @@ World bots ka default pool: `@SwiggyByworldBot`, `@SwiggyByworld1Bot` …
   text (photo ya khali message) aaya to 3s grace ke baad OTP Sent maan liya
   jata hai — pehle wahan `Cancel` + dobara number jata tha, number jal jata tha
   aur OTP kabhi type nahi hota tha.
+- **Flood wait / late reply:** Telegram `Sleeping for 4s/16s on flood wait
+  (GetHistory)` par step fail nahi hota: ek waqt me ek GetHistory, slow read
+  par 8s cache, read ka waqt step budget me add, timeout par 90s ka late-reply
+  scan (`SWIGGY_WORLD_LATE_REPLY_GRACE_MS`, 0 = off), OTP bot refresh bhi
+  throttle par 2–5s. Delete/login ka jawab late aaye to **wahi number** par
+  dobara try — naya number nahi.
 - **Delete ke baad wahi number (naya card nahi):** delete hone ke baad koi
   naya number ya OTP bot se naya card nahi liya jata — jo number delete hua
   wahi `Login → OTP Login → OTP` par dobara jaata hai.

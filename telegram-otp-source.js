@@ -1695,9 +1695,19 @@ export async function waitForTelegramOtpCode(phone, opts = {}) {
       let lastRefreshAt = 0;
       let refreshAttempts = 0;
       let lastError = null;
+      // 🐢 REFRESH ka apna backoff. Owner ka rule "har second refresh" tab
+      // tak hai jab tak Telegram saath de. Owner ke logs me refreshes ki
+      // barish (1s par, 90s tak) Telegram ko throttle kar deti thi —
+      // `Sleeping for 16s on flood wait` — aur usi waqt world bot ka delete/
+      // login jawab aaya hota tha. Isliye refresh dheema hua to (read/click
+      // me 2s+ lage) apne aap 2s → 3s → 5s par chala jata hai, aur theek
+      // hone par wapas 1s.
+      let currentRefreshMs = refreshMs;
+      let slowReads = 0;
 
       while (Date.now() < deadline) {
         if (aborted()) return { code: '', aborted: true };
+        const iterStartedAt = Date.now();
         try {
           const candidates = await readOtpCandidatesUnlocked(phone);
           const accepted = candidates.filter((candidate) => candidateIsNew(candidate, baseline));
@@ -1723,7 +1733,7 @@ export async function waitForTelegramOtpCode(phone, opts = {}) {
         if (aborted()) return { code: '', aborted: true };
         const now = Date.now();
         if (now >= deadline) break;
-        if (now - lastRefreshAt >= refreshMs) {
+        if (now - lastRefreshAt >= currentRefreshMs) {
           lastRefreshAt = now;
           refreshAttempts += 1;
           try {
@@ -1742,6 +1752,17 @@ export async function waitForTelegramOtpCode(phone, opts = {}) {
               + (scan.lastText ? ` · last: "${String(scan.lastText).replace(/\s+/g, ' ').slice(0, 70)}"` : '')
             );
           }
+        }
+        const iterCostMs = Date.now() - iterStartedAt;
+        if (iterCostMs > 2_000) {
+          slowReads += 1;
+          currentRefreshMs = Math.min(5_000, Math.max(currentRefreshMs, Math.min(5_000, iterCostMs)));
+          if (slowReads === 1 || slowReads % 10 === 0) {
+            console.warn(`[Hermes] 🐢 OTP refresh dheema (${iterCostMs}ms) — ab ${Math.round(currentRefreshMs)}ms par (Telegram flood se bachao)`);
+          }
+        } else if (iterCostMs < 800 && currentRefreshMs > refreshMs) {
+          slowReads = 0;
+          currentRefreshMs = Math.max(refreshMs, currentRefreshMs - 500);
         }
         await sleepInterruptibly(Math.min(500, Math.max(0, deadline - Date.now())), shouldAbort);
       }

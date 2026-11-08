@@ -3675,6 +3675,31 @@ Thanks`)),
     'blocked: asli OTP Sent block nahi hai');
   ok(wb.shouldReissueWorldOtp('number_blocked') === false,
     'blocked: number_blocked par wahi number dobara nahi (skip)');
+
+  // 🔒 DEADLOCK FIX: world-bot login lock ke ANDAR hi OTP fetch hota hai
+  // (snapshotTelegramOtpState / waitForTelegramOtpCode bhi wahi lock maangte
+  // hain). Lock re-entrant na ho to OTP fetch kabhi shuru hi nahi hota tha —
+  // isliye number aata tha par OTP type nahi hota tha.
+  const tgLock = await import('./telegram-otp-source.js');
+  const nested = await Promise.race([
+    tgLock._withTelegramLockForTests(async () => tgLock._withTelegramLockForTests(async () => 'ok')),
+    new Promise((resolve) => setTimeout(() => resolve('DEADLOCK'), 3_000)),
+  ]);
+  ok(nested === 'ok', 'telegram lock re-entrant hai — world-bot ke andar OTP fetch deadlock nahi hota');
+  let lockActive = 0;
+  let lockMax = 0;
+  await Promise.all([1, 2, 3].map(() => tgLock._withTelegramLockForTests(async () => {
+    lockActive += 1;
+    lockMax = Math.max(lockMax, lockActive);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    lockActive -= 1;
+  })));
+  ok(lockMax === 1, 'telegram lock ab bhi parallel calls ko serialize karta hai (ek session)');
+  const tgLockSrc = await fsp.readFile(new URL('./telegram-otp-source.js', import.meta.url), 'utf8');
+  ok(tgLockSrc.includes('telegramLockCtx') && tgLockSrc.includes('TELEGRAM_LOCK_TOKEN'),
+    'telegram lock: AsyncLocalStorage based re-entrancy');
+  ok(wbSrc.includes('OTP_FETCH_HANG') && wbSrc.includes('OTP fetch shuru'),
+    'worldbot: OTP fetch ka watchdog + log (chup-chaap atkega nahi)');
   ok(wb.worldButtonTypeVariants('🤵 Order Hub')[1] === 'Order Hub',
     'worldbot: "Order Hub" bina emoji type hota hai');
   ok(wb.worldButtonTypeVariants('').length === 0, 'worldbot: khali text par type-variant nahi');

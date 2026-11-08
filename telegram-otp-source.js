@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { AsyncLocalStorage } from 'node:async_hooks';
 // ===== 📨 TELEGRAM OTP BOT NUMBER + OTP SOURCE =====
 //
 // Hamara normal Telegraf/Bot API bot kisi doosre Telegram bot ko message
@@ -562,13 +563,50 @@ export async function telegramUserClientStatus() {
   }
 }
 
+// 🔒 Ek hi Telegram session par do kaam nahi (warna FLOOD_WAIT/session revoke).
+// Par lock RE-ENTRANT hona chahiye: world-bot login poora `withTelegramUserClient`
+// ke andar chalta hai aur usi ke andar OTP fetch (`snapshotTelegramOtpState` /
+// `waitForTelegramOtpCode`) bhi wahi lock maangta hai. Pehle wo apne hi lock ka
+// intezaar karta reh jata tha = DEADLOCK → OTP kabhi aata hi nahi tha, world bot
+// me type bhi nahi hota tha. Ab usi async context me dubara lock maangne par
+// seedha andar chala jata hai.
+const telegramLockCtx = new AsyncLocalStorage();
+const TELEGRAM_LOCK_TOKEN = Symbol('telegram-lock-owner');
+let telegramLockWaiters = 0;
+
+export function telegramLockState() {
+  return {
+    inside: telegramLockCtx.getStore() === TELEGRAM_LOCK_TOKEN,
+    waiters: telegramLockWaiters,
+  };
+}
+
 async function withTelegramLock(fn) {
+  if (telegramLockCtx.getStore() === TELEGRAM_LOCK_TOKEN) {
+    // Same async context — pehle se humare paas lock hai.
+    console.log('[TelegramLock] ↪︎ re-entrant call (deadlock se bachaav)');
+    return fn();
+  }
   const previous = lockTail.catch(() => {});
   let release;
   const gate = new Promise((resolve) => { release = resolve; });
   lockTail = previous.then(() => gate);
-  await previous;
-  try { return await fn(); } finally { release(); }
+  telegramLockWaiters += 1;
+  try {
+    await previous;
+  } finally {
+    telegramLockWaiters = Math.max(0, telegramLockWaiters - 1);
+  }
+  try {
+    return await telegramLockCtx.run(TELEGRAM_LOCK_TOKEN, fn);
+  } finally {
+    release();
+  }
+}
+
+// Tests: nested lock deadlock na ho (world-bot OTP fetch).
+export async function _withTelegramLockForTests(fn) {
+  return withTelegramLock(fn);
 }
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, Math.max(0, Number(ms) || 0)));

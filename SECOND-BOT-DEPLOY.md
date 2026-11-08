@@ -391,6 +391,16 @@ World bots ka default pool: `@SwiggyByworldBot`, `@SwiggyByworld1Bot` …
   dekhi thi) → number **skip nahi** hota: pehle *wahi* number `Login → 2 (OTP Login)
   → number` se dobara issue hota hai (`SWIGGY_WORLD_NUMBER_RETRIES`, default 1).
   Tab bhi na ho to hi number aage badta hai aur bot rotate hota hai.
+- **Ganda state kabhi nahi:** naya login shuru karne se pehle bot ka adhoora
+  OTP/number prompt `Cancel` (ya `/cancel`) se saaf hota hai, phir `/start`.
+  Bot jab OTP/number/naam maang raha ho to **button ka text nahi bhejta** —
+  warna wahi text OTP/number ban kar `❌ Invalid OTP` / `❌ Invalid Mobile Number`
+  deta tha (owner ke log me yahi ho raha tha).
+- **Bot ke apne refuse:** `❌ Could not send OTP … account suspended` = number
+  dead (skip, bot wahi) · `… login attempts exceeded` = number 2 ghante cooldown.
+  Aise case me 20s wait ya retry nahi hota.
+- **Queue:** bot "queue/wait" bole to 45s tak wait (`SWIGGY_WORLD_QUEUE_WAIT_MS`)
+  — asli run me queue ke baad OTP Sent ~40-60s me aata hai.
 - **Button trigger:** pehle click; screen na badle to **usi button ka text likh kar
   bhej** diya jata hai (`🔐 Login` → `Login` → `login`). Click ka jawab der se aaye to
   type skip (double action nahi). `SWIGGY_WORLD_TRIGGER=type` = click hi nahi.

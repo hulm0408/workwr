@@ -422,6 +422,10 @@ World bots ka default pool: `@SwiggyByworldBot`, `@SwiggyByworld1Bot` …
   text (photo ya khali message) aaya to 3s grace ke baad OTP Sent maan liya
   jata hai — pehle wahan `Cancel` + dobara number jata tha, number jal jata tha
   aur OTP kabhi type nahi hota tha.
+- **Delete ke baad Main Menu:** `Account Deleted Successfully` par `Haan 💜`
+  (bot se remove) ke baad **🏠 Main Menu** dabta hai — na `/start`, na seedha
+  `Login`. Uske baad wahi number se fresh login: `Login` → `OTP Login` → number
+  → OTP → naam → JSON (JSON aate hi bhej diya jata hai).
 - **Flood wait friendly:** `messages.GetHistory` flood wait ya khali read par 3
   koshish + 0.4s read-cache; `Login button nahi mila — screen: none` par bot
   switch nahi, pehle menu reset karke ek aur koshish.

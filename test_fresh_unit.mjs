@@ -3425,6 +3425,19 @@ Thanks`)),
     'worldbot: Login button na mile to reset ke baad ek aur koshish (bot switch nahi)');
   ok(wbFlowSrc.includes('worldReadCache') && wbFlowSrc.includes('Date.now() - worldReadCache.at < 400'),
     'worldbot: 0.4s read-cache — GetHistory flood wait kam');
+  // 🏠 Delete ke baad owner ka step: Main Menu → Login → OTP Login → number
+  // (na `/start`, na seedha Login).
+  ok(wb.worldBotButtonRole('🏠 Main Menu') === 'mainMenu'
+    && wb.worldBotButtonRole('Back to Menu') === 'mainMenu'
+    && wb.worldBotButtonRole('Cancel') === 'cancel',
+  'worldbot: "Main Menu" ka apna role (Cancel/Back se alag)');
+  ok(wbFlowSrc.includes('delete-main-menu')
+    && wbFlowSrc.includes('delete ke baad \"${menuHit.button.text}\" dabaya')
+    && wbFlowSrc.includes('atMenu'),
+  'worldbot: delete success ke baad Main Menu dabta hai, seedha Login/start nahi');
+  ok(wbFlowSrc.includes("findRoleOnScreens(settled, 'mainMenu')")
+    && wbFlowSrc.includes('fresh login — Main Menu se Login'),
+  'worldbot: fresh login Main Menu se shuru (start sirf last resort)');
   ok(wbFlowSrc.includes('let otpWatermarkForRound = null')
     && wbFlowSrc.includes('otpProvider({ watermark: otpWatermarkForRound, phone: cleanPhone })')
     && wbFlowSrc.includes('otpProvider({ watermark: deleteWatermark, phone: cleanPhone })'),

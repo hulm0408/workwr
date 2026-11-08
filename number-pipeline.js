@@ -1107,7 +1107,8 @@ export async function processSingleNumberViaWorldBot({
     // ---- Fresh login (ab naam poochhna chahiye) ----
     await say(section('✅ World Bot — Delete Ho Gaya — Fresh Login', [
       `📱 <code>${esc(phone)}</code> · @${esc(botUsername)}`,
-      '→ Ab dobara OTP Login — is baar naya account banega (naam poochhega).',
+      '→ Main Menu → Login → OTP Login → wahi number → OTP → naam (is baar naya account banega).',
+      '→ JSON aa gaya to seedha bhej denge — beech me kuch nahi.',
     ].join('\n')));
     const again = await worldBotLogin({
       phone,

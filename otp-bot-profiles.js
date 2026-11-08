@@ -29,6 +29,8 @@ export const OTP_BOT_PROFILES = {
     // Refresh ke liye sirf REFRESH button (Hermes card sabse upar).
     refreshRoles: ['refresh'],
     refreshLabel: 'REFRESH',
+    // Button na mile / click na chale to yahi text bhej kar refresh hota hai.
+    refreshText: 'Refresh',
     // Welcome/card buttons jo kuch bhi karte hon unhe ignore karo.
     ignoreRolePatterns: [],
     startCommand: '/start',
@@ -46,6 +48,8 @@ export const OTP_BOT_PROFILES = {
     claimPreference: ['new', 'find'],
     refreshRoles: ['refresh'],
     refreshLabel: 'REFRESH',
+    // Button na mile / click na chale to yahi text bhej kar refresh hota hai.
+    refreshText: 'Refresh',
     ignoreRolePatterns: [],
     startCommand: '/start',
     hint: 'FIND NUMBER → card → OTP SHOWN → REFRESH',
@@ -61,6 +65,7 @@ export const OTP_BOT_PROFILES = {
     // naya SMS dekhne/refresh karne ka rasta hai.
     refreshRoles: ['refresh', 'view'],
     refreshLabel: 'VIEW MESSAGES',
+    refreshText: 'View Messages',
     // GET NUMBERS = naya number maango (FIND NUMBER jaisa hi).
     extraRoleMatchers: [
       { role: 'view', re: /\b(view|show|check)\s+(messages?|sms|inbox)\b|\bmessages?\b|\binbox\b/ },

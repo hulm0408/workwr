@@ -3381,6 +3381,27 @@ Thanks`)),
     'worldbot: number prompt detect');
   // Asli bot ka lamba naam-prompt (owner ke log se) — pehle 12-word limit ki
   // wajah se miss hota tha, isliye naya account banne par naam hi nahi jata tha.
+  // 🔄 OTP Sent ke baad OTP bot me HAR SECOND refresh (owner rule) + text fallback.
+  const profilesLocal = await import('./otp-bot-profiles.js');
+  ok(profilesLocal.getOtpBotProfile('hermes').refreshText === 'Refresh'
+    && profilesLocal.getOtpBotProfile('hathi').refreshText === 'Refresh'
+    && profilesLocal.getOtpBotProfile('chauhan').refreshText === 'View Messages',
+  'otp bot: refresh ka text fallback set hai (Hermes/Hathi/HardXotp)');
+  const tgRefreshSrc = await fsp.readFile(new URL('./telegram-otp-source.js', import.meta.url), 'utf8');
+  ok(tgRefreshSrc.includes('async function refreshHermesChatUnlocked')
+    && tgRefreshSrc.includes('fetchIncomingUnlocked(12)')
+    && tgRefreshSrc.includes('lastClickedButton = `${text} (text)`'),
+  'otp bot refresh: 12 screens tak button dhoondhta hai, na mile to text bhejta hai');
+  ok(tgRefreshSrc.includes('|| 1_000)') && tgRefreshSrc.includes('refreshAttempts += 1'),
+  'otp bot refresh: default har 1 second + attempt counter');
+  const pipelineRefreshSrc = await fsp.readFile(new URL('./number-pipeline.js', import.meta.url), 'utf8');
+  ok(pipelineRefreshSrc.includes('SWIGGY_OTP_REFRESH_MS') && pipelineRefreshSrc.includes('|| 1_000'),
+  'worldbot: OTP refresh world-bot flow me 1s (env se override)');
+  const wbFlowSrc = await fsp.readFile(new URL('./swiggy-world-bot.js', import.meta.url), 'utf8');
+  ok(wbFlowSrc.includes('click ne screen badal di') && wbFlowSrc.includes('doosra variant mat bhejo'),
+  'worldbot: click ne screen badli to text/variant dobara nahi bhejta (OTP Login do baar nahi)');
+  ok(wbFlowSrc.includes('async function waitForScreenChange') && wbFlowSrc.includes('fromId: cancelFromId'),
+  'worldbot: slow bot par duplicate /cancel nahi (screen-change ka intezaar)');
   ok(wb.worldBotPromptKind('🆕 New Account Detected!\n\nTell us the name to set on your Swiggy account.') === 'askName',
     'worldbot: asli lamba "New Account Detected… name" prompt detect hota hai');
   ok(wb.worldBotPromptKind('Login JSON\nTap Copy on the code block below\n{"name":"x","mobile":"9"}') === '',
@@ -3655,8 +3676,8 @@ Thanks`)),
     'worldbot: settledScreen + roleOnLatest (latest 2 messages) helpers');
   ok((wbSrc.match(/settledScreen\(/g) || []).length >= 6,
     'worldbot: har step se pehle bot ka jawab poora aane ka intezaar');
-  ok(wbSrc.includes("if (!roleOnLatest(await parseScreenMessages(client, entity), 'login'))"),
-    'worldbot: menu par pehle se Login button ho to /start dobara nahi jata');
+  ok(wbSrc.includes('worldResetToMenu khud /start bhej kar menu ka intezaar karta hai'),
+    'worldbot: reset ke baad /start dobara nahi jata (duplicate command nahi)');
   ok(wbSrc.includes('WORLD_TERMINAL_SCREEN'),
     'worldbot: cancel/menu/ready par state saaf maani jati hai');
   ok(wb.worldBotAwaitingKind([{ text: '🏠 Main Menu\nPick a feature' }]) === '',

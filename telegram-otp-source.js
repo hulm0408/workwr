@@ -992,6 +992,76 @@ async function clickButtonUnlocked(role, { phone = '' } = {}) {
   });
 }
 
+// 🔄 OTP ke liye REFRESH — owner ka rule: OTP Sent ke baad OTP bot me **har
+// second** refresh dabao, 20s me OTP aa jaye to copy karke world bot me do.
+//  1) Latest button-screens me (12 tak) refresh button dhundo aur click karo
+//     (sirf usi screen ka jiska card number match kare).
+//  2) Button na mile / click phate to button ka TEXT likh kar bhejo.
+// Pehle sirf "latest" screen dekhi jati thi — agar latest screen kisi aur
+// number ki card hoti to refresh hi nahi hota tha aur bot Cancel kar deta tha.
+async function refreshHermesChatUnlocked({ phone = '', attempt = 0 } = {}) {
+  const { client, config } = await ensureClientUnlocked();
+  const wanted = String(phone || '').replace(/\D/g, '').slice(-10);
+  const profile = getActiveOtpBotProfile();
+  const allowed = profile.refreshRoles || ['refresh'];
+  let lastReason = 'no-refresh-button';
+
+  try {
+    const messages = await fetchIncomingUnlocked(12);
+    for (const message of messages) {
+      const buttons = await getMessageButtons(message);
+      const entries = buttons
+        .map((button) => ({
+          button,
+          text: buttonText(button),
+          role: roleForHermesButton(button, config),
+        }))
+        .filter((entry) => entry.text);
+      if (!entries.length) continue;
+      const text = messageText(message);
+      const cardPhone = parseTelegramNumberCard(text)?.phone || '';
+      if (wanted && cardPhone && cardPhone !== wanted) {
+        lastReason = 'latest-screen-different-number';
+        continue;
+      }
+      const index = entries.findIndex((entry) => allowed.includes(entry.role));
+      if (index < 0) continue;
+      const entry = entries[index];
+      try {
+        const answer = await entry.button.click({});
+        providerState.lastActionAt = Date.now();
+        providerState.lastClickedButton = entry.text;
+        providerState.lastClickedRole = entry.role;
+        providerState.lastCallbackMessage = String(answer?.message || '').trim().slice(0, 180);
+        providerState.claimPhase = `refresh-${attempt || 1}`;
+        console.log(`[Hermes] 🔄 REFRESH #${attempt || 1} (click: ${entry.text})`);
+        return { ok: true, via: 'click', buttonText: entry.text };
+      } catch (error) {
+        lastReason = `click-fail: ${String(error?.message || error).slice(0, 60)}`;
+      }
+    }
+  } catch (error) {
+    lastReason = `read-fail: ${String(error?.message || error).slice(0, 60)}`;
+  }
+
+  // 2) Text fallback — bot ke button ka naam type karke bhi refresh hota hai.
+  const text = String(profile.refreshText || 'Refresh');
+  try {
+    const entity = await ensureEntityUnlocked(client, config);
+    await client.sendMessage(entity, { message: text });
+    providerState.lastActionAt = Date.now();
+    providerState.lastClickedButton = `${text} (text)`;
+    providerState.lastClickedRole = 'refresh';
+    providerState.claimPhase = `refresh-text-${attempt || 1}`;
+    console.log(`[Hermes] 🔄 REFRESH #${attempt || 1} (text: "${text}") — button nahi mila (${lastReason})`);
+    return { ok: true, via: 'text', buttonText: text, reason: lastReason };
+  } catch (error) {
+    providerState.claimPhase = 'refresh-failed';
+    console.warn(`[Hermes] REFRESH fail: ${String(error?.message || error).slice(0, 90)}`);
+    return { ok: false, reason: lastReason };
+  }
+}
+
 async function sendStartUnlocked() {
   const { client, config } = await ensureClientUnlocked();
   const entity = await ensureEntityUnlocked(client, config);
@@ -1374,7 +1444,7 @@ async function readOtpCandidatesUnlocked(phone) {
 export async function waitForTelegramOtpCode(phone, opts = {}) {
   return withTelegramLock(async () => {
     const timeoutMs = Math.max(1_000, Number(opts.timeoutMs) || 20_000);
-    const refreshMs = Math.max(800, Number(opts.refreshMs ?? opts.pollMs) || 2_500);
+    const refreshMs = Math.max(800, Number(opts.refreshMs ?? opts.pollMs) || 1_000);
     const waitMs = Math.max(0, Number(opts.waitMs) || 0);
     const acceptAnyAfterMs = Math.max(
       0,
@@ -1392,6 +1462,7 @@ export async function waitForTelegramOtpCode(phone, opts = {}) {
       const startedAt = Date.now();
       const deadline = startedAt + timeoutMs;
       let lastRefreshAt = 0;
+      let refreshAttempts = 0;
       let lastError = null;
 
       while (Date.now() < deadline) {
@@ -1423,7 +1494,13 @@ export async function waitForTelegramOtpCode(phone, opts = {}) {
         if (now >= deadline) break;
         if (now - lastRefreshAt >= refreshMs) {
           lastRefreshAt = now;
-          try { await clickButtonUnlocked('refresh', { phone }); } catch (error) { lastError = error; setLastError(error); }
+          refreshAttempts += 1;
+          try {
+            await refreshHermesChatUnlocked({ phone, attempt: refreshAttempts });
+          } catch (error) {
+            lastError = error;
+            setLastError(error);
+          }
         }
         await sleepInterruptibly(Math.min(700, Math.max(0, deadline - Date.now())), shouldAbort);
       }

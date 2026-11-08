@@ -75,6 +75,7 @@ const { createServer } = await import('node:http');
 const { startKeepAlive } = await import('./keep-alive.js');
 const instanceInfo = await import('./instance-info.js');
 const instanceShard = await import('./instance-shard.js');
+const worldBot = await import('./swiggy-world-bot.js');
 
 // ---------------------------------------------------------------------------
 // Process guards — ek stray async error poore bot ko NA maare.
@@ -309,8 +310,14 @@ function startCard() {
   const telegram = isTelegramNumberSource();
   const target = Number(bs.getSetting('target')) || 100;
   const maxMin = Number(bs.getSetting('maxMinutes')) || 120;
+  const engineWorld = bs.getSetting('accountEngine') === 'worldbot';
   return statusCard(instanceInfo.instanceTitle('🆕 Swiggy Fresh Bot'), [
-    mono(telegram ? '[NEW] › OTP › REFRESH › VERIFY › ADDR › FRESH' : '[POOL] › OTP › INBOX › VERIFY › ADDR › FRESH'),
+    mono(engineWorld
+      ? '[POOL] › WORLD BOT LOGIN › OTP › JSON'
+      : (telegram ? '[NEW] › OTP › REFRESH › VERIFY › ADDR › FRESH' : '[POOL] › OTP › INBOX › VERIFY › ADDR › FRESH')),
+    engineWorld
+      ? `🌍 ${mono(`WORLD BOT @${worldBot.worldBotUsername()}`)} <i>· koi proxy/WAF nahi</i>`
+      : '',
     '<b>Abhi:</b> START ka wait hai',
     telegram
       ? `📨 ${mono(`${activeOtpBotLabel().toUpperCase()} ONLY`)} · 🔥 Firebase ${mono('OFF')}`
@@ -371,6 +378,9 @@ function settingsCard() {
     field('⏳ OTP wait', bs.fmtSetting('otpWaitMs')),
     field('📴 Offline devices', bs.getSetting('allowOffline') ? 'ON (try bhi karenge)' : 'OFF (sirf online)'),
     ``,
+    field('🌍 Account engine', bs.getSetting('accountEngine') === 'worldbot'
+      ? `WORLD BOT — @${esc(worldBot.worldBotUsername())} ke buttons click honge (koi proxy/WAF nahi)`
+      : 'DIRECT API — is bot ka apna Swiggy bridge (proxy + WAF solver)'),
     field('📨 Telegram mode', bs.fmtSetting('telegramOtpMode')),
     field('🤖 OTP bot', `${esc(bs.fmtSetting('otpBotProfile'))} — <code>@${esc(String(telegramProviderStatus().botUsername || ''))}</code>`),
     numberSourceLine(),
@@ -405,6 +415,8 @@ const settingsRows = () => [
   [{ text: `🚦 Gap: ${bs.fmtSetting('gapMs')}`, callback_data: 'ap_pick_gap' }],
   [{ text: `📴 Offline: ${bs.getSetting('allowOffline') ? 'ON' : 'OFF'}`, callback_data: 'ap_toggle_offline' }],
   [{ text: `🔁 Never-stop: ${bs.getSetting('autoContinue') ? 'ON' : 'OFF'}`, callback_data: 'ap_toggle_neverstop', style: 'success' }],
+  [{ text: `🌍 Account engine: ${bs.fmtSetting('accountEngine')}`, callback_data: 'ap_toggle_engine', style: 'primary' }],
+  [{ text: '🔎 World Bot screen check', callback_data: 'ap_world_probe' }],
   [{ text: '🩺 Diagnose (kya toota hai?)', callback_data: 'ap_diag' }],
   [{ text: '↩️ Back', callback_data: 'ap_home', style: 'primary' }],
 ];
@@ -827,7 +839,13 @@ function startSourceCard() {
     sub(profile.hint),
     '',
   ]));
+  const engine = bs.getSetting('accountEngine') === 'worldbot' ? 'worldbot' : 'direct';
   return section('🚀 Batch Kahan Se Chalega?', [
+    ...(engine === 'worldbot' ? [
+      `🌍 <b>World Bot mode ON</b> — <code>@${esc(worldBot.worldBotUsername())}</code> ke buttons click honge (proxy/WAF OFF).`,
+      sub('Numbers + OTP Firebase pool se; Swiggy login/delete kaam world bot karega.'),
+      '',
+    ] : []),
     ...botLines,
     `${fbCount ? '✅' : '⚙️'} <b>🔥 Firebase</b> — ${fbCount} ACTIVE source`,
     sub('Pool/device scan + SMS inbox'),
@@ -870,7 +888,34 @@ async function launchBatch(ctx, opts = {}) {
     try { bs.setSetting('telegramOtpMode', false); } catch {}
   }
 
-  if (isTelegramNumberSource()) {
+  // 🌍 World Bot mode me number-source Hermes nahi hota, lekin wahi spare
+  // Telegram account chahiye (bot ke buttons click karne ke liye).
+  const worldBotEngine = bs.getSetting('accountEngine') === 'worldbot';
+  if (worldBotEngine) {
+    const tg = (() => { try { return telegramOtp.telegramUserClientStatus(); } catch { return {}; } })();
+    if (telegramLoginFlow || tg.loginInProgress) {
+      await ctx.answerCbQuery('⏳ Telegram login chal raha hai — pehle complete karo.', { show_alert: true }).catch(() => {});
+      await ctx.reply(telegramAccountCard(), kb(telegramLoginRows())).catch(() => {});
+      return;
+    }
+    if (!tg.configured) {
+      await ctx.answerCbQuery('👤 World Bot ke liye spare Telegram account chahiye!', { show_alert: true }).catch(() => {});
+      await ctx.reply(
+        section('👤 World Bot — Telegram Account Required', [
+          `🌍 <code>@${esc(worldBot.worldBotUsername())}</code> ke buttons click karne ke liye wahi spare Telegram user session chahiye jo OTP bots ke liye use hota hai.`,
+          '',
+          ...telegramOtp.telegramOtpSetupHintLines(),
+        ].join('\n')),
+        kb([
+          [{ text: '👤 Add Telegram Account', callback_data: 'ap_telegram_account', style: 'success' }],
+          [{ text: '⚙️ Settings', callback_data: 'ap_settings', style: 'primary' }],
+        ])
+      ).catch(() => {});
+      return;
+    }
+  }
+
+  if (!worldBotEngine && isTelegramNumberSource()) {
     const status = telegramProviderStatus();
     if (telegramLoginFlow || status.loginInProgress) {
       await ctx.answerCbQuery('⏳ Telegram login chal raha hai — pehle Add Telegram Account complete karo.', { show_alert: true }).catch(() => {});
@@ -1120,6 +1165,18 @@ async function diagCard() {
     const win = Math.round(numberDecisionWindowMs() / 1000);
     lines.push(field('⛔ Number rule', `${mono('1 NUMBER = 1 BAAR')} — ${win}s me attempt start, warna chhod do; queue me park nahi`));
   } catch { lines.push(field('⛔ Number rule', 'ek number = ek hi baar')); }
+  // 🌍 Account engine — kaun Swiggy account bana raha hai.
+  try {
+    const engine = bs.getSetting('accountEngine') === 'worldbot' ? 'worldbot' : 'direct';
+    const wbStatus = worldBot.getWorldBotStatus();
+    const tg = (() => { try { return telegramOtp.telegramUserClientStatus(); } catch { return {}; } })();
+    const wbLine = wbStatus?.phase && wbStatus.phase !== 'idle'
+      ? ` · last phase: ${wbStatus.phase}${wbStatus.lastAction ? ` (${wbStatus.lastAction})` : ''}`
+      : '';
+    lines.push(field('🌍 Account engine', engine === 'worldbot'
+      ? `✅ ${mono('WORLD BOT')} @${esc(worldBot.worldBotUsername())} — koi proxy/WAF nahi · spare TG ${tg.configured ? '✅' : '❌'}${esc(wbLine)}`
+      : `✅ ${mono('DIRECT API')} — bridge + proxy/WAF solver (Settings → 🌍 Account engine se World Bot chuno)`));
+  } catch { lines.push(field('🌍 Account engine', '—')); }
   // 🔁 Never-stop + auto-resume — batch rukne na rukne ka sach.
   try {
     const resume = bs.getAutopilotResume();
@@ -2103,6 +2160,80 @@ bot.action('ap_toggle_neverstop', async (ctx) => {
     ? (r.value ? '🔁 Never-stop ON — batch ab khud aage badhega' : '🔁 Never-stop OFF — purana safety-stop behaviour')
     : `❌ ${r.error}`, { show_alert: true }).catch(() => {});
   await editOrSend(ctx, settingsCard(), settingsRows());
+});
+
+// 🌍 ACCOUNT ENGINE — direct API (proxy + WAF solver) ya Swiggy World Bot
+// (@SwiggyByWorldBot ke buttons click; koi proxy nahi). Batch chalte waqt
+// badalna allowed nahi — warna aadha batch ek engine par, aadha doosre par.
+bot.action('ap_toggle_engine', async (ctx) => {
+  if (!(await gate(ctx))) return;
+  if (isAutopilotRunning()) {
+    await ctx.answerCbQuery('⏳ Batch chal raha hai — pehle STOP karo, phir engine badlo.', { show_alert: true }).catch(() => {});
+    return;
+  }
+  const cur = bs.getSetting('accountEngine') === 'worldbot' ? 'worldbot' : 'direct';
+  const next = cur === 'worldbot' ? 'direct' : 'worldbot';
+  const r = bs.setSetting('accountEngine', next);
+  if (!r.ok) {
+    await ctx.answerCbQuery(`❌ ${r.error}`, { show_alert: true }).catch(() => {});
+    return;
+  }
+  let note = next === 'worldbot'
+    ? '🌍 World Bot ON — account @' + worldBot.worldBotUsername() + ' ke buttons click karke banega (proxy/WAF OFF).'
+    : '🌍 Direct API ON — is bot ka apna Swiggy bridge (proxy + WAF solver).';
+  if (next === 'worldbot') {
+    const st = (() => { try { return telegramOtp.telegramUserClientStatus(); } catch { return {}; } })();
+    if (!st.configured) note = '⚠️ World Bot ON, par spare Telegram account configured nahi — Settings → Add Telegram Account karo.';
+    else if (telegramSettingEnabled()) note += ' ℹ️ Telegram Hermes number-source World Bot mode me OFF hai (numbers Firebase se).';
+  }
+  await ctx.answerCbQuery(note, { show_alert: true }).catch(() => {});
+  await editOrSend(ctx, settingsCard(), settingsRows());
+});
+
+// 🔎 World Bot screen check — bot ke latest buttons/text dikhata hai, taaki
+// flow kahan atka ye turant pata chale (bina batch start kiye).
+async function worldProbeCard() {
+  const cfg = worldBot.worldBotConfig();
+  const probe = await worldBot.probeWorldBot({ limit: 4, config: cfg });
+  if (!probe.ok) {
+    return section('🌍 World Bot — Check Fail', [
+      `🤖 Bot: <code>@${esc(cfg.username)}</code>`,
+      `❌ <code>${esc(String(probe.reason || 'unknown').slice(0, 220))}</code>`,
+      '',
+      sub('Spare Telegram account configured hona chahiye (Settings → 👤 Add Telegram Account). Session sirf ek jagah chale — doosri copy band rakho.'),
+    ].join('\n'));
+  }
+  const lines = [
+    `🤖 <b>Bot:</b> <code>@${esc(cfg.username)}</code> · engine: <b>${esc(bs.fmtSetting('accountEngine'))}</b>`,
+    '',
+  ];
+  for (const screen of probe.screens.slice(0, 3)) {
+    lines.push(`› <i>${esc(screen.text || '(text nahi)')}</i>`);
+    if (screen.buttons.length) lines.push(`   ⌨️ ${screen.buttons.map((b) => mono(esc(String(b).slice(0, 28)))).join(' · ')}`);
+    lines.push('');
+  }
+  lines.push(sub('Ye wahi screen hai jis par batch click karega. Buttons na dikhein to bot me /start bhej kar dobara check karo.'));
+  return section('🌍 World Bot — Live Screen', lines.join('\n'));
+}
+
+bot.action('ap_world_probe', async (ctx) => {
+  if (!(await gate(ctx))) return;
+  await ctx.answerCbQuery('🔎 World Bot screen dekh raha hoon…').catch(() => {});
+  await editOrSend(ctx, await worldProbeCard(), [[{ text: '↩️ Settings', callback_data: 'ap_settings', style: 'primary' }]]);
+});
+
+bot.command('world', async (ctx) => {
+  if (!isOwner(ctx.from?.id)) return;
+  const wait = await ctx.reply('🌍 World Bot se baat kar raha hoon…').catch(() => null);
+  const text = await worldProbeCard();
+  const rows = [[{ text: '⚙️ Settings', callback_data: 'ap_settings', style: 'primary' }]];
+  if (wait) {
+    await ctx.telegram.editMessageText(ctx.chat.id, wait.message_id, undefined, text, kb(rows)).catch(async () => {
+      await ctx.reply(text, kb(rows)).catch(() => {});
+    });
+  } else {
+    await ctx.reply(text, kb(rows)).catch(() => {});
+  }
 });
 
 bot.action('ap_toggle_offline', async (ctx) => {

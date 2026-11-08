@@ -333,6 +333,39 @@ Dikhne me:
 hoti hai. Faayda: bot **rukta nahi**, same number par OTP **burn nahi hota**,
 aur har number par pehla attempt maximum 1 minute ke andar start hota hai. Lock process memory me rehta hai, redeploy tak.
 
+### 🌍 Swiggy World Bot mode (@SwiggyByWorldBot)
+
+Do account engines hain (Settings → 🌍 Account engine, ya
+`PREMIUM_ACCOUNT_ENGINE=worldbot`):
+
+| | DIRECT API (default) | WORLD BOT |
+|---|---|---|
+| Swiggy call | is bot ka bridge | `@SwiggyByWorldBot` |
+| Proxy / WAF solver | zaroori | **bilkul nahi** |
+| Number + OTP source | Firebase pool / Hermes | Firebase pool |
+| Session delivery | `.json` file chat me | `.json` file chat me |
+
+World Bot flow (jaise owner ke screenshots me hai):
+
+1. Spare Telegram account se bot chat kholo → `/start` → **🔐 Login** →
+   **📲 OTP Login** → 10-digit number bhejo.
+2. Bot `OTP Sent` bolta hai. OTP Firebase inbox se aata hai (wahi device jisse
+   number aaya) → bot ko bhej do. OTP na aaye / galat ho to `❌ Cancel` aur
+   agla number — wahi one-shot rule.
+3. Bot **naam poochhta hai** = naya account → JSON aata hai → bot DB me save
+   + owner ko **`.json` file**.
+4. Bot **naam nahi poochhta** = purana account →
+   `🤵 Order Hub → woh account → 🗑 Delete Account → wohi account →
+   Delete OTP → Account Deleted Successfully` → phir se OTP Login
+   (ab naam poochhega) → fresh JSON.
+5. Uske baad best-effort `Switch Accounts → account → Permanently Logged Out`
+   (`SWIGGY_WORLD_LOGOUT_AFTER_DELETE=0` se band).
+
+Ek hi Telegram chat = **1 lane** (engine khud force karta hai), isliye World Bot
+mode slow par predictable hai. Kuch atke to **Settings → 🔎 World Bot screen
+check** ya `/world` — bot ka latest text + buttons dikhata hai, usi se pata
+chalta hai kaunsa step badla hai.
+
 ### 🔁 Never-stop + auto-resume (batch na ruke)
 
 Owner ka pakka rule: **batch khud na ruke**. Engine me do layer hain:

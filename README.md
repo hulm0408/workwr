@@ -295,6 +295,16 @@ Chhota summary:
   sirf **TARGET pura** hone ya **⏹ STOP** par khatam hota hai. OFF karne par
   purana safety-stop behaviour wapas aa jata hai.
 
+- **🌍 Account engine** — `DIRECT API` (is bot ka apna Swiggy bridge + proxy/WAF
+  solver) ya `WORLD BOT` (**@SwiggyByWorldBot** ke buttons click; **koi proxy
+  nahi**). World Bot mode me numbers + OTP Firebase pool se aate hain aur
+  Swiggy login/delete ka saara kaam wo bot karta hai:
+  `/start → Login → OTP Login → number → OTP → (naam poochha = naya account)
+  → JSON`. Naam na poochhe to account purana hai → `Order Hub → account →
+  Delete Account → account → Delete OTP → Account Deleted Successfully` → phir
+  se OTP Login (ab naam poochhega) → fresh JSON. Aakhir me best-effort
+  `Switch Accounts → account → Permanently Logged Out`. Har fresh session wahi
+  `.json` file ban kar is chat me aata hai.
 - **🔁 Auto-resume** — batch chalte waqt Render deploy/restart, GitHub-Actions
   runner badalna ya process crash ho jaye to bot boot hone par **wahi batch
   khud shuru** karta hai (target/source wahi). Manual STOP ya target pura
@@ -508,6 +518,10 @@ chalta rehta hai; temporary error par number failed nahi gina jata.
 | `PREMIUM_BATCH_CONCURRENCY` | 10 | Ek saath kitni parallel lanes (1–10); asal lanes distinct proxy/direct routes tak limited |
 | `PREMIUM_BATCH_MAX_MINUTES` | 120 | Max run time (Never-stop ON me ye sirf checkpoint hai — deadline khud extend hoti hai) |
 | `PREMIUM_NEVER_STOP` | 1 (ON) | `1` = batch khud na ruke (auto cool-off/reextend/rescan) · `0` = purane safety stops |
+| `PREMIUM_ACCOUNT_ENGINE` | `direct` | `direct` = apna Swiggy bridge (proxy/WAF) · `worldbot` = @SwiggyByWorldBot ke buttons click (proxy nahi) |
+| `SWIGGY_WORLD_BOT_USERNAME` | `SwiggyByWorldBot` | World Bot ka handle (badalna ho to) |
+| `SWIGGY_WORLD_STEP_TIMEOUT_MS` | 45000 | World Bot ke ek step (button/JSON) ka budget |
+| `SWIGGY_WORLD_LOGOUT_AFTER_DELETE` | 1 | Delete+fresh ke baad `Switch Accounts → Permanently Logged Out` try kare |
 | `PREMIUM_BATCH_GAP_MS` | 6000 | Ek hi lane/IP par do numbers ke beech gap |
 | `PREMIUM_RATE_LIMIT_BACKOFF_MS` | 900000 | Fallback lane cooldown — fast ladder se cap hota hai (max 15s) |
 | `PREMIUM_RATE_LIMIT_RETRY_MS` | 5000 | Rate-limit par lane ka pehla wait (5s → 8s → 12s, chhat 15s) |

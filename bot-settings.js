@@ -22,6 +22,13 @@ const SPECS = {
   //     karke khud aage badhta hai. Sirf TARGET ya manual STOP end karte hain.
   // OFF: purana behaviour (safety stop cards wapas).
   autoContinue:      { bool: true, dflt: true, label: '🔁 Never-stop mode (batch khud na ruke)' },
+  // 🌍 Account engine — Swiggy account kaise bane:
+  //   direct   = is bot ka apna Swiggy API/bridge flow (proxy + WAF solver)
+  //   worldbot = @SwiggyByWorldBot ke buttons click karke (koi proxy nahi;
+  //              wahi flow jo owner screenshot me dikhaya: Login → OTP Login
+  //              → number → OTP → JSON; purana account = delete → re-login)
+  accountEngine:     { dflt: 'direct', label: '🌍 Account engine (direct API ya Swiggy World Bot)',
+                       enum: ['direct', 'worldbot'] },
   telegramOtpMode:   { bool: true, dflt: false, label: '📨 Telegram Hermes mode (number + OTP Telegram bot se)' },
   telegramOtpTimeoutMs: { min: 5000, max: 180000, dflt: 20000, label: 'Hermes OTP Refresh budget (ms)' },
   telegramOtpRefreshMs: { min: 1000, max: 15000, dflt: 2500, label: 'Hermes Refresh interval (ms)' },
@@ -42,6 +49,7 @@ const ENV_MAP = {
   otpTimeoutMs: 'PREMIUM_OTP_TIMEOUT_MS',
   allowOffline: 'PREMIUM_ALLOW_OFFLINE_DEVICES',
   autoContinue: 'PREMIUM_NEVER_STOP',
+  accountEngine: 'PREMIUM_ACCOUNT_ENGINE',
   telegramOtpMode: 'PREMIUM_TELEGRAM_OTP_MODE',
   telegramOtpTimeoutMs: 'TELEGRAM_OTP_TIMEOUT_MS',
   telegramOtpRefreshMs: 'TELEGRAM_OTP_REFRESH_MS',
@@ -123,6 +131,7 @@ export function fmtSetting(key) {
   const v = getSetting(key);
   if (key === 'allowOffline' || key === 'telegramOtpMode' || key === 'autoContinue') return v ? 'ON' : 'OFF';
   if (key === 'otpBotProfile') return { hermes: 'Hermes', hathi: 'Hathi', chauhan: 'HardXotp' }[v] || 'Hermes';
+  if (key === 'accountEngine') return v === 'worldbot' ? 'World Bot' : 'Direct API';
   if (key === 'gapMs' || key === 'backoffMs' || key === 'otpWaitMs' || key === 'otpTimeoutMs' || key === 'telegramOtpTimeoutMs' || key === 'telegramOtpRefreshMs') {
     return v >= 60000 ? `${Math.round(v / 60000)} min` : `${Math.round(v / 1000)}s`;
   }

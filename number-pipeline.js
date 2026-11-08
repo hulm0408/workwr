@@ -19,6 +19,7 @@ import {
   getDb,
   saveDb,
   deleteAccount,
+  importSessionJson,
   syncCloudVaultNow,
   findAccountKeyByPhone,
   getNextAutoUserName,
@@ -47,6 +48,13 @@ import {
   waitForTelegramOtpCode,
   discardCurrentTelegramNumber,
 } from './telegram-otp-source.js';
+import {
+  worldBotLogin,
+  worldBotDeleteAccount,
+  worldBotPermanentLogout,
+  worldBotConfig,
+  normalizeWorldPhone,
+} from './swiggy-world-bot.js';
 
 // ---------------------------------------------------------------------------
 // Ledger (db.json → premiumFlow.used) + fresh-selection helpers
@@ -371,6 +379,11 @@ export async function processSingleNumber({
   shouldSkip = null,
   markUsed = true,
 }) {
+  // 🌍 Swiggy World Bot mode — Swiggy ka saara kaam @SwiggyByWorldBot karta
+  // hai (koi proxy/WAF/bridge nahi). Alag chhota pipeline.
+  if (String(otpCfg?.accountEngine || '').toLowerCase() === 'worldbot') {
+    return processSingleNumberViaWorldBot({ userId, entry, report, otpCfg, shouldAbort, shouldSkip, markUsed });
+  }
   const phone = entry?.phone;
   if (!phone) return { ok: false, kind: 'failed_bad_entry', phone: '', reason: 'Entry me phone nahi hai' };
   const telegramMode = isTelegramOtpEntry(entry, otpCfg);
@@ -719,5 +732,302 @@ export async function processSingleNumber({
     return { ok: false, kind: 'failed_exception', phone, reason: String(err?.message || err) };
   } finally {
     if (telegramMode) discardCurrentTelegramNumber(phone);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 🌍 SWIGGY WORLD BOT PIPELINE — @SwiggyByWorldBot clicker
+//
+// Yahan Swiggy API / proxy / WAF solver kuch nahi. Flow:
+//   1) World bot se OTP Login → bot khud Swiggy OTP bhejta hai
+//   2) OTP Firebase inbox se aata hai (wahi device jisse number aaya)
+//   3) Naam poochha gaya   → NAYA account → JSON file → bot DB me save
+//      Naam nahi poochha   → PURANA account:
+//        Order Hub → account → Delete Account → Delete OTP → deleted
+//        → OTP Login dobara (ab naam poochhega) → fresh JSON
+//   4) Best-effort: Switch Accounts → account → Permanently Logged Out
+//   5) JSON owner ko .json file ke roop me jata hai (engine ka sendSession)
+//
+// Outcomes wahi hain jo engine samajhta hai: fresh_new / fresh_after_delete,
+// one-shot OTP failures, skipped_delete_blocked, deferred_*.
+// ---------------------------------------------------------------------------
+export async function processSingleNumberViaWorldBot({
+  userId = 'autopilot',
+  entry,
+  report = null,
+  otpCfg = {},
+  shouldAbort = null,
+  shouldSkip = null,
+  markUsed = true,
+} = {}) {
+  const phone = normalizeWorldPhone(entry?.phone);
+  if (!phone) return { ok: false, kind: 'failed_bad_entry', phone: '', reason: 'Entry me phone nahi hai' };
+
+  const deviceIds = entry?.deviceId ? [entry.deviceId] : null;
+  const say = async (text) => { if (report) { try { await report(text); } catch {} } };
+  const skipRequested = () => {
+    try { return Boolean(shouldSkip?.()); } catch { return false; }
+  };
+  const aborted = () => Boolean(skipRequested() || (shouldAbort && shouldAbort()));
+  const abortResult = (stage) => ({
+    ok: false,
+    kind: skipRequested() ? 'manual_skip' : 'aborted',
+    phone,
+    stage,
+    manualSkip: skipRequested(),
+    reason: skipRequested() ? 'Owner ne current number SKIP kar diya' : '',
+    viaWorldBot: true,
+  });
+
+  if (markUsed) {
+    const cooldown = getExtractedNumberCooldown(phone);
+    if (cooldown.blocked) {
+      return {
+        ok: false,
+        kind: 'deferred_number_cooldown',
+        phone,
+        reason: 'Ye number pehle extract/send ho chuka hai — 7-day cooldown chal raha hai',
+        viaWorldBot: true,
+      };
+    }
+  }
+
+  const worldCfg = worldBotConfig();
+  const waitMs = Number(otpCfg.waitMs ?? 3_000);
+  const timeoutMs = Number(otpCfg.timeoutMs ?? 90_000);
+  const pollMs = Number(otpCfg.pollMs ?? 1_500);
+  const acceptAnyAfterMs = Number(otpCfg.acceptAnyAfterMs ?? 15_000);
+
+  // Har OTP round ka apna baseline: purana SMS/OTP kabhi reuse na ho.
+  const makeOtpProvider = () => async () => {
+    if (aborted()) return { code: '', aborted: true };
+    let seen = null;
+    try { seen = await snapshotSeenOtpState(phone, { deviceIds }); } catch {}
+    const res = await waitForOtpCode(phone, {
+      waitMs,
+      timeoutMs,
+      pollMs,
+      acceptAnyAfterMs,
+      excludeIds: seen || undefined,
+      sinceTs: Date.now() - 30_000,
+      deviceIds,
+      shouldAbort,
+    });
+    return res || { code: '' };
+  };
+
+  const db = getDb();
+  const existingKey = findAccountKeyByPhone(db.config?.accounts || {}, phone) || '';
+  const existingName = existingKey ? (db.config.accounts[existingKey]?.name || existingKey) : '';
+
+  const saveWorldSession = async (result, kind) => {
+    const imported = importSessionJson(result.jsonText);
+    if (!imported?.success) {
+      return {
+        ok: false,
+        kind: 'failed_bad_entry',
+        phone,
+        reason: imported?.message || 'World Bot ka JSON parse nahi hua',
+        viaWorldBot: true,
+      };
+    }
+    syncCloudVaultNow(getDb()).catch(() => {});
+    if (markUsed) {
+      markLedger(phone, 'success', { accountKey: imported.key, kind: kind === 'new' ? 'new' : 'after-delete' });
+      await markPoolStatus(entry, 'used');
+    }
+    return {
+      ok: true,
+      kind: kind === 'new' ? 'fresh_new' : 'fresh_after_delete',
+      phone,
+      accountKey: imported.key,
+      account: imported.accountObj || getDb().config.accounts?.[imported.key] || null,
+      viaWorldBot: true,
+    };
+  };
+
+  const mapLoginFailure = (res, stage) => {
+    const kind = String(res?.kind || '');
+    if (kind === 'aborted') return abortResult(stage);
+    // Setup problem (spare Telegram session missing/dead) = config issue, not
+    // number issue. Engine ise alag handle karta hai (batch clear message ke
+    // saath rukta hai, numbers jalte nahi).
+    if (/session authorized nahi|setup missing|api_id|api_hash|login chal raha|telegram account/i.test(String(res?.reason || ''))) {
+      return {
+        ok: false,
+        kind: 'worldbot_setup',
+        phone,
+        stage: 'worldbot_setup',
+        reason: String(res.reason || 'Telegram session setup pending').slice(0, 220),
+        viaWorldBot: true,
+      };
+    }
+    if (kind === 'failed_invalid_number') {
+      return {
+        ok: false, kind: 'failed_otp_send', phone, stage: 'worldbot_number',
+        otpFailure: true, otpAttemptConsumed: true, otpAttempts: 1,
+        reason: res.reason || 'World Bot ne number invalid bataya', viaWorldBot: true,
+      };
+    }
+    if (kind === 'failed_otp_miss') {
+      return {
+        ok: false, kind: 'failed_otp_miss', phone, stage: 'otp_wait',
+        otpFailure: true, otpAttemptConsumed: true, otpAttempts: 1,
+        reason: res.reason || 'World Bot ka OTP inbox me nahi mila', viaWorldBot: true,
+      };
+    }
+    if (kind === 'failed_otp_verify') {
+      return {
+        ok: false, kind: 'failed_otp_verify', phone, stage: 'otp_verify',
+        otpFailure: true, otpAttemptConsumed: true, otpAttempts: 1,
+        reason: res.reason || 'World Bot ne OTP accept nahi kiya', viaWorldBot: true,
+      };
+    }
+    // Chat/timeout/no-JSON = infra rukawat. Number one-shot khatam, engine
+    // recovery karega (never-stop ON me batch rukta nahi).
+    return {
+      ok: false,
+      kind: 'deferred_swiggy_transient',
+      phone,
+      code: res?.code || 'WORLDBOT',
+      reason: `WorldBot: ${res?.reason || 'flow fail'}`,
+      viaWorldBot: true,
+    };
+  };
+
+  try {
+    await say(section('🌍 World Bot — Login Shuru', [
+      `📱 <b>Number:</b> <code>${esc(phone)}</code>`,
+      `🤖 Bot: <code>@${esc(worldCfg.username)}</code> · koi proxy/WAF nahi`,
+      '→ /start → Login → OTP Login → number → OTP (Firebase inbox se)',
+      existingKey ? sub('Is number ka purana saved account hai — bot naam na poochhe to delete flow chalega.') : '',
+    ].filter(Boolean).join('\n')));
+    if (aborted()) return abortResult('before-login');
+
+    // ---- Step 1: World bot se login (bot khud OTP bhejta hai) ----
+    const first = await worldBotLogin({
+      phone,
+      otpProvider: makeOtpProvider(),
+      nameProvider: async () => existingName || getNextAutoUserName(),
+      report: say,
+      shouldAbort,
+      config: worldCfg,
+    });
+    if (!first.ok) return mapLoginFailure(first, 'worldbot_login');
+    if (aborted()) return abortResult('after-login');
+
+    // 🆕 Naya account — naam poochha gaya → seedha save + JSON file
+    if (first.askedName) {
+      await say(section('🆕 World Bot — Naya Account (naam poochha)', [
+        `📱 <code>${esc(phone)}</code> · JSON aa gaya, save kar raha hoon…`,
+      ].join('\n')));
+      const saved = await saveWorldSession(first, 'new');
+      return saved;
+    }
+
+    // ---- ♻️ Purana account — delete → phir fresh login ----
+    await say(section('♻️ World Bot — Purana Account Mila', [
+      `📱 <code>${esc(phone)}</code>`,
+      '→ Bot ne naam <b>nahi</b> poochha = account purana hai.',
+      '→ Order Hub → account → Delete Account → Delete OTP → phir fresh login.',
+    ].join('\n')));
+    if (aborted()) return abortResult('before-delete');
+
+    const del = await worldBotDeleteAccount({
+      phone,
+      otpProvider: makeOtpProvider(),
+      report: say,
+      shouldAbort,
+      config: worldCfg,
+    });
+    if (!del.ok) {
+      if (del.kind === 'aborted') return abortResult('delete');
+      if (del.kind === 'deferred_delete_otp_miss' || del.kind === 'delete_otp_rejected') {
+        if (markUsed) markLedger(phone, 'deferred', { reason: del.reason || 'delete OTP miss', kind: 'worldbot-delete' });
+        return {
+          ok: false,
+          kind: 'deferred_delete_otp_miss',
+          phone,
+          stage: 'delete_otp_wait',
+          otpFailure: true,
+          otpAttemptConsumed: true,
+          otpAttempts: 1,
+          reason: del.reason || 'Delete OTP nahi mila / accept nahi hua',
+          viaWorldBot: true,
+        };
+      }
+      if (markUsed) {
+        markLedger(phone, 'skipped', { reason: del.reason || 'worldbot delete blocked', kind: 'worldbot-delete' });
+        await markPoolStatus(entry, 'skipped');
+      }
+      return {
+        ok: false,
+        kind: 'skipped_delete_blocked',
+        phone,
+        reason: del.reason || `World Bot delete fail (${del.kind})`,
+        viaWorldBot: true,
+      };
+    }
+
+    // Bot side delete OK — apne DB/vault se bhi purana account hatao.
+    if (existingKey) {
+      try { deleteAccount(existingKey, { purgeVault: true }); } catch (e) { console.warn('[Pipeline] worldbot purge:', e?.message); }
+      syncCloudVaultNow(getDb()).catch(() => {});
+    }
+    if (aborted()) return abortResult('after-delete');
+
+    // ---- Fresh login (ab naam poochhna chahiye) ----
+    await say(section('✅ World Bot — Delete Ho Gaya — Fresh Login', [
+      `📱 <code>${esc(phone)}</code>`,
+      '→ Ab dobara OTP Login — is baar naya account banega (naam poochhega).',
+    ].join('\n')));
+    const again = await worldBotLogin({
+      phone,
+      otpProvider: makeOtpProvider(),
+      nameProvider: async () => existingName || getNextAutoUserName(),
+      report: say,
+      shouldAbort,
+      config: worldCfg,
+      fresh: true,
+    });
+    if (!again.ok) return mapLoginFailure(again, 'worldbot_fresh_login');
+    if (!again.askedName) {
+      if (markUsed) {
+        markLedger(phone, 'skipped', { reason: 'delete ke baad bhi account purana lag raha hai', kind: 'worldbot' });
+        await markPoolStatus(entry, 'skipped');
+      }
+      return {
+        ok: false,
+        kind: 'skipped_delete_blocked',
+        phone,
+        reason: 'Delete ke baad bhi World Bot ne naam nahi poochha — account abhi bhi purana hai',
+        viaWorldBot: true,
+      };
+    }
+
+    const saved = await saveWorldSession(again, 'after-delete');
+
+    // Owner ka aakhri step: Switch Accounts → account → Permanently Logged Out.
+    // Best-effort — fail ho to fresh session par koi asar nahi.
+    if (saved.ok && worldCfg.logoutAfterDelete) {
+      try {
+        const out = await worldBotPermanentLogout({ phone, shouldAbort, config: worldCfg });
+        if (!out?.ok) console.warn(`[Pipeline] worldbot permanent logout skip: ${out?.reason || out?.kind}`);
+      } catch (e) {
+        console.warn('[Pipeline] worldbot permanent logout:', e?.message);
+      }
+    }
+    return saved;
+  } catch (err) {
+    if (aborted()) return abortResult('exception');
+    console.error('[Pipeline/WorldBot]', err?.stack || err?.message);
+    return {
+      ok: false,
+      kind: 'deferred_swiggy_transient',
+      phone,
+      code: 'WORLDBOT_EXCEPTION',
+      reason: `WorldBot: ${String(err?.message || err).slice(0, 180)}`,
+      viaWorldBot: true,
+    };
   }
 }

@@ -3295,6 +3295,107 @@ console.log('Ek number = ek hi baar (1-minute decision window, koi parking nahi)
   ok(autoResumeSrc.includes('ap_toggle_neverstop'),
     'never-stop: Settings me ON/OFF toggle maujood');
 
+  // -------------------------------------------------------------------------
+  // 🌍 SWIGGY WORLD BOT — pure clicker helpers (network nahi)
+  // -------------------------------------------------------------------------
+  const wb = await import('./swiggy-world-bot.js');
+  ok(wb.worldBotButtonRole('🔐 Login') === 'login', 'worldbot: main menu Login');
+  ok(wb.worldBotButtonRole('🔑 JSON/TID Login') === 'jsonLogin', 'worldbot: JSON/TID Login alag');
+  ok(wb.worldBotButtonRole('📲 OTP Login') === 'otpLogin', 'worldbot: OTP Login');
+  ok(wb.worldBotButtonRole('❌ Cancel') === 'cancel', 'worldbot: Cancel');
+  ok(wb.worldBotButtonRole('🤵 Order Hub') === 'orderHub', 'worldbot: Order Hub');
+  ok(wb.worldBotButtonRole('🗑 Delete Account') === 'deleteAccount', 'worldbot: Delete Account');
+  ok(wb.worldBotButtonRole('Switch Accounts') === 'switchAccounts', 'worldbot: Switch Accounts');
+  ok(wb.worldBotButtonRole('Permanently Logged Out') === 'permanentLogout', 'worldbot: Permanently Logged Out');
+
+  const wbButtons = [
+    { text: '🔑 JSON/TID Login' },
+    { text: '📲 OTP Login' },
+    { text: '🔐 Login' },
+  ];
+  ok(wb.pickWorldBotButton(wbButtons, 'login')?.text === '🔐 Login',
+    'worldbot: login chunte waqt OTP/JSON button nahi pakda jata');
+  ok(wb.pickWorldBotButton(wbButtons, 'otpLogin')?.text === '📲 OTP Login',
+    'worldbot: OTP Login button sahi chuna jata hai');
+
+  const accountButtons = [
+    { text: 'Rahul Kumar - 919106011898' },
+    { text: 'Vvssxr Mgjlr - 6296591407' },
+  ];
+  ok(wb.findWorldBotAccountButton(accountButtons, '6296591407')?.text === 'Vvssxr Mgjlr - 6296591407',
+    'worldbot: account list me number se button milta hai');
+  ok(wb.findWorldBotAccountButton(accountButtons, '9999999999') === null,
+    'worldbot: doosra number account button nahi banata');
+
+  const wbJsonSample = JSON.stringify({
+    name: 'Vvsxsr Mgjlr',
+    customerId: '289291349',
+    mobile: '6296591407',
+    token: '90143e0e-39e4-4eca-9c7d-70907ec42d472399a-32b8-4f17-b77f-1c10ad22fd16',
+    tid: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiI2Mj',
+  }, null, 2);
+  const wbParsed = wb.extractWorldBotJson(`Login JSON
+\`\`\`json
+${wbJsonSample}
+\`\`\`
+Copy code`);
+  ok(Boolean(wbParsed) && JSON.parse(wbParsed.text).mobile === '6296591407',
+    'worldbot: code-block se session JSON nikalta hai');
+  ok(Boolean(wb.extractWorldBotJson(`Here is your session:
+${wbJsonSample}
+Thanks`)),
+    'worldbot: plain text me chhupa JSON bhi milta hai');
+  ok(wb.extractWorldBotJson('koi json nahi hai') === null, 'worldbot: bekar text par null');
+
+  ok(wb.worldBotPromptKind('OTP Sent\nSend the 6-digit OTP you received from Swiggy.') === 'otpSent',
+    'worldbot: OTP Sent detect');
+  ok(wb.worldBotPromptKind('Send your 10-digit Swiggy number.') === 'askNumber',
+    'worldbot: number prompt detect');
+  ok(wb.worldBotPromptKind('Send your name') === 'askName',
+    'worldbot: naam ka sawaal = NAYA account');
+  ok(wb.worldBotPromptKind('Invalid Mobile Number') === 'invalidNumber',
+    'worldbot: invalid number detect');
+  ok(wb.worldBotPromptKind('OTP Was Not Accepted') === 'otpFail',
+    'worldbot: galat OTP detect');
+  ok(wb.worldBotPromptKind('Delete OTP Sent') === 'deleteSent',
+    'worldbot: delete OTP sent detect');
+  ok(wb.worldBotPromptKind('Account Deleted Successfully') === 'deleted',
+    'worldbot: delete success detect');
+
+  ok(wb.isWorldBotPhoneValid('6296591407') && !wb.isWorldBotPhoneValid('1234567890'),
+    'worldbot: sirf 6-9 se shuru 10-digit number valid');
+  ok(wb.normalizeWorldPhone('+91 6296591407') === '6296591407',
+    'worldbot: +91 hata kar 10-digit');
+
+  const wbSrc = await fsp.readFile(new URL('./swiggy-world-bot.js', import.meta.url), 'utf8');
+  ok(wbSrc.includes('withTelegramUserClient'), 'worldbot: wahi spare Telegram session use hota hai');
+  ok(wbSrc.includes('downloadMedia'), 'worldbot: JSON file download hoti hai');
+  ok(wb.pickWorldBotConfirmButton([{ text: '❌ Cancel' }, { text: 'Haan 💜' }])?.text === 'Haan 💜',
+    'worldbot: "Bot se remove: Haan" confirm click hota hai');
+  ok(wb.pickWorldBotConfirmButton([{ text: 'No' }]) === null,
+    'worldbot: random button ko confirm nahi samajhta');
+  ok(wbSrc.includes('worldBotDeleteAccount'), 'worldbot: purana account delete flow');
+  ok(wbSrc.includes('worldBotPermanentLogout'), 'worldbot: Permanently Logged Out step');
+  const pipelineSrc = await fsp.readFile(new URL('./number-pipeline.js', import.meta.url), 'utf8');
+  ok(pipelineSrc.includes("accountEngine || '').toLowerCase() === 'worldbot'"),
+    'worldbot: pipeline world-bot flow par switch karti hai');
+  ok(pipelineSrc.includes("kind: 'fresh_after_delete'") && pipelineSrc.includes('worldBotDeleteAccount'),
+    'worldbot: delete ke baad fresh login -> fresh_after_delete');
+  ok(pipelineSrc.includes("kind: 'worldbot_setup'"), 'worldbot: session setup pending alag outcome');
+  ok(src.includes("requestRunEnd('worldbot-setup')"),
+    'worldbot: setup pending par batch saaf message ke saath rukta hai (numbers nahi jalte)');
+  ok(src.includes('const worldBotMode = accountEngine ==='),
+    'worldbot: engine world-bot mode samajhta hai');
+  ok(src.includes('if (worldBotMode) laneCount = 1'),
+    'worldbot: ek hi Telegram chat = 1 lane');
+  ok(src.includes("worldBotMode ? null : (lane.proxy || null)"),
+    'worldbot: koi proxy use nahi hota');
+  ok(autoResumeSrc.includes('ap_toggle_engine') && autoResumeSrc.includes("bot.command('world'"),
+    'worldbot: Settings toggle + /world screen check maujood');
+  ok(autoResumeSrc.includes('ap_world_probe'), 'worldbot: live screen probe button');
+  ok(bs.getSetting('accountEngine') === 'direct',
+    'worldbot: default engine direct (owner jab chahe World Bot chune)');
+
   // --- messaging imaandaar ---
   const card = engine.formatCompactAutopilotCard({
     sourceMode: 'firebase', running: true, target: 100, fresh: 2, processed: 3,

@@ -407,6 +407,9 @@ World bots ka default pool: `@SwiggyByworldBot`, `@SwiggyByworld1Bot` …
   async context me lock re-entrant hai; parallel calls ab bhi serialize hote hain.
 - **REFRESH har second:** OTP Sent ke baad OTP bot (Hermes/Hathi/HardXotp) me
   `SWIGGY_OTP_REFRESH_MS` (default 1000ms) ke hisaab se REFRESH dabta hai —
+  chat ke aakhri `SWIGGY_OTP_SCAN_LIMIT` (30) messages + number-card ki message
+  id padhi jati hai, aur number bhejne se pehle liya gaya **watermark** tay
+  karta hai ki code naya hai (jaldi aaya OTP bhi miss nahi hota) —
   button 12 screens tak dhoondha jata hai, na mile to `Refresh` (HardXotp me
   `View Messages`) text bhej diya jata hai. Pehle sirf "latest" screen dekhi
   jati thi, isliye dusre number ki card ho to refresh hi nahi hota tha.

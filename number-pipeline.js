@@ -47,6 +47,7 @@ import { normalizeIndianMobileNumber } from './phone-utils.js';
 import { getOtpBotProfile } from './otp-bot-profiles.js';
 import {
   snapshotTelegramOtpState,
+  captureTelegramOtpWatermark,
   waitForTelegramOtpCode,
   discardCurrentTelegramNumber,
 } from './telegram-otp-source.js';
@@ -847,11 +848,26 @@ export async function processSingleNumberViaWorldBot({
   );
 
   // Har OTP round ka apna baseline: purana SMS/OTP kabhi reuse na ho.
-  const makeOtpProvider = () => async () => {
+  // 🔖 Watermark = number/delete-trigger bhejne se THIK PEHLE ka OTP state.
+  // Iske baad aaya ya edit hua code hi is number ka OTP hai — isliye jaldi
+  // (2s me) aa gaya OTP bhi miss nahi hota.
+  const makeOtpWatermark = () => async () => {
+    if (telegramMode) {
+      try { return await captureTelegramOtpWatermark(phone); } catch { return null; }
+    }
+    try { return await snapshotSeenOtpState(phone, { deviceIds }); } catch { return null; }
+  };
+
+  const makeOtpProvider = () => async (ctx = {}) => {
     if (aborted()) return { code: '', aborted: true };
     if (telegramMode) {
-      let baseline = null;
-      try { baseline = await snapshotTelegramOtpState(phone); } catch {}
+      // Pipeline ka diya watermark pehle; na ho to abhi ka state.
+      let baseline = ctx?.watermark || null;
+      if (!baseline) {
+        try { baseline = await captureTelegramOtpWatermark(phone); } catch {
+          try { baseline = await snapshotTelegramOtpState(phone); } catch {}
+        }
+      }
       const res = await waitForTelegramOtpCode(phone, {
         waitMs: 0,
         timeoutMs: telegramTimeoutMs,
@@ -862,8 +878,10 @@ export async function processSingleNumberViaWorldBot({
       });
       return res || { code: '' };
     }
-    let seen = null;
-    try { seen = await snapshotSeenOtpState(phone, { deviceIds }); } catch {}
+    let seen = ctx?.watermark || null;
+    if (!seen) {
+      try { seen = await snapshotSeenOtpState(phone, { deviceIds }); } catch {}
+    }
     const res = await waitForOtpCode(phone, {
       waitMs,
       timeoutMs,
@@ -1011,6 +1029,7 @@ export async function processSingleNumberViaWorldBot({
     const first = await worldBotLogin({
       phone,
       otpProvider: makeOtpProvider(),
+      otpWatermark: makeOtpWatermark(),
       nameProvider: async () => existingName || getNextAutoUserName(),
       report: say,
       shouldAbort,
@@ -1038,6 +1057,7 @@ export async function processSingleNumberViaWorldBot({
     const del = await worldBotDeleteAccount({
       phone,
       otpProvider: makeOtpProvider(),
+      otpWatermark: makeOtpWatermark(),
       report: say,
       shouldAbort,
       config: cfg,
@@ -1092,6 +1112,7 @@ export async function processSingleNumberViaWorldBot({
     const again = await worldBotLogin({
       phone,
       otpProvider: makeOtpProvider(),
+      otpWatermark: makeOtpWatermark(),
       nameProvider: async () => existingName || getNextAutoUserName(),
       report: say,
       shouldAbort,

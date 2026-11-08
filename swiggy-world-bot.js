@@ -797,6 +797,7 @@ function reportCard(report, html) {
 export async function worldBotLogin({
   phone,
   otpProvider = null,
+  otpWatermark = null,
   nameProvider = null,
   report = null,
   shouldAbort = null,
@@ -839,6 +840,7 @@ export async function worldBotLogin({
       // Ek number ke liye poora OTP-issue sequence: Login → OTP Login (2) → number.
       // Owner rule: kai baar OTP bhejne ki screen hi nahi aati aur bot Cancel bhi
       // nahi bhejta — tab agla number nahi, WAHI number dobara issue hota hai.
+      let otpWatermarkForRound = null;
       const issueNumberOtp = async ({ attempt = 1 } = {}) => {
         if (attempt > 1) {
           // adhoora screen saaf karo, typed-text guard reset, phir /start se menu.
@@ -894,6 +896,19 @@ export async function worldBotLogin({
 
         // Number bhejne se pehle bot ka jawab poora aane do (burst nahi).
         issueBaseline = screenSignature(await settledScreen(client, entity, cfg));
+        // 🔖 OTP bot ka watermark number bhejne se THIK PEHLE — iske baad
+        // aaya/edited code hi is number ka naya OTP hai. (Pehle baseline "OTP
+        // Sent" ke baad liya jata tha, isliye jaldi aaya OTP purana gina jata
+        // tha aur 90s tak type hi nahi hota tha.)
+        otpWatermarkForRound = null;
+        if (typeof otpWatermark === 'function') {
+          try {
+            otpWatermarkForRound = await otpWatermark();
+            console.log(`[WorldBot] 🔖 OTP watermark set (${cleanPhone}) — ab iske baad ka code hi naya`);
+          } catch (error) {
+            console.warn(`[WorldBot] ⚠️ OTP watermark fail: ${String(error?.message || error).slice(0, 90)}`);
+          }
+        }
         await sendWorldText(client, entity, cleanPhone);
 
         // ⏱ Owner rule: OTP send ka budget 20s (queue bola ho to +20s).
@@ -953,7 +968,7 @@ export async function worldBotLogin({
       const fetchStartedAt = Date.now();
       console.log(`[WorldBot] 🔎 OTP fetch shuru — ${cleanPhone} · budget ${Math.round(inboxMs / 1000)}s`);
       const otp = await Promise.race([
-        otpProvider(),
+        otpProvider({ watermark: otpWatermarkForRound, phone: cleanPhone }),
         new Promise((resolve) => setTimeout(() => resolve({
           code: '',
           code2: 'OTP_FETCH_HANG',
@@ -1515,6 +1530,7 @@ async function worldResetToMenu(client, entity, cfg = {}) {
 export async function worldBotDeleteAccount({
   phone,
   otpProvider = null,
+  otpWatermark = null,
   report = null,
   shouldAbort = null,
   config = worldBotConfig(),
@@ -1582,6 +1598,16 @@ export async function worldBotDeleteAccount({
 
       // 3) Delete Account
       setPhase('delete-click');
+      // 🔖 Delete OTP ka watermark delete trigger se thik pehle.
+      let deleteWatermark = null;
+      if (typeof otpWatermark === 'function') {
+        try {
+          deleteWatermark = await otpWatermark();
+          console.log(`[WorldBot] 🔖 delete OTP watermark set (${cleanPhone})`);
+        } catch (error) {
+          console.warn(`[WorldBot] ⚠️ delete watermark fail: ${String(error?.message || error).slice(0, 90)}`);
+        }
+      }
       screen = await parseScreenMessages(client, entity);
       const deleteHit = findRoleOnScreens(screen, 'deleteAccount');
       if (!deleteHit) {
@@ -1652,7 +1678,7 @@ export async function worldBotDeleteAccount({
         `📱 <code>${cleanPhone}</code> · OTP Firebase inbox se aa raha hai…`,
       ].join('\n'));
       if (typeof otpProvider !== 'function') throw new WorldBotError('no-otp-provider', 'Delete OTP provider missing');
-      const otp = await otpProvider();
+      const otp = await otpProvider({ watermark: deleteWatermark, phone: cleanPhone });
       if (!otp?.code) {
         return {
           ok: false,

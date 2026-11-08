@@ -1064,6 +1064,26 @@ export async function processSingleNumberViaWorldBot({
     });
     if (!del.ok) {
       if (del.kind === 'aborted') return abortResult('delete');
+      // ⛔ "Account delete nahi ho sakta — user charges present": fresh account
+      // is number par ban hi nahi sakta. Bot ne already Main Menu → Switch
+      // Account → woh ID → Permanently Log Out kar diya hai; ab naya number.
+      if (del.kind === 'delete_blocked_charges') {
+        if (markUsed) {
+          markLedger(phone, 'skipped', { reason: del.reason || 'delete blocked (charges/dues)', kind: 'worldbot-delete-blocked' });
+          await markPoolStatus(entry, 'skipped');
+        }
+        return {
+          ok: false,
+          kind: 'skipped_delete_blocked',
+          stage: 'worldbot_delete',
+          code: 'DELETE_CHARGES',
+          phone,
+          reason: `${del.reason || 'Account delete nahi ho sakta (charges/dues)'} — is number par fresh account nahi ban sakta`
+            + `${del.loggedOut ? ' · bot se account permanently log out kar diya' : ''} · naya number le raha hoon`,
+          viaWorldBot: true,
+          switchBot: false,
+        };
+      }
       if (del.kind === 'deferred_delete_otp_miss' || del.kind === 'delete_otp_rejected') {
         if (markUsed) markLedger(phone, 'deferred', { reason: del.reason || 'delete OTP miss', kind: 'worldbot-delete' });
         return {

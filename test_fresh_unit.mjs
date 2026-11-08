@@ -3438,6 +3438,36 @@ Thanks`)),
   ok(wbFlowSrc.includes("findRoleOnScreens(settled, 'mainMenu')")
     && wbFlowSrc.includes('fresh login — Main Menu se Login'),
   'worldbot: fresh login Main Menu se shuru (start sirf last resort)');
+
+  // ⛔ "Ye account delete nahi ho sakta — user charges present" → owner ka
+  // fallback: Main Menu → Switch Account → woh ID → Permanently Log Out →
+  // naya number (is number par fresh account ban hi nahi sakta).
+  ok(wb.worldBotPromptKind("❌ This account can't be deleted because user charges are present.") === 'deleteBlocked',
+    'worldbot: "charges present, can\'t be deleted" detect hota hai (deleted nahi)');
+  ok(wb.worldBotPromptKind('Account cannot be deleted — pending dues') === 'deleteBlocked'
+    && wb.worldBotPromptKind('User charges are present. Unable to delete account') === 'deleteBlocked',
+    'worldbot: delete-blocked ke baaki shabd bhi (dues / unable to delete)');
+  ok(wb.worldBotPromptKind('✅ Account Deleted Successfully') === 'deleted'
+    && wb.worldBotPromptKind('Delete OTP Sent') === 'deleteSent'
+    && wb.worldBotDeleteBlockedInfo('Number bhejo') === null,
+    'worldbot: deleted/deleteSent waisa hi, normal text blocked nahi');
+  ok(wbFlowSrc.includes('handleDeleteBlocked')
+    && wbFlowSrc.includes("kind: 'delete_blocked_charges'")
+    && wbFlowSrc.includes('delete ke baad Main Menu')
+    || (wbFlowSrc.includes('handleDeleteBlocked') && wbFlowSrc.includes("kind: 'delete_blocked_charges'")),
+  'worldbot: delete blocked par cleanup + delete_blocked_charges result');
+  ok(wbFlowSrc.includes('async function logoutAccountUnlocked')
+    && wbFlowSrc.includes('logout: Switch Accounts (Main Menu)')
+    && wbFlowSrc.includes('switchAndPick')
+    && wbFlowSrc.includes('Number(m.id) > beforeId'),
+  'worldbot: Main Menu → Switch Account → ID → Permanently Logged Out (stale button nahi)');
+  const pipelineCharges = await fsp.readFile(new URL('./number-pipeline.js', import.meta.url), 'utf8');
+  ok(pipelineCharges.includes("del.kind === 'delete_blocked_charges'")
+    && pipelineCharges.includes("code: 'DELETE_CHARGES'")
+    && pipelineCharges.includes('is number par fresh account nahi ban sakta'),
+  'pipeline: delete blocked = number skipped, naya number (bot switch nahi)');
+  ok(src.includes('Delete Blocked (Charges) — Naya Number'),
+    'engine: card par "Delete Blocked (Charges) — Naya Number"');
   ok(wbFlowSrc.includes('let otpWatermarkForRound = null')
     && wbFlowSrc.includes('otpProvider({ watermark: otpWatermarkForRound, phone: cleanPhone })')
     && wbFlowSrc.includes('otpProvider({ watermark: deleteWatermark, phone: cleanPhone })'),

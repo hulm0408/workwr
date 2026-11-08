@@ -3214,7 +3214,9 @@ export async function startAutopilot(opts = {}) {
                 : oneShotOtpFailure
                   ? '⚡ OTP Fail — New Number'
                   : res.kind === 'skipped_delete_blocked'
-                    ? '⚠️ Skipped'
+                    ? (res.code === 'DELETE_CHARGES'
+                      ? '⛔ Delete Blocked (Charges) — Naya Number'
+                      : '⚠️ Skipped')
                     : res.kind === 'aborted'
                       ? '⏹ Aborted'
                       : res.kind === 'deferred_swiggy_transient'

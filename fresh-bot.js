@@ -62,6 +62,7 @@ const telegramOtp = await import('./telegram-otp-source.js');
 const sources = await import('./firebase-sources.js');
 const otpBotProfiles = await import('./otp-bot-profiles.js');
 const startPresets = await import('./start-source-presets.js');
+const shopStock = await import('./shop-bot-stock.js');
 const bs = await import('./bot-settings.js');
 const proxyPool = await import('./proxy-pool.js');
 const {
@@ -418,6 +419,7 @@ const settingsRows = () => [
   [{ text: `🔁 Never-stop: ${bs.getSetting('autoContinue') ? 'ON' : 'OFF'}`, callback_data: 'ap_toggle_neverstop', style: 'success' }],
   [{ text: `🌍 Account engine: ${bs.fmtSetting('accountEngine')}`, callback_data: 'ap_toggle_engine', style: 'primary' }],
   [{ text: '🔎 World Bot screen check', callback_data: 'ap_world_probe' }],
+  [{ text: '📦 Shop Bot Stock (@its_shop_bot)', callback_data: 'ap_shop_stock', style: 'success' }],
   [{ text: '🩺 Diagnose (kya toota hai?)', callback_data: 'ap_diag' }],
   [{ text: '↩️ Back', callback_data: 'ap_home', style: 'primary' }],
 ];
@@ -821,8 +823,11 @@ function activeStartPresetId() {
   const engine = bs.getSetting('accountEngine') === 'worldbot' ? 'worldbot' : 'direct';
   const tgMode = telegramSettingEnabled();
   const profile = otpBotProfiles.normalizeOtpBotProfileId(bs.getSetting('otpBotProfile'));
-  if (engine === 'worldbot') return tgMode ? 'hermes_world' : 'world';
-  return tgMode && profile === 'hathi' ? 'hathi' : '';
+  if (engine === 'worldbot') {
+    if (!tgMode) return 'world';
+    return profile === 'hathi' ? 'hathi' : 'hermes_world';
+  }
+  return '';
 }
 
 function otpBotChoiceRows() {
@@ -879,6 +884,7 @@ function startSourceCard() {
   return section('🚀 Batch Kahan Se Chalega?', [
     ...presetLines,
     `${status.configured ? '✅' : '⚙️'} Telegram: ${status.configured ? 'spare account ready' : 'account add karo'} · 🔥 Firebase: ${fbCount} source`,
+    `📦 Shop Bot stock: <b>${shopStock.shopStockStatus().pending}/10</b> — 10 poore hone par JSON files @its_shop_bot ko (zip nahi)`,
     '',
     `⏱ OTP wait ${bs.fmtSetting('telegramOtpTimeoutMs')} · OTP na aaye to number skip`,
     sub('Jo yahan chunoge wahi is batch ka source lock hoga. World Bot ke saare bots same hain — error aaye tab hi next bot.'),
@@ -2288,6 +2294,69 @@ bot.action('ap_world_probe', async (ctx) => {
   if (!(await gate(ctx))) return;
   await ctx.answerCbQuery('🔎 World Bot screen dekh raha hoon…').catch(() => {});
   await editOrSend(ctx, await worldProbeCard(), [[{ text: '↩️ Settings', callback_data: 'ap_settings', style: 'primary' }]]);
+});
+
+// ---------------------------------------------------------------------------
+// 📦 SHOP BOT STOCK — har fresh JSON @its_shop_bot ke stock me
+// Owner ka rule: 10 poore hone par wahi 10 JSON files (zip NAHI) bhejo,
+// minimum 10 aur maximum bhi 10. Shop bot unhe Swiggy/Twing product me daalta
+// hai. Ye screen queue/status dikhati hai aur "abhi bhejo" ka option deti hai.
+// ---------------------------------------------------------------------------
+function shopStockCard() {
+  const st = shopStock.shopStockStatus();
+  const when = st.lastSentAt ? new Date(st.lastSentAt).toISOString().slice(0, 16).replace('T', ' ') + ' UTC' : '';
+  return section('📦 Shop Bot Stock', [
+    `${st.enabled ? '✅' : '🚫'} Bot: <code>@${esc(st.username)}</code> · batch <b>${st.batchSize}</b> JSON files`,
+    `› Queue: <b>${st.pending}/${st.batchSize}</b>${st.needed ? ` — ${st.needed} aur aate hi apne aap chala jayega` : ' — bhejne wala hai'}`,
+    `› Ab tak bheje: <b>${st.sent}</b>${when ? ` · last batch ${esc(when)}` : ''}`,
+    st.lastError ? `⚠️ Last error: <code>${esc(st.lastError)}</code>` : '',
+    '',
+    sub('Har fresh Swiggy session ka JSON yahin queue hota hai. Bhejte waqt ZIP nahi hota — ek-ek .json file hi jaati hai, taaki shop bot use seedha stock me daal de.'),
+  ].filter(Boolean).join('\n'));
+}
+
+function shopStockRows() {
+  const st = shopStock.shopStockStatus();
+  return [
+    [{ text: st.pending ? `📤 Abhi Bhejo (${st.pending})` : '📤 Abhi Bhejo (queue khali)', callback_data: 'ap_shop_flush', style: 'success' }],
+    [{ text: '⚙️ Settings', callback_data: 'ap_settings', style: 'primary' }],
+  ];
+}
+
+async function showShopStock(ctx) {
+  const text = shopStockCard();
+  const rows = shopStockRows();
+  await ctx.editMessageText(text, kb(rows))
+    .catch(async () => { await ctx.reply(text, kb(rows)).catch(() => {}); });
+}
+
+bot.command(['shopstock', 'shopbot', 'stock'], async (ctx) => {
+  if (!isOwner(ctx.from?.id)) return;
+  const text = shopStockCard();
+  const rows = shopStockRows();
+  await ctx.reply(text, kb(rows)).catch(() => {});
+});
+
+bot.action('ap_shop_stock', async (ctx) => {
+  if (!(await gate(ctx))) return;
+  await ctx.answerCbQuery().catch(() => {});
+  await showShopStock(ctx);
+});
+
+bot.action('ap_shop_flush', async (ctx) => {
+  if (!(await gate(ctx))) return;
+  const st = shopStock.shopStockStatus();
+  if (!st.pending) {
+    await ctx.answerCbQuery('Queue khali hai — pehle 10 fresh aane do.', { show_alert: true }).catch(() => {});
+    return;
+  }
+  await ctx.answerCbQuery('📤 Bhej raha hoon…').catch(() => {});
+  const res = await shopStock.flushShopStock({ force: true });
+  const msg = res.ok
+    ? `📤 ${res.sent} JSON files @${st.username} ko bhej di`
+    : `⚠️ ${res.sent || 0} gaye, baaki queue me safe: ${res.error || res.kind || 'fail'}`;
+  await ctx.answerCbQuery(msg.slice(0, 190), { show_alert: !res.ok }).catch(() => {});
+  await showShopStock(ctx);
 });
 
 bot.command('world', async (ctx) => {

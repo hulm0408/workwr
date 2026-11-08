@@ -9,8 +9,8 @@
 // Matlab: number + OTP kahan se aayega, aur Swiggy account kaun banayega.
 //   • hermes_world → number+OTP @HermeshuOTPROBOT se, Swiggy ka kaam
 //                    @SwiggyByworldBot ke buttons se (world bot engine).
-//   • hathi        → number+OTP @Hathi_otp_bot se, Swiggy ka kaam seedha
-//                    Swiggy engine (bridge) se.
+//   • hathi        → number+OTP @Hathi_otp_bot se, Swiggy ka kaam bhi
+//                    @SwiggyByworldBot ke buttons se (same world bot engine).
 //   • world        → number+OTP Firebase pool se, Swiggy ka kaam
 //                    @SwiggyByworldBot se.
 //
@@ -36,18 +36,19 @@ export const START_SOURCE_PRESETS = {
       '🌍 Swiggy login/delete: <b>@SwiggyByworldBot</b> (buttons click, no proxy)',
     ],
   },
-  // 2) Hathi number/OTP + seedha Swiggy engine
+  // 2) Hathi number/OTP + World Bot account (owner: "HATHI WALA BOT BHI
+  //    SWIGGY BY WORLD KE SAATH HOGA")
   hathi: {
     id: 'hathi',
     label: '🐘 HATHI WALA BOT',
-    shortLabel: 'Hathi OTP',
+    shortLabel: 'Hathi + World',
     sourceMode: 'telegram',
     otpBotProfile: 'hathi',
     telegramOtpMode: true,
-    accountEngine: 'direct',
+    accountEngine: 'worldbot',
     lines: [
       '🐘 Number + OTP: <b>@Hathi_otp_bot</b>',
-      '⚡ Swiggy login/OTP/delete: seedha Swiggy engine (world bot OFF)',
+      '🌍 Swiggy login/delete: <b>@SwiggyByworldBot</b> (buttons click, no proxy)',
     ],
   },
   // 3) Firebase number/OTP + World Bot account

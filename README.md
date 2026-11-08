@@ -12,7 +12,7 @@
 
 **Ek START dabao — phone chhod ke aa jao.** Bot khud:
 
-0. **START dabao → teen source buttons**: 🤝 **HERMESHU + SWIGGYBYWORLD** (number+OTP Hermes se, Swiggy kaam `@SwiggyByworldBot` se), 🐘 **HATHI WALA BOT** (number+OTP `@Hathi_otp_bot` se), 🌍 **SWIGGY BY WORLD** (number+OTP Firebase pool se, Swiggy kaam `@SwiggyByworldBot` se). `⚙️ Advanced` me purane option (Firebase only, HardXotp) aur 🗑 **Delete All Firebase** bhi hai.
+0. **START dabao → teen source buttons**: 🤝 **HERMESHU + SWIGGYBYWORLD** (number+OTP Hermes se, Swiggy kaam `@SwiggyByworldBot` se), 🐘 **HATHI WALA BOT** (number+OTP `@Hathi_otp_bot` se, Swiggy kaam bhi `@SwiggyByworldBot` se), 🌍 **SWIGGY BY WORLD** (number+OTP Firebase pool se, Swiggy kaam `@SwiggyByworldBot` se). `⚙️ Advanced` me purane option (Firebase only, HardXotp) aur 🗑 **Delete All Firebase** bhi hai.
 1. Selected source se number uthata hai — Hermes/Hathi me **NEW NUMBER (warna FIND NUMBER)**, HardXotp me **NEW NUMBER (warna GET NUMBERS)**, Firebase me pool (`clients/`, online devices pehle)
 2. Swiggy par OTP bhejta hai → bot ke card par **REFRESH** (Hermes/Hathi) / **VIEW MESSAGES** (HardXotp) ya Firebase **OTP inbox** (`messages/`) se code padh kar paste karta hai. OTP **20s** (configurable) me na aaye to wahi number chhod kar agla number.
 3. Har number ko FRESH banata hai:
@@ -499,6 +499,7 @@ chalta rehta hai; temporary error par number failed nahi gina jata.
 |---|---|
 | `fresh-bot.js` | Bot UI — START/STOP/STATUS/**SETTINGS** (entry point) |
 | `start-source-presets.js` | START ke 3 source buttons (Hermes+World / Hathi / Swiggy by World) |
+| `shop-bot-stock.js` | Fresh JSON → `@its_shop_bot` stock queue (10-10 files, zip nahi) |
 | `autopilot-engine.js` | **Parallel batch lanes** — distinct IPs/devices, target/time, lane-local rotate/defer, live-card |
 | `number-pipeline.js` | EK number ka poora lifecycle (saare scenarios) |
 | `firebase-numbers.js` | Firebase reader — pool + OTP inbox + **dynamic source override** |
@@ -513,6 +514,21 @@ chalta rehta hai; temporary error par number failed nahi gina jata.
 | `test_fresh_unit.mjs` | Unit tests (mocked fetch) — `npm test` |
 | `scratch/firebase-inspect.mjs` | Firebase ka live structure dump — `npm run inspect` |
 
+### 📦 Shop Bot stock (`@its_shop_bot`)
+
+Har fresh Swiggy session (world bot ho ya direct) apne aap `@its_shop_bot` ke
+stock queue me jaata hai:
+
+1. Fresh JSON → queue (`/shopstock` par `7/10` dikhta hai).
+2. **10 poore** hone par wahi 10 files ek-ek **`.json` document** ki tarah
+   spare Telegram account se shop bot ko jaati hain — **zip nahi, text nahi**.
+3. Shop bot unhe **Swiggy / Twing** product me stock kar deta hai (product
+   button khud click hota hai, `SHOP_BOT_PICK_PRODUCT=0` se band).
+4. Fail ho to queue **safe** rehti hai — agle fresh par dobara try. Manual:
+   `/shopstock` → **📤 Abhi Bhejo** (adhoora batch bhi chala jayega).
+
+Batch size fix **10** hai (min 10, max 10) — env se badal nahi sakta.
+
 ## Env knobs (optional — defaults acche hain)
 
 | Var | Default | Matlab |
@@ -526,6 +542,10 @@ chalta rehta hai; temporary error par number failed nahi gina jata.
 | `SWIGGY_WORLD_BOT_USERNAMES` | *(khali)* | Comma wali list se poora bot pool override — default pool: `SwiggyByworldBot, SwiggyByworld1Bot … SwiggyByworld5Bot` (saare same) |
 | `SWIGGY_WORLD_STEP_TIMEOUT_MS` | 45000 | World Bot ke ek step (button/JSON) ka budget |
 | `SWIGGY_WORLD_LOGOUT_AFTER_DELETE` | 1 | Delete+fresh ke baad `Switch Accounts → Permanently Logged Out` try kare |
+| `SHOP_BOT_STOCK_ENABLED` | 1 | Har fresh JSON ko `@its_shop_bot` ke stock me bheje (`0` = band) |
+| `SHOP_BOT_USERNAME` | `its_shop_bot` | Stock lene wala shop bot |
+| `SHOP_BOT_PICK_PRODUCT` | 1 | Shop bot ke **Swiggy/Twing** product button khud dabaye |
+| `SHOP_BOT_PRODUCT_REGEX` | `swiggy\|twing` | Shop bot ke product button ka naam alag ho to regex |
 | `PREMIUM_BATCH_GAP_MS` | 6000 | Ek hi lane/IP par do numbers ke beech gap |
 | `PREMIUM_RATE_LIMIT_BACKOFF_MS` | 900000 | Fallback lane cooldown — fast ladder se cap hota hai (max 15s) |
 | `PREMIUM_RATE_LIMIT_RETRY_MS` | 5000 | Rate-limit par lane ka pehla wait (5s → 8s → 12s, chhat 15s) |

@@ -20,10 +20,12 @@ import {
   saveDb,
   deleteAccount,
   importSessionJson,
+  getSessionExportJson,
   syncCloudVaultNow,
   findAccountKeyByPhone,
   getNextAutoUserName,
 } from './store.js';
+import { queueShopStockJson } from './shop-bot-stock.js';
 import {
   requestSwiggyOtpViaBridge,
   requestSwiggyDeleteOtpViaBridge,
@@ -241,6 +243,22 @@ export function preferOnline(entries) {
   const offline = entries.filter((e) => e.online === false);
   const shuffle = (arr) => arr.slice().sort(() => Math.random() - 0.5);
   return [...shuffle(online), ...shuffle(unknown), ...shuffle(offline)];
+}
+
+// 📦 Har fresh session (Swiggy JSON) shop bot ke stock queue me jaata hai.
+// 10 poore hone par wahi 10 JSON files @its_shop_bot ko documents ki tarah
+// bhej di jaati hain (zip nahi). Koi bhi fail ho to run par asar nahi —
+// queue safe rehti hai aur agle fresh par dobara try hota hai.
+async function pushSessionToShopStock({ accountKey = '', phone = '', report = null } = {}) {
+  if (!accountKey) return { ok: false, kind: 'no-account' };
+  try {
+    const json = getSessionExportJson(accountKey);
+    if (!json) return { ok: false, kind: 'no-json' };
+    return await queueShopStockJson({ accountKey, phone, json, report });
+  } catch (e) {
+    console.warn('[Pipeline] shop-stock queue:', e?.message || e);
+    return { ok: false, kind: 'exception' };
+  }
 }
 
 export function isTelegramOtpEntry(entry = null, otpCfg = {}) {
@@ -619,6 +637,8 @@ export async function processSingleNumber({
         markLedger(phone, 'success', { accountKey: loginAcc.accountKey, kind: 'new' });
         await markPoolStatus(entry, 'used');
       }
+      // 📦 Shop bot stock queue (10 poore hone par JSON files jayengi).
+      await pushSessionToShopStock({ accountKey: loginAcc.accountKey, phone, report: say });
       return {
         ok: true, kind: 'fresh_new', phone,
         accountKey: loginAcc.accountKey, account: loginAcc,
@@ -726,6 +746,7 @@ export async function processSingleNumber({
       markLedger(phone, 'success', { accountKey: freshAcc.accountKey, kind: 'after-delete' });
       await markPoolStatus(entry, 'used');
     }
+    await pushSessionToShopStock({ accountKey: freshAcc.accountKey, phone, report: say });
     return {
       ok: true, kind: 'fresh_after_delete', phone,
       accountKey: freshAcc.accountKey, account: freshAcc,
@@ -857,6 +878,7 @@ export async function processSingleNumberViaWorldBot({
       markLedger(phone, 'success', { accountKey: imported.key, kind: kind === 'new' ? 'new' : 'after-delete' });
       await markPoolStatus(entry, 'used');
     }
+    await pushSessionToShopStock({ accountKey: imported.key, phone, report: say });
     return {
       ok: true,
       kind: kind === 'new' ? 'fresh_new' : 'fresh_after_delete',

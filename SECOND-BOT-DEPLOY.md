@@ -117,6 +117,7 @@ har 5–10 min (timeout 120s).
 | `GITHUB_VAULT_TOKEN` | wahi PAT | optional |
 | `VAULT_ENCRYPTION_KEY` | wahi key | optional |
 | `GITHUB_VAULT_BRANCH` | `bot-vault-2` | ✅ agar vault use kar rahe ho |
+| `SHOP_BOT_STOCK_ENABLED` / `SHOP_BOT_USERNAME` | `1` / `its_shop_bot` | stock push |
 
 `DATA_DIR` sirf tab badlo jab ek hi machine/disk par do copy chala rahe ho
 (do Render services ke liye zaroorat nahi — har service ka apna container).
@@ -367,7 +368,7 @@ World Bot flow (jaise owner ke screenshots me hai):
 | Button | Number + OTP | Swiggy account kaam |
 |---|---|---|
 | 🤝 HERMESHU + SWIGGYBYWORLD | `@HermeshuOTPROBOT` card | `@SwiggyByworldBot` |
-| 🐘 HATHI WALA BOT | `@Hathi_otp_bot` card | seedha Swiggy engine (bridge) |
+| 🐘 HATHI WALA BOT | `@Hathi_otp_bot` card | `@SwiggyByworldBot` (wahi world bot engine) |
 | 🌍 SWIGGY BY WORLD | Firebase pool (device scan + SMS) | `@SwiggyByworldBot` |
 
 `⚙️ Advanced` me purane sab option (Firebase only, HardXotp) aur
@@ -385,6 +386,17 @@ World bots ka default pool: `@SwiggyByworldBot`, `@SwiggyByworld1Bot` …
 - `⏹ STOP`, `SKIP`, invalid-number aur Telegram-setup pending par **switch
   nahi** hota (ye bot ki galti nahi hai).
 - Pool badalna ho to env: `SWIGGY_WORLD_BOT_USERNAMES=A_bot,B_bot` (CSV).
+
+#### 📦 Shop Bot stock (@its_shop_bot)
+
+Har fresh Swiggy JSON apne aap stock queue me jaata hai. **10 poore** hone par
+wahi 10 files ek-ek `.json` document (zip nahi) spare Telegram account se
+`@its_shop_bot` ko chali jaati hain aur shop bot unhe **Swiggy / Twing**
+product me daal deta hai. Batch size fix **10** hai (min 10, max 10).
+
+- Status / manual push: `/shopstock` → **📤 Abhi Bhejo**
+- Band karna ho: `SHOP_BOT_STOCK_ENABLED=0`
+- Fail par queue safe — agle fresh par dobara try
 
 Ek hi Telegram chat = **1 lane** (engine khud force karta hai), isliye World Bot
 mode slow par predictable hai. Kuch atke to **Settings → 🔎 World Bot screen

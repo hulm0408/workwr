@@ -3477,9 +3477,9 @@ Thanks`)),
     'START: HERMESHU + SWIGGYBYWORLD = world bot engine');
   ok(presets.getStartSourcePreset('hermes_world')?.otpBotProfile === 'hermes',
     'START: HERMESHU + SWIGGYBYWORLD me Hermes numbers/OTP');
-  ok(presets.getStartSourcePreset('hathi')?.accountEngine === 'direct'
+  ok(presets.getStartSourcePreset('hathi')?.accountEngine === 'worldbot'
     && presets.getStartSourcePreset('hathi')?.otpBotProfile === 'hathi',
-  'START: HATHI WALA BOT = hathi OTP + seedha Swiggy engine');
+  'START: HATHI WALA BOT = hathi OTP + world bot (Swiggy by World)');
   ok(presets.getStartSourcePreset('world')?.sourceMode === 'firebase'
     && presets.getStartSourcePreset('world')?.accountEngine === 'worldbot',
   'START: SWIGGY BY WORLD = Firebase numbers + world bot');
@@ -3502,6 +3502,90 @@ Thanks`)),
   // World bot mode me Hermes source allowed hai (combined preset).
   ok(src.includes("resolvedSourceMode === 'telegram' ? 'telegram' : 'firebase'"),
     'worldbot: combined preset me Hermes number-source allowed');
+
+  // -------------------------------------------------------------------------
+  // 📦 SHOP BOT STOCK — @its_shop_bot me stock push
+  // Owner: "JAISE 10 ID SEND KARDI TO IS BOT ME WO ID STOCK PAR BHI ADD KARDE,
+  // MINIMUM 10 AND MAX BHI 10, ZIP NAHI — JSON FILE BAS SEND KARDENA."
+  // -------------------------------------------------------------------------
+  const shopStock = await import('./shop-bot-stock.js');
+  ok(shopStock.SHOP_STOCK_BATCH_SIZE === 10, 'shopstock: batch size 10 (min 10, max bhi 10)');
+  ok(shopStock.shopBotConfig({}).batchSize === 10
+    && shopStock.shopBotConfig({ SHOP_BOT_STOCK_BATCH: '25' }).batchSize === 10
+    && shopStock.shopBotConfig({ SHOP_BOT_STOCK_BATCH: '3' }).batchSize === 10,
+  'shopstock: env se batch 10 se zyada/kam nahi hota');
+  ok(shopStock.shopBotConfig({}).username === 'its_shop_bot',
+    'shopstock: default bot @its_shop_bot');
+  ok(shopStock.shopBotConfig({ SHOP_BOT_STOCK_ENABLED: '0' }).enabled === false,
+    'shopstock: SHOP_BOT_STOCK_ENABLED=0 se off');
+
+  const plan = shopStock.planStockBatches(Array.from({ length: 23 }, (_, i) => ({ key: `k${i}` })), 10);
+  ok(plan.batches.length === 2 && plan.batches.every((b) => b.length === 10) && plan.rest.length === 3,
+    'shopstock: sirf 10-10 ke poore batch bhejte hain, 3 bache rehte hain');
+  ok(shopStock.planStockBatches(Array.from({ length: 9 }, (_, i) => ({ key: `k${i}` })), 10).batches.length === 0,
+    'shopstock: 9 par kuch nahi jata (10 se kam nahi)');
+  const forced = shopStock.planStockBatches(Array.from({ length: 12 }, (_, i) => ({ key: `k${i}` })), 10, { force: true });
+  ok(forced.batches.length === 2 && forced.batches[1].length === 2,
+    'shopstock: "abhi bhejo" par adhoora batch bhi jata hai');
+  ok(shopStock.isShopStockJsonName('acc_9876543210.json') === true
+    && shopStock.isShopStockJsonName('acc.zip') === false,
+  'shopstock: sirf .json file — zip nahi');
+  ok(shopStock.shopStockFileName('9876543210', '') === 'acc_9876543210.json',
+    'shopstock: file ka naam phone se (acc_<number>.json)');
+  const prodButtons = shopStock.pickShopProductButtons([
+    { text: 'Swiggy' }, { text: 'Twing' }, { text: 'Meesho' }, { text: 'swiggy' },
+  ]);
+  ok(prodButtons.length === 2 && prodButtons[0].text === 'Swiggy' && prodButtons[1].text === 'Twing',
+    'shopstock: Swiggy + Twing product buttons hi pick hote hain');
+  ok(shopStock.pickShopProductButtons([{ text: 'Meesho' }]).length === 0,
+    'shopstock: doosre product ko nahi chhedta');
+
+  ok(shopStock.shopBotConfig({}).retryMs === 60_000,
+    'shopstock: fail par 60s retry window (bar-bar error nahi)');
+
+  // Queue sach me jama hoti hai (db object par mutate + wahi save) — pehle
+  // getDb() dobara padhne se queue 1/10 par atak jati thi.
+  const storeMod = await import('./store.js');
+  const queueBefore = JSON.parse(JSON.stringify(storeMod.getDb().shopBotStock || {}));
+  try {
+    const db = storeMod.getDb();
+    db.shopBotStock = { pending: [], sent: 0, sentKeys: [], lastSentAt: 0, lastBatchAt: 0, lastAttemptAt: Date.now(), lastError: '' };
+    storeMod.saveDb(db);
+    await shopStock.queueShopStockJson({ accountKey: 'qa_1', phone: '9999990001', json: { a: 1 } });
+    const second = await shopStock.queueShopStockJson({ accountKey: 'qa_2', phone: '9999990002', json: { a: 2 } });
+    ok(second.pending === 2, 'shopstock: queue jama hoti hai (1 → 2 pending)');
+    const dupRes = await shopStock.queueShopStockJson({ accountKey: 'qa_2', phone: '9999990002', json: { a: 2 } });
+    ok(dupRes.kind === 'already-queued' && dupRes.queued === false,
+      'shopstock: wahi account dobara queue nahi hota');
+    const st = shopStock.shopStockStatus();
+    ok(st.pending === 2 && st.needed === 8, 'shopstock: status 2/10 aur 8 chahiye');
+  } finally {
+    const restore = storeMod.getDb();
+    if (Object.keys(queueBefore).length) restore.shopBotStock = queueBefore;
+    else delete restore.shopBotStock;
+    storeMod.saveDb(restore);
+  }
+
+  const shopSrc = await fsp.readFile(new URL('./shop-bot-stock.js', import.meta.url), 'utf8');
+  ok(shopSrc.includes('forceDocument: true') && !shopSrc.includes('archiver') && !/\.zip/i.test(shopSrc),
+    'shopstock: document bhejta hai, zip banata hi nahi');
+  ok(shopSrc.includes('withTelegramUserClient') && shopSrc.includes('sendFile'),
+    'shopstock: wahi spare Telegram session + MTProto sendFile');
+  ok(pipelineSrc.includes('pushSessionToShopStock'),
+    'shopstock: pipeline fresh session ko queue karti hai');
+  ok((pipelineSrc.match(/pushSessionToShopStock\(/g) || []).length >= 4,
+    'shopstock: fresh_new + fresh_after_delete + world bot — teeno raste queue karte hain');
+  ok(typeof shopStock.queueShopStockJson === 'function'
+    && typeof shopStock.flushShopStock === 'function'
+    && typeof shopStock.shopStockStatus === 'function',
+  'shopstock: queue / flush / status API maujood');
+  ok(autoResumeSrc.includes("bot.command(['shopstock', 'shopbot', 'stock']")
+    && autoResumeSrc.includes("'ap_shop_flush'"),
+  'shopstock: /shopstock screen + "abhi bhejo" button');
+  ok(autoResumeSrc.includes('ap_shop_stock'),
+    'shopstock: Settings me Shop Bot Stock row');
+  ok(shopStock.shopStockStatus({}).needed === 10 - shopStock.shopStockStatus({}).pending,
+    'shopstock: status me kitne aur chahiye (needed)');
 
   // --- messaging imaandaar ---
   const card = engine.formatCompactAutopilotCard({

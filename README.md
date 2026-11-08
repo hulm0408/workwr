@@ -557,6 +557,28 @@ Batch size fix **10** hai (min 10, max 10) — env se badal nahi sakta.
 | Logout ka naam alag ho | `permanently logged out` / `logout` / `sign out` — sab match |
 | Bot switch storm | Sirf 3 hi soorat me switch, ek number par max 3 bot |
 
+## Message style (in bots jaisa saaf look)
+
+Bot ke saare cards ek hi shakal me aate hain — bikhri hui information nahi:
+
+```
+—[ 🟢 LIVE ]— 02:44
+──────────────
+NEW › OTP › [REFRESH] › VERIFY › ADDR › FRESH
+Abhi: REFRESH par OTP aa raha hai
+▰▰▱▱▱▱▱▱▱▱ 20%  2/10
+📱 9876543210 · ⏱ 1m 5s
+Next: OTP mila to verify · na mila to NEW NUMBER
+```
+
+* **Fancy heading** — `—[ ⚡ 𝗧𝗜𝗧𝗟𝗘 ]—` Unicode bold me (Telegram har device par dikhata hai), saath me right-side `HH:mm` (IST) time chip.
+* **Patli line** — header ke niche `──────────────`; purani `━━━` / fake table art hamesha ke liye gayi.
+* **Labels fancy, values plain** — `𝗬𝗼𝘂𝗿 𝗡𝘂𝗺𝗯𝗲𝗿:` ke aage number saada rehta hai.
+* **Numbers / OTP / JSON kabhi fancy nahi** — copy-paste aur padhna kharab na ho (`mono()` inhe `<code>` me rakhta hai).
+* **Lambi detail collapsible** — `/world` ke last 5 screens `<blockquote expandable>` me: card chhota rehta hai, kholne par poora detail.
+
+Helpers `rich-text.js` me hain: `fancy()`, `bracketHeader()`, `headerRule()`, `stamp()`, `sectionStamp()`, `details()`, aur ulta `plain()` (fancy glyphs → ASCII, taaki stage matching/regex na tootey).
+
 ## Env knobs (optional — defaults acche hain)
 
 | Var | Default | Matlab |
@@ -574,6 +596,7 @@ Batch size fix **10** hai (min 10, max 10) — env se badal nahi sakta.
 | `SWIGGY_WORLD_QUEUE_WAIT_MS` | 20000 | Bot "queue/wait" bole to itna wait; isse zyada → **bot badlo** |
 | `SWIGGY_WORLD_TRIGGER` | `auto` | Button **click** → screen na badle to **button ka text likh kar bhej** (`type` = click bilkul nahi) |
 | `SWIGGY_WORLD_CLICK_GRACE_MS` | 4000 | Click ke baad screen badalne ka intezaar, phir text trigger |
+| `SWIGGY_WORLD_NUMBER_RETRIES` | 1 | OTP send confirm na ho (aur bot ne Cancel bhi na bheja ho) to number **skip nahi** — wahi number itni baar `Login → 2 → number` se dobara issue (max 2, `0` = off) |
 | `SWIGGY_WORLD_LOGOUT_AFTER_DELETE` | 1 | Delete+fresh ke baad `Switch Accounts → Permanently Logged Out` try kare |
 | `SHOP_BOT_STOCK_ENABLED` | 1 | Har fresh JSON ko `@its_shop_bot` ke stock me bheje (`0` = band) |
 | `SHOP_BOT_USERNAME` | `its_shop_bot` | Stock lene wala shop bot |

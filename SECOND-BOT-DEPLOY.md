@@ -387,6 +387,10 @@ World bots ka default pool: `@SwiggyByworldBot`, `@SwiggyByworld1Bot` …
   flow atka, STOP/SKIP, invalid number, Telegram setup pending.
 - OTP ka wait hamesha **20 second** — OTP aane par turant enter hota hai (send
   confirm hota hai; na jaye to wahi OTP dobara, bot nahi badalta).
+- **OTP send hi confirm na ho aur bot `Cancel` bhi na bheje** (owner ne ye screen
+  dekhi thi) → number **skip nahi** hota: pehle *wahi* number `Login → 2 (OTP Login)
+  → number` se dobara issue hota hai (`SWIGGY_WORLD_NUMBER_RETRIES`, default 1).
+  Tab bhi na ho to hi number aage badta hai aur bot rotate hota hai.
 - **Button trigger:** pehle click; screen na badle to **usi button ka text likh kar
   bhej** diya jata hai (`🔐 Login` → `Login` → `login`). Click ka jawab der se aaye to
   type skip (double action nahi). `SWIGGY_WORLD_TRIGGER=type` = click hi nahi.

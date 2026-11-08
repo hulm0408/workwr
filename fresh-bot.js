@@ -72,7 +72,7 @@ const {
   SWIGGY_LONG_SESSION_MIN_MS,
 } = await import('./swiggy-bridge.js');
 const wafPool = await import('./waf-pool.js');
-const { esc, section, sub, field, mono, statusCard } = await import('./rich-text.js');
+const { esc, section, sectionStamp, sub, field, mono, statusCard, details, stamp } = await import('./rich-text.js');
 const { createServer } = await import('node:http');
 const { startKeepAlive } = await import('./keep-alive.js');
 const instanceInfo = await import('./instance-info.js');
@@ -2299,17 +2299,19 @@ async function worldProbeCard() {
   const status = worldBot.getWorldBotStatus();
   const recent = Array.isArray(status.recentScreens) ? status.recentScreens.slice(0, 5) : [];
   if (recent.length) {
-    lines.push('<b>Batch ke andar ke steps</b>');
+    // 5 screens card ko lamba karti thi — ab collapsible block me (kholne par
+    // poora detail, band hone par card saaf).
+    const stepLines = [];
     for (const step of recent) {
-      const when = step.at ? new Date(step.at).toISOString().slice(11, 19) : '';
-      lines.push(`› <code>${esc(String(step.phase || '').slice(0, 22))}</code> ${esc(when)} — <i>${esc(String(step.text || '(text nahi)').slice(0, 120))}</i>`);
-      if (step.buttons?.length) lines.push(`   ⌨️ ${step.buttons.slice(0, 6).map((b) => mono(esc(String(b).slice(0, 24)))).join(' · ')}`);
+      const when = stamp(step.at ? new Date(step.at) : new Date());
+      stepLines.push(`› <code>${esc(String(step.phase || '').slice(0, 22))}</code> ${esc(when)} — <i>${esc(String(step.text || '(text nahi)').slice(0, 140))}</i>`);
+      if (step.buttons?.length) stepLines.push(`   ⌨️ ${step.buttons.slice(0, 6).map((b) => mono(esc(String(b).slice(0, 24)))).join(' · ')}`);
     }
-    lines.push('');
+    lines.push(details(stepLines, { title: `📜 Batch ke andar ke ${recent.length} steps` }), '');
   }
   if (status.lastError) lines.push(`⚠️ Last error: <code>${esc(String(status.lastError).slice(0, 160))}</code>`, '');
   lines.push(sub('Ye wahi screen hai jis par batch click karega. Buttons na dikhein to bot me /start bhej kar dobara check karo.'));
-  return section('🌍 World Bot — Live Screen', lines.join('\n'));
+  return sectionStamp('🌍 World Bot — Live Screen', lines.join('\n'), new Date());
 }
 
 bot.action('ap_world_probe', async (ctx) => {

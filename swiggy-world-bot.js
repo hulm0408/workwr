@@ -68,6 +68,9 @@ export const WORLD_BOT_DEFAULTS = {
   // Bot "account creation queue me hai" bole to itna wait — isse zyada =
   // bot badlo.
   queueWaitMs: 20_000,
+  // OTP send confirm na ho (aur bot ne Cancel bhi na bheja ho) to number SKIP
+  // nahi hota — wahi number itni baar dobara issue hota hai (Login → 2 → number).
+  numberRetries: 1,
 };
 
 const state = {
@@ -199,6 +202,9 @@ export function worldBotConfig(env = process.env) {
       ? String(env.SWIGGY_WORLD_TRIGGER).trim().toLowerCase()
       : 'auto',
     clickGraceMs: num('SWIGGY_WORLD_CLICK_GRACE_MS', 4_000, 1_000),
+    // Same number ko kitni baar dobara issue karna hai (0-2) — OTP send fail par
+    // number skip karne se pehle. Pipeline ko sirf final failure milti hai.
+    numberRetries: Math.max(0, Math.min(2, Math.trunc(num('SWIGGY_WORLD_NUMBER_RETRIES', WORLD_BOT_DEFAULTS.numberRetries, 0)))),
     // Delete ke baad "Switch Accounts → Permanently Logged Out" (best-effort).
     logoutAfterDelete: String(env?.SWIGGY_WORLD_LOGOUT_AFTER_DELETE ?? '1') !== '0',
   };
@@ -328,6 +334,14 @@ export function worldBotPromptKind(text = '') {
   if (/\b(invalid mobile|invalid number|number galat)\b/.test(n)) return 'invalidNumber';
   // "OTP sent" ke kai tarah ke shabd: "OTP has been sent", "we sent a code",
   // "OTP bhej diya" — sab ek hi step hain.
+  // ⚠️ "OTP bhejne ke liye 10 digit number bhejo" me bhi "OTP" + "bhej" hai —
+  // ise OTP Sent maan lena galat tha (number maang raha hota hai). Pehle wahi
+  // pakdo. Asli confirmation me "sent"/"bhej diya" hota hai, "bhejo" nahi.
+  const asksForNumber = /\b(send|enter|type|provide|bhejo|bhej do|batao|daalo|daal do)\b/.test(n)
+    && /\b(10\s?-?digit|mobile|number|namber)\b/.test(n);
+  if (asksForNumber && !/\b(otp sent|otp has been sent|code sent|sent to|otp bhej diya|bhej diya)\b/.test(n)) {
+    return 'askNumber';
+  }
   if (/\b(otp sent|otp bhej|send the 6 digit otp)\b/.test(n)) return 'otpSent';
   if (/\b(otp|code)\b/.test(n) && /\b(sent|delivered|bhej\w*|gaya|chala gaya)\b/.test(n)) return 'otpSent';
   // Naam ka sawaal — "What is your name?", "Send your name", "apna naam batao".
@@ -373,6 +387,20 @@ export function isValidWorldSessionJson(value) {
 
 // Kisi bhi error ko samajhne layak category me baanto — isse pata chalta hai
 // bot badalna hai, session dobara login karna hai, ya sirf number defer karna.
+// OTP send confirm na hua ho (aur bot ne Cancel bhi na bheja) to number skip
+// nahi karte — pehle WAHI number dobara issue hota hai. Sirf in cases me retry:
+//   failed_otp_send / no-login-button / no-otp-login / no-button / flow stuck
+// Retry NAHI: aborted, invalid number, queued_timeout (bot load → switch),
+// OTP miss/verify (wahan 20s rule lagta hai), bot_unreachable, setup, network.
+export function shouldReissueWorldOtp(kind = '') {
+  const k = String(kind || '').trim().toLowerCase();
+  if (!k) return false;
+  if (/^(aborted|queued_timeout|failed_otp_miss|failed_otp_verify|invalidnumber|failed_invalid_number|bot_unreachable|worldbot_setup|flood_wait|network)$/.test(k)) {
+    return false;
+  }
+  return /otp_send|no_login|no-login|no-otp-login|no_otp_login|no_button|no-button|no_prompt|number_prompt|timeout|failed_world_bot|send_number|otp-send/.test(k);
+}
+
 export function classifyWorldBotError(error = {}) {
   const raw = String(error?.message ?? error ?? '');
   const code = String(error?.code || '').toUpperCase();
@@ -698,55 +726,100 @@ export async function worldBotLogin({
         return hit;
       });
 
-      // 2) 🔐 Login → method picker
-      setPhase('login-menu');
-      before = screenSignature(await parseScreenMessages(client, entity));
-      const loginHit = findRoleOnScreens(await parseScreenMessages(client, entity), 'login');
-      if (!loginHit) throw new WorldBotError('no-login-button', `Login button nahi mila — screen: ${(state.lastScreenButtons || []).join(' | ') || 'none'}`);
-      await clickOrType({
-        client, entity, entry: loginHit.button, cfg, shouldAbort, baseline: before,
-        what: 'login method screen',
-        predicate: (freshList, all) => findRoleOnScreens([...freshList, ...all], 'otpLogin'),
-      });
+      // Ek number ke liye poora OTP-issue sequence: Login → OTP Login (2) → number.
+      // Owner rule: kai baar OTP bhejne ki screen hi nahi aati aur bot Cancel bhi
+      // nahi bhejta — tab agla number nahi, WAHI number dobara issue hota hai.
+      const issueNumberOtp = async ({ attempt = 1 } = {}) => {
+        if (attempt > 1) {
+          // adhoora screen saaf karo, typed-text guard reset, phir /start se menu.
+          await safeCancel(client, entity, cfg).catch(() => {});
+          state.lastTypedText = '';
+          state.lastTypedAt = 0;
+          await sleep(Math.max(600, Math.min(2_000, Number(cfg.pollMs) || 1_500)));
+          await sendWorldText(client, entity, '/start').catch(() => {});
+          await sleep(Math.max(700, Math.min(2_500, Number(cfg.pollMs) || 1_500)));
+        }
 
-      // 3) 📲 OTP Login → number maango
-      setPhase('otp-login');
-      before = screenSignature(await parseScreenMessages(client, entity));
-      const otpBtn = findRoleOnScreens(await parseScreenMessages(client, entity), 'otpLogin');
-      if (!otpBtn) throw new WorldBotError('no-otp-login', 'OTP Login button nahi mila');
+        // 2) 🔐 Login → method picker
+        setPhase('login-menu');
+        let issueBaseline = screenSignature(await parseScreenMessages(client, entity));
+        const loginHit = findRoleOnScreens(await parseScreenMessages(client, entity), 'login');
+        if (!loginHit) throw new WorldBotError('no-login-button', `Login button nahi mila — screen: ${(state.lastScreenButtons || []).join(' | ') || 'none'}`);
+        await clickOrType({
+          client, entity, entry: loginHit.button, cfg, shouldAbort, baseline: issueBaseline,
+          what: 'login method screen',
+          predicate: (freshList, all) => findRoleOnScreens([...freshList, ...all], 'otpLogin'),
+        });
 
-      // 4) number prompt (click na chale to "OTP Login" text type hoga)
-      setPhase('send-number');
-      const numberPrompt = await clickOrType({
-        client, entity, entry: otpBtn.button, cfg, shouldAbort, baseline: before,
-        what: 'number prompt',
-        timeoutMs: Math.min(20_000, cfg.stepTimeoutMs),
-        predicate: (freshList, all) => {
-          const allText = [...freshList, ...all].map((m) => m.text).join('\n');
-          return worldBotPromptKind(allText) === 'askNumber' ? true : null;
-        },
-      }).then(() => true).catch(() => true); // prompt na mile to bhi number bhej do
+        // 3) 📲 OTP Login → number maango
+        setPhase('otp-login');
+        issueBaseline = screenSignature(await parseScreenMessages(client, entity));
+        const otpBtn = findRoleOnScreens(await parseScreenMessages(client, entity), 'otpLogin');
+        if (!otpBtn) throw new WorldBotError('no-otp-login', 'OTP Login button nahi mila');
 
-      await reportCard(report, [
-        '🌍 <b>Swiggy World Bot — OTP Login</b>',
-        `📱 <b>Number:</b> <code>${cleanPhone}</code>`,
-        '→ /start → Login → OTP Login ho gaya, ab number bhej raha hoon…',
-      ].join('\n'));
-      void numberPrompt;
+        // 4) number prompt (click na chale to "OTP Login" text type hoga)
+        setPhase('send-number');
+        await clickOrType({
+          client, entity, entry: otpBtn.button, cfg, shouldAbort, baseline: issueBaseline,
+          what: 'number prompt',
+          timeoutMs: Math.min(20_000, cfg.stepTimeoutMs),
+          predicate: (freshList, all) => {
+            const allText = [...freshList, ...all].map((m) => m.text).join('\n');
+            return worldBotPromptKind(allText) === 'askNumber' ? true : null;
+          },
+        }).then(() => true).catch(() => true); // prompt na mile to bhi number bhej do
 
-      before = screenSignature(await parseScreenMessages(client, entity));
-      await sendWorldText(client, entity, cleanPhone);
+        await reportCard(report, [
+          '🌍 <b>Swiggy World Bot — OTP Login</b>',
+          `📱 <b>Number:</b> <code>${cleanPhone}</code>`,
+          attempt > 1
+            ? `↻ Wahi number dobara bhej raha hoon (try ${attempt}) — /start → Login → OTP Login`
+            : '→ /start → Login → OTP Login ho gaya, ab number bhej raha hoon…',
+        ].join('\n'));
 
-      // ⏱ Owner rule: OTP send ka budget 20s (queue bola ho to +20s). Isme
-      // OTP Sent na aaye → bot badla jata hai; warna wahi bot chalta rehta hai.
-      const numberResult = await waitForOtpSent({ client, entity, baseline: before, cfg, shouldAbort });
-      if (numberResult.kind === 'invalidNumber') {
+        issueBaseline = screenSignature(await parseScreenMessages(client, entity));
+        await sendWorldText(client, entity, cleanPhone);
+
+        // ⏱ Owner rule: OTP send ka budget 20s (queue bola ho to +20s).
+        return waitForOtpSent({ client, entity, baseline: issueBaseline, cfg, shouldAbort });
+      };
+
+      // ⏱ 20s me OTP Sent na aaye / screen hi na aaye to pehle WAHI number
+      // dobara issue hota hai (Login → 2 → number). Tab bhi na ho to hi number
+      // aage badta hai aur bot rotate hota hai.
+      const issueTries = Math.max(1, Math.min(3, 1 + Math.max(0, Number(cfg.numberRetries ?? 1) || 0)));
+      let numberResult = null;
+      let lastIssueKind = '';
+      for (let attempt = 1; attempt <= issueTries; attempt += 1) {
+        try {
+          numberResult = await issueNumberOtp({ attempt });
+        } catch (e) {
+          if (e?.code === 'aborted' || /owner ne stop/i.test(String(e?.message || ''))) throw e;
+          const kind = classifyWorldBotError(e);
+          numberResult = { ok: false, kind: kind === 'failed_world_bot' ? 'failed_otp_send' : kind, reason: e?.message || String(e) };
+        }
+        lastIssueKind = String(numberResult?.kind || '');
+        if (numberResult?.ok || lastIssueKind === 'invalidNumber') break;
+        if (!shouldReissueWorldOtp(lastIssueKind)) break;
+        if (attempt >= issueTries) break;
+        console.warn(`[WorldBot] ↻ "${lastIssueKind}" — ${cleanPhone} ko wahi number dobara issue kar raha hoon (try ${attempt + 1}/${issueTries})`);
+        setPhase('reissue-number', { lastError: numberResult?.reason || '' });
+        await reportCard(report, `↻ <b>Wahi number dobara</b> — OTP send confirm nahi hua, isliye number skip nahi kar raha.\n📱 <code>${cleanPhone}</code> · try ${attempt + 1}/${issueTries}`);
+      }
+
+      if (numberResult?.kind === 'invalidNumber') {
         await safeCancel(client, entity, cfg).catch(() => {});
         return { ok: false, kind: 'failed_invalid_number', phone: cleanPhone, reason: 'Swiggy World Bot ne number invalid bataya' };
       }
-      if (!numberResult.ok) {
+      if (!numberResult?.ok) {
         await safeCancel(client, entity, cfg).catch(() => {});
-        return { ok: false, kind: numberResult.kind, phone: cleanPhone, reason: numberResult.reason };
+        return {
+          ok: false,
+          kind: numberResult?.kind || 'failed_otp_send',
+          phone: cleanPhone,
+          attempts: issueTries,
+          reason: `${numberResult?.reason || 'OTP send confirm nahi hua'} · ${issueTries} try ke baad bhi`,
+        };
       }
 
       // 5) OTP lao (Firebase inbox se — pipeline deta hai) aur bhejo

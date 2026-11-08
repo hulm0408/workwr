@@ -25,6 +25,11 @@ delete process.env.FIREBASE_DB_AUTH;
 // persist kar dete the → bot us fake URL par "fetch failed" karne lagta tha.)
 process.env.DATA_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), 'test-data');
 
+// Card titles ab fancy Unicode bold me hote hain (—[ ⚡ 𝗧𝗜𝗧𝗟𝗘 ]—).
+// Text dhoondhne wale asserts ke liye dono shakal check karo.
+const fancyRich = await import('./rich-text.js');
+const hasText = (haystack, needle) => String(haystack).includes(needle) || String(haystack).includes(fancyRich.fancy(needle));
+
 let passed = 0;
 function ok(cond, label) {
   assert.ok(cond, label);
@@ -1988,7 +1993,30 @@ console.log('telegram Hermes source + Add Telegram Account primitives:');
   ok(rich.progressBar(3, 10).includes('3/10') && rich.progressBar(3, 10).includes('▰') && rich.progressBar(3, 10).includes('▱'), 'progress bar soft blocks + done/total dikhata hai');
   ok(rich.progressBar(3, 10).includes('30%'), 'progress bar percentage bhi dikhata hai');
   ok(rich.progressBar(99, 10).includes('99/10') && !rich.progressBar(99, 10).includes('▱'), 'progress bar over-target par full rehta hai, crash nahi');
-  ok(rich.statusCard('LIVE', ['one', '', 'two']).includes('<b>LIVE</b>') && !rich.statusCard('LIVE', ['one', '', 'two']).includes('\n\n'), 'statusCard khali lines hata kar compact card banata hai');
+  // Task H — in bots jaisa "alag font" (fancy Unicode bold) + saaf cards.
+  ok(rich.fancy('Your Number') === '\u{1D5EC}\u{1D5FC}\u{1D602}\u{1D5FF}\u{20}\u{1D5E1}\u{1D602}\u{1D5FA}\u{1D5EF}\u{1D5F2}\u{1D5FF}', 'fancy: A-Z/a-z Unicode bold me badalte hain');
+  ok(rich.fancy('OTP — ok!') === '\u{1D5E2}\u{1D5E7}\u{1D5E3}\u{20}\u{2014}\u{20}\u{1D5FC}\u{1D5F8}\u{21}', 'fancy: punctuation/space chhue bina rehte hain');
+  ok(rich.plain(rich.fancy('Fetching 42 JSON')) === 'Fetching 42 JSON', 'plain: fancy glyphs wapas ASCII me (stage matching ke liye)');
+  ok(rich.bracketHeader('⚡ Fetching').startsWith('—[') && rich.bracketHeader('⚡ Fetching').endsWith(']—') && rich.bracketHeader('⚡ Fetching').includes(rich.fancy('Fetching')), 'bracketHeader: —[ ⚡ TITLE ]— shakal');
+  ok(rich.bracketHeader('Live', { time: '02:29' }).includes('<code>02:29</code>'), 'bracketHeader: right-side time chip');
+  ok(rich.headerRule() === '─'.repeat(14) && rich.headerRule(8).length === 8, 'headerRule: patli line, width configurable');
+  ok(rich.stamp(new Date('2026-11-08T20:32:00Z')) === '02:02', 'stamp: IST me HH:mm');
+  ok(rich.stamp('kuch bhi nahi') === '', 'stamp: galat date par khali string, crash nahi');
+  const fancySection = rich.section('📞 Your Number', 'value line');
+  ok(fancySection.includes(rich.bracketHeader('📞 Your Number')) && fancySection.includes(rich.headerRule()) && fancySection.includes('value line') && fancySection.startsWith('<blockquote>'), 'section: bracket header + rule + body ek hi card me');
+  const stampedSection = rich.sectionStamp('🟢 Live', 'body', new Date('2026-11-08T20:32:00Z'));
+  ok(rich.statusCard('🟢 LIVE', ['body'], { stamp: new Date('2026-11-08T20:32:00Z') }).includes('<code>02:02</code>')
+    && !rich.statusCard('🟢 LIVE', ['body']).includes('<code>02:02</code>'), 'statusCard: stamp do to time chip, warna nahi');
+  ok(stampedSection.includes('<code>02:02</code>') && stampedSection.includes(rich.headerRule()), 'sectionStamp: live card par timestamp');
+  const detailBlock = rich.details(['screen 1', 'screen 2'], { title: 'Last 5 screens' });
+  ok(detailBlock.startsWith('<blockquote expandable>') && detailBlock.includes('screen 1') && detailBlock.includes('screen 2'), 'details: lambi info collapsible blockquote me');
+  ok(rich.details([]) === '' && rich.details(['', null]) === '', 'details: khali list par kuch nahi bhejta');
+  const fieldLine = rich.field('Your Number', '9876543210');
+  ok(fieldLine.includes(rich.fancy('Your Number')) && fieldLine.includes('9876543210') && !fieldLine.includes(rich.fancy('9876543210')), 'field: label fancy, value plain (copy-paste safe)');
+  const otpCard = rich.otpSentCard('9876543210');
+  ok(otpCard.includes('<code>9876543210</code>') && !otpCard.includes(rich.fancy('9876543210')) && !/[\u{1D7EC}-\u{1D7F5}]/u.test(otpCard), 'otpSentCard: number/OTP hamesha plain rehta hai');
+  ok(rich.mono('{"phone":"9876543210"}') === '<code>{&quot;phone&quot;:&quot;9876543210&quot;}</code>', 'mono: JSON copy-paste ke liye plain rehta hai');
+  ok(rich.statusCard('LIVE', ['one', '', 'two']).includes(rich.bracketHeader('LIVE')) && !rich.statusCard('LIVE', ['one', '', 'two']).includes('\n\n'), 'statusCard khali lines hata kar compact card banata hai');
   const compactLive = engine.formatCompactAutopilotCard({
     sourceMode: 'telegram', running: true, target: 10, fresh: 2, processed: 3, failed: 1,
     addressAdded: 1, startedAt: Date.now() - 65_000, elapsedMs: 65_000,
@@ -2008,7 +2036,7 @@ console.log('telegram Hermes source + Add Telegram Account primitives:');
     processed: 2, failed: 1, addressAdded: 1, elapsedMs: 120_000,
     freshAccounts: [{ phone: '9876543210', accountKey: 'AK1' }],
   }, { final: true });
-  ok(compactFinal.includes('BATCH KHATAM') && compactFinal.includes('Aapne STOP kiya') && compactFinal.includes('Fresh JSON chat me'), 'compact final card asal stop reason + JSON note deta hai');
+  ok(hasText(compactFinal, 'BATCH KHATAM') && compactFinal.includes('Aapne STOP kiya') && compactFinal.includes('Fresh JSON chat me'), 'compact final card asal stop reason + JSON note deta hai');
   const compactHermesClaim = engine.formatCompactAutopilotCard({
     sourceMode: 'telegram', running: true, target: 100, fresh: 0, processed: 0,
     elapsedMs: 12_000, telegramClaimPhase: 'clicked-new',
@@ -3361,6 +3389,31 @@ Thanks`)),
     'worldbot: delete OTP sent detect');
   ok(wb.worldBotPromptKind('Account Deleted Successfully') === 'deleted',
     'worldbot: delete success detect');
+
+  // ⚠️ Number maangne wala message OTP-Sent nahi hai (owner ka bug: "OTP
+  // bhejne ke liye number bhejo" ko OTP Sent samajh liya jata tha).
+  ok(wb.worldBotPromptKind('OTP bhejne ke liye 10 digit mobile number bhejo') === 'askNumber',
+    'worldbot: "OTP ... number bhejo" ko askNumber maanta hai, otpSent nahi');
+  ok(wb.worldBotPromptKind('✅ OTP Sent to your number') === 'otpSent',
+    'worldbot: asli OTP Sent phir bhi otpSent');
+
+  // 🔁 OTP send confirm na ho aur bot Cancel bhi na bheje → number SKIP nahi,
+  // WAHI number dobara issue (Login → 2 → number).
+  ok(wb.shouldReissueWorldOtp('failed_otp_send') === true,
+    'reissue: OTP send fail par wahi number dobara');
+  ok(wb.shouldReissueWorldOtp('no-login-button') === true && wb.shouldReissueWorldOtp('no-otp-login') === true,
+    'reissue: Login/OTP Login button na mile to bhi wahi number dobara');
+  ok(wb.shouldReissueWorldOtp('queued_timeout') === false,
+    'reissue: queue timeout par nahi (bot badalta hai)');
+  ok(wb.shouldReissueWorldOtp('failed_otp_miss') === false && wb.shouldReissueWorldOtp('failed_otp_verify') === false,
+    'reissue: OTP miss/verify fail par nahi (20s rule = number aage)');
+  ok(wb.shouldReissueWorldOtp('bot_unreachable') === false && wb.shouldReissueWorldOtp('aborted') === false
+    && wb.shouldReissueWorldOtp('worldbot_setup') === false,
+    'reissue: bot dead/abort/setup par retry nahi');
+  ok(wb.worldBotConfig({}).numberRetries === 1 && wb.worldBotConfig({ SWIGGY_WORLD_NUMBER_RETRIES: '2' }).numberRetries === 2
+    && wb.worldBotConfig({ SWIGGY_WORLD_NUMBER_RETRIES: '9' }).numberRetries === 2
+    && wb.worldBotConfig({ SWIGGY_WORLD_NUMBER_RETRIES: '0' }).numberRetries === 0,
+    'reissue: numberRetries config (default 1, max 2, 0 = off)');
 
   ok(wb.isWorldBotPhoneValid('6296591407') && !wb.isWorldBotPhoneValid('1234567890'),
     'worldbot: sirf 6-9 se shuru 10-digit number valid');

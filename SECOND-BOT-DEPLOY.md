@@ -426,6 +426,11 @@ World bots ka default pool: `@SwiggyByworldBot`, `@SwiggyByworld1Bot` …
   (bot se remove) ke baad **🏠 Main Menu** dabta hai — na `/start`, na seedha
   `Login`. Uske baad wahi number se fresh login: `Login` → `OTP Login` → number
   → OTP → naam → JSON (JSON aate hi bhej diya jata hai).
+- **Delete blocked (charges/dues):** bot bole "this account can't be deleted
+  because user charges are present" → fresh account us number par possible
+  nahi. Flow: **Main Menu → Switch Accounts → woh ID → Permanently Logged
+  Out → naya number**. Number skip hota hai (ledger me skipped), bot nahi
+  badalta. Card: `⛔ Delete Blocked (Charges) — Naya Number`.
 - **Flood wait friendly:** `messages.GetHistory` flood wait ya khali read par 3
   koshish + 0.4s read-cache; `Login button nahi mila — screen: none` par bot
   switch nahi, pehle menu reset karke ek aur koshish.

@@ -332,10 +332,31 @@ export function extractWorldBotJson(text = '') {
   return null;
 }
 
+// ⛔ Delete nahi ho sakta — owner ka case: "this account can't be deleted
+// because user charges are present". Aise number par fresh account banana
+// possible nahi, isliye: Main Menu → Switch Account → woh ID → Permanently
+// Log Out → naya number.
+export function worldBotDeleteBlockedInfo(text = '') {
+  const raw = String(text || '').trim();
+  const n = norm(raw);
+  if (!n) return null;
+  const cannotDelete = /\b(can\s*t|can\s*not|cannot|could\s*not|couldn\s*t|unable\s*to|not\s+possible)\b.{0,60}\bdelet/.test(n)
+    || /\bdelet\w*\b.{0,40}\b(not\s+possible|not\s+allowed|failed)\b/.test(n);
+  const chargeWords = /\b(user\s+charges?|charges?|dues?|pending\s+(amount|payment|order|bill|dues)|wallet\s*balance|outstanding|balance\s+amount)\b/.test(n);
+  if (!cannotDelete && !(chargeWords && /\bdelet/.test(n))) return null;
+  return {
+    kind: 'deleteBlocked',
+    reason: `Account delete nahi ho sakta${chargeWords ? ' (charges/dues pending)' : ''}: ${raw.replace(/\s+/g, ' ').slice(0, 160)}`,
+    text: raw.replace(/\s+/g, ' ').slice(0, 200),
+  };
+}
+
 // Bot ke latest message se pata karo kis step par hai.
 export function worldBotPromptKind(text = '') {
   const n = norm(text);
   if (!n) return '';
+  // ⛔ "can't be deleted … charges" me "deleted" bhi hai — isliye pehle ye.
+  if (worldBotDeleteBlockedInfo(text)) return 'deleteBlocked';
   if (/\b(deleted successfully|account deleted|successfully archived|deleted)\b/.test(n)) return 'deleted';
   if (/\b(delete otp|otp sent.{0,40}delete|delete.{0,30}otp)\b/.test(n)) return 'deleteSent';
   if (/\b(otp was not accepted|invalid otp|otp galat|wrong otp|otp expired)\b/.test(n)) return 'otpFail';
@@ -1741,9 +1762,41 @@ export async function worldBotDeleteAccount({
       const deletePredicate = (freshList) => {
         for (const message of freshList) {
           const kind = worldBotPromptKind(message.text);
+          // ⛔ "ye account delete nahi ho sakta (user charges present)" — 45s
+          // wait ka koi matlab nahi, turant owner ka fallback flow.
+          if (kind === 'deleteBlocked') return { kind: 'blocked', message };
           if (kind === 'deleteSent' || kind === 'askNumber' || kind === 'otpSent') return kind;
         }
         return null;
+      };
+
+      // ⛔ Delete blocked (charges/dues) → owner ka flow:
+      //   Main Menu → Switch Account → woh ID → Permanently Log Out → naya number.
+      const handleDeleteBlocked = async (message) => {
+        const info = worldBotDeleteBlockedInfo(message?.text || '');
+        console.warn(`[WorldBot] ⛔ delete blocked — ${info?.reason || 'charges/dues pending'}`);
+        await reportCard(report, [
+          '🌍 <b>World Bot — Delete Nahi Ho Sakta</b>',
+          `📱 <code>${cleanPhone}</code>`,
+          `⚠️ ${plain(info?.reason || 'Account delete nahi ho sakta').replace(/[<>&]/g, '')}`,
+          '→ Main Menu → Switch Account → woh ID → Permanently Log Out, phir naya number.',
+        ].join('\n'));
+        setPhase('delete-blocked-cleanup');
+        // 1) Main Menu (button ho to wahi; /start nahi)
+        await worldResetToMenu(client, entity, cfg).catch(() => {});
+        // 2) Switch Account → woh number → Permanently Log Out
+        const out = await logoutAccountUnlocked(client, entity, cfg, cleanPhone, { shouldAbort })
+          .catch((error) => ({ ok: false, reason: String(error?.message || error).slice(0, 120) }));
+        console.log(`[WorldBot] 🔓 blocked account logout: ${out?.ok ? 'ho gaya' : `fail (${out?.reason || out?.kind})`}`);
+        return {
+          ok: false,
+          kind: 'delete_blocked_charges',
+          phone: cleanPhone,
+          loggedOut: Boolean(out?.ok),
+          code: 'DELETE_CHARGES',
+          reason: `${info?.reason || 'Account delete nahi ho sakta (charges/dues)'}${out?.ok ? ' · bot se permanently log out kar diya' : ''}`,
+          viaWorldBot: true,
+        };
       };
       const deleteWaiter = () => waitForReply({
         client, entity, baseline: before, timeoutMs: cfg.stepTimeoutMs, shouldAbort,
@@ -1756,6 +1809,7 @@ export async function worldBotDeleteAccount({
         client, entity, entry: deleteHit.button, cfg, shouldAbort, baseline: before,
         what: 'Delete OTP Sent', predicate: deletePredicate,
       }).catch(() => null);
+      if (deleteAck?.kind === 'blocked') return await handleDeleteBlocked(deleteAck.message);
 
       // Bot kabhi pehle confirm poochhta hai ("Haan 💜" / Yes) — tab wahi
       // dabana padta hai, warna flow wahin atak jata hai.
@@ -1774,6 +1828,7 @@ export async function worldBotDeleteAccount({
             client, entity, entry: confirmBtn, cfg, shouldAbort, baseline: before,
             what: 'Delete OTP Sent (confirm ke baad)', predicate: deletePredicate,
           }).catch(() => null);
+          if (deleteAck?.kind === 'blocked') return await handleDeleteBlocked(deleteAck.message);
         }
       }
 
@@ -1789,10 +1844,14 @@ export async function worldBotDeleteAccount({
       })();
       if (againBtn) {
         before = screenSignature(screen);
-        await clickOrType({
+        const againAck = await clickOrType({
           client, entity, entry: againBtn, cfg, shouldAbort, baseline: before, timeoutMs: 12_000,
           what: 'delete account dobara chuno', predicate: deletePredicate,
-        }).catch(() => {});
+        }).catch(() => null);
+        if (againAck?.kind === 'blocked') return await handleDeleteBlocked(againAck.message);
+        const blockedScreen = (await parseScreenMessages(client, entity).catch(() => []))
+          .find((m) => worldBotDeleteBlockedInfo(m.text));
+        if (blockedScreen) return await handleDeleteBlocked(blockedScreen);
       }
 
       // 5) Delete OTP
@@ -1826,6 +1885,7 @@ export async function worldBotDeleteAccount({
         predicate: (freshList) => {
           for (const message of freshList) {
             const kind = worldBotPromptKind(message.text);
+            if (kind === 'deleteBlocked') return { kind: 'blocked', message };
             if (kind === 'deleted') return { kind: 'deleted', message };
             if (kind === 'otpFail') return { kind: 'otpFail', message };
           }
@@ -1834,6 +1894,7 @@ export async function worldBotDeleteAccount({
         pollMs: cfg.pollMs,
       });
 
+      if (result.kind === 'blocked') return await handleDeleteBlocked(result.message);
       if (result.kind === 'otpFail') {
         return { ok: false, kind: 'delete_otp_rejected', phone: cleanPhone, reason: 'World Bot ne delete OTP accept nahi kiya' };
       }
@@ -1911,6 +1972,91 @@ export async function worldBotDeleteAccount({
 // Best-effort: Switch Accounts → account → Permanently Logged Out
 // (owner ka step: delete + fresh ke baad purani entry clean ho jaye)
 // ---------------------------------------------------------------------------
+// Switch Accounts → woh number → Permanently Logged Out.
+// Owner ka rule: purge screen par pehle **Main Menu**, phir Switch Account →
+// woh ID → Permanently Log Out. Har step sirf LATEST screen se padha jata hai
+// (purane account-menu ke stale buttons click karne se flow bhatak jata tha),
+// aur har click ke baad bot ke naye jawab ka intezaar hota hai.
+async function logoutAccountUnlocked(client, entity, cfg, cleanPhone, { shouldAbort = null } = {}) {
+  const step = Math.max(600, Number(cfg?.pollMs) || 1_200);
+  const latest = async (n = 3) => (await parseScreenMessages(client, entity).catch(() => [])).slice(0, n);
+  const accountBtn = (msgs = []) => {
+    for (const message of msgs) {
+      const btn = findWorldBotAccountButton(message.buttons, cleanPhone);
+      if (btn) return btn;
+    }
+    return null;
+  };
+  const waitFor = async (finder, timeoutMs = 15_000) => {
+    const deadline = Date.now() + Math.max(1_000, Number(timeoutMs) || 15_000);
+    for (;;) {
+      if (typeof shouldAbort === 'function' && shouldAbort()) return null;
+      const hit = finder(await latest());
+      if (hit) return hit;
+      if (Date.now() >= deadline) return null;
+      await sleep(step);
+    }
+  };
+  const clickBtn = async (entry, predicate, what, timeoutMs = 15_000) => {
+    const before = screenSignature(await parseScreenMessages(client, entity).catch(() => []));
+    return clickOrType({ client, entity, entry, cfg, shouldAbort, baseline: before, what, predicate, timeoutMs })
+      .catch((error) => {
+        console.warn(`[WorldBot] ${what}: ${String(error?.message || error).slice(0, 80)}`);
+        return null;
+      });
+  };
+
+  setPhase('logout-start');
+
+  // 🏠 Owner: "main menu bhejega then switch account and select that id and
+  // permanently log out". Menu par hi Switch Accounts ho to seedha wahi.
+  let switched = false;
+  const switchAndPick = async (entry, label) => {
+    if (!entry) return;
+    const beforeId = Number((await latest(1))[0]?.id) || 0;
+    await clickBtn(entry.button || entry, (fresh, all) => accountBtn(fresh) || accountBtn(all) || null, label);
+    // ⚠️ Sirf NAYE screen ka account button — purane Order Hub wala stale
+    // button click karne se bot wapas account menu par chala jata tha.
+    const inList = await waitFor((msgs) => accountBtn(msgs.filter((m) => Number(m.id) > beforeId)), 12_000);
+    if (inList) await clickBtn(inList, (fresh) => roleOnLatest(fresh, 'permanentLogout'), 'logout: switch list me account');
+    switched = true;
+  };
+
+  const menuSwitch = await waitFor((msgs) => roleOnLatest(msgs, 'switchAccounts'), 1_500);
+  if (menuSwitch) await switchAndPick(menuSwitch, 'logout: Switch Accounts (Main Menu)');
+
+  // 1) Account list — Order Hub se (menu par "Switch Accounts" nahi hota).
+  let acct = switched ? null : await waitFor((msgs) => accountBtn(msgs), 2_000);
+  if (!acct && !switched) {
+    await clickRole(client, entity, 'orderHub', { cfg, shouldAbort, what: 'Order Hub (logout)' }).catch(() => {});
+    acct = await waitFor((msgs) => accountBtn(msgs), 18_000);
+  }
+  if (!acct && !switched) {
+    return { ok: false, kind: 'logout_account_not_listed', phone: cleanPhone, reason: 'Account list me number nahi mila' };
+  }
+
+  // 2) Woh account → account menu
+  if (acct) {
+    await clickBtn(acct, (fresh) => roleOnLatest(fresh, 'switchAccounts')
+      || roleOnLatest(fresh, 'deleteAccount') || roleOnLatest(fresh, 'permanentLogout'), 'logout: account chuno');
+  }
+
+  // 3) Switch Accounts (account menu par) → phir list me wahi number
+  if (!switched) {
+    const switchHit = await waitFor((msgs) => roleOnLatest(msgs, 'switchAccounts'), 4_000);
+    if (switchHit) await switchAndPick(switchHit, 'logout: Switch Accounts');
+  }
+
+  // 4) Permanently Logged Out
+  const logoutHit = await waitFor((msgs) => roleOnLatest(msgs, 'permanentLogout'), 15_000);
+  if (!logoutHit) return { ok: false, kind: 'logout_button_missing', phone: cleanPhone, reason: 'Permanently Logged Out button nahi mila' };
+  await clickBtn(logoutHit.button, (fresh) => (fresh && fresh.length ? true : null), 'Permanently Logged Out');
+  state.lastOkAt = Date.now();
+  setPhase('logout-done');
+  console.log(`[WorldBot] 🚪 ${cleanPhone} — Permanently Logged Out`);
+  return { ok: true, kind: 'logged_out', phone: cleanPhone };
+}
+
 export async function worldBotPermanentLogout({
   phone,
   shouldAbort = null,
@@ -1923,47 +2069,7 @@ export async function worldBotPermanentLogout({
   try {
     return await withTelegramUserClient(async ({ client }) => {
       const entity = await getWorldEntity(client, cfg.username);
-      const before = screenSignature(await parseScreenMessages(client, entity));
-      const switchHit = findRoleOnScreens(await parseScreenMessages(client, entity), 'switchAccounts');
-      if (!switchHit) {
-        // Screen par na ho to Order Hub se account list kholo.
-        await clickRole(client, entity, 'orderHub', { cfg, shouldAbort, what: 'Order Hub' }).catch(() => {});
-        await sleep(cfg.pollMs);
-      } else {
-        await clickOrType({
-          client, entity, entry: switchHit.button, cfg, shouldAbort, baseline: before,
-          what: 'account switcher',
-          timeoutMs: Math.min(20_000, cfg.stepTimeoutMs),
-          predicate: (freshList, all) => [...freshList, ...all].some((m) => findWorldBotAccountButton(m.buttons, cleanPhone)) ? true : null,
-        }).catch(() => {});
-      }
-
-      let screen = await parseScreenMessages(client, entity);
-      let accountBtn = null;
-      for (const message of screen) {
-        const btn = findWorldBotAccountButton(message.buttons, cleanPhone);
-        if (btn) { accountBtn = btn; break; }
-      }
-      if (!accountBtn) return { ok: false, kind: 'logout_account_not_listed', phone: cleanPhone, reason: 'Switch Accounts me number nahi mila' };
-      await clickOrType({
-        client, entity, entry: accountBtn, cfg, shouldAbort,
-        baseline: screenSignature(screen),
-        what: 'logout ke liye account chuno', timeoutMs: 15_000,
-        predicate: (freshList, all) => findRoleOnScreens([...freshList, ...all], 'permanentLogout'),
-      }).catch(() => {});
-
-      screen = await parseScreenMessages(client, entity);
-      const logoutHit = findRoleOnScreens(screen, 'permanentLogout');
-      if (!logoutHit) return { ok: false, kind: 'logout_button_missing', phone: cleanPhone, reason: 'Permanently Logged Out button nahi mila' };
-      await clickOrType({
-        client, entity, entry: logoutHit.button, cfg, shouldAbort,
-        baseline: screenSignature(screen),
-        what: 'Permanently Logged Out', timeoutMs: 15_000,
-        predicate: (fresh) => (fresh && fresh.length ? true : null),
-      }).catch(() => {});
-      state.lastOkAt = Date.now();
-      setPhase('logout-done');
-      return { ok: true, kind: 'logged_out', phone: cleanPhone };
+      return await logoutAccountUnlocked(client, entity, cfg, cleanPhone, { shouldAbort });
     });
   } catch (error) {
     setError(error);

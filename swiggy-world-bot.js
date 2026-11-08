@@ -248,6 +248,9 @@ export function worldBotButtonRole(text = '') {
   if (/\bpermanent\w*\b/.test(n) && /\blog|out\b/.test(n)) return 'permanentLogout';
   if (/\b(log\s*out|logout|sign\s*out)\b/.test(n)) return 'permanentLogout';
   if (/\b(permanent\w*\s*log\s*out|log\s*out\s*permanent\w*)\b/.test(n)) return 'permanentLogout';
+  // 🏠 "Main Menu" / "Back to Menu" — delete ke baad owner ka step: pehle
+  // Main Menu dabao, phir Login (na /start, na seedha Login).
+  if (/\b(main\s*menu|back\s*to\s*menu|home|start\s*over)\b/.test(n)) return 'mainMenu';
   if (/\b(cancel|back)\b/.test(n)) return 'cancel';
   if (/\blogin\b/.test(n)) return 'login';
   return '';
@@ -875,8 +878,10 @@ export async function worldBotLogin({
     return await withTelegramUserClient(async ({ client }) => {
       const entity = await getWorldEntity(client, cfg.username);
 
-      // 1) /start → main menu (pehle pichla adhoora flow saaf: OTP/number prompt)
+      // 1) Main menu — delete ke baad owner ka flow: Main Menu → Login → OTP
+      // Login → number. `/start` sirf tab jab Main Menu/Login kuch na mile.
       setPhase('start');
+      if (fresh) console.log('[WorldBot] 🔁 fresh login — Main Menu se Login → OTP Login → number');
       // worldResetToMenu khud /start bhej kar menu ka intezaar karta hai —
       // yahan dobara /start bhejne se duplicate command jati thi.
       const menuReady = await worldResetToMenu(client, entity, cfg);
@@ -1613,11 +1618,25 @@ async function worldResetToMenu(client, entity, cfg = {}) {
   const pending = worldBotAwaitingKind(screen);
   if (pending) {
     setPhase('reset-menu');
-    console.log(`[WorldBot] 🧹 adhoora flow (${pending}) mila — pehle Cancel, phir /start`);
+    console.log(`[WorldBot] 🧹 adhoora flow (${pending}) mila — pehle Cancel, phir Main Menu`);
     await safeCancel(client, entity, cfg).catch(() => {});
   }
+  // 🏠 Owner ka rule: delete/question screen par "Main Menu" button ho to WAHI
+  // dabao — `/start` nahi, seedha Login bhi nahi.
+  let settled = await settledScreen(client, entity, cfg).catch(() => parseScreenMessages(client, entity));
+  const menuHit = findRoleOnScreens(settled, 'mainMenu');
+  if (menuHit && !roleOnLatest(settled, 'login')) {
+    setPhase('main-menu');
+    console.log(`[WorldBot] 🏠 "${menuHit.button.text}" dabaya — Main Menu par ja raha hoon`);
+    await clickOrType({
+      client, entity, entry: menuHit.button, cfg,
+      what: 'Main Menu',
+      timeoutMs: Math.min(20_000, Number(cfg?.stepTimeoutMs) || 20_000),
+      predicate: (freshList, all) => roleOnLatest(freshList, 'login') || (all && roleOnLatest(all, 'login')) || null,
+    }).catch((e) => console.warn(`[WorldBot] Main Menu click: ${e?.message || e}`));
+    settled = await settledScreen(client, entity, cfg).catch(() => parseScreenMessages(client, entity));
+  }
   // Bot pehle se saaf menu par hai to /start dobara mat bhejo (command burst).
-  const settled = await settledScreen(client, entity, cfg).catch(() => parseScreenMessages(client, entity));
   if (!worldBotAwaitingKind(settled) && roleOnLatest(settled, 'login')) {
     console.log('[WorldBot] ✅ menu pehle se saaf hai — /start skip');
     return true;
@@ -1835,10 +1854,36 @@ export async function worldBotDeleteAccount({
         console.warn('[WorldBot] delete remove-confirm:', e?.message);
       }
 
+      // 🏠 Owner ka pakka step: delete hone ke baad **Main Menu** dabana hai —
+      // na `/start`, na seedha Login. Phir hi pipeline fresh login chalayega
+      // (Login → OTP Login → wahi number → OTP → naam → JSON).
+      setPhase('delete-main-menu');
+      let atMenu = false;
+      try {
+        const afterDelete = await settledScreen(client, entity, cfg).catch(() => parseScreenMessages(client, entity));
+        atMenu = Boolean(roleOnLatest(afterDelete, 'login'));
+        const menuHit = findRoleOnScreens(afterDelete, 'mainMenu');
+        if (menuHit) {
+          console.log(`[WorldBot] 🏠 delete ke baad "${menuHit.button.text}" dabaya — Main Menu par ja raha hoon`);
+          await clickOrType({
+            client, entity, entry: menuHit.button, cfg, shouldAbort,
+            what: 'Main Menu (delete ke baad)',
+            timeoutMs: Math.min(20_000, Number(cfg?.stepTimeoutMs) || 20_000),
+            predicate: (freshList, all) => roleOnLatest(freshList, 'login') || roleOnLatest(all, 'login') || null,
+          }).catch((e) => console.warn(`[WorldBot] Main Menu click: ${e?.message || e}`));
+          const menuScreen = await settledScreen(client, entity, cfg).catch(() => parseScreenMessages(client, entity));
+          atMenu = Boolean(roleOnLatest(menuScreen, 'login'));
+        } else if (!atMenu) {
+          console.log('[WorldBot] ℹ️ delete screen par Main Menu button nahi mila — Login button ka intezaar');
+        }
+      } catch (error) {
+        console.warn(`[WorldBot] Main Menu step: ${String(error?.message || error).slice(0, 90)}`);
+      }
+
       state.lastOkAt = Date.now();
       setPhase('delete-done');
-      console.log(`[WorldBot] 🗑 Account deleted: ${cleanPhone}`);
-      return { ok: true, kind: 'deleted', phone: cleanPhone, viaWorldBot: true };
+      console.log(`[WorldBot] 🗑 Account deleted: ${cleanPhone}${atMenu ? ' · Main Menu ready' : ''}`);
+      return { ok: true, kind: 'deleted', phone: cleanPhone, atMenu, viaWorldBot: true };
     });
   } catch (error) {
     setError(error);

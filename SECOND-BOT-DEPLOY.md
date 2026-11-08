@@ -360,8 +360,14 @@ World Bot flow (jaise owner ke screenshots me hai):
    `🤵 Order Hub → woh account → 🗑 Delete Account → wohi account →
    Delete OTP → Account Deleted Successfully` → phir se OTP Login
    (ab naam poochhega) → fresh JSON.
-5. Uske baad best-effort `Switch Accounts → account → Permanently Logged Out`
-   (`SWIGGY_WORLD_LOGOUT_AFTER_DELETE=0` se band).
+5. Login successful → JSON ka **starting se ending** (`{` … `}`) hissa **ek
+   `.json` file** me (`data/session-files/acc_<number>.json`) → wahi file
+   **worker bot** par bheji jaati hai → **10 poore** hone par wahi 10 files
+   `@its_shop_bot` (stock) me — zip nahi, ek-ek JSON file.
+6. File bhejne ke **BAAD** hi best-effort `Switch Accounts → account →
+   Permanently Logged Out` (`SWIGGY_WORLD_LOGOUT_AFTER_DELETE=0` se band).
+   File attach fail ho to logout nahi hota; engine dobara bhejta hai
+   (`sessionSent` flag se double send nahi).
 
 #### 🚀 START ke teen source buttons
 
@@ -422,6 +428,13 @@ World bots ka default pool: `@SwiggyByworldBot`, `@SwiggyByworld1Bot` …
   text (photo ya khali message) aaya to 3s grace ke baad OTP Sent maan liya
   jata hai — pehle wahan `Cancel` + dobara number jata tha, number jal jata tha
   aur OTP kabhi type nahi hota tha.
+- **Delete ke baad wahi number (naya card nahi):** delete hone ke baad koi
+  naya number ya OTP bot se naya card nahi liya jata — jo number delete hua
+  wahi `Login → OTP Login → OTP` par dobara jaata hai.
+- **JSON file + worker bot + stock:** login ke baad bot ke JSON ka pehla `{`
+  se aakhri `}` tak ka hissa ek `.json` file me likha jata hai, wahi file
+  worker bot par jaati hai, 10 poore hone par wahi files `@its_shop_bot` ko.
+  File jaane ke **baad** logout.
 - **Delete ke baad Main Menu:** `Account Deleted Successfully` par `Haan 💜`
   (bot se remove) ke baad **🏠 Main Menu** dabta hai — na `/start`, na seedha
   `Login`. Uske baad wahi number se fresh login: `Login` → `OTP Login` → number

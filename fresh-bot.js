@@ -709,7 +709,10 @@ function sessionLifeLine(exportData = {}) {
 // Fresh JSON ki asal delivery — Autopilot ke instant send aur owner ke
 // /session resend command dono yahi use karte hain. Document 3 baar try;
 // phir bhi fail ho to poora JSON code-block hissoun me.
-async function deliverSessionJson(chatId, { phone, accountKey, kind, account, note = '' } = {}) {
+// 📄 `jsonText`/`fileName` diye jaate hain to BILKUL wahi text/file jaati hai
+// (World-bot pipeline khud "starting se ending tak" ki file banati hai —
+// Task T). Warna purana rasta: DB se export karke pretty JSON.
+async function deliverSessionJson(chatId, { phone, accountKey, kind, account, note = '', jsonText: rawJsonText = '', fileName = '' } = {}) {
   if (!chatId) return false;
   const typeText = kind === 'fresh_after_delete'
     ? '♻️ Delete + Fresh'
@@ -723,27 +726,29 @@ async function deliverSessionJson(chatId, { phone, accountKey, kind, account, no
     `📱 ${mono(phone || '')} · 👤 ${mono(accountKey || '')}`,
   ].join('\n');
 
-  const exportData = getSessionExportJson(accountKey, account);
-  if (!exportData) {
+  const givenText = String(rawJsonText || '').trim();
+  let exportData = null;
+  try { exportData = getSessionExportJson(accountKey, account); } catch {}
+  if (!givenText && !exportData) {
     await bot.telegram.sendMessage(chatId,
       `${baseCaption}\n\n<i>(JSON export nahi mil paya — session bot DB me saved hai)</i>`,
       { parse_mode: 'HTML' }).catch(() => {});
     return false;
   }
-  const addressLine = exportData.remoteAddressStatus === 'added' && exportData.remoteAddressId
+  const addressLine = exportData?.remoteAddressStatus === 'added' && exportData?.remoteAddressId
     ? `🏠 Address: ${mono(`ADDED · ${exportData.remoteAddressId}`)}`
-    : exportData.remoteAddressStatus
+    : exportData?.remoteAddressStatus
       ? `🏠 Address: ${mono('NOT ADDED')} — wajah JSON me hai`
       : '';
   const caption = [
     baseCaption,
-    sessionLifeLine(exportData),
+    exportData ? sessionLifeLine(exportData) : '',
     addressLine,
     note ? esc(String(note).slice(0, 220)) : '',
   ].filter(Boolean).join('\n');
 
-  const jsonText = JSON.stringify(exportData, null, 2);
-  const filename = `${phone || accountKey || 'session'}.json`;
+  const jsonText = givenText || JSON.stringify(exportData, null, 2);
+  const filename = String(fileName || '').trim() || `${phone || accountKey || 'session'}.json`;
   const sent = await sendSessionFile(chatId, { jsonText, filename, caption });
   if (sent.ok) return true;
 
@@ -1024,8 +1029,9 @@ async function launchBatch(ctx, opts = {}) {
     // 📤 Fresh session bante HI uska JSON isi chat me FILE bana kar bhej do
     // (boss ki demand: "jaise koi bhi fresh JSON mile, same time par chat
     // me send karna hai"). Batch ka end/summary ka wait bilkul nahi.
+    // Return true/false — pipeline isi ka intezaar karke logout karti hai.
     async sendSession(payload = {}) {
-      await deliverSessionJson(ctx.chat?.id || fallback.chatId, payload);
+      return deliverSessionJson(ctx.chat?.id || fallback.chatId, payload);
     },
   };
 
@@ -3128,7 +3134,7 @@ function createHeadlessUi(chatId) {
       } catch {}
     },
     async sendSession(payload) {
-      await deliverSessionJson(chatId, payload);
+      return deliverSessionJson(chatId, payload);
     },
   };
 }

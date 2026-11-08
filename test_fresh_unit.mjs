@@ -3500,6 +3500,87 @@ Thanks`)),
   ok(wbFlowSrc.includes('async function waitForScreenChange') && wbFlowSrc.includes('fromId: cancelFromId'),
   'worldbot: slow bot par duplicate /cancel nahi (screen-change ka intezaar)');
 
+  // -------------------------------------------------------------------------
+  // 🗂 TASK T — delete ke baad WAHI number → JSON "starting se ending tak"
+  // ek file → worker bot par → 10 poore hone par stock → PHIR logout.
+  // -------------------------------------------------------------------------
+  const sessionFile = await import('./session-file.js');
+  const messyJson = '{\n  "cookies": "tid=abc; token=xyz",\n  "mobile": "9876543210"\n}';
+  const botMessage = [
+    '✅ Login JSON',
+    'Tap Copy on the code block below',
+    '```json',
+    messyJson,
+    '```',
+    'Copy Code',
+  ].join('\n');
+  ok(sessionFile.sessionJsonBody(botMessage) === messyJson,
+    'json file: bot ke message se sirf `{` se `}` tak (header/fence/footer hata)');
+  ok(sessionFile.sessionJsonBody('koi json nahi') === ''
+    && sessionFile.sessionJsonBody('{ "adhoora": ') === '',
+  'json file: JSON na ho / adhoora ho to khali (jhoothi file nahi banti)');
+  ok(sessionFile.sessionJsonBody('["a","b"]') === '["a","b"]',
+    'json file: array JSON bhi chalti hai');
+  ok(sessionFile.sessionFileText({ cookies: 'tid=abc' }) === JSON.stringify({ cookies: 'tid=abc' }, null, 2),
+    'json file: DB export object se pretty JSON');
+  ok(sessionFile.sessionFileText(botMessage) === messyJson,
+    'json file: string input par bhi wahi "starting se ending" trim');
+  ok(sessionFile.sessionFileName('9876543210', 'acc_9876543210') === 'acc_9876543210.json'
+    && sessionFile.sessionFileName('+91 98765 43210', '') === 'acc_9876543210.json',
+  'json file: naam acc_<10 digit>.json');
+
+  // Asli file disk par banti hai — aur bilkul wahi text likhti hai.
+  const tmpDir = await fsp.mkdtemp(path.join(path.dirname(fileURLToPath(import.meta.url)), 'test-data', 'sf-'));
+  const written = sessionFile.writeSessionFile({ phone: '9876543210', accountKey: 'acc_9876543210', text: messyJson, dir: tmpDir });
+  ok(written.ok && written.name === 'acc_9876543210.json' && written.bytes === Buffer.byteLength(messyJson, 'utf8'),
+    'json file: ek asli .json file banti hai (naam + size sahi)');
+  const onDisk = await fsp.readFile(written.path, 'utf8');
+  ok(onDisk.trim() === messyJson,
+    'json file: file ka content = JSON ka starting se ending tak wala hissa');
+  ok(sessionFile.writeSessionFile({ phone: '1', accountKey: 'x', text: '   ', dir: tmpDir }).ok === false,
+    'json file: khali text par file nahi banti');
+
+  // Pipeline ka order: file → worker bot → logout → stock.
+  const pipelineT = pipelineCharges;
+  ok(pipelineT.includes("from './session-file.js'") && pipelineT.includes('writeSessionFile({ phone, accountKey: imported.key'),
+    'pipeline: login ke baad JSON ki file banti hai');
+  ok(pipelineT.includes('jsonText: fileText')
+    && pipelineT.includes('fileName: file.ok ? file.name'),
+  'pipeline: wahi file worker bot ko jaati hai (jsonText + fileName)');
+  const sendAt = pipelineT.indexOf('const out = await sendSession({');
+  const logoutAt = pipelineT.indexOf('const out = await worldBotPermanentLogout({ phone, shouldAbort, config: botCfg || worldCfg })');
+  const stockAt = pipelineT.indexOf('const stock = await pushSessionToShopStock({');
+  ok(sendAt > 0 && logoutAt > sendAt && stockAt > logoutAt,
+    'pipeline: file bhejo → PHIR logout → phir 10-wala stock queue');
+  ok(pipelineT.includes('if (sessionSent) {') && pipelineT.includes('loggedOut = Boolean(out?.ok)'),
+    'pipeline: logout sirf file bhejne ke BAAD (send fail par nahi)');
+  ok(pipelineT.includes('sessionSent,') && pipelineT.includes('stockPending,'),
+    'pipeline: result me sessionSent/loggedOut/stockPending');
+  ok(pipelineT.includes('json: fileText || null')
+    && pipelineT.includes('const payload = json || getSessionExportJson(accountKey)'),
+  'pipeline: stock ko bhi wahi JSON text jaata hai (do jagah do JSON nahi)');
+  // Delete ke baad wahi number — naya number/naya card nahi.
+  ok(pipelineT.includes('✅ World Bot — Delete Ho Gaya — Wahi Number Login')
+    && pipelineT.includes('Naya number / naya OTP card nahi'),
+  'pipeline: delete ke baad wahi number login (card/naya number nahi)');
+  ok(!pipelineT.includes('getNextTelegramNumber(') && !pipelineT.includes('getNextNumber('),
+    'pipeline: world-bot flow apne aap koi naya number/card nahi maangta');
+
+  // Engine: pipeline ka awaited sender + duplicate send ka rok.
+  ok(src.includes('export function makeSessionSender(') && src.includes('sendSession: makeSessionSender(ui)'),
+    'engine: pipeline ko awaited sendSession milta hai');
+  ok(src.includes('if (res.sessionSent !== true)'),
+    'engine: pipeline ne bhej diya to dobara file nahi bhejta');
+  ok(autoResumeSrc.includes('return deliverSessionJson(ctx.chat?.id || fallback.chatId, payload)')
+    && autoResumeSrc.includes('jsonText: rawJsonText = \'\'',),
+  'fresh-bot: sendSession true/false deta hai aur diya hua JSON text/file use karta hai');
+  ok(autoResumeSrc.includes('return deliverSessionJson(chatId, payload)'),
+    'fresh-bot: headless UI ka sendSession bhi result deta hai');
+  ok((pipelineT.match(/saveWorldSession\(/g) || []).length >= 2
+    && pipelineT.includes("saveWorldSession(first, 'new', cfg)")
+    && pipelineT.includes("saveWorldSession(again, 'after-delete', cfg)"),
+  'pipeline: dono raste (naya + delete ke baad) ek hi save/send/logout rasta');
+
   // 🎯 "OTP aaya hi nahi" ki asli wajah — window 12 se bahar, jaldi aaya code
   // "purana" gina jata tha, aur "123 456" jaisa code parse hi nahi hota tha.
   const tgMod = await import('./telegram-otp-source.js');

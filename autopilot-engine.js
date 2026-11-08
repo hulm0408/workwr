@@ -754,6 +754,23 @@ export function securityChallengeRouteKind({
   return 'proxy';
 }
 
+// 📤 World-bot pipeline ko wahi "file bhejo" rasta deta hai, par await kiya
+// ja sake (true/false). Owner ka rule: file worker bot par JAANE KE BAAD hi
+// logout ho — isliye pipeline ko asli result chahiye, fire-and-forget kaafi
+// nahi. Bhejne ke baad engine dobara nahi bhejta (res.sessionSent).
+export function makeSessionSender(currentUi) {
+  return async (payload = {}) => {
+    try {
+      if (!currentUi || typeof currentUi.sendSession !== 'function') return false;
+      const out = await currentUi.sendSession(payload);
+      return out !== false;
+    } catch (e) {
+      console.warn('[Autopilot] session send (pipeline):', e?.message);
+      return false;
+    }
+  };
+}
+
 // Fresh session bante HI uska JSON chat me bhejo (batch ke end ka wait nahi).
 // ui.sendSession fresh-bot deta hai (document file ke tor par bhejta hai).
 // Fire-and-forget: send fail ho bhi jaye to batch kabhi na ruke.
@@ -1487,9 +1504,13 @@ export async function startAutopilot(opts = {}) {
       state.freshAccounts.push({ phone: res.phone, accountKey: res.accountKey });
       // 📤 Fresh JSON isi waqt chat me bhej do — boss ko batch khatam
       // hone tak ruk kar list se nahi dhoondhna padega.
-      notifyFreshSession(ui, {
-        phone: res.phone, accountKey: res.accountKey, kind: res.kind, account: res.account,
-      });
+      // (World-bot pipeline ne khud bhej diya ho — res.sessionSent — to
+      // dobara nahi bhejte, warna chat me do file chali jaati hain.)
+      if (res.sessionSent !== true) {
+        notifyFreshSession(ui, {
+          phone: res.phone, accountKey: res.accountKey, kind: res.kind, account: res.account,
+        });
+      }
       state.consecutiveFails = 0;
       return 'ok';
     }
@@ -3127,6 +3148,9 @@ export async function startAutopilot(opts = {}) {
               shouldAbort: () => state.stopRequested || isAutopilotSkipRequested(entry.phone),
               shouldSkip: () => isAutopilotSkipRequested(entry.phone),
               report: async (text) => { await push(progressCard(text), stopRows()); },
+              // 📤 JSON file ka delivery pipeline ke haath me (Task T) — file
+              // banti hai, worker bot par jaati hai, phir logout.
+              sendSession: makeSessionSender(ui),
             });
           } finally {
             finalProxy = getBridgeProxy();

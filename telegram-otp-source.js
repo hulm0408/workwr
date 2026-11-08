@@ -533,6 +533,35 @@ function setLastError(error) {
     : raw.slice(0, 220);
 }
 
+// ---------------------------------------------------------------------------
+// Generic spare-account session hook — OTP bot ke ilawa doosre Telegram bots
+// (jaise @SwiggyByWorldBot) ko bhi ISI client/lock par chalane ke liye.
+// Ek hi session par do client = FLOOD_WAIT/session revoke, isliye lock shared.
+// ---------------------------------------------------------------------------
+export function withTelegramUserClient(fn) {
+  return withTelegramLock(async () => {
+    const { client, config } = await ensureClientUnlocked();
+    return fn({ client, config });
+  });
+}
+
+export async function telegramUserClientStatus() {
+  try {
+    const config = getTelegramOtpConfig();
+    return {
+      configured: Boolean(config.configured),
+      missing: [...(config.missing || [])],
+      connected: Boolean(providerState.connected),
+      authorized: Boolean(providerState.authorized),
+      me: providerState.meLabel || '',
+      loginInProgress: Boolean(providerState.loginInProgress),
+      lastError: providerState.lastError || '',
+    };
+  } catch (e) {
+    return { configured: false, missing: [], connected: false, authorized: false, me: '', loginInProgress: false, lastError: String(e?.message || e) };
+  }
+}
+
 async function withTelegramLock(fn) {
   const previous = lockTail.catch(() => {});
   let release;

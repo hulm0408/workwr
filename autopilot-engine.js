@@ -434,6 +434,8 @@ export function getAutopilotSnapshot() {
     telegramLastActionAt: Number(telegramLive.lastActionAt) || 0,
     workerRecoveries: state.workerRecoveries || 0,
     neverStop: Boolean(state.neverStop),
+    accountEngine: state.accountEngine || 'direct',
+    worldBotMode: Boolean(state.worldBotMode),
     timeExtensions: state.timeExtensions || 0,
     infraPauses: state.infraPauses || 0,
     infraPauseUntil: state.infraPauseUntil || 0,
@@ -955,6 +957,14 @@ function compactStepInfo(snap = {}, stageText = '') {
 }
 
 function compactSourceLine(snap = {}) {
+  if (snap.accountEngine === 'worldbot' || snap.worldBotMode) {
+    if (snap.sourceMode === 'telegram') {
+      const botLabel = String(snap.otpBotLabel || getOtpBotProfile(snap.otpBotProfile || '').label || 'Hermes').toUpperCase();
+      return `🌍 ${mono('WORLD BOT')} · 📨 ${mono(botLabel)}`;
+    }
+    const source = truncateUiText(snap.poolSourceHost || snap.poolSourceName || 'Firebase', 24);
+    return `🌍 ${mono('WORLD BOT')} · 🔥 ${mono(source)} · ${mono(`${Number(snap.poolFresh) || 0} fresh`)}`;
+  }
   if (snap.sourceMode === 'telegram') {
     const botLabel = String(snap.otpBotLabel || getOtpBotProfile(snap.otpBotProfile || '').label || 'Hermes').toUpperCase();
     return `📨 ${mono(`${botLabel} ONLY`)} · 🔥 Firebase ${mono('OFF')}`;
@@ -1012,6 +1022,7 @@ export function formatCompactAutopilotCard(snap = state, { stageText = '', final
     security_challenge: 'Swiggy ne 3 baar OTP security challenge diya — batch safety stop',
     waf_stuck: 'WAF rukawat',
     circuit_breaker: 'Lagatar failures par safety stop',
+    'worldbot-setup': 'Swiggy World Bot / Telegram session setup pending',
   }[s.stopReason] || (s.stopReason ? `Stop: ${s.stopReason}` : 'Batch complete');
   const skipRequested = !final && Boolean(s.skipRequestedPhone && s.skipRequestedPhone === currentPhone);
   const now = final ? reason : (skipRequested ? 'Current number SKIP ho raha hai' : info.now);
@@ -1185,12 +1196,30 @@ export async function startAutopilot(opts = {}) {
   const neverStop = opts.neverStop === undefined
     ? s('autoContinue', true) !== false
     : opts.neverStop !== false;
+  // 🌍 Account engine: 'worldbot' = @SwiggyByWorldBot ke buttons click karke
+  // account banega (Swiggy API/proxy/WAF solver bilkul nahi). 'direct' =
+  // purana bridge flow. START op explicit opts jeetta hai.
+  const accountEngine = String(
+    opts.accountEngine || s('accountEngine', 'direct') || 'direct'
+  ).trim().toLowerCase() === 'worldbot' ? 'worldbot' : 'direct';
+  const worldBotMode = accountEngine === 'worldbot';
   const allowOffline = s('allowOffline', String(process.env.PREMIUM_ALLOW_OFFLINE_DEVICES || '') === '1') === true;
   const telegramSetting = s('telegramOtpMode', false) === true;
-  const sourceMode = resolveAutopilotNumberSource({
+  const resolvedSourceMode = resolveAutopilotNumberSource({
     ...opts,
     telegramSetting,
   });
+  // 🌍 World Bot mode me Swiggy ka kaam bot karta hai; number + OTP do jagah
+  // se aa sakte hain:
+  //   • Firebase pool (default) — START ka "🌍 SWIGGY BY WORLD"
+  //   • Hermes/Hathi OTP bot  — START ka "🤝 HERMESHU + SWIGGYBYWORLD"
+  // Baaki koi source ho to Firebase par lock kar do.
+  const sourceMode = worldBotMode
+    ? (resolvedSourceMode === 'telegram' ? 'telegram' : 'firebase')
+    : resolvedSourceMode;
+  if (worldBotMode) {
+    console.log(`[Autopilot] 🌍 World Bot mode — number source ${sourceMode === 'telegram' ? 'Telegram OTP bot' : 'Firebase pool'} (proxy/WAF OFF).`);
+  }
   // Kaunsa OTP bot: START par owner ka selection > bot setting > Hermes.
   // Config isi active profile se banega, isliye setActiveOtpBotProfile()
   // getTelegramOtpConfig() se PEHLE chalta hai.
@@ -1244,6 +1273,8 @@ export async function startAutopilot(opts = {}) {
     telegramOtpTimeoutMs,
     telegramOtpRefreshMs,
     telegramWaitMs: 0,
+    // Pipeline isi field par world-bot flow chunta hai.
+    accountEngine,
   };
 
   ui = opts.ui && typeof opts.ui.update === 'function' ? opts.ui : ui;
@@ -1285,6 +1316,8 @@ export async function startAutopilot(opts = {}) {
     telegramClaimRetries: 0,
     workerRecoveries: 0,
     neverStop,
+    accountEngine,
+    worldBotMode,
     timeExtensions: 0,
     infraPauses: 0,
     infraPauseUntil: 0,
@@ -1415,6 +1448,13 @@ export async function startAutopilot(opts = {}) {
       state.transientStrikes = (state.transientStrikes || 0) + 1;
       state.lastError = `${res.code || 'SWIGGY_TRANSIENT'}: ${res.reason || ''}`.slice(0, 160);
       return 'swiggy_transient';
+    }
+
+    // 🌍 World Bot setup (spare Telegram session missing/dead) — number ki
+    // galti nahi, isliye na processed na failed; engine batch rok kar batata hai.
+    if (res.kind === 'worldbot_setup') {
+      state.lastError = String(res.reason || 'World Bot setup pending').slice(0, 200);
+      return 'worldbot_setup';
     }
 
     state.processed++;
@@ -1561,6 +1601,12 @@ export async function startAutopilot(opts = {}) {
     // behavior, koi rukawat nahi.
     const freePromise = (async () => {
       try {
+        // 🌍 World Bot mode: Swiggy ka kaam bot karta hai — proxy ki zaroorat
+        // hi nahi, isliye fetch/solve bilkul band.
+        if (worldBotMode) {
+          console.log('[Autopilot] 🌍 Swiggy World Bot mode — koi proxy/WAF solve nahi.');
+          return { skipped: true, reason: 'worldbot-mode' };
+        }
         // Direct mode: proxy fetch/solve bilkul nahi — yahi wo cheez thi jo
         // free CPU par minute kha jati thi aur 4 bots me aapas me ladti thi.
         if (proxyPool.isDirectMode?.()) {
@@ -1804,6 +1850,7 @@ export async function startAutopilot(opts = {}) {
         // PEHLE proxy final karo (free auto-fetch khatam hone do), PHIR token
         // solve karo — aws-waf-token IP-bound hai, galat IP ka token bekar hai.
         await freeStartPromise;
+        if (worldBotMode) return ''; // world bot ko WAF token chahiye hi nahi
         ps = proxyPool.proxySummary();
         if (ps.enabled) {
           const chosen = rotateProxy();
@@ -2789,6 +2836,9 @@ export async function startAutopilot(opts = {}) {
       proxyEnabled: Boolean(ps.enabled),
       enabledProxyCount: ps.enabledCount || 0,
     });
+    // 🌍 World Bot ek hi Telegram chat par chalta hai — 2 lanes = do flows
+    // ek hi screen par = gadbad. Isliye hamesha 1 lane, chahe setting kuch bhi.
+    if (worldBotMode) laneCount = 1;
     state.concurrency = laneCount;
     state.requestedConcurrency = requestedConcurrency;
     lanes = Array.from({ length: laneCount }, (_, i) => ({
@@ -2805,8 +2855,17 @@ export async function startAutopilot(opts = {}) {
       routePrepNoticeAt: 0,
       rawRouteOkKey: '',
     }));
-    for (const lane of lanes) ensureLaneRoute(lane);
-    syncRouteSummaryState();
+    // World Bot me route/proxy ka koi kaam nahi — allocator ko chhedo hi nahi.
+    if (!worldBotMode) {
+      for (const lane of lanes) ensureLaneRoute(lane);
+      syncRouteSummaryState();
+    } else {
+      for (const lane of lanes) {
+        lane.routeMode = 'direct';
+        lane.proxy = null;
+      }
+      state.routeMode = 'direct';
+    }
     const rotationLimit = 25 * laneCount;
     const wafCooldownLimit = 60 * laneCount;
     console.log(`[Autopilot] ⚡ Parallel lanes ready: ${laneCount}/${requestedConcurrency} (proxy routes ${ps.enabledCount || 0} + direct 1).`);
@@ -2904,7 +2963,9 @@ export async function startAutopilot(opts = {}) {
             continue;
           }
 
-          if (!ensureLaneRoute(lane)) {
+          // 🌍 World Bot mode me IP/route ka koi matlab nahi (Swiggy call hi
+          // hum nahi karte) — lane ko proxy/WAF token dene ki koshish skip.
+          if (!worldBotMode && !ensureLaneRoute(lane)) {
             await waitForRouteChange(1_000);
             continue;
           }
@@ -3005,7 +3066,7 @@ export async function startAutopilot(opts = {}) {
 
       // WAF warm-up background me chal raha tha — pehla OTP iske baghair na jaye.
       // Owner ne isi beech SKIP kar diya ho to warm-up ka wait bhi mat karo.
-      if (!isAutopilotSkipRequested(entry.phone)) await ensureWarm();
+      if (!worldBotMode && !isAutopilotSkipRequested(entry.phone)) await ensureWarm();
 
       // Scan se aaye number ka prechecked last-seen pipeline ko dedo — wahi
       // device dobara fetch nahi hoga. Agar ye device base window miss ke
@@ -3046,7 +3107,7 @@ export async function startAutopilot(opts = {}) {
               stage: 'engine',
               reason: '1 minute decision window khatam — number chhod diya, dobara try nahi hoga',
             }
-          : await runWithBridgeProxy(lane.proxy || null, async () => {
+          : await runWithBridgeProxy(worldBotMode ? null : (lane.proxy || null), async () => {
           // Consume at the first actual attempt; no later path may pick it again.
           attemptedThisRun.add(entry.phone);
           consumedThisRun.add(entry.phone);
@@ -3067,7 +3128,7 @@ export async function startAutopilot(opts = {}) {
         }, {
           owner: lane.owner,
           releaseOnExit: false,
-          wafTokenMode: laneCount > 1 && lane.proxy?.id ? 'defer-until-challenge' : '',
+          wafTokenMode: !worldBotMode && laneCount > 1 && lane.proxy?.id ? 'defer-until-challenge' : '',
         });
       // SKIP kisi lambay bridge step ke bilkul aakhir me aaya ho tab bhi
       // tally se pehle manual outcome hi jeetega — ye number fresh count
@@ -3167,6 +3228,13 @@ export async function startAutopilot(opts = {}) {
 
       // 60s me decision start nahi hua — number chhod diya, kabhi retry nahi.
       if (outcome === 'decision_expired') continue;
+
+      // 🌍 World Bot setup pending — yahan numbers jalana bekaar hai. Batch
+      // saaf message ke saath rukta hai (never-stop bhi ise override nahi karta).
+      if (outcome === 'worldbot_setup') {
+        requestRunEnd('worldbot-setup');
+        break;
+      }
 
       // Owner SKIP: sirf ye number khatam, batch bina gap agle number par.
       if (outcome === 'manual_skip') {
@@ -3663,7 +3731,7 @@ export async function startAutopilot(opts = {}) {
     // restart (Render deploy, Actions runner badalna) hote hi batch khud
     // wapas shuru ho jata hai.
     try {
-      const resumeOffReasons = ['target', 'manual', 'telegram-setup', 'firebase-cleared'];
+      const resumeOffReasons = ['target', 'manual', 'telegram-setup', 'worldbot-setup', 'firebase-cleared'];
       if (resumeOffReasons.includes(endReason)) clearAutopilotResume();
       else setAutopilotResume({ wanted: true, lastEndReason: endReason, lastEndedAt: Date.now() });
     } catch (e) { console.warn('[Autopilot] resume flag:', e?.message || e); }

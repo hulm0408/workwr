@@ -3295,6 +3295,298 @@ console.log('Ek number = ek hi baar (1-minute decision window, koi parking nahi)
   ok(autoResumeSrc.includes('ap_toggle_neverstop'),
     'never-stop: Settings me ON/OFF toggle maujood');
 
+  // -------------------------------------------------------------------------
+  // 🌍 SWIGGY WORLD BOT — pure clicker helpers (network nahi)
+  // -------------------------------------------------------------------------
+  const wb = await import('./swiggy-world-bot.js');
+  ok(wb.worldBotButtonRole('🔐 Login') === 'login', 'worldbot: main menu Login');
+  ok(wb.worldBotButtonRole('🔑 JSON/TID Login') === 'jsonLogin', 'worldbot: JSON/TID Login alag');
+  ok(wb.worldBotButtonRole('📲 OTP Login') === 'otpLogin', 'worldbot: OTP Login');
+  ok(wb.worldBotButtonRole('❌ Cancel') === 'cancel', 'worldbot: Cancel');
+  ok(wb.worldBotButtonRole('🤵 Order Hub') === 'orderHub', 'worldbot: Order Hub');
+  ok(wb.worldBotButtonRole('🗑 Delete Account') === 'deleteAccount', 'worldbot: Delete Account');
+  ok(wb.worldBotButtonRole('Switch Accounts') === 'switchAccounts', 'worldbot: Switch Accounts');
+  ok(wb.worldBotButtonRole('Permanently Logged Out') === 'permanentLogout', 'worldbot: Permanently Logged Out');
+
+  const wbButtons = [
+    { text: '🔑 JSON/TID Login' },
+    { text: '📲 OTP Login' },
+    { text: '🔐 Login' },
+  ];
+  ok(wb.pickWorldBotButton(wbButtons, 'login')?.text === '🔐 Login',
+    'worldbot: login chunte waqt OTP/JSON button nahi pakda jata');
+  ok(wb.pickWorldBotButton(wbButtons, 'otpLogin')?.text === '📲 OTP Login',
+    'worldbot: OTP Login button sahi chuna jata hai');
+
+  const accountButtons = [
+    { text: 'Rahul Kumar - 919106011898' },
+    { text: 'Vvssxr Mgjlr - 6296591407' },
+  ];
+  ok(wb.findWorldBotAccountButton(accountButtons, '6296591407')?.text === 'Vvssxr Mgjlr - 6296591407',
+    'worldbot: account list me number se button milta hai');
+  ok(wb.findWorldBotAccountButton(accountButtons, '9999999999') === null,
+    'worldbot: doosra number account button nahi banata');
+
+  const wbJsonSample = JSON.stringify({
+    name: 'Vvsxsr Mgjlr',
+    customerId: '289291349',
+    mobile: '6296591407',
+    token: '90143e0e-39e4-4eca-9c7d-70907ec42d472399a-32b8-4f17-b77f-1c10ad22fd16',
+    tid: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiI2Mj',
+  }, null, 2);
+  const wbParsed = wb.extractWorldBotJson(`Login JSON
+\`\`\`json
+${wbJsonSample}
+\`\`\`
+Copy code`);
+  ok(Boolean(wbParsed) && JSON.parse(wbParsed.text).mobile === '6296591407',
+    'worldbot: code-block se session JSON nikalta hai');
+  ok(Boolean(wb.extractWorldBotJson(`Here is your session:
+${wbJsonSample}
+Thanks`)),
+    'worldbot: plain text me chhupa JSON bhi milta hai');
+  ok(wb.extractWorldBotJson('koi json nahi hai') === null, 'worldbot: bekar text par null');
+
+  ok(wb.worldBotPromptKind('OTP Sent\nSend the 6-digit OTP you received from Swiggy.') === 'otpSent',
+    'worldbot: OTP Sent detect');
+  ok(wb.worldBotPromptKind('Send your 10-digit Swiggy number.') === 'askNumber',
+    'worldbot: number prompt detect');
+  ok(wb.worldBotPromptKind('Send your name') === 'askName',
+    'worldbot: naam ka sawaal = NAYA account');
+  ok(wb.worldBotPromptKind('Invalid Mobile Number') === 'invalidNumber',
+    'worldbot: invalid number detect');
+  ok(wb.worldBotPromptKind('OTP Was Not Accepted') === 'otpFail',
+    'worldbot: galat OTP detect');
+  ok(wb.worldBotPromptKind('Delete OTP Sent') === 'deleteSent',
+    'worldbot: delete OTP sent detect');
+  ok(wb.worldBotPromptKind('Account Deleted Successfully') === 'deleted',
+    'worldbot: delete success detect');
+
+  ok(wb.isWorldBotPhoneValid('6296591407') && !wb.isWorldBotPhoneValid('1234567890'),
+    'worldbot: sirf 6-9 se shuru 10-digit number valid');
+  ok(wb.normalizeWorldPhone('+91 6296591407') === '6296591407',
+    'worldbot: +91 hata kar 10-digit');
+
+  const wbSrc = await fsp.readFile(new URL('./swiggy-world-bot.js', import.meta.url), 'utf8');
+  ok(wbSrc.includes('withTelegramUserClient'), 'worldbot: wahi spare Telegram session use hota hai');
+  ok(wbSrc.includes('downloadMedia'), 'worldbot: JSON file download hoti hai');
+  ok(wb.pickWorldBotConfirmButton([{ text: '❌ Cancel' }, { text: 'Haan 💜' }])?.text === 'Haan 💜',
+    'worldbot: "Bot se remove: Haan" confirm click hota hai');
+  ok(wb.pickWorldBotConfirmButton([{ text: 'No' }]) === null,
+    'worldbot: random button ko confirm nahi samajhta');
+  ok(wbSrc.includes('worldBotDeleteAccount'), 'worldbot: purana account delete flow');
+  ok(wbSrc.includes('worldBotPermanentLogout'), 'worldbot: Permanently Logged Out step');
+  const pipelineSrc = await fsp.readFile(new URL('./number-pipeline.js', import.meta.url), 'utf8');
+  ok(pipelineSrc.includes("accountEngine || '').toLowerCase() === 'worldbot'"),
+    'worldbot: pipeline world-bot flow par switch karti hai');
+  ok(pipelineSrc.includes("kind: 'fresh_after_delete'") && pipelineSrc.includes('worldBotDeleteAccount'),
+    'worldbot: delete ke baad fresh login -> fresh_after_delete');
+  ok(pipelineSrc.includes("kind: 'worldbot_setup'"), 'worldbot: session setup pending alag outcome');
+  ok(src.includes("requestRunEnd('worldbot-setup')"),
+    'worldbot: setup pending par batch saaf message ke saath rukta hai (numbers nahi jalte)');
+  ok(src.includes('const worldBotMode = accountEngine ==='),
+    'worldbot: engine world-bot mode samajhta hai');
+  ok(src.includes('if (worldBotMode) laneCount = 1'),
+    'worldbot: ek hi Telegram chat = 1 lane');
+  ok(src.includes("worldBotMode ? null : (lane.proxy || null)"),
+    'worldbot: koi proxy use nahi hota');
+  ok(autoResumeSrc.includes('ap_toggle_engine') && autoResumeSrc.includes("bot.command('world'"),
+    'worldbot: Settings toggle + /world screen check maujood');
+  ok(autoResumeSrc.includes('ap_world_probe'), 'worldbot: live screen probe button');
+  ok(bs.getSetting('accountEngine') === 'direct',
+    'worldbot: default engine direct (owner jab chahe World Bot chune)');
+
+  // -------------------------------------------------------------------------
+  // 🌍 MULTI-BOT POOL + START ke 3 source buttons
+  // Owner: "SAARE BOT SAME HAI" — error aaye tab hi next bot, bina error ke
+  // switch allowed nahi. START par 3 buttons: Hermeshu+SwiggyByWorld,
+  // Hathi wala bot, Swiggy by World.
+  // -------------------------------------------------------------------------
+  const pool = wb.listWorldBotUsernames({ SWIGGY_WORLD_BOT_USERNAMES: '' });
+  ok(pool.length === 6 && pool[0] === 'SwiggyByworldBot' && pool[5] === 'SwiggyByworld5Bot',
+    'worldbot pool: @SwiggyByworldBot + 5 (saare same)');
+  ok(wb.worldBotUsername({ SWIGGY_WORLD_BOT_USERNAMES: '' }) === 'SwiggyByworldBot',
+    'worldbot pool: pehla bot hi default active');
+  ok(wb.listWorldBotUsernames({ SWIGGY_WORLD_BOT_USERNAMES: 'A_bot, b_bot ,, C_bot' }).length === 3,
+    'worldbot pool: env CSV se custom pool (khali item skip)');
+  ok(wb.listWorldBotUsernames({
+    SWIGGY_WORLD_BOT_USERNAMES: '',
+    SWIGGY_WORLD_BOT_USERNAME: 'Z_bot',
+  })[0] === 'Z_bot',
+  'worldbot pool: single username (agar pool me nahi) sabse aage');
+  ok(wb.listWorldBotUsernames({
+    SWIGGY_WORLD_BOT_USERNAMES: 'A_bot,b_bot',
+    SWIGGY_WORLD_BOT_USERNAME: 'Z_bot',
+  }).join(',') === 'A_bot,b_bot',
+  'worldbot pool: CSV pool single username ko override karta hai');
+
+  wb.resetWorldBotPool();
+  ok(wb.currentWorldBotUsername({ SWIGGY_WORLD_BOT_USERNAMES: '' }) === 'SwiggyByworldBot',
+    'worldbot pool: active bot pehle se');
+  const rotated = wb.rotateWorldBot('test-error', { SWIGGY_WORLD_BOT_USERNAMES: '' });
+  ok(rotated === 'SwiggyByworld1Bot' && wb.worldBotPoolIndex() === 1,
+    'worldbot pool: error par next bot (1Bot)');
+  wb.rotateWorldBot('t', { SWIGGY_WORLD_BOT_USERNAMES: '' });
+  wb.rotateWorldBot('t', { SWIGGY_WORLD_BOT_USERNAMES: '' });
+  wb.rotateWorldBot('t', { SWIGGY_WORLD_BOT_USERNAMES: '' });
+  wb.rotateWorldBot('t', { SWIGGY_WORLD_BOT_USERNAMES: '' });
+  ok(wb.currentWorldBotUsername({ SWIGGY_WORLD_BOT_USERNAMES: '' }) === 'SwiggyByworld5Bot',
+    'worldbot pool: poole ke aakhir tak chalta hai');
+  ok(wb.rotateWorldBot('t', { SWIGGY_WORLD_BOT_USERNAMES: '' }) === 'SwiggyByworldBot',
+    'worldbot pool: aakhir ke baad wapas pehla bot (wrap-around)');
+  wb.resetWorldBotPool();
+
+  // Switch sirf ERROR par — bina error ke nahi.
+  ok(wb.shouldSwitchWorldBot({ ok: false, kind: 'failed_otp_send' }) === true,
+    'worldbot switch: OTP send fail = next bot');
+  ok(wb.shouldSwitchWorldBot({ ok: false, kind: 'failed_world_bot' }) === true,
+    'worldbot switch: bot flow fail = next bot');
+  ok(wb.shouldSwitchWorldBot({ ok: false, kind: 'delete_failed' }) === true,
+    'worldbot switch: delete fail = next bot');
+  ok(wb.shouldSwitchWorldBot({ ok: false, kind: 'aborted' }) === false,
+    'worldbot switch: manual STOP/abort par bot switch NAHI');
+  ok(wb.shouldSwitchWorldBot({ ok: false, kind: 'manual_skip' }) === false,
+    'worldbot switch: SKIP par bot switch nahi');
+  ok(wb.shouldSwitchWorldBot({ ok: true, kind: 'fresh_new' }) === false,
+    'worldbot switch: success par bot switch nahi (wahi bot sticky)');
+  ok(wb.shouldSwitchWorldBot({ ok: false, kind: 'failed_invalid_number' }) === false,
+    'worldbot switch: invalid number bot ki galti nahi — bot switch nahi');
+  ok(wb.shouldSwitchWorldBot({ ok: false, kind: 'worldbot_setup' }) === false,
+    'worldbot switch: Telegram session setup pending par bot switch nahi');
+  ok(wb.shouldSwitchWorldBot({ ok: false, kind: 'something_else', switchBot: true }) === true,
+    'worldbot switch: switchBot flag se explicit switch');
+
+  // Delete fail par bhi retry nahi — bas active bot rotate ho jata hai.
+  ok(pipelineSrc.includes('const maxTries = Math.max(1, Math.min(bots.length, 3))'),
+    'worldbot failover: ek number par max 3 bots (poora pool nahi jalta)');
+  ok(pipelineSrc.includes('if (result?.ok) return result;')
+    && pipelineSrc.includes('const nextBot = rotateWorldBot('),
+  'worldbot failover: success par wahi bot, error par next bot');
+  ok(pipelineSrc.includes('World Bot Switch'),
+    'worldbot failover: UI par switch ka saaf message');
+  ok(pipelineSrc.includes('waitForTelegramOtpCode(phone, {'),
+    'worldbot failover: Hermes/Hathi number par OTP wahin se aata hai');
+  ok(pipelineSrc.includes("telegramMode\n        ? '→ Number + OTP OTP-bot chat se"),
+    'worldbot failover: login card source ke hisaab se');
+
+  // --- START ke 3 source buttons ---
+  const presets = await import('./start-source-presets.js');
+  ok(presets.START_SOURCE_PRESET_IDS.join('|') === 'hermes_world|hathi|world',
+    'START: teen hi source presets');
+  ok(presets.getStartSourcePreset('hermes_world')?.accountEngine === 'worldbot',
+    'START: HERMESHU + SWIGGYBYWORLD = world bot engine');
+  ok(presets.getStartSourcePreset('hermes_world')?.otpBotProfile === 'hermes',
+    'START: HERMESHU + SWIGGYBYWORLD me Hermes numbers/OTP');
+  ok(presets.getStartSourcePreset('hathi')?.accountEngine === 'worldbot'
+    && presets.getStartSourcePreset('hathi')?.otpBotProfile === 'hathi',
+  'START: HATHI WALA BOT = hathi OTP + world bot (Swiggy by World)');
+  ok(presets.getStartSourcePreset('world')?.sourceMode === 'firebase'
+    && presets.getStartSourcePreset('world')?.accountEngine === 'worldbot',
+  'START: SWIGGY BY WORLD = Firebase numbers + world bot');
+  ok(presets.startSourcePresetSettings(presets.getStartSourcePreset('world')).telegramOtpMode === false,
+    'START: SWIGGY BY WORLD par Firebase mode on');
+  ok(presets.startSourcePresetSettings(presets.getStartSourcePreset('hermes_world')).telegramOtpMode === true,
+    'START: combined preset par telegram mode on');
+  ok(autoResumeSrc.includes('presetRow(\'hermes_world\')')
+    && autoResumeSrc.includes('presetRow(\'hathi\')')
+    && autoResumeSrc.includes('presetRow(\'world\')'),
+  'START: teen buttons picker par maujood');
+  ok(autoResumeSrc.includes('HERMESHU + SWIGGYBYWORLD')
+    || (await fsp.readFile(new URL('./start-source-presets.js', import.meta.url), 'utf8')).includes('HERMESHU + SWIGGYBYWORLD'),
+  'START: combined button ka naam owner wala');
+  ok(autoResumeSrc.includes('startSourcePresetSettings(preset)'),
+    'START: preset dabate hi settings lock (engine + OTP bot)');
+  ok(autoResumeSrc.includes("accountEngine: bs.getSetting('accountEngine') === 'worldbot' ? 'worldbot' : 'direct'"),
+    'START: engine choice batch ke saath lock hota hai');
+
+  // World bot mode me Hermes source allowed hai (combined preset).
+  ok(src.includes("resolvedSourceMode === 'telegram' ? 'telegram' : 'firebase'"),
+    'worldbot: combined preset me Hermes number-source allowed');
+
+  // -------------------------------------------------------------------------
+  // 📦 SHOP BOT STOCK — @its_shop_bot me stock push
+  // Owner: "JAISE 10 ID SEND KARDI TO IS BOT ME WO ID STOCK PAR BHI ADD KARDE,
+  // MINIMUM 10 AND MAX BHI 10, ZIP NAHI — JSON FILE BAS SEND KARDENA."
+  // -------------------------------------------------------------------------
+  const shopStock = await import('./shop-bot-stock.js');
+  ok(shopStock.SHOP_STOCK_BATCH_SIZE === 10, 'shopstock: batch size 10 (min 10, max bhi 10)');
+  ok(shopStock.shopBotConfig({}).batchSize === 10
+    && shopStock.shopBotConfig({ SHOP_BOT_STOCK_BATCH: '25' }).batchSize === 10
+    && shopStock.shopBotConfig({ SHOP_BOT_STOCK_BATCH: '3' }).batchSize === 10,
+  'shopstock: env se batch 10 se zyada/kam nahi hota');
+  ok(shopStock.shopBotConfig({}).username === 'its_shop_bot',
+    'shopstock: default bot @its_shop_bot');
+  ok(shopStock.shopBotConfig({ SHOP_BOT_STOCK_ENABLED: '0' }).enabled === false,
+    'shopstock: SHOP_BOT_STOCK_ENABLED=0 se off');
+
+  const plan = shopStock.planStockBatches(Array.from({ length: 23 }, (_, i) => ({ key: `k${i}` })), 10);
+  ok(plan.batches.length === 2 && plan.batches.every((b) => b.length === 10) && plan.rest.length === 3,
+    'shopstock: sirf 10-10 ke poore batch bhejte hain, 3 bache rehte hain');
+  ok(shopStock.planStockBatches(Array.from({ length: 9 }, (_, i) => ({ key: `k${i}` })), 10).batches.length === 0,
+    'shopstock: 9 par kuch nahi jata (10 se kam nahi)');
+  const forced = shopStock.planStockBatches(Array.from({ length: 12 }, (_, i) => ({ key: `k${i}` })), 10, { force: true });
+  ok(forced.batches.length === 2 && forced.batches[1].length === 2,
+    'shopstock: "abhi bhejo" par adhoora batch bhi jata hai');
+  ok(shopStock.isShopStockJsonName('acc_9876543210.json') === true
+    && shopStock.isShopStockJsonName('acc.zip') === false,
+  'shopstock: sirf .json file — zip nahi');
+  ok(shopStock.shopStockFileName('9876543210', '') === 'acc_9876543210.json',
+    'shopstock: file ka naam phone se (acc_<number>.json)');
+  const prodButtons = shopStock.pickShopProductButtons([
+    { text: 'Swiggy' }, { text: 'Twing' }, { text: 'Meesho' }, { text: 'swiggy' },
+  ]);
+  ok(prodButtons.length === 2 && prodButtons[0].text === 'Swiggy' && prodButtons[1].text === 'Twing',
+    'shopstock: Swiggy + Twing product buttons hi pick hote hain');
+  ok(shopStock.pickShopProductButtons([{ text: 'Meesho' }]).length === 0,
+    'shopstock: doosre product ko nahi chhedta');
+
+  ok(shopStock.shopBotConfig({}).retryMs === 60_000,
+    'shopstock: fail par 60s retry window (bar-bar error nahi)');
+
+  // Queue sach me jama hoti hai (db object par mutate + wahi save) — pehle
+  // getDb() dobara padhne se queue 1/10 par atak jati thi.
+  const storeMod = await import('./store.js');
+  const queueBefore = JSON.parse(JSON.stringify(storeMod.getDb().shopBotStock || {}));
+  try {
+    const db = storeMod.getDb();
+    db.shopBotStock = { pending: [], sent: 0, sentKeys: [], lastSentAt: 0, lastBatchAt: 0, lastAttemptAt: Date.now(), lastError: '' };
+    storeMod.saveDb(db);
+    await shopStock.queueShopStockJson({ accountKey: 'qa_1', phone: '9999990001', json: { a: 1 } });
+    const second = await shopStock.queueShopStockJson({ accountKey: 'qa_2', phone: '9999990002', json: { a: 2 } });
+    ok(second.pending === 2, 'shopstock: queue jama hoti hai (1 → 2 pending)');
+    const dupRes = await shopStock.queueShopStockJson({ accountKey: 'qa_2', phone: '9999990002', json: { a: 2 } });
+    ok(dupRes.kind === 'already-queued' && dupRes.queued === false,
+      'shopstock: wahi account dobara queue nahi hota');
+    const st = shopStock.shopStockStatus();
+    ok(st.pending === 2 && st.needed === 8, 'shopstock: status 2/10 aur 8 chahiye');
+  } finally {
+    const restore = storeMod.getDb();
+    if (Object.keys(queueBefore).length) restore.shopBotStock = queueBefore;
+    else delete restore.shopBotStock;
+    storeMod.saveDb(restore);
+  }
+
+  const shopSrc = await fsp.readFile(new URL('./shop-bot-stock.js', import.meta.url), 'utf8');
+  ok(shopSrc.includes('forceDocument: true') && !shopSrc.includes('archiver') && !/\.zip/i.test(shopSrc),
+    'shopstock: document bhejta hai, zip banata hi nahi');
+  ok(shopSrc.includes('withTelegramUserClient') && shopSrc.includes('sendFile'),
+    'shopstock: wahi spare Telegram session + MTProto sendFile');
+  ok(pipelineSrc.includes('pushSessionToShopStock'),
+    'shopstock: pipeline fresh session ko queue karti hai');
+  ok((pipelineSrc.match(/pushSessionToShopStock\(/g) || []).length >= 4,
+    'shopstock: fresh_new + fresh_after_delete + world bot — teeno raste queue karte hain');
+  ok(typeof shopStock.queueShopStockJson === 'function'
+    && typeof shopStock.flushShopStock === 'function'
+    && typeof shopStock.shopStockStatus === 'function',
+  'shopstock: queue / flush / status API maujood');
+  ok(autoResumeSrc.includes("bot.command(['shopstock', 'shopbot', 'stock']")
+    && autoResumeSrc.includes("'ap_shop_flush'"),
+  'shopstock: /shopstock screen + "abhi bhejo" button');
+  ok(autoResumeSrc.includes('ap_shop_stock'),
+    'shopstock: Settings me Shop Bot Stock row');
+  ok(shopStock.shopStockStatus({}).needed === 10 - shopStock.shopStockStatus({}).pending,
+    'shopstock: status me kitne aur chahiye (needed)');
+
   // --- messaging imaandaar ---
   const card = engine.formatCompactAutopilotCard({
     sourceMode: 'firebase', running: true, target: 100, fresh: 2, processed: 3,

@@ -82,9 +82,10 @@ wo chaaho to bolo, plan bana dunga, par wo rewrite hai.
   account se) → output `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`,
   `TELEGRAM_SESSION` → Render env me daalo. Free web service ki disk
   restart par mit sakti hai, isliye env route zyada tikau hai.
-- Doosre spare account ke bina: `/start` → **🔥 Firebase (N)** chuno →
-  Telegram mode off, Firebase OTP. Bot chalega, par Telegram-only flow
-  tabhi milega jab account ho.
+- Doosre spare account ke bina: `/start` → **🌍 SWIGGY BY WORLD** (ya
+  Advanced → **🔥 Firebase (N)**) chuno → Telegram mode off, Firebase OTP.
+  World Bot ke buttons click karne ke liye spare Telegram account phir bhi
+  chahiye hota hai; Telegram-only flow tabhi milega jab account ho.
 
 ### D. Neend na aaye (free web service)
 `RENDER_EXTERNAL_URL` Render khud deta hai → bot khud `.../health` ko har
@@ -116,6 +117,7 @@ har 5–10 min (timeout 120s).
 | `GITHUB_VAULT_TOKEN` | wahi PAT | optional |
 | `VAULT_ENCRYPTION_KEY` | wahi key | optional |
 | `GITHUB_VAULT_BRANCH` | `bot-vault-2` | ✅ agar vault use kar rahe ho |
+| `SHOP_BOT_STOCK_ENABLED` / `SHOP_BOT_USERNAME` | `1` / `its_shop_bot` | stock push |
 
 `DATA_DIR` sirf tab badlo jab ek hi machine/disk par do copy chala rahe ho
 (do Render services ke liye zaroorat nahi — har service ka apna container).
@@ -332,6 +334,74 @@ Dikhne me:
 **Sach:** 5s me kaam "turant" nahi hota — Swiggy ki per-IP limit minutes me
 hoti hai. Faayda: bot **rukta nahi**, same number par OTP **burn nahi hota**,
 aur har number par pehla attempt maximum 1 minute ke andar start hota hai. Lock process memory me rehta hai, redeploy tak.
+
+### 🌍 Swiggy World Bot mode (@SwiggyByWorldBot)
+
+Do account engines hain (Settings → 🌍 Account engine, ya
+`PREMIUM_ACCOUNT_ENGINE=worldbot`):
+
+| | DIRECT API (default) | WORLD BOT |
+|---|---|---|
+| Swiggy call | is bot ka bridge | `@SwiggyByWorldBot` |
+| Proxy / WAF solver | zaroori | **bilkul nahi** |
+| Number + OTP source | Firebase pool / Hermes / Hathi | Firebase pool **ya** Hermes/Hathi |
+| Session delivery | `.json` file chat me | `.json` file chat me |
+
+World Bot flow (jaise owner ke screenshots me hai):
+
+1. Spare Telegram account se bot chat kholo → `/start` → **🔐 Login** →
+   **📲 OTP Login** → 10-digit number bhejo.
+2. Bot `OTP Sent` bolta hai. OTP Firebase inbox se aata hai (wahi device jisse
+   number aaya) → bot ko bhej do. OTP na aaye / galat ho to `❌ Cancel` aur
+   agla number — wahi one-shot rule.
+3. Bot **naam poochhta hai** = naya account → JSON aata hai → bot DB me save
+   + owner ko **`.json` file**.
+4. Bot **naam nahi poochhta** = purana account →
+   `🤵 Order Hub → woh account → 🗑 Delete Account → wohi account →
+   Delete OTP → Account Deleted Successfully` → phir se OTP Login
+   (ab naam poochhega) → fresh JSON.
+5. Uske baad best-effort `Switch Accounts → account → Permanently Logged Out`
+   (`SWIGGY_WORLD_LOGOUT_AFTER_DELETE=0` se band).
+
+#### 🚀 START ke teen source buttons
+
+| Button | Number + OTP | Swiggy account kaam |
+|---|---|---|
+| 🤝 HERMESHU + SWIGGYBYWORLD | `@HermeshuOTPROBOT` card | `@SwiggyByworldBot` |
+| 🐘 HATHI WALA BOT | `@Hathi_otp_bot` card | `@SwiggyByworldBot` (wahi world bot engine) |
+| 🌍 SWIGGY BY WORLD | Firebase pool (device scan + SMS) | `@SwiggyByworldBot` |
+
+`⚙️ Advanced` me purane sab option (Firebase only, HardXotp) aur
+**🗑 Delete All Firebase** milta hai.
+
+#### 🔁 Bot pool + failover (saare bot same)
+
+World bots ka default pool: `@SwiggyByworldBot`, `@SwiggyByworld1Bot` …
+`@SwiggyByworld5Bot` — **saare bilkul same** kaam karte hain. Rules:
+
+- Ek number par **pehla bot hi** chalta hai; jo bot chal jaye wahi **sticky**
+  rehta hai (bina wajah switch nahi).
+- OTP send fail / OTP na aaye / OTP galat / bot flow fail / delete fail →
+  **agla bot** (wrap-around), ek number par max **3 bots** try hote hain.
+- `⏹ STOP`, `SKIP`, invalid-number aur Telegram-setup pending par **switch
+  nahi** hota (ye bot ki galti nahi hai).
+- Pool badalna ho to env: `SWIGGY_WORLD_BOT_USERNAMES=A_bot,B_bot` (CSV).
+
+#### 📦 Shop Bot stock (@its_shop_bot)
+
+Har fresh Swiggy JSON apne aap stock queue me jaata hai. **10 poore** hone par
+wahi 10 files ek-ek `.json` document (zip nahi) spare Telegram account se
+`@its_shop_bot` ko chali jaati hain aur shop bot unhe **Swiggy / Twing**
+product me daal deta hai. Batch size fix **10** hai (min 10, max 10).
+
+- Status / manual push: `/shopstock` → **📤 Abhi Bhejo**
+- Band karna ho: `SHOP_BOT_STOCK_ENABLED=0`
+- Fail par queue safe — agle fresh par dobara try
+
+Ek hi Telegram chat = **1 lane** (engine khud force karta hai), isliye World Bot
+mode slow par predictable hai. Kuch atke to **Settings → 🔎 World Bot screen
+check** ya `/world` — bot ka latest text + buttons dikhata hai, usi se pata
+chalta hai kaunsa step badla hai.
 
 ### 🔁 Never-stop + auto-resume (batch na ruke)
 

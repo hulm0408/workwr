@@ -3520,8 +3520,12 @@ Thanks`)),
   // ⏱ 20 second rule — OTP, OTP-send aur queue ke budgets.
   ok(wb.worldBotConfig({}).otpTimeoutMs === 20_000,
     'worldbot: OTP wait 20 second (owner rule)');
-  ok(wb.worldBotConfig({}).otpSendTimeoutMs === 20_000 && wb.worldBotConfig({}).queueWaitMs === 20_000,
-    'worldbot: OTP-send aur queue ka budget bhi 20s');
+  ok(wb.worldBotConfig({}).otpSendTimeoutMs === 20_000,
+    'worldbot: OTP-send ka budget 20s (owner rule)');
+  ok(wb.worldBotConfig({}).queueWaitMs === 45_000,
+    'worldbot: queue ke baad 45s wait (asli run me OTP ~40-60s baad aata hai)');
+  ok(wb.worldBotConfig({ SWIGGY_WORLD_QUEUE_WAIT_MS: '20000' }).queueWaitMs === 20_000,
+    'worldbot: queue wait env se override ho sakta hai');
   ok(wb.worldBotQueueKind('Account creation is in queue, please wait') === true,
     'worldbot: "queue/wait" message pehchanta hai');
   ok(wb.worldBotQueueKind('OTP sent successfully') === false
@@ -3604,13 +3608,43 @@ Thanks`)),
   // Owner: "instead of clicking button read all the text of button and type
   // that text to trigger that" + "har possibilities of mistakes sochlo".
   // -------------------------------------------------------------------------
-  ok(JSON.stringify(wb.worldButtonTypeVariants('🔐 Login')) === JSON.stringify(['🔐 Login', 'Login', 'login']),
-    'worldbot: button ka poora text + bina emoji + simple roop type hota hai');
+  ok(JSON.stringify(wb.worldButtonTypeVariants('🔐 Login')) === JSON.stringify(['🔐 Login', 'Login']),
+    'worldbot: button ka poora text + bina emoji roop type hota hai (lowercase nahi)');
+  ok(wb.worldButtonTypeVariants('2️⃣ OTP Login').includes('OTP Login'),
+    'worldbot: numbered button (2️⃣ OTP Login) ka plain "OTP Login" variant bhi type hota hai');
+
+  // 🛑 Owner ka log: bot OTP/number maang raha ho to button ka text bhejne se
+  // bot usi ko OTP/number samajh kar "❌ Invalid OTP / Invalid Mobile Number"
+  // deta tha. Isliye state-aware guard.
+  ok(wb.worldBotAwaitingKind([{ text: '✅ OTP Sent\nSend the 6-digit OTP you received from Swiggy.' }]) === 'otp',
+    'awaiting: OTP ka intezaar detect');
+  ok(wb.worldBotAwaitingKind([{ text: 'Send your 10-digit Swiggy number.' }]) === 'number',
+    'awaiting: number ka intezaar detect');
+  ok(wb.worldBotAwaitingKind([{ text: '🆕 New Account Detected!\nTell us the name' }]) === 'name',
+    'awaiting: naam ka intezaar detect');
+  ok(wb.worldBotAwaitingKind([{ text: '🏠 Main Menu\nPick a feature' }]) === '',
+    'awaiting: clean menu par kuch nahi');
+  ok(wbSrc.includes('awaiting-otp') && wbSrc.includes('worldBotAwaitingKind'),
+    'worldbot: clickOrType OTP/number state me text nahi bhejta');
+
+  // ❌ Swiggy ne OTP bhejne se mana kiya = number ka faisla (20s wait bekaar).
+  const blockedSuspend = wb.worldBotOtpBlockInfo('❌ Could not send OTP. Swiggy response: Your account is suspended. Please contact us through support@swiggy.in');
+  ok(blockedSuspend?.kind === 'number_blocked' && blockedSuspend?.code === 'SWIGGY_SUSPENDED',
+    'blocked: suspended number dead (number_blocked)');
+  const blockedAttempts = wb.worldBotOtpBlockInfo('❌ Could not send OTP. Swiggy response: Number of login attempts exceeded. Please retry after 2 hours.');
+  ok(blockedAttempts?.kind === 'number_blocked' && blockedAttempts?.code === 'SWIGGY_ATTEMPTS',
+    'blocked: attempts exceeded = number cooldown');
+  ok(wb.worldBotOtpBlockInfo('✅ OTP Sent\nSend the 6-digit OTP') === null,
+    'blocked: asli OTP Sent block nahi hai');
+  ok(wb.shouldReissueWorldOtp('number_blocked') === false,
+    'blocked: number_blocked par wahi number dobara nahi (skip)');
   ok(wb.worldButtonTypeVariants('🤵 Order Hub')[1] === 'Order Hub',
     'worldbot: "Order Hub" bina emoji type hota hai');
   ok(wb.worldButtonTypeVariants('').length === 0, 'worldbot: khali text par type-variant nahi');
   ok(wb.worldBotConfig({}).trigger === 'auto' && wb.worldBotConfig({ SWIGGY_WORLD_TRIGGER: 'type' }).trigger === 'type',
     'worldbot: trigger auto/type/click (default auto)');
+  ok(wbSrc.includes('worldResetToMenu') && wbSrc.includes("sendWorldText(client, entity, '/cancel')"),
+    'worldbot: naya login shuru karne se pehle adhoora OTP/number flow Cancel se saaf hota hai');
   ok(wbSrc.includes('async function clickOrType') && wbSrc.includes('worldButtonTypeVariants'),
     'worldbot: click-or-type trigger maujood');
   ok((wbSrc.match(/clickOrType\(/g) || []).length >= 8,

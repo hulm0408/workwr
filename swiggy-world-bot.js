@@ -66,8 +66,10 @@ export const WORLD_BOT_DEFAULTS = {
   // "OTP Sent" confirmation (bot ki taraf se OTP send) ka budget.
   otpSendTimeoutMs: 20_000,
   // Bot "account creation queue me hai" bole to itna wait — isse zyada =
-  // bot badlo.
-  queueWaitMs: 20_000,
+  // bot badlo. 👀 Owner ke asli run me queue message ke ~40-60s baad OTP Sent
+  // aata hai, isliye 20s bahut kam pad raha tha (bot bekaar rotate hota tha
+  // aur pending OTP chhoot jata tha) → default 45s.
+  queueWaitMs: 45_000,
   // OTP send confirm na ho (aur bot ne Cancel bhi na bheja ho) to number SKIP
   // nahi hota — wahi number itni baar dobara issue hota hai (Login → 2 → number).
   numberRetries: 1,
@@ -334,6 +336,14 @@ export function worldBotPromptKind(text = '') {
   if (/\b(invalid mobile|invalid number|number galat)\b/.test(n)) return 'invalidNumber';
   // "OTP sent" ke kai tarah ke shabd: "OTP has been sent", "we sent a code",
   // "OTP bhej diya" — sab ek hi step hain.
+  // ❌ Bot ne khud OTP bhejne se mana kar diya — "Could not send OTP.
+  // Swiggy response: Your account is suspended" ya "login attempts exceeded".
+  // Ye number ka faisla hai, 20s wait/retry ka koi matlab nahi.
+  if (/\b(could not|cannot|can t|cant|unable to)\s+(send|sending)\b.*\botp\b|\botp\b.*\b(could not|cannot)\s+be\s+sent\b/.test(n)) {
+    if (/\bsuspend/.test(n)) return 'otpSuspended';
+    if (/\b(attempts?\s+exceeded|too many|retry after|try after)/.test(n)) return 'otpAttempts';
+    return 'otpSendFailed';
+  }
   // ⚠️ "OTP bhejne ke liye 10 digit number bhejo" me bhi "OTP" + "bhej" hai —
   // ise OTP Sent maan lena galat tha (number maang raha hota hai). Pehle wahi
   // pakdo. Asli confirmation me "sent"/"bhej diya" hota hai, "bhejo" nahi.
@@ -366,8 +376,12 @@ export function worldButtonTypeVariants(text = '') {
     .replace(/[^\p{L}\p{N}\s&/+.-]+/gu, ' ')
     .replace(/\s+/g, ' ')
     .trim();
-  const lower = noEmoji.toLowerCase();
-  const out = [...new Set([raw, noEmoji, lower].filter(Boolean))];
+  // "2️⃣ OTP Login" → "OTP Login": asli bot numbered/keycap buttons ko plain
+  // naam se hi samajhta hai (owner ke ideal log me "OTP Login" chala).
+  const clean = noEmoji.replace(/^[0-9]+[️⃣.)\-]*\s+/u, '').trim();
+  // ⚠️ Lowercase variant jaan-boojh kar nahi bhejte: "otp login" bhejne par bot
+  // use NUMBER samajh kar "❌ Invalid Mobile Number" deta tha (owner ka log).
+  const out = [...new Set([raw, clean, noEmoji].filter(Boolean))];
   return out;
 }
 
@@ -387,6 +401,39 @@ export function isValidWorldSessionJson(value) {
 
 // Kisi bhi error ko samajhne layak category me baanto — isse pata chalta hai
 // bot badalna hai, session dobara login karna hai, ya sirf number defer karna.
+// Bot ne OTP bhejne se mana kiya — kaunsa case aur kya karna hai.
+//   suspended  → number dead (skip, bot na badlo)
+//   attempts   → "retry after 2 hours" (number cooldown, bot na badlo)
+//   sendFailed → generic send error (number aage, bot rotate ho sakta hai)
+export function worldBotOtpBlockInfo(text = '') {
+  const kind = worldBotPromptKind(text);
+  if (kind === 'otpSuspended') {
+    return { kind: 'number_blocked', code: 'SWIGGY_SUSPENDED', reason: 'Swiggy: account suspended — ye number dead hai' };
+  }
+  if (kind === 'otpAttempts') {
+    return { kind: 'number_blocked', code: 'SWIGGY_ATTEMPTS', reason: 'Swiggy: login attempts exceeded — ye number 2 ghante ke liye blocked' };
+  }
+  if (kind === 'otpSendFailed') {
+    return { kind: 'failed_otp_send', code: 'SWIGGY_SEND_FAIL', reason: 'Swiggy ne OTP bhejne se mana kiya' };
+  }
+  return null;
+}
+
+// Bot abhi kya maang raha hai (latest screen se): 'otp' | 'number' | 'name' | ''.
+// Isi se tay hota hai ki button ka TEXT bhejna safe hai ya nahi — warna wo text
+// hi OTP/number ban kar "❌ Invalid OTP / Invalid Mobile Number" deta tha.
+export function worldBotAwaitingKind(messages = []) {
+  const list = Array.isArray(messages) ? messages : [];
+  for (const message of list.slice(0, 3)) {
+    const text = String(message?.text ?? message ?? '');
+    const kind = worldBotPromptKind(text);
+    if (kind === 'otpSent' || kind === 'deleteSent' || kind === 'otpFail') return 'otp';
+    if (kind === 'askNumber') return 'number';
+    if (kind === 'askName') return 'name';
+  }
+  return '';
+}
+
 // OTP send confirm na hua ho (aur bot ne Cancel bhi na bheja) to number skip
 // nahi karte — pehle WAHI number dobara issue hota hai. Sirf in cases me retry:
 //   failed_otp_send / no-login-button / no-otp-login / no-button / flow stuck
@@ -395,7 +442,7 @@ export function isValidWorldSessionJson(value) {
 export function shouldReissueWorldOtp(kind = '') {
   const k = String(kind || '').trim().toLowerCase();
   if (!k) return false;
-  if (/^(aborted|queued_timeout|failed_otp_miss|failed_otp_verify|invalidnumber|failed_invalid_number|bot_unreachable|worldbot_setup|flood_wait|network)$/.test(k)) {
+  if (/^(aborted|queued_timeout|failed_otp_miss|failed_otp_verify|invalidnumber|failed_invalid_number|number_blocked|bot_unreachable|worldbot_setup|flood_wait|network)$/.test(k)) {
     return false;
   }
   return /otp_send|no_login|no-login|no-otp-login|no_otp_login|no_button|no-button|no_prompt|number_prompt|timeout|failed_world_bot|send_number|otp-send/.test(k);
@@ -710,10 +757,11 @@ export async function worldBotLogin({
     return await withTelegramUserClient(async ({ client }) => {
       const entity = await getWorldEntity(client, cfg.username);
 
-      // 1) /start → main menu
+      // 1) /start → main menu (pehle pichla adhoora flow saaf: OTP/number prompt)
       setPhase('start');
+      await worldResetToMenu(client, entity, cfg);
       let before = screenSignature(await parseScreenMessages(client, entity));
-      await sendWorldText(client, entity, '/start');
+      await sendWorldText(client, entity, '/start').catch(() => {});
       await waitForReply({
         client, entity, baseline: before, timeoutMs: cfg.startTimeoutMs, shouldAbort,
         what: 'main menu',
@@ -732,12 +780,9 @@ export async function worldBotLogin({
       const issueNumberOtp = async ({ attempt = 1 } = {}) => {
         if (attempt > 1) {
           // adhoora screen saaf karo, typed-text guard reset, phir /start se menu.
-          await safeCancel(client, entity, cfg).catch(() => {});
           state.lastTypedText = '';
           state.lastTypedAt = 0;
-          await sleep(Math.max(600, Math.min(2_000, Number(cfg.pollMs) || 1_500)));
-          await sendWorldText(client, entity, '/start').catch(() => {});
-          await sleep(Math.max(700, Math.min(2_500, Number(cfg.pollMs) || 1_500)));
+          await worldResetToMenu(client, entity, cfg).catch(() => {});
         }
 
         // 2) 🔐 Login → method picker
@@ -755,7 +800,11 @@ export async function worldBotLogin({
         setPhase('otp-login');
         issueBaseline = screenSignature(await parseScreenMessages(client, entity));
         const otpBtn = findRoleOnScreens(await parseScreenMessages(client, entity), 'otpLogin');
-        if (!otpBtn) throw new WorldBotError('no-otp-login', 'OTP Login button nahi mila');
+        // Button na mile par bot pehle se number maang raha ho → wahi sahi jagah hai.
+        if (!otpBtn) {
+          if (worldBotAwaitingKind(await parseScreenMessages(client, entity)) === 'number') return 'askNumber';
+          throw new WorldBotError('no-otp-login', 'OTP Login button nahi mila');
+        }
 
         // 4) number prompt (click na chale to "OTP Login" text type hoga)
         setPhase('send-number');
@@ -790,7 +839,9 @@ export async function worldBotLogin({
       const issueTries = Math.max(1, Math.min(3, 1 + Math.max(0, Number(cfg.numberRetries ?? 1) || 0)));
       let numberResult = null;
       let lastIssueKind = '';
+      let usedAttempts = 0;
       for (let attempt = 1; attempt <= issueTries; attempt += 1) {
+        usedAttempts = attempt;
         try {
           numberResult = await issueNumberOtp({ attempt });
         } catch (e) {
@@ -817,8 +868,8 @@ export async function worldBotLogin({
           ok: false,
           kind: numberResult?.kind || 'failed_otp_send',
           phone: cleanPhone,
-          attempts: issueTries,
-          reason: `${numberResult?.reason || 'OTP send confirm nahi hua'} · ${issueTries} try ke baad bhi`,
+          attempts: usedAttempts,
+          reason: `${numberResult?.reason || 'OTP send confirm nahi hua'}${usedAttempts > 1 ? ` · ${usedAttempts} try ke baad bhi` : ''}`,
         };
       }
 
@@ -1041,6 +1092,10 @@ async function waitForOtpSent({ client, entity, baseline, cfg, shouldAbort }) {
     lastAll = all;
     const fresh = baseline ? freshMessages(all, baseline) : all;
     for (const message of fresh) {
+      // ❌ "Could not send OTP … suspended / attempts exceeded" — yahan 20s
+      // wait ya retry ka koi matlab nahi, number ka faisla turant.
+      const blocked = worldBotOtpBlockInfo(message.text);
+      if (blocked) return { ok: false, kind: blocked.kind, code: blocked.code, reason: blocked.reason, message };
       const kind = worldBotPromptKind(message.text);
       if (kind === 'otpSent') return { ok: true, kind: 'otpSent', message };
       if (kind === 'invalidNumber') return { ok: false, kind: 'invalidNumber', message };
@@ -1078,6 +1133,14 @@ async function waitForOtpSent({ client, entity, baseline, cfg, shouldAbort }) {
 async function sendWorldCode(client, entity, code) {
   const text = String(code || '').trim();
   if (!text) return false;
+  // Bot number/naam maang raha ho to OTP bhejna bekaar (aur ganda) hai.
+  try {
+    const awaiting = worldBotAwaitingKind(await parseScreenMessages(client, entity));
+    if (awaiting && awaiting !== 'otp') {
+      console.warn(`[WorldBot] OTP send skip — bot abhi ${awaiting} par hai`);
+      return false;
+    }
+  } catch {}
   for (let attempt = 1; attempt <= 2; attempt += 1) {
     try {
       await sendWorldText(client, entity, text);
@@ -1145,7 +1208,7 @@ async function clickCopyCode({ client, entity, cfg, shouldAbort }) {
 // ---------------------------------------------------------------------------
 async function clickOrType({
   client, entity, entry, cfg, shouldAbort, what,
-  predicate, baseline = null, timeoutMs = null, maxTypedTries = 2,
+  predicate, baseline = null, timeoutMs = null, maxTypedTries = 3,
 }) {
   const total = Math.max(5_000, Number(timeoutMs) || Number(cfg?.stepTimeoutMs) || WORLD_BOT_DEFAULTS.stepTimeoutMs);
   const grace = Math.min(total, Math.max(1_000, Number(cfg?.clickGraceMs) || 4_000));
@@ -1183,9 +1246,36 @@ async function clickOrType({
     } catch {}
   }
 
+  // 🛑 Owner ka log: bot pichle number ke OTP ka intezaar kar raha tha aur humne
+  // "Login" / "OTP Login" text bhej diya → bot ne usi ko OTP/number samajh kar
+  // "❌ Invalid OTP" / "❌ Invalid Mobile Number" diya. Isliye jis waqt bot
+  // OTP/number/naam maang raha ho, button ka text bilkul nahi bhejte.
+  try {
+    const awaiting = worldBotAwaitingKind(await parseScreenMessages(client, entity));
+    if (awaiting === 'otp') throw new WorldBotError('awaiting-otp', 'Bot OTP ka intezaar kar raha hai — button text nahi bhejunga (Invalid OTP se bachaav)');
+    if (awaiting === 'number') throw new WorldBotError('awaiting-number', 'Bot number maang raha hai — button text nahi bhejunga');
+    if (awaiting === 'name') throw new WorldBotError('awaiting-name', 'Bot naam maang raha hai — button text nahi bhejunga');
+  } catch (e) {
+    if (['awaiting-otp', 'awaiting-number', 'awaiting-name'].includes(String(e?.code || ''))) throw e;
+  }
+
   const variants = worldButtonTypeVariants(label).slice(0, Math.max(1, maxTypedTries));
   let lastError = null;
   for (const variant of variants) {
+    // 🔁 Har variant se PEHLE dobara dekho: pehla variant kaam kar gaya ho to
+    // agla text bot ke number/OTP field me chala jata tha ("Invalid Mobile
+    // Number"). Predicate sach ho gaya ho to wahi return karo.
+    try {
+      const now = await parseScreenMessages(client, entity);
+      const done = predicate ? predicate(freshMessages(now, before), now) : null;
+      if (done) { state.lastTrigger = 'type-late'; return done; }
+      const awaitingNow = worldBotAwaitingKind(now);
+      if (awaitingNow === 'otp' || awaitingNow === 'number' || awaitingNow === 'name') {
+        throw new WorldBotError(`awaiting-${awaitingNow}`, `Bot ab ${awaitingNow} par hai — "${variant}" bhejna khatarnak hai`);
+      }
+    } catch (e) {
+      if (['awaiting-otp', 'awaiting-number', 'awaiting-name'].includes(String(e?.code || ''))) throw e;
+    }
     // Wahi text 8s ke andar dobara na bhejo (double trigger).
     if (state.lastTypedText === variant && Date.now() - (Number(state.lastTypedAt) || 0) < 8_000) {
       console.warn(`[WorldBot] "${variant}" abhi hi type kiya tha — skip`);
@@ -1198,7 +1288,9 @@ async function clickOrType({
       state.lastTypedAt = Date.now();
       console.log(`[WorldBot] ⌨️ type trigger: "${variant}"`);
       const hit = await waitForReply({
-        client, entity, baseline: before, timeoutMs: Math.min(total, 25_000), shouldAbort,
+        client, entity, baseline: before,
+        // Har variant ka apna chhota budget — 3 variant x 25s = 75s waste nahi.
+        timeoutMs: Math.min(total, Math.max(5_000, grace)), shouldAbort,
         what: `${what} (typed "${variant}")`, predicate, pollMs: cfg?.pollMs,
       });
       state.lastTrigger = 'type';
@@ -1212,16 +1304,53 @@ async function clickOrType({
 }
 
 async function safeCancel(client, entity, cfg = {}) {
-  const hit = findRoleOnScreens(await parseScreenMessages(client, entity), 'cancel');
-  if (!hit) return false;
-  try {
-    await clickWorldButton(hit.button);
-  } catch (e) {
-    // Click fail → "Cancel" text type karke bhi try (owner rule).
-    await sendWorldText(client, entity, String(hit.button?.text || 'Cancel').trim()).catch(() => {});
+  const waitMs = Math.min(1_800, Math.max(600, Number(cfg?.pollMs) || 1_500));
+  const screens = await parseScreenMessages(client, entity);
+  const awaiting = worldBotAwaitingKind(screens);
+  const hit = findRoleOnScreens(screens, 'cancel');
+  let did = false;
+  if (hit) {
+    try {
+      await clickWorldButton(hit.button);
+      did = true;
+    } catch {
+      // Click fail → "Cancel" text type karke bhi try (owner rule).
+      await sendWorldText(client, entity, String(hit.button?.text || 'Cancel').trim()).catch(() => {});
+      did = true;
+    }
+  } else if (awaiting === 'otp') {
+    // Bot khud kehta hai: "Send /cancel to cancel." Pehle wahi shabd.
+    await sendWorldText(client, entity, 'Cancel').catch(() => {});
+    did = true;
+  } else if (awaiting === 'number' || awaiting === 'name') {
+    await sendWorldText(client, entity, '/cancel').catch(() => {});
+    did = true;
   }
-  await sleep(Math.min(1_500, cfg.pollMs || 1_500));
-  return true;
+  await sleep(waitMs);
+  // OTP prompt abhi bhi khada hai to bot ka bataya hua command bhejo.
+  if (worldBotAwaitingKind(await parseScreenMessages(client, entity)) === 'otp') {
+    await sendWorldText(client, entity, '/cancel').catch(() => {});
+    await sleep(waitMs);
+    did = true;
+  }
+  return did;
+}
+
+// Login shuru karne se pehle bot ko saaf menu par lao. Owner ke log me bot
+// pichle number ke OTP par khada tha aur naya /start + Login usi me ghus kar
+// "❌ Invalid OTP" de raha tha (aur number waste ho raha tha).
+async function worldResetToMenu(client, entity, cfg = {}) {
+  const pending = worldBotAwaitingKind(await parseScreenMessages(client, entity));
+  if (pending) {
+    setPhase('reset-menu');
+    console.log(`[WorldBot] 🧹 adhoora flow (${pending}) mila — pehle Cancel, phir /start`);
+    await safeCancel(client, entity, cfg).catch(() => {});
+  }
+  await sendWorldText(client, entity, '/start').catch(() => {});
+  await sleep(Math.max(800, Math.min(2_500, Number(cfg?.pollMs) || 1_500)));
+  const left = worldBotAwaitingKind(await parseScreenMessages(client, entity));
+  if (left) console.warn(`[WorldBot] ⚠️ /start ke baad bhi bot ${left} par khada hai`);
+  return !left;
 }
 
 // ---------------------------------------------------------------------------

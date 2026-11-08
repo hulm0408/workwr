@@ -575,6 +575,8 @@ Next: OTP mila to verify · na mila to NEW NUMBER
 * **Patli line** — header ke niche `──────────────`; purani `━━━` / fake table art hamesha ke liye gayi.
 * **Labels fancy, values plain** — `𝗬𝗼𝘂𝗿 𝗡𝘂𝗺𝗯𝗲𝗿:` ke aage number saada rehta hai.
 * **Numbers / OTP / JSON kabhi fancy nahi** — copy-paste aur padhna kharab na ho (`mono()` inhe `<code>` me rakhta hai).
+* **Process wahi jo ideal flow me hai** — login se pehle bot ka adhoora OTP/number prompt pehle `Cancel` se saaf hota hai, phir `/start` → `Login` → `OTP Login` → number → OTP. Bot jab OTP/number/naam maang raha ho to **button ka text kabhi nahi bhejta** (warna bot usi ko OTP/number samajh kar `❌ Invalid OTP` / `❌ Invalid Mobile Number` deta tha).
+* **Bot ke apne errors maane jate hain** — `❌ Could not send OTP … account suspended` ⇒ number dead (skip, bot na badlo); `… login attempts exceeded` ⇒ number 2 ghante cooldown; 20s wait/retry nahi.
 * **Lambi detail collapsible** — `/world` ke last 5 screens `<blockquote expandable>` me: card chhota rehta hai, kholne par poora detail.
 
 Helpers `rich-text.js` me hain: `fancy()`, `bracketHeader()`, `headerRule()`, `stamp()`, `sectionStamp()`, `details()`, aur ulta `plain()` (fancy glyphs → ASCII, taaki stage matching/regex na tootey).
@@ -593,7 +595,7 @@ Helpers `rich-text.js` me hain: `fancy()`, `bracketHeader()`, `headerRule()`, `s
 | `SWIGGY_WORLD_STEP_TIMEOUT_MS` | 45000 | World Bot ke ek step (button/JSON) ka budget |
 | `SWIGGY_WORLD_OTP_TIMEOUT_MS` | 20000 | OTP ka intezaar **sirf 20s** — nahi aaya to number skip (bot wahi) |
 | `SWIGGY_WORLD_OTP_SEND_TIMEOUT_MS` | 20000 | Bot "OTP Sent" 20s me confirm na kare → **bot badlo** |
-| `SWIGGY_WORLD_QUEUE_WAIT_MS` | 20000 | Bot "queue/wait" bole to itna wait; isse zyada → **bot badlo** |
+| `SWIGGY_WORLD_QUEUE_WAIT_MS` | 45000 | Bot "queue/wait" bole to itna wait (asli run me OTP Sent ~40-60s baad aata hai); isse zyada → **bot badlo** |
 | `SWIGGY_WORLD_TRIGGER` | `auto` | Button **click** → screen na badle to **button ka text likh kar bhej** (`type` = click bilkul nahi) |
 | `SWIGGY_WORLD_CLICK_GRACE_MS` | 4000 | Click ke baad screen badalne ka intezaar, phir text trigger |
 | `SWIGGY_WORLD_NUMBER_RETRIES` | 1 | OTP send confirm na ho (aur bot ne Cancel bhi na bheja ho) to number **skip nahi** — wahi number itni baar `Login → 2 → number` se dobara issue (max 2, `0` = off) |

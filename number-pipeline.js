@@ -939,6 +939,24 @@ export async function processSingleNumberViaWorldBot({
         viaWorldBot: true, switchBot: false,
       };
     }
+    // ❌ Swiggy ne khud OTP bhejne se mana kiya ("account suspended" /
+    // "login attempts exceeded") → ye NUMBER ka faisla hai: retry nahi,
+    // bot bhi nahi badalta.
+    if (kind === 'number_blocked') {
+      try {
+        markLedger(phone, 'skipped', {
+          reason: String(res?.reason || 'Swiggy ne OTP block kiya').slice(0, 160),
+          kind: 'worldbot-blocked',
+        });
+      } catch {}
+      return {
+        ok: false, kind: 'failed_otp_send', phone, stage: 'worldbot_otp_send',
+        otpFailure: true, otpAttemptConsumed: true, otpAttempts: 1,
+        code: res?.code || 'WORLDBOT_BLOCKED',
+        reason: res?.reason || `${botTag} ne OTP bhejne se mana kiya`,
+        viaWorldBot: true, switchBot: false,
+      };
+    }
     // ✅ Sirf YAHAN bot badalta hai: bot OTP bhej hi na paye ya queue me
     // 20s se zyada atka reh jaye.
     if (kind === 'failed_otp_send' || kind === 'queued_timeout' || kind === 'bot_unreachable') {

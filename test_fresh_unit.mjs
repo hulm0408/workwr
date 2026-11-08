@@ -3399,7 +3399,9 @@ Thanks`)),
   'worldbot: OTP refresh world-bot flow me 1s (env se override)');
   ok(pipelineRefreshSrc.includes('captureTelegramOtpWatermark')
     && pipelineRefreshSrc.includes('const makeOtpWatermark = () => async () =>')
-    && (pipelineRefreshSrc.match(/otpWatermark: makeOtpWatermark\(\)/g) || []).length === 3
+    // loginOnce() + deleteOnce() dono me watermark (pehle 3 call sites the;
+    // Task U me shared helpers ban gaye) — dono raste covered hain.
+    && (pipelineRefreshSrc.match(/otpWatermark: makeOtpWatermark\(\)/g) || []).length >= 2
     && pipelineRefreshSrc.includes('ctx?.watermark'),
   'worldbot: login + delete + fresh login teeno OTP rounds ko watermark milta hai');
   const wbFlowSrc = await fsp.readFile(new URL('./swiggy-world-bot.js', import.meta.url), 'utf8');
@@ -3417,14 +3419,15 @@ Thanks`)),
   ok(wbFlowSrc.includes('blankReplyAt') && wbFlowSrc.includes('bot ne reply diya')
     && wbFlowSrc.includes('confirmedBy: blankReplyMedia ?'),
   'worldbot: blank/media reply = OTP Sent (Cancel + dobara number nahi)');
-  ok(wbFlowSrc.includes("new WorldBotError('empty-screen'") && wbFlowSrc.includes('attempt <= 3'),
-    'worldbot: Telegram flood wait / khali read par 3 koshish (screen: none se fail nahi)');
+  ok(wbFlowSrc.includes("new WorldBotError('empty-screen'") && wbFlowSrc.includes('attempt <= 2'),
+    'worldbot: Telegram flood wait / khali read par koshish (screen: none se fail nahi)');
   ok(wbFlowSrc.includes('let clickCallback') && wbFlowSrc.includes('click ka callback aaya'),
     'worldbot: click ka callback aaya to "OTP Login" text dobara nahi jata');
   ok(wbFlowSrc.includes('Login button nahi mila — menu reset karke ek aur koshish'),
     'worldbot: Login button na mile to reset ke baad ek aur koshish (bot switch nahi)');
-  ok(wbFlowSrc.includes('worldReadCache') && wbFlowSrc.includes('Date.now() - worldReadCache.at < 400'),
-    'worldbot: 0.4s read-cache — GetHistory flood wait kam');
+  ok(wbFlowSrc.includes('worldReadCache') && wbFlowSrc.includes('worldReadCache.at < worldReadCache.ttlMs')
+    && wbFlowSrc.includes('worldReadCache.inflight') && wbFlowSrc.includes('worldReadCache.ttlMs = Math.min(8_000'),
+  'worldbot: single-flight + adaptive read-cache — GetHistory flood wait kam');
   // 🏠 Delete ke baad owner ka step: Main Menu → Login → OTP Login → number
   // (na `/start`, na seedha Login).
   ok(wb.worldBotButtonRole('🏠 Main Menu') === 'mainMenu'
@@ -3480,8 +3483,10 @@ Thanks`)),
   ok(phoneUtils.swiggyNameFromPhone('') === '' && phoneUtils.swiggyNameFromPhone('+91 98765 43210') === 'ihgfe',
     'name: khali/invalid par khali, +91 ke baad bhi wahi 10 digit');
   ok(pipelineCharges.includes("swiggyNameFromPhone(phone) || existingName || getNextAutoUserName()")
-    && (pipelineCharges.match(/nameProvider: async \(\) => swiggyNameFromPhone\(phone\)/g) || []).length === 2,
-  'pipeline: world bot ko naam phone ke digit se milta hai (login + fresh login)');
+    && pipelineCharges.includes('const loginOnce = (fresh = false) => worldBotLogin({')
+    && pipelineCharges.includes('let first = await loginOnce();')
+    && pipelineCharges.includes('let again = await loginOnce(true);'),
+  'pipeline: world bot ko naam phone ke digit se milta hai (login + fresh login, dono ek hi rasta)');
 
   // ⚡ Delete success = turant Main Menu + logout ke DO confirmation.
   ok(wbFlowSrc.includes('settle = true') && wbFlowSrc.includes('settle: false')
@@ -3580,6 +3585,154 @@ Thanks`)),
     && pipelineT.includes("saveWorldSession(first, 'new', cfg)")
     && pipelineT.includes("saveWorldSession(again, 'after-delete', cfg)"),
   'pipeline: dono raste (naya + delete ke baad) ek hi save/send/logout rasta');
+
+  // -------------------------------------------------------------------------
+  // 🐢 TASK U — Telegram flood wait (GetHistory) se flow marna band.
+  // Owner ke logs: "Sleeping for 4s / 16s on flood wait" → delete ka jawab
+  // aaya hi nahi → number skip. Ab: single-flight read, adaptive cache,
+  // deadline extension, late-reply scan, aur delete unknown par WAHI number.
+  // -------------------------------------------------------------------------
+  ok(wbFlowSrc.includes('single-flight') && wbFlowSrc.includes('worldReadCache.inflight')
+    && wbFlowSrc.includes('worldReadCache.ttlMs = Math.min(8_000'),
+  'flood: ek waqt me ek hi GetHistory + slow read par 8s tak cache');
+  ok(wbFlowSrc.includes('worldReadCache.floodUntil') && wbFlowSrc.includes('chat read ${readMs}ms'),
+    'flood: slow read detect hota hai aur log me dikhta hai');
+  ok(wbFlowSrc.includes('async function scanForLateReply')
+    && wbFlowSrc.includes('export function worldBotBlockedMs')
+    && wbFlowSrc.includes('function readBlockMs'),
+  'flood: deadline extension + aakhri dheemi scan (late reply milta hai)');
+  ok(wbFlowSrc.includes('graceMs: Number(cfg.lateReplyGraceMs) || 90_000'),
+    'flood: delete/login result par 90s ka late-reply grace');
+  ok(wb.worldBotConfig({}).lateReplyGraceMs === 90_000
+    && wb.worldBotConfig({ SWIGGY_WORLD_LATE_REPLY_GRACE_MS: '0' }).lateReplyGraceMs === 0
+    && wb.worldBotConfig({ SWIGGY_WORLD_LATE_REPLY_GRACE_MS: '999999' }).lateReplyGraceMs === 180_000,
+  'flood: lateReplyGraceMs config (default 90s, 0 = off, max 180s)');
+  ok(wb.worldBotBlockedMs() === 0 && typeof wb.worldBotReadInfo === 'function',
+    'flood: read info (flood time) expose hota hai');
+  ok(wbFlowSrc.includes("error?.code === 'worldbot-timeout'\n            ? 'login_result_timeout'")
+    || (wbFlowSrc.includes('login_result_timeout') && wbFlowSrc.includes('delete_result_timeout')),
+  'flood: timeout ka apna kind (login_result_timeout / delete_result_timeout)');
+  ok(pipelineT.includes('login_result_timeout') && pipelineT.includes('let first = await loginOnce();')
+    && pipelineT.includes('first = await loginOnce(true);'),
+  'flood: login ka jawab late → WAHI number dobara (naya number nahi)');
+  ok(pipelineT.includes('deleteStateUnknown') && pipelineT.includes("'delete_result_timeout',")
+    && pipelineT.includes('const probe = await loginOnce(true);'),
+  'flood: delete ka jawab late → wahi number se state check (skip nahi)');
+  ok(pipelineT.includes("if (probe.ok && probe.askedName)") && pipelineT.includes("return saveWorldSession(probe, 'after-delete', cfg);"),
+    'flood: naam poochha = delete ho chuka → seedha file/send/logout');
+  ok(pipelineT.includes("if (probe.ok && !probe.askedName)") && pipelineT.includes('del = await deleteOnce();'),
+    'flood: naam nahi poochha = account zinda → delete dobara (usi number par)');
+  ok(pipelineT.includes("code: 'WORLDBOT_LATE_REPLY'"),
+    'flood: probe bhi late → number ledger me skipped nahi (agle round wahi number)');
+  ok(wbFlowSrc.includes('let floodExtraMs = 0') && wbFlowSrc.includes('floodExtraMs = Math.min(60_000'),
+    'flood: "OTP Sent" ke 20s budget me flood ka waqt add hota hai');
+  const tgFloodSrc = await fsp.readFile(new URL('./telegram-otp-source.js', import.meta.url), 'utf8');
+  ok(tgFloodSrc.includes('let currentRefreshMs = refreshMs') && tgFloodSrc.includes('OTP refresh dheema')
+    && tgFloodSrc.includes('currentRefreshMs = Math.min(5_000'),
+  'flood: OTP bot refresh dheema hota hai jab Telegram throttle kare');
+  ok(wbFlowSrc.includes('const inbound = list.filter((m) => !m?.out);')
+    && wbFlowSrc.includes('return findRoleOnScreens(pool, role) || findRoleOnScreens(list.slice(0, 2), role);'),
+  'flood: apne bheje message (/start) ko "latest screen" nahi maanta (blank screen fix)');
+
+  // 🧪 ASLI behaviour — fake Telegram client se flood wait ka test:
+  //   • pehla read 900ms "flood" (GetHistory ne sula diya) → deadline badhni
+  //     chahiye, warna bot ka jawab aane se pehle step fail ho jata hai
+  //   • jawab budget ke baad aaya → aakhri dheemi scan use pakad le
+  wb._resetWorldBotReadCacheForTests();
+  const fakeMsg = (id, text, out = false) => ({ id, text, out, buttons: [] });
+  let floodReads = 0;
+  const floodClient = {
+    async getMessages() {
+      floodReads += 1;
+      if (floodReads === 1) {
+        await new Promise((r) => setTimeout(r, 900));   // flood wait
+        return [fakeMsg(1, 'Purana screen')];
+      }
+      return [fakeMsg(1, 'Purana screen')];
+    },
+  };
+  const t0 = Date.now();
+  await wb._readWorldMessagesForTests(floodClient, { id: 'x' }, 6);
+  const slowMs = Date.now() - t0;
+  ok(slowMs >= 800 && wb.worldBotBlockedMs() >= 300,
+    `flood: slow read detect (${slowMs}ms) → blocked ${wb.worldBotBlockedMs()}ms`);
+  const info = wb.worldBotReadInfo();
+  ok(info.ttlMs >= 600, `flood: agla read ${info.ttlMs}ms cache se (GetHistory kam)`);
+  // Single-flight: 3 parallel readers → sirf ek GetHistory
+  wb._resetWorldBotReadCacheForTests();
+  let calls = 0;
+  const slowClient = {
+    async getMessages() {
+      calls += 1;
+      await new Promise((r) => setTimeout(r, 120));
+      return [fakeMsg(2, 'sirf ek read')];
+    },
+  };
+  await Promise.all([
+    wb._readWorldMessagesForTests(slowClient, { id: 'x' }, 6),
+    wb._readWorldMessagesForTests(slowClient, { id: 'x' }, 6),
+    wb._readWorldMessagesForTests(slowClient, { id: 'x' }, 6),
+  ]);
+  ok(calls === 1, `flood: 3 parallel readers = ${calls} GetHistory (single-flight)`);
+
+  // Jawab budget ke baad aaya (flood ke baad) — late scan pakadta hai.
+  wb._resetWorldBotReadCacheForTests();
+  const startedLate = Date.now();
+  const lateClient = {
+    async getMessages() {
+      const t = Date.now() - startedLate;
+      if (t > 700) {
+        return [
+          { id: 99, text: 'Account Deleted Successfully', out: false, buttons: [[{ text: '🏠 Main Menu' }]] },
+          ...(t > 700 ? [] : []),
+        ];
+      }
+      return [fakeMsg(3, 'kuch nahi')];
+    },
+  };
+  const hit = await wb._waitForReplyForTests({
+    client: lateClient,
+    entity: { id: 'x' },
+    baseline: null,
+    timeoutMs: 400,
+    graceMs: 4_000,
+    pollMs: 150,
+    what: 'late reply test',
+    predicate: (freshList) => {
+      for (const m of freshList) {
+        if (/deleted successfully/i.test(String(m.text || ''))) return { kind: 'deleted', late: true };
+      }
+      return null;
+    },
+  }).catch((e) => ({ error: String(e?.message || e) }));
+  ok(hit?.kind === 'deleted' && hit.late === true,
+    `flood: budget ke baad aaya jawab bhi mila (late scan) — ${JSON.stringify(hit).slice(0, 80)}`);
+
+  // Deadline extension: read 900ms + budget 400ms → bhi jawab milta hai.
+  wb._resetWorldBotReadCacheForTests();
+  const extStart = Date.now();
+  let extCalls = 0;
+  const extClient = {
+    async getMessages() {
+      extCalls += 1;
+      if (extCalls === 1) await new Promise((r) => setTimeout(r, 950)); // flood
+      const late = Date.now() - extStart > 950;
+      return late
+        ? [{ id: 50, text: 'Login JSON', out: false, buttons: [] }]
+        : [fakeMsg(4, 'purana')];
+    },
+  };
+  const extHit = await wb._waitForReplyForTests({
+    client: extClient,
+    entity: { id: 'x' },
+    baseline: null,
+    timeoutMs: 500,
+    graceMs: 0,
+    pollMs: 150,
+    what: 'deadline extension test',
+    predicate: (freshList) => (freshList.some((m) => /login json/i.test(String(m.text || ''))) ? { ok: true } : null),
+  }).catch((e) => ({ error: String(e?.message || e) }));
+  ok(extHit?.ok === true, 'flood: deadline extension — flood ke baad ka jawab budget ke andar mila');
 
   // 🎯 "OTP aaya hi nahi" ki asli wajah — window 12 se bahar, jaldi aaya code
   // "purana" gina jata tha, aur "123 456" jaisa code parse hi nahi hota tha.

@@ -1132,7 +1132,7 @@ export async function processSingleNumberViaWorldBot({
     if (aborted()) return abortResult('before-login');
 
     // ---- Step 1: World bot se login (bot khud OTP bhejta hai) ----
-    const first = await worldBotLogin({
+    const loginOnce = (fresh = false) => worldBotLogin({
       phone,
       otpProvider: makeOtpProvider(),
       otpWatermark: makeOtpWatermark(),
@@ -1141,7 +1141,20 @@ export async function processSingleNumberViaWorldBot({
       report: say,
       shouldAbort,
       config: cfg,
+      fresh,
     });
+    let first = await loginOnce();
+    // ⏱ OTP accept ho gaya par bot ka JSON/naam ka jawab Telegram flood wait me
+    // late aaya — ye number ka fail NAHI hai. Wahi number par ek aur try
+    // (Main Menu → Login → OTP Login → wahi number), naya number/card nahi.
+    if (!first.ok && first.kind === 'login_result_timeout') {
+      await say(section('⏳ Login Ka Jawab Late — Wahi Number Dobara', [
+        `📱 <code>${esc(phone)}</code> · @${esc(botUsername)}`,
+        '→ Bot ka jawab Telegram flood wait me late aaya (OTP accept ho gaya tha) — number skip nahi kar raha.',
+        '→ Ab wahi number dobara: Main Menu → Login → OTP Login → number → OTP.',
+      ].join('\n')));
+      first = await loginOnce(true);
+    }
     if (!first.ok) return mapLoginFailure(first, 'worldbot_login');
     if (aborted()) return abortResult('after-login');
 
@@ -1161,7 +1174,7 @@ export async function processSingleNumberViaWorldBot({
     ].join('\n')));
     if (aborted()) return abortResult('before-delete');
 
-    const del = await worldBotDeleteAccount({
+    const deleteOnce = () => worldBotDeleteAccount({
       phone,
       otpProvider: makeOtpProvider(),
       otpWatermark: makeOtpWatermark(),
@@ -1169,6 +1182,54 @@ export async function processSingleNumberViaWorldBot({
       shouldAbort,
       config: cfg,
     });
+    let del = await deleteOnce();
+
+    // ⏱ Delete ka jawab 45s+90s ke andar nahi aaya (Telegram flood wait ne
+    // read sula diye). Ye "delete blocked" NAHI hai — number skip karna
+    // galat hoga (owner: "jis number ko delete kiya usko login karna hai").
+    // Wahi number se state check:
+    //   • naam poochha  = account delete ho chuka → seedha file/send/logout
+    //   • naam nahi     = account zinda → delete dobara (usi number par)
+    const deleteStateUnknown = !del.ok && [
+      'delete_result_timeout',
+      'delete_account_not_listed',
+      'delete_button_missing',
+      'delete_failed',
+    ].includes(String(del.kind || ''));
+    if (deleteStateUnknown) {
+      await say(section('⏳ Delete Ka Jawab Late — Wahi Number Se Check', [
+        `📱 <code>${esc(phone)}</code> · @${esc(botUsername)}`,
+        '→ Delete ka jawab Telegram flood wait me chhup gaya — number skip nahi kar raha.',
+        '→ Ab Login → OTP Login → <b>wahi number</b>: naam poochha = delete ho chuka, nahi poochha = delete baaki.',
+      ].join('\n')));
+      const probe = await loginOnce(true);
+      if (aborted()) return abortResult('delete_timeout_probe');
+      if (probe.ok && probe.askedName) {
+        console.log('[WorldBot] 🕰 delete ka jawab late — account delete ho chuka (naam poochha)');
+        if (existingKey) {
+          try { deleteAccount(existingKey, { purgeVault: true }); } catch (e) { console.warn('[Pipeline] worldbot purge (late):', e?.message); }
+          syncCloudVaultNow(getDb()).catch(() => {});
+        }
+        return saveWorldSession(probe, 'after-delete', cfg);
+      }
+      if (probe.ok && !probe.askedName) {
+        console.log('[WorldBot] 🕰 account abhi zinda — delete dobara (usi number par)');
+        del = await deleteOnce();
+      } else if (!probe.ok) {
+        // Probe bhi late/fail — ab is number ko ledger me "skipped" mat likho
+        // (7-day cooldown bhi na lage), taaki agle round me wahi number aaye.
+        return {
+          ok: false,
+          kind: 'deferred_swiggy_transient',
+          phone,
+          code: 'WORLDBOT_LATE_REPLY',
+          reason: `${botUsername}: delete/probe ka jawab late — number skip nahi kiya (agle round me wahi number)`,
+          viaWorldBot: true,
+          switchBot: false,
+        };
+      }
+    }
+
     if (!del.ok) {
       if (del.kind === 'aborted') return abortResult('delete');
       // ⛔ "Account delete nahi ho sakta — user charges present": fresh account
@@ -1241,17 +1302,16 @@ export async function processSingleNumberViaWorldBot({
       autoName ? `📛 Naam: <code>${esc(autoName)}</code> (number ke pehle 5 digit → a–i, 0 → x)` : '',
       '→ JSON aa gaya to file banakar worker bot par bhej denge, phir logout.',
     ].filter(Boolean).join('\n')));
-    const again = await worldBotLogin({
-      phone,
-      otpProvider: makeOtpProvider(),
-      otpWatermark: makeOtpWatermark(),
-      // 🅰️ Owner ka naam rule: mobile ke pehle 5 digit → alphabetic (1→a … 9→i, 0→x).
-      nameProvider: async () => swiggyNameFromPhone(phone) || existingName || getNextAutoUserName(),
-      report: say,
-      shouldAbort,
-      config: cfg,
-      fresh: true,
-    });
+    // ⏱ Yahi rule fresh login par bhi: jawab late aaya to wahi number dobara
+    // (delete to ho chuka hai, sirf bot ka JSON late hai).
+    let again = await loginOnce(true);
+    if (!again.ok && again.kind === 'login_result_timeout') {
+      await say(section('⏳ Fresh Login Ka Jawab Late — Wahi Number Dobara', [
+        `📱 <code>${esc(phone)}</code> · @${esc(botUsername)}`,
+        '→ Account delete ho chuka hai; bot ka JSON late aaya — wahi number dobara.',
+      ].join('\n')));
+      again = await loginOnce(true);
+    }
     if (!again.ok) return mapLoginFailure(again, 'worldbot_fresh_login');
     if (!again.askedName) {
       if (markUsed) {

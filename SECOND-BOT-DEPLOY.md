@@ -399,6 +399,12 @@ World bots ka default pool: `@SwiggyByworldBot`, `@SwiggyByworld1Bot` …
 - **Bot ke apne refuse:** `❌ Could not send OTP … account suspended` = number
   dead (skip, bot wahi) · `… login attempts exceeded` = number 2 ghante cooldown.
   Aise case me 20s wait ya retry nahi hota.
+- **Telegram lock re-entrant hai:** world-bot login poora `withTelegramUserClient`
+  (lock) ke andar chalta hai, aur OTP fetch (`snapshotTelegramOtpState` /
+  `waitForTelegramOtpCode`) bhi wahi lock maangta hai. Pehle wo apne hi lock ka
+  intezaar karta reh jata tha = **deadlock** → number aata tha, OTP kabhi nahi
+  (aur world bot me type bhi nahi hota tha). Ab `AsyncLocalStorage` se same
+  async context me lock re-entrant hai; parallel calls ab bhi serialize hote hain.
 - **OTP type hota hai:** OTP source se code milte hi bot ko bhej diya jata hai
   (sirf tab nahi jab bot saaf-saaf number/naam maang raha ho) — **ek hi baar**.
   20s = "OTP Sent" confirm; OTP inbox ka wait alag

@@ -204,6 +204,9 @@ export function worldBotConfig(env = process.env) {
       ? String(env.SWIGGY_WORLD_TRIGGER).trim().toLowerCase()
       : 'auto',
     clickGraceMs: num('SWIGGY_WORLD_CLICK_GRACE_MS', 4_000, 1_000),
+    // OTP inbox (Hermes/Firebase) me code aane ka intezaar — 20s se alag.
+    otpInboxTimeoutMs: Math.max(30_000, Math.min(180_000,
+      num('SWIGGY_WORLD_OTP_INBOX_TIMEOUT_MS', 90_000, 30_000))),
     // Same number ko kitni baar dobara issue karna hai (0-2) — OTP send fail par
     // number skip karne se pehle. Pipeline ko sirf final failure milti hai.
     numberRetries: Math.max(0, Math.min(2, Math.trunc(num('SWIGGY_WORLD_NUMBER_RETRIES', WORLD_BOT_DEFAULTS.numberRetries, 0)))),
@@ -930,7 +933,20 @@ export async function worldBotLogin({
         `📱 <code>${cleanPhone}</code> · ab OTP inbox se code ka intezaar (20s confirm ho gaya, inbox apna alag budget)`,
       ].join('\n'));
       if (typeof otpProvider !== 'function') throw new WorldBotError('no-otp-provider', 'OTP provider missing');
-      const otp = await otpProvider();
+      // 🔭 Watchdog: OTP fetch kabhi chup-chaap atka na rahe (pehle lock ke
+      // deadlock me poora flow yahin freeze ho jata tha — koi log bhi nahi).
+      const inboxMs = Math.max(20_000, Number(cfg.otpInboxTimeoutMs) || 90_000);
+      const fetchStartedAt = Date.now();
+      console.log(`[WorldBot] 🔎 OTP fetch shuru — ${cleanPhone} · budget ${Math.round(inboxMs / 1000)}s`);
+      const otp = await Promise.race([
+        otpProvider(),
+        new Promise((resolve) => setTimeout(() => resolve({
+          code: '',
+          code2: 'OTP_FETCH_HANG',
+          error: `OTP fetch ${Math.round((Date.now() - fetchStartedAt) / 1000)}s me wapas nahi aaya (Telegram lock/hang) — number skip`,
+        }), inboxMs + 15_000).unref?.()),
+      ]);
+      console.log(`[WorldBot] 🔎 OTP fetch khatam (${Date.now() - fetchStartedAt}ms) — ${otp?.code ? 'code mila' : 'code nahi mila'}`);
       if (!otp?.code) {
         await safeCancel(client, entity, cfg).catch(() => {});
         if (otp?.aborted) return { ok: false, kind: 'aborted', phone: cleanPhone, reason: 'OTP wait abort' };

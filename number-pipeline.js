@@ -54,6 +54,10 @@ import {
   worldBotPermanentLogout,
   worldBotConfig,
   normalizeWorldPhone,
+  listWorldBotUsernames,
+  currentWorldBotUsername,
+  rotateWorldBot,
+  shouldSwitchWorldBot,
 } from './swiggy-world-bot.js';
 
 // ---------------------------------------------------------------------------
@@ -764,6 +768,8 @@ export async function processSingleNumberViaWorldBot({
   if (!phone) return { ok: false, kind: 'failed_bad_entry', phone: '', reason: 'Entry me phone nahi hai' };
 
   const deviceIds = entry?.deviceId ? [entry.deviceId] : null;
+  // Numbers Hermes/Hathi/Firebase — teeno se aa sakte hain. OTP bhi wahin se.
+  const telegramMode = isTelegramOtpEntry(entry, otpCfg);
   const say = async (text) => { if (report) { try { await report(text); } catch {} } };
   const skipRequested = () => {
     try { return Boolean(shouldSkip?.()); } catch { return false; }
@@ -797,10 +803,25 @@ export async function processSingleNumberViaWorldBot({
   const timeoutMs = Number(otpCfg.timeoutMs ?? 90_000);
   const pollMs = Number(otpCfg.pollMs ?? 1_500);
   const acceptAnyAfterMs = Number(otpCfg.acceptAnyAfterMs ?? 15_000);
+  const telegramTimeoutMs = Number(otpCfg.telegramOtpTimeoutMs ?? 20_000);
+  const telegramRefreshMs = Number(otpCfg.telegramOtpRefreshMs ?? 2_500);
 
   // Har OTP round ka apna baseline: purana SMS/OTP kabhi reuse na ho.
   const makeOtpProvider = () => async () => {
     if (aborted()) return { code: '', aborted: true };
+    if (telegramMode) {
+      let baseline = null;
+      try { baseline = await snapshotTelegramOtpState(phone); } catch {}
+      const res = await waitForTelegramOtpCode(phone, {
+        waitMs: 0,
+        timeoutMs: telegramTimeoutMs,
+        refreshMs: telegramRefreshMs,
+        acceptAnyAfterMs,
+        baseline,
+        shouldAbort,
+      });
+      return res || { code: '' };
+    }
     let seen = null;
     try { seen = await snapshotSeenOtpState(phone, { deviceIds }); } catch {}
     const res = await waitForOtpCode(phone, {
@@ -862,6 +883,7 @@ export async function processSingleNumberViaWorldBot({
         viaWorldBot: true,
       };
     }
+    const botTag = `@${res?.username || currentWorldBotUsername()}`;
     if (kind === 'failed_invalid_number') {
       return {
         ok: false, kind: 'failed_otp_send', phone, stage: 'worldbot_number',
@@ -873,33 +895,39 @@ export async function processSingleNumberViaWorldBot({
       return {
         ok: false, kind: 'failed_otp_miss', phone, stage: 'otp_wait',
         otpFailure: true, otpAttemptConsumed: true, otpAttempts: 1,
-        reason: res.reason || 'World Bot ka OTP inbox me nahi mila', viaWorldBot: true,
+        reason: res.reason || `${botTag} ka OTP inbox me nahi mila`, viaWorldBot: true, switchBot: true,
       };
     }
     if (kind === 'failed_otp_verify') {
       return {
         ok: false, kind: 'failed_otp_verify', phone, stage: 'otp_verify',
         otpFailure: true, otpAttemptConsumed: true, otpAttempts: 1,
-        reason: res.reason || 'World Bot ne OTP accept nahi kiya', viaWorldBot: true,
+        reason: res.reason || `${botTag} ne OTP accept nahi kiya`, viaWorldBot: true, switchBot: true,
       };
     }
-    // Chat/timeout/no-JSON = infra rukawat. Number one-shot khatam, engine
-    // recovery karega (never-stop ON me batch rukta nahi).
+    // Chat/timeout/no-JSON = bot ki taraf se error. Owner rule: isi par next
+    // world bot try hota hai (bina error ke switch allowed nahi).
     return {
       ok: false,
       kind: 'deferred_swiggy_transient',
       phone,
       code: res?.code || 'WORLDBOT',
-      reason: `WorldBot: ${res?.reason || 'flow fail'}`,
+      reason: `WorldBot ${botTag}: ${res?.reason || 'flow fail'}`,
       viaWorldBot: true,
+      switchBot: true,
     };
   };
 
-  try {
+  // Ek bot par poora flow (login → new/old → delete → fresh → logout).
+  const runFlowOnBot = async (botUsername) => {
+    const cfg = { ...worldCfg, username: botUsername };
+
     await say(section('🌍 World Bot — Login Shuru', [
       `📱 <b>Number:</b> <code>${esc(phone)}</code>`,
-      `🤖 Bot: <code>@${esc(worldCfg.username)}</code> · koi proxy/WAF nahi`,
-      '→ /start → Login → OTP Login → number → OTP (Firebase inbox se)',
+      `🤖 Bot: <code>@${esc(botUsername)}</code> · koi proxy/WAF nahi`,
+      telegramMode
+        ? '→ Number + OTP OTP-bot chat se · account Swiggy World Bot se banega'
+        : '→ /start → Login → OTP Login → number → OTP (Firebase inbox se)',
       existingKey ? sub('Is number ka purana saved account hai — bot naam na poochhe to delete flow chalega.') : '',
     ].filter(Boolean).join('\n')));
     if (aborted()) return abortResult('before-login');
@@ -911,7 +939,7 @@ export async function processSingleNumberViaWorldBot({
       nameProvider: async () => existingName || getNextAutoUserName(),
       report: say,
       shouldAbort,
-      config: worldCfg,
+      config: cfg,
     });
     if (!first.ok) return mapLoginFailure(first, 'worldbot_login');
     if (aborted()) return abortResult('after-login');
@@ -919,15 +947,14 @@ export async function processSingleNumberViaWorldBot({
     // 🆕 Naya account — naam poochha gaya → seedha save + JSON file
     if (first.askedName) {
       await say(section('🆕 World Bot — Naya Account (naam poochha)', [
-        `📱 <code>${esc(phone)}</code> · JSON aa gaya, save kar raha hoon…`,
+        `📱 <code>${esc(phone)}</code> · @${esc(botUsername)} · JSON aa gaya, save kar raha hoon…`,
       ].join('\n')));
-      const saved = await saveWorldSession(first, 'new');
-      return saved;
+      return saveWorldSession(first, 'new');
     }
 
     // ---- ♻️ Purana account — delete → phir fresh login ----
     await say(section('♻️ World Bot — Purana Account Mila', [
-      `📱 <code>${esc(phone)}</code>`,
+      `📱 <code>${esc(phone)}</code> · @${esc(botUsername)}`,
       '→ Bot ne naam <b>nahi</b> poochha = account purana hai.',
       '→ Order Hub → account → Delete Account → Delete OTP → phir fresh login.',
     ].join('\n')));
@@ -938,7 +965,7 @@ export async function processSingleNumberViaWorldBot({
       otpProvider: makeOtpProvider(),
       report: say,
       shouldAbort,
-      config: worldCfg,
+      config: cfg,
     });
     if (!del.ok) {
       if (del.kind === 'aborted') return abortResult('delete');
@@ -954,6 +981,7 @@ export async function processSingleNumberViaWorldBot({
           otpAttempts: 1,
           reason: del.reason || 'Delete OTP nahi mila / accept nahi hua',
           viaWorldBot: true,
+          switchBot: true,
         };
       }
       if (markUsed) {
@@ -966,6 +994,7 @@ export async function processSingleNumberViaWorldBot({
         phone,
         reason: del.reason || `World Bot delete fail (${del.kind})`,
         viaWorldBot: true,
+        switchBot: true,
       };
     }
 
@@ -978,7 +1007,7 @@ export async function processSingleNumberViaWorldBot({
 
     // ---- Fresh login (ab naam poochhna chahiye) ----
     await say(section('✅ World Bot — Delete Ho Gaya — Fresh Login', [
-      `📱 <code>${esc(phone)}</code>`,
+      `📱 <code>${esc(phone)}</code> · @${esc(botUsername)}`,
       '→ Ab dobara OTP Login — is baar naya account banega (naam poochhega).',
     ].join('\n')));
     const again = await worldBotLogin({
@@ -987,7 +1016,7 @@ export async function processSingleNumberViaWorldBot({
       nameProvider: async () => existingName || getNextAutoUserName(),
       report: say,
       shouldAbort,
-      config: worldCfg,
+      config: cfg,
       fresh: true,
     });
     if (!again.ok) return mapLoginFailure(again, 'worldbot_fresh_login');
@@ -1009,15 +1038,51 @@ export async function processSingleNumberViaWorldBot({
 
     // Owner ka aakhri step: Switch Accounts → account → Permanently Logged Out.
     // Best-effort — fail ho to fresh session par koi asar nahi.
-    if (saved.ok && worldCfg.logoutAfterDelete) {
+    if (saved.ok && cfg.logoutAfterDelete) {
       try {
-        const out = await worldBotPermanentLogout({ phone, shouldAbort, config: worldCfg });
+        const out = await worldBotPermanentLogout({ phone, shouldAbort, config: cfg });
         if (!out?.ok) console.warn(`[Pipeline] worldbot permanent logout skip: ${out?.reason || out?.kind}`);
       } catch (e) {
         console.warn('[Pipeline] worldbot permanent logout:', e?.message);
       }
     }
     return saved;
+  };
+
+  // 🔁 BOT FAILOVER — owner rule: ek hi bot par kaam; Swiggy/bot error aaye
+  // tab hi next bot. Har number par max `min(pool, 3)` bots try hote hain
+  // (poora pool ek number par jalana bekaar hai), phir wahi active bot
+  // agle number ke liye set ho jata hai.
+  const bots = listWorldBotUsernames();
+  const maxTries = Math.max(1, Math.min(bots.length, 3));
+  let lastResult = null;
+  try {
+    for (let round = 0; round < maxTries; round++) {
+      if (aborted()) return abortResult('before-worldbot');
+      const botUsername = currentWorldBotUsername();
+      const result = await runFlowOnBot(botUsername);
+      if (result?.ok) return result;
+      lastResult = result;
+
+      const canSwitch = shouldSwitchWorldBot(result) && round + 1 < maxTries;
+      if (!canSwitch) {
+        // Delete-stage fail par retry nahi, lekin agli baar ke liye active
+        // bot rotate kar do — tab tak ye bot kharab mana jayega.
+        if (shouldSwitchWorldBot(result)) {
+          rotateWorldBot(`${result.kind}: ${result.reason || ''}`.slice(0, 140));
+        }
+        return result;
+      }
+
+      const nextBot = rotateWorldBot(`${result.kind}: ${result.reason || ''}`.slice(0, 140));
+      await say(section('🔁 World Bot Switch', [
+        `› <code>@${esc(botUsername)}</code> par error aaya — usi par atke nahi rehna.`,
+        result.reason ? `<blockquote>${esc(String(result.reason).slice(0, 180))}</blockquote>` : '',
+        `› Ab <code>@${esc(nextBot)}</code> par try (${round + 2}/${maxTries}) — sab bots same hain.`,
+        sub('Bina error ke bot switch nahi hota; jo bot chal jaye wahi active rehta hai.'),
+      ].filter(Boolean).join('\n')));
+    }
+    return lastResult;
   } catch (err) {
     if (aborted()) return abortResult('exception');
     console.error('[Pipeline/WorldBot]', err?.stack || err?.message);
@@ -1028,6 +1093,7 @@ export async function processSingleNumberViaWorldBot({
       code: 'WORLDBOT_EXCEPTION',
       reason: `WorldBot: ${String(err?.message || err).slice(0, 180)}`,
       viaWorldBot: true,
+      switchBot: true,
     };
   }
 }

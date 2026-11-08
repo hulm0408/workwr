@@ -3396,6 +3396,113 @@ Thanks`)),
   ok(bs.getSetting('accountEngine') === 'direct',
     'worldbot: default engine direct (owner jab chahe World Bot chune)');
 
+  // -------------------------------------------------------------------------
+  // 🌍 MULTI-BOT POOL + START ke 3 source buttons
+  // Owner: "SAARE BOT SAME HAI" — error aaye tab hi next bot, bina error ke
+  // switch allowed nahi. START par 3 buttons: Hermeshu+SwiggyByWorld,
+  // Hathi wala bot, Swiggy by World.
+  // -------------------------------------------------------------------------
+  const pool = wb.listWorldBotUsernames({ SWIGGY_WORLD_BOT_USERNAMES: '' });
+  ok(pool.length === 6 && pool[0] === 'SwiggyByworldBot' && pool[5] === 'SwiggyByworld5Bot',
+    'worldbot pool: @SwiggyByworldBot + 5 (saare same)');
+  ok(wb.worldBotUsername({ SWIGGY_WORLD_BOT_USERNAMES: '' }) === 'SwiggyByworldBot',
+    'worldbot pool: pehla bot hi default active');
+  ok(wb.listWorldBotUsernames({ SWIGGY_WORLD_BOT_USERNAMES: 'A_bot, b_bot ,, C_bot' }).length === 3,
+    'worldbot pool: env CSV se custom pool (khali item skip)');
+  ok(wb.listWorldBotUsernames({
+    SWIGGY_WORLD_BOT_USERNAMES: '',
+    SWIGGY_WORLD_BOT_USERNAME: 'Z_bot',
+  })[0] === 'Z_bot',
+  'worldbot pool: single username (agar pool me nahi) sabse aage');
+  ok(wb.listWorldBotUsernames({
+    SWIGGY_WORLD_BOT_USERNAMES: 'A_bot,b_bot',
+    SWIGGY_WORLD_BOT_USERNAME: 'Z_bot',
+  }).join(',') === 'A_bot,b_bot',
+  'worldbot pool: CSV pool single username ko override karta hai');
+
+  wb.resetWorldBotPool();
+  ok(wb.currentWorldBotUsername({ SWIGGY_WORLD_BOT_USERNAMES: '' }) === 'SwiggyByworldBot',
+    'worldbot pool: active bot pehle se');
+  const rotated = wb.rotateWorldBot('test-error', { SWIGGY_WORLD_BOT_USERNAMES: '' });
+  ok(rotated === 'SwiggyByworld1Bot' && wb.worldBotPoolIndex() === 1,
+    'worldbot pool: error par next bot (1Bot)');
+  wb.rotateWorldBot('t', { SWIGGY_WORLD_BOT_USERNAMES: '' });
+  wb.rotateWorldBot('t', { SWIGGY_WORLD_BOT_USERNAMES: '' });
+  wb.rotateWorldBot('t', { SWIGGY_WORLD_BOT_USERNAMES: '' });
+  wb.rotateWorldBot('t', { SWIGGY_WORLD_BOT_USERNAMES: '' });
+  ok(wb.currentWorldBotUsername({ SWIGGY_WORLD_BOT_USERNAMES: '' }) === 'SwiggyByworld5Bot',
+    'worldbot pool: poole ke aakhir tak chalta hai');
+  ok(wb.rotateWorldBot('t', { SWIGGY_WORLD_BOT_USERNAMES: '' }) === 'SwiggyByworldBot',
+    'worldbot pool: aakhir ke baad wapas pehla bot (wrap-around)');
+  wb.resetWorldBotPool();
+
+  // Switch sirf ERROR par — bina error ke nahi.
+  ok(wb.shouldSwitchWorldBot({ ok: false, kind: 'failed_otp_send' }) === true,
+    'worldbot switch: OTP send fail = next bot');
+  ok(wb.shouldSwitchWorldBot({ ok: false, kind: 'failed_world_bot' }) === true,
+    'worldbot switch: bot flow fail = next bot');
+  ok(wb.shouldSwitchWorldBot({ ok: false, kind: 'delete_failed' }) === true,
+    'worldbot switch: delete fail = next bot');
+  ok(wb.shouldSwitchWorldBot({ ok: false, kind: 'aborted' }) === false,
+    'worldbot switch: manual STOP/abort par bot switch NAHI');
+  ok(wb.shouldSwitchWorldBot({ ok: false, kind: 'manual_skip' }) === false,
+    'worldbot switch: SKIP par bot switch nahi');
+  ok(wb.shouldSwitchWorldBot({ ok: true, kind: 'fresh_new' }) === false,
+    'worldbot switch: success par bot switch nahi (wahi bot sticky)');
+  ok(wb.shouldSwitchWorldBot({ ok: false, kind: 'failed_invalid_number' }) === false,
+    'worldbot switch: invalid number bot ki galti nahi — bot switch nahi');
+  ok(wb.shouldSwitchWorldBot({ ok: false, kind: 'worldbot_setup' }) === false,
+    'worldbot switch: Telegram session setup pending par bot switch nahi');
+  ok(wb.shouldSwitchWorldBot({ ok: false, kind: 'something_else', switchBot: true }) === true,
+    'worldbot switch: switchBot flag se explicit switch');
+
+  // Delete fail par bhi retry nahi — bas active bot rotate ho jata hai.
+  ok(pipelineSrc.includes('const maxTries = Math.max(1, Math.min(bots.length, 3))'),
+    'worldbot failover: ek number par max 3 bots (poora pool nahi jalta)');
+  ok(pipelineSrc.includes('if (result?.ok) return result;')
+    && pipelineSrc.includes('const nextBot = rotateWorldBot('),
+  'worldbot failover: success par wahi bot, error par next bot');
+  ok(pipelineSrc.includes('World Bot Switch'),
+    'worldbot failover: UI par switch ka saaf message');
+  ok(pipelineSrc.includes('waitForTelegramOtpCode(phone, {'),
+    'worldbot failover: Hermes/Hathi number par OTP wahin se aata hai');
+  ok(pipelineSrc.includes("telegramMode\n        ? '→ Number + OTP OTP-bot chat se"),
+    'worldbot failover: login card source ke hisaab se');
+
+  // --- START ke 3 source buttons ---
+  const presets = await import('./start-source-presets.js');
+  ok(presets.START_SOURCE_PRESET_IDS.join('|') === 'hermes_world|hathi|world',
+    'START: teen hi source presets');
+  ok(presets.getStartSourcePreset('hermes_world')?.accountEngine === 'worldbot',
+    'START: HERMESHU + SWIGGYBYWORLD = world bot engine');
+  ok(presets.getStartSourcePreset('hermes_world')?.otpBotProfile === 'hermes',
+    'START: HERMESHU + SWIGGYBYWORLD me Hermes numbers/OTP');
+  ok(presets.getStartSourcePreset('hathi')?.accountEngine === 'direct'
+    && presets.getStartSourcePreset('hathi')?.otpBotProfile === 'hathi',
+  'START: HATHI WALA BOT = hathi OTP + seedha Swiggy engine');
+  ok(presets.getStartSourcePreset('world')?.sourceMode === 'firebase'
+    && presets.getStartSourcePreset('world')?.accountEngine === 'worldbot',
+  'START: SWIGGY BY WORLD = Firebase numbers + world bot');
+  ok(presets.startSourcePresetSettings(presets.getStartSourcePreset('world')).telegramOtpMode === false,
+    'START: SWIGGY BY WORLD par Firebase mode on');
+  ok(presets.startSourcePresetSettings(presets.getStartSourcePreset('hermes_world')).telegramOtpMode === true,
+    'START: combined preset par telegram mode on');
+  ok(autoResumeSrc.includes('presetRow(\'hermes_world\')')
+    && autoResumeSrc.includes('presetRow(\'hathi\')')
+    && autoResumeSrc.includes('presetRow(\'world\')'),
+  'START: teen buttons picker par maujood');
+  ok(autoResumeSrc.includes('HERMESHU + SWIGGYBYWORLD')
+    || (await fsp.readFile(new URL('./start-source-presets.js', import.meta.url), 'utf8')).includes('HERMESHU + SWIGGYBYWORLD'),
+  'START: combined button ka naam owner wala');
+  ok(autoResumeSrc.includes('startSourcePresetSettings(preset)'),
+    'START: preset dabate hi settings lock (engine + OTP bot)');
+  ok(autoResumeSrc.includes("accountEngine: bs.getSetting('accountEngine') === 'worldbot' ? 'worldbot' : 'direct'"),
+    'START: engine choice batch ke saath lock hota hai');
+
+  // World bot mode me Hermes source allowed hai (combined preset).
+  ok(src.includes("resolvedSourceMode === 'telegram' ? 'telegram' : 'firebase'"),
+    'worldbot: combined preset me Hermes number-source allowed');
+
   // --- messaging imaandaar ---
   const card = engine.formatCompactAutopilotCard({
     sourceMode: 'firebase', running: true, target: 100, fresh: 2, processed: 3,

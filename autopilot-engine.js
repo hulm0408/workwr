@@ -958,6 +958,10 @@ function compactStepInfo(snap = {}, stageText = '') {
 
 function compactSourceLine(snap = {}) {
   if (snap.accountEngine === 'worldbot' || snap.worldBotMode) {
+    if (snap.sourceMode === 'telegram') {
+      const botLabel = String(snap.otpBotLabel || getOtpBotProfile(snap.otpBotProfile || '').label || 'Hermes').toUpperCase();
+      return `🌍 ${mono('WORLD BOT')} · 📨 ${mono(botLabel)}`;
+    }
     const source = truncateUiText(snap.poolSourceHost || snap.poolSourceName || 'Firebase', 24);
     return `🌍 ${mono('WORLD BOT')} · 🔥 ${mono(source)} · ${mono(`${Number(snap.poolFresh) || 0} fresh`)}`;
   }
@@ -1205,12 +1209,16 @@ export async function startAutopilot(opts = {}) {
     ...opts,
     telegramSetting,
   });
-  // 🌍 World Bot mode me number + OTP dono Firebase pool se hote hain (world
-  // bot sirf Swiggy side karta hai). Hermes number-source wahan kaam hi nahi
-  // karta — isliye source khud Firebase par lock ho jata hai.
-  const sourceMode = worldBotMode ? 'firebase' : resolvedSourceMode;
-  if (worldBotMode && resolvedSourceMode !== 'firebase') {
-    console.log('[Autopilot] 🌍 World Bot mode — number source Firebase par lock (Hermes claim off).');
+  // 🌍 World Bot mode me Swiggy ka kaam bot karta hai; number + OTP do jagah
+  // se aa sakte hain:
+  //   • Firebase pool (default) — START ka "🌍 SWIGGY BY WORLD"
+  //   • Hermes/Hathi OTP bot  — START ka "🤝 HERMESHU + SWIGGYBYWORLD"
+  // Baaki koi source ho to Firebase par lock kar do.
+  const sourceMode = worldBotMode
+    ? (resolvedSourceMode === 'telegram' ? 'telegram' : 'firebase')
+    : resolvedSourceMode;
+  if (worldBotMode) {
+    console.log(`[Autopilot] 🌍 World Bot mode — number source ${sourceMode === 'telegram' ? 'Telegram OTP bot' : 'Firebase pool'} (proxy/WAF OFF).`);
   }
   // Kaunsa OTP bot: START par owner ka selection > bot setting > Hermes.
   // Config isi active profile se banega, isliye setActiveOtpBotProfile()

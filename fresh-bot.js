@@ -61,6 +61,7 @@ const { isFirebaseConfigured, firebaseSetupHintLines, listPoolNumbers, _countDev
 const telegramOtp = await import('./telegram-otp-source.js');
 const sources = await import('./firebase-sources.js');
 const otpBotProfiles = await import('./otp-bot-profiles.js');
+const startPresets = await import('./start-source-presets.js');
 const bs = await import('./bot-settings.js');
 const proxyPool = await import('./proxy-pool.js');
 const {
@@ -812,12 +813,48 @@ async function sendSessionFile(chatId, { jsonText = '', filename = 'session.json
 // Firebase. Isi screen par "Delete All Firebase" bhi hai taaki purani 400+
 // list ek tap me saaf ho jaye.
 // ---------------------------------------------------------------------------
+// Owner ka rule: START par sirf TEEN source buttons —
+//   1) HERMESHU + SWIGGYBYWORLD (combined)  2) HATHI WALA BOT  3) SWIGGY BY WORLD
+// Advanced (Firebase only / HardXotp) alag screen par, taaki main screen saaf
+// rahe aur galti se galat source na chale.
+function activeStartPresetId() {
+  const engine = bs.getSetting('accountEngine') === 'worldbot' ? 'worldbot' : 'direct';
+  const tgMode = telegramSettingEnabled();
+  const profile = otpBotProfiles.normalizeOtpBotProfileId(bs.getSetting('otpBotProfile'));
+  if (engine === 'worldbot') return tgMode ? 'hermes_world' : 'world';
+  return tgMode && profile === 'hathi' ? 'hathi' : '';
+}
+
 function otpBotChoiceRows() {
+  const status = telegramProviderStatus();
+  const tick = status.configured ? '✅' : '⚙️';
+  const active = activeStartPresetId();
+  const presetRow = (id, style = 'success') => {
+    const preset = startPresets.getStartSourcePreset(id);
+    if (!preset) return null;
+    const needsTg = preset.sourceMode === 'telegram';
+    return [{
+      text: `${needsTg ? tick : '🔥'} ${preset.label}${active === id ? ' ✓' : ''}`,
+      callback_data: `ap_start_go_${id}`,
+      style: preset.accountEngine === 'worldbot' ? 'primary' : style,
+    }];
+  };
+  return [
+    presetRow('hermes_world'),
+    presetRow('hathi'),
+    presetRow('world'),
+    [{ text: '⚙️ Advanced (Firebase only / HardXotp)', callback_data: 'ap_start_adv' }],
+    [{ text: '🗑 Delete All Firebase', callback_data: 'ap_src_delete_all', style: 'danger' }],
+    [{ text: '↩️ Back', callback_data: 'ap_home' }],
+  ].filter(Boolean);
+}
+
+// Advanced screen — pehle wala poora picker (per-bot + Firebase only).
+function advancedSourceRows() {
   const status = telegramProviderStatus();
   const fbCount = (() => { try { return sources.listSources().length; } catch { return 0; } })();
   const ready = status.configured ? '✅' : '⚙️';
   const activeProfile = bs.getSetting('otpBotProfile');
-  // Rows profile list se banti hain — naya bot add karte hi yahan khud aata hai.
   const botRows = otpBotProfiles.listOtpBotProfiles().map((profile) => [{
     text: `${ready} ${profile.emoji || '📨'} ${profile.label} bot${activeProfile === profile.id ? ' ✓' : ''}`,
     callback_data: `ap_start_go_${profile.id}`,
@@ -826,32 +863,25 @@ function otpBotChoiceRows() {
   return [
     ...botRows,
     [{ text: `🔥 Firebase (${fbCount})`, callback_data: 'ap_start_go_firebase', style: 'primary' }],
-    [{ text: '🗑 Delete All Firebase', callback_data: 'ap_src_delete_all', style: 'danger' }],
-    [{ text: '↩️ Back', callback_data: 'ap_home' }],
+    [{ text: '↩️ Back', callback_data: 'ap_start' }],
   ];
 }
 
 function startSourceCard() {
   const status = telegramProviderStatus();
   const fbCount = (() => { try { return sources.listSources().length; } catch { return 0; } })();
-  const botLines = otpBotProfiles.listOtpBotProfiles().flatMap((profile) => ([
-    `${status.configured ? '✅' : '⚙️'} <b>${profile.emoji || '📨'} ${esc(profile.label)} bot</b> — <code>@${esc(profile.username)}</code>`,
-    sub(profile.hint),
+  const active = activeStartPresetId();
+  const presetLines = startPresets.listStartSourcePresets().flatMap((preset) => [
+    `${active === preset.id ? '👉' : '•'} <b>${preset.label}</b>${active === preset.id ? ' ✓' : ''}`,
+    ...preset.lines.map((line) => sub(line)),
     '',
-  ]));
-  const engine = bs.getSetting('accountEngine') === 'worldbot' ? 'worldbot' : 'direct';
+  ]);
   return section('🚀 Batch Kahan Se Chalega?', [
-    ...(engine === 'worldbot' ? [
-      `🌍 <b>World Bot mode ON</b> — <code>@${esc(worldBot.worldBotUsername())}</code> ke buttons click honge (proxy/WAF OFF).`,
-      sub('Numbers + OTP Firebase pool se; Swiggy login/delete kaam world bot karega.'),
-      '',
-    ] : []),
-    ...botLines,
-    `${fbCount ? '✅' : '⚙️'} <b>🔥 Firebase</b> — ${fbCount} ACTIVE source`,
-    sub('Pool/device scan + SMS inbox'),
+    ...presetLines,
+    `${status.configured ? '✅' : '⚙️'} Telegram: ${status.configured ? 'spare account ready' : 'account add karo'} · 🔥 Firebase: ${fbCount} source`,
     '',
     `⏱ OTP wait ${bs.fmtSetting('telegramOtpTimeoutMs')} · OTP na aaye to number skip`,
-    sub('Jo yahan chunoge wahi is batch ka source lock hoga. Telegram bots ke liye wahi spare account use hota hai.'),
+    sub('Jo yahan chunoge wahi is batch ka source lock hoga. World Bot ke saare bots same hain — error aaye tab hi next bot.'),
   ].join('\n'));
 }
 
@@ -879,7 +909,23 @@ async function launchBatch(ctx, opts = {}) {
 
   // START picker se aaya source: settings yahin lock karo taaki engine,
   // pipeline aur UI — teeno ek hi source par rahein.
-  const chosen = String(opts.source || '').trim().toLowerCase();
+  const rawChoice = String(opts.source || '').trim().toLowerCase();
+  // 🚀 Teen main buttons (Hermes+World / Hathi / Swiggy by World) preset hain:
+  // ek tap me number-source + account-engine dono set ho jate hain.
+  const preset = startPresets.getStartSourcePreset(rawChoice);
+  if (preset) {
+    const patch = startPresets.startSourcePresetSettings(preset) || {};
+    for (const [key, value] of Object.entries(patch)) {
+      try { bs.setSetting(key, value); } catch {}
+    }
+    if (patch.otpBotProfile) {
+      try { telegramOtp.setActiveOtpBotProfile(patch.otpBotProfile); } catch {}
+    }
+    console.log(`[FreshBot] 🚀 START preset: ${startPresets.startSourcePresetLine(preset)}`);
+  }
+  const chosen = preset
+    ? (preset.sourceMode === 'telegram' ? preset.otpBotProfile : 'firebase')
+    : rawChoice;
   if (otpBotProfiles.isOtpBotProfileId(chosen)) {
     try { bs.setSetting('otpBotProfile', chosen); } catch {}
     try { bs.setSetting('telegramOtpMode', true); } catch {}
@@ -933,7 +979,7 @@ async function launchBatch(ctx, opts = {}) {
       ).catch(() => {});
       return;
     }
-  } else if (!isFirebaseConfigured()) {
+  } else if (!isTelegramNumberSource() && !isFirebaseConfigured()) {
     await ctx.answerCbQuery('⚙️ Firebase config pending!', { show_alert: true }).catch(() => {});
     await ctx.reply(section('⚙️ Firebase Setup Pending', firebaseSetupHintLines().join('\n')),
       kb([[{ text: '🏠 Menu', callback_data: 'ap_home', style: 'primary' }]])).catch(() => {});
@@ -975,9 +1021,11 @@ async function launchBatch(ctx, opts = {}) {
 
   // START picker ne jo chuna woh env NUMBER_SOURCE ko bhi override karta hai
   // (user ka explicit choice). Khali ho to purana resolve logic chalta hai.
-  const explicitMode = otpBotProfiles.isOtpBotProfileId(chosen)
-    ? 'telegram'
-    : (chosen === 'firebase' ? 'firebase' : '');
+  const explicitMode = preset
+    ? preset.sourceMode
+    : (otpBotProfiles.isOtpBotProfileId(chosen)
+      ? 'telegram'
+      : (chosen === 'firebase' ? 'firebase' : ''));
   const lockedSourceMode = explicitMode || resolvedNumberSourceMode();
   const lockedOtpBot = lockedSourceMode === 'telegram'
     ? otpBotProfiles.normalizeOtpBotProfileId(chosen || bs.getSetting('otpBotProfile'))
@@ -991,6 +1039,8 @@ async function launchBatch(ctx, opts = {}) {
     numberSource: lockedSourceMode,
     source: lockedSourceMode,
     otpBot: lockedOtpBot,
+    // Engine choice isi batch ke liye lock — preset/Settings jo kehta hai wahi.
+    accountEngine: bs.getSetting('accountEngine') === 'worldbot' ? 'worldbot' : 'direct',
     ui,
   }).catch((e) => console.error('[FreshBot] autopilot:', e?.stack || e?.message));
 }
@@ -1299,8 +1349,26 @@ bot.command('session', async (ctx) => {
 bot.action('ap_start', showStartSourcePicker);
 // Engine ke rows premium callback names bhi bhejta hai — same kaam, same handler
 bot.action('prem_batch_start', showStartSourcePicker);
-bot.action(new RegExp(`^ap_start_go_(${otpBotProfiles.OTP_BOT_PROFILE_IDS.join('|')}|firebase)$`), async (ctx) => {
+bot.action(new RegExp(`^ap_start_go_(${[...startPresets.START_SOURCE_PRESET_IDS, ...otpBotProfiles.OTP_BOT_PROFILE_IDS, 'firebase'].join('|')})$`), async (ctx) => {
   await launchBatch(ctx, { source: ctx.match[1] });
+});
+
+// ⚙️ Advanced source list (Firebase only / HardXotp / delete all)
+bot.action('ap_start_adv', async (ctx) => {
+  if (!(await gate(ctx))) return;
+  if (isAutopilotRunning()) {
+    await ctx.answerCbQuery('Pehle se chal raha hai!', { show_alert: true }).catch(() => {});
+    return;
+  }
+  await ctx.answerCbQuery().catch(() => {});
+  const text = section('⚙️ Advanced Source', [
+    'Yahan se purane source bhi chun sakte ho.',
+    '',
+    sub('Normal use ke liye ↩️ Back karke teen main buttons hi kaafi hain.'),
+  ].join('\n'));
+  const rows = advancedSourceRows();
+  await ctx.editMessageText(text, kb(rows))
+    .catch(async () => { await ctx.reply(text, kb(rows)).catch(() => {}); });
 });
 
 // 🗑 Delete All Firebase — pehle confirm, phir poori list saaf + delete-memory

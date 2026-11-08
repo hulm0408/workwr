@@ -82,9 +82,10 @@ wo chaaho to bolo, plan bana dunga, par wo rewrite hai.
   account se) → output `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`,
   `TELEGRAM_SESSION` → Render env me daalo. Free web service ki disk
   restart par mit sakti hai, isliye env route zyada tikau hai.
-- Doosre spare account ke bina: `/start` → **🔥 Firebase (N)** chuno →
-  Telegram mode off, Firebase OTP. Bot chalega, par Telegram-only flow
-  tabhi milega jab account ho.
+- Doosre spare account ke bina: `/start` → **🌍 SWIGGY BY WORLD** (ya
+  Advanced → **🔥 Firebase (N)**) chuno → Telegram mode off, Firebase OTP.
+  World Bot ke buttons click karne ke liye spare Telegram account phir bhi
+  chahiye hota hai; Telegram-only flow tabhi milega jab account ho.
 
 ### D. Neend na aaye (free web service)
 `RENDER_EXTERNAL_URL` Render khud deta hai → bot khud `.../health` ko har
@@ -342,7 +343,7 @@ Do account engines hain (Settings → 🌍 Account engine, ya
 |---|---|---|
 | Swiggy call | is bot ka bridge | `@SwiggyByWorldBot` |
 | Proxy / WAF solver | zaroori | **bilkul nahi** |
-| Number + OTP source | Firebase pool / Hermes | Firebase pool |
+| Number + OTP source | Firebase pool / Hermes / Hathi | Firebase pool **ya** Hermes/Hathi |
 | Session delivery | `.json` file chat me | `.json` file chat me |
 
 World Bot flow (jaise owner ke screenshots me hai):
@@ -360,6 +361,30 @@ World Bot flow (jaise owner ke screenshots me hai):
    (ab naam poochhega) → fresh JSON.
 5. Uske baad best-effort `Switch Accounts → account → Permanently Logged Out`
    (`SWIGGY_WORLD_LOGOUT_AFTER_DELETE=0` se band).
+
+#### 🚀 START ke teen source buttons
+
+| Button | Number + OTP | Swiggy account kaam |
+|---|---|---|
+| 🤝 HERMESHU + SWIGGYBYWORLD | `@HermeshuOTPROBOT` card | `@SwiggyByworldBot` |
+| 🐘 HATHI WALA BOT | `@Hathi_otp_bot` card | seedha Swiggy engine (bridge) |
+| 🌍 SWIGGY BY WORLD | Firebase pool (device scan + SMS) | `@SwiggyByworldBot` |
+
+`⚙️ Advanced` me purane sab option (Firebase only, HardXotp) aur
+**🗑 Delete All Firebase** milta hai.
+
+#### 🔁 Bot pool + failover (saare bot same)
+
+World bots ka default pool: `@SwiggyByworldBot`, `@SwiggyByworld1Bot` …
+`@SwiggyByworld5Bot` — **saare bilkul same** kaam karte hain. Rules:
+
+- Ek number par **pehla bot hi** chalta hai; jo bot chal jaye wahi **sticky**
+  rehta hai (bina wajah switch nahi).
+- OTP send fail / OTP na aaye / OTP galat / bot flow fail / delete fail →
+  **agla bot** (wrap-around), ek number par max **3 bots** try hote hain.
+- `⏹ STOP`, `SKIP`, invalid-number aur Telegram-setup pending par **switch
+  nahi** hota (ye bot ki galti nahi hai).
+- Pool badalna ho to env: `SWIGGY_WORLD_BOT_USERNAMES=A_bot,B_bot` (CSV).
 
 Ek hi Telegram chat = **1 lane** (engine khud force karta hai), isliye World Bot
 mode slow par predictable hai. Kuch atke to **Settings → 🔎 World Bot screen

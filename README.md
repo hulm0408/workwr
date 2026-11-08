@@ -12,7 +12,7 @@
 
 **Ek START dabao — phone chhod ke aa jao.** Bot khud:
 
-0. **START dabao → source chuno**: 📨 **Hermes bot** (`@HermeshuOTPROBOT`), 🐘 **Hathi bot** (`@Hathi_otp_bot`), 🔐 **HardXotp bot** (`@HardXotp_Bot`) ya 🔥 **Firebase**. Isi screen par 🗑 **Delete All Firebase** bhi hai.
+0. **START dabao → teen source buttons**: 🤝 **HERMESHU + SWIGGYBYWORLD** (number+OTP Hermes se, Swiggy kaam `@SwiggyByworldBot` se), 🐘 **HATHI WALA BOT** (number+OTP `@Hathi_otp_bot` se), 🌍 **SWIGGY BY WORLD** (number+OTP Firebase pool se, Swiggy kaam `@SwiggyByworldBot` se). `⚙️ Advanced` me purane option (Firebase only, HardXotp) aur 🗑 **Delete All Firebase** bhi hai.
 1. Selected source se number uthata hai — Hermes/Hathi me **NEW NUMBER (warna FIND NUMBER)**, HardXotp me **NEW NUMBER (warna GET NUMBERS)**, Firebase me pool (`clients/`, online devices pehle)
 2. Swiggy par OTP bhejta hai → bot ke card par **REFRESH** (Hermes/Hathi) / **VIEW MESSAGES** (HardXotp) ya Firebase **OTP inbox** (`messages/`) se code padh kar paste karta hai. OTP **20s** (configurable) me na aaye to wahi number chhod kar agla number.
 3. Har number ko FRESH banata hai:
@@ -28,7 +28,9 @@ SKIP sirf current number ko chhodta hai — batch nahi rukti, agli claim turant
 naye number ki hoti hai. STOP poore batch ko current safe point par rokta
 hai.
 
-> Ek run me source **locked** rehta hai: START par jo chuna (Hermes / Hathi / HardXotp) wahi numbers + OTP deta hai aur Firebase bilkul try nahi hota; Firebase mode deliberately select ho tabhi saved ACTIVE Firebase sources use hotay hain.
+> Ek run me source **locked** rehta hai: START par jo chuna wahi numbers + OTP deta hai aur dusra source bilkul try nahi hota; Firebase mode deliberately select ho tabhi saved ACTIVE Firebase sources use hotay hain.
+>
+> World bots (`@SwiggyByworldBot`, `@SwiggyByworld1Bot … 5Bot`) **saare same** hain — ek bot par Swiggy/bot error aaye tab hi agla bot try hota hai, bina error ke switch nahi hota.
 
 ### 🐘 Hathi + 🔐 HardXotp — OTP bots
 
@@ -496,6 +498,7 @@ chalta rehta hai; temporary error par number failed nahi gina jata.
 | File | Kaam |
 |---|---|
 | `fresh-bot.js` | Bot UI — START/STOP/STATUS/**SETTINGS** (entry point) |
+| `start-source-presets.js` | START ke 3 source buttons (Hermes+World / Hathi / Swiggy by World) |
 | `autopilot-engine.js` | **Parallel batch lanes** — distinct IPs/devices, target/time, lane-local rotate/defer, live-card |
 | `number-pipeline.js` | EK number ka poora lifecycle (saare scenarios) |
 | `firebase-numbers.js` | Firebase reader — pool + OTP inbox + **dynamic source override** |
@@ -519,7 +522,8 @@ chalta rehta hai; temporary error par number failed nahi gina jata.
 | `PREMIUM_BATCH_MAX_MINUTES` | 120 | Max run time (Never-stop ON me ye sirf checkpoint hai — deadline khud extend hoti hai) |
 | `PREMIUM_NEVER_STOP` | 1 (ON) | `1` = batch khud na ruke (auto cool-off/reextend/rescan) · `0` = purane safety stops |
 | `PREMIUM_ACCOUNT_ENGINE` | `direct` | `direct` = apna Swiggy bridge (proxy/WAF) · `worldbot` = @SwiggyByWorldBot ke buttons click (proxy nahi) |
-| `SWIGGY_WORLD_BOT_USERNAME` | `SwiggyByWorldBot` | World Bot ka handle (badalna ho to) |
+| `SWIGGY_WORLD_BOT_USERNAME` | `SwiggyByWorldBot` | World Bot ka handle (badalna ho to) — pool me na ho to sabse aage lagta hai |
+| `SWIGGY_WORLD_BOT_USERNAMES` | *(khali)* | Comma wali list se poora bot pool override — default pool: `SwiggyByworldBot, SwiggyByworld1Bot … SwiggyByworld5Bot` (saare same) |
 | `SWIGGY_WORLD_STEP_TIMEOUT_MS` | 45000 | World Bot ke ek step (button/JSON) ka budget |
 | `SWIGGY_WORLD_LOGOUT_AFTER_DELETE` | 1 | Delete+fresh ke baad `Switch Accounts → Permanently Logged Out` try kare |
 | `PREMIUM_BATCH_GAP_MS` | 6000 | Ek hi lane/IP par do numbers ke beech gap |

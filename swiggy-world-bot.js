@@ -24,6 +24,32 @@ import { withTelegramUserClient } from './telegram-otp-source.js';
 
 export const WORLD_BOT_USERNAME_DEFAULT = 'SwiggyByWorldBot';
 
+// Owner ke saare world bots — sab same hain. Pehle wale par kaam hota hai;
+// SIRF Swiggy error (OTP send/flow fail) par next bot par switch hota hai,
+// bina error ke switch allowed nahi (owner rule).
+export const WORLD_BOT_POOL_DEFAULT = [
+  'SwiggyByworldBot',
+  'SwiggyByworld1Bot',
+  'SwiggyByworld2Bot',
+  'SwiggyByworld3Bot',
+  'SwiggyByworld4Bot',
+  'SwiggyByworld5Bot',
+];
+
+const normHandle = (value = '') => String(value || '').trim().replace(/^@+/, '');
+
+export function listWorldBotUsernames(env = process.env) {
+  const multi = String(env?.SWIGGY_WORLD_BOT_USERNAMES || '').trim();
+  if (multi) {
+    const list = multi.split(/[,\s]+/).map(normHandle).filter(Boolean);
+    if (list.length) return [...new Set(list)];
+  }
+  const single = normHandle(env?.SWIGGY_WORLD_BOT_USERNAME || env?.SWIGGY_WORLD_BOT || env?.WORLD_BOT_USERNAME || '');
+  const pool = [...WORLD_BOT_POOL_DEFAULT];
+  if (single && !pool.some((u) => u.toLowerCase() === single.toLowerCase())) pool.unshift(single);
+  return pool;
+}
+
 // Har step ka default budget. Bot slow ho to Settings/env se badhaya ja sakta
 // hai (SWIGGY_WORLD_STEP_TIMEOUT_MS) — batch isi ke andar recover karta hai.
 export const WORLD_BOT_DEFAULTS = {
@@ -48,8 +74,12 @@ const state = {
 };
 
 export function getWorldBotStatus() {
+  const pool = listWorldBotUsernames();
   return {
     ...state,
+    pool,
+    activeIndex: activeBotIndex,
+    activeUsername: pool[activeBotIndex % Math.max(1, pool.length)] || '',
     lastScreenButtons: [...(state.lastScreenButtons || [])],
   };
 }
@@ -65,13 +95,59 @@ function setError(error) {
 }
 
 export function worldBotUsername(env = process.env) {
-  const raw = String(
-    env?.SWIGGY_WORLD_BOT_USERNAME
-    || env?.SWIGGY_WORLD_BOT
-    || env?.WORLD_BOT_USERNAME
-    || WORLD_BOT_USERNAME_DEFAULT
-  ).trim().replace(/^@+/, '');
-  return raw || WORLD_BOT_USERNAME_DEFAULT;
+  return listWorldBotUsernames(env)[0] || WORLD_BOT_USERNAME_DEFAULT;
+}
+
+// Sticky index: jab tak koi error nahi, wahi bot use hota hai. Error par
+// rotateWorldBot() next bot par le jata hai (wrap-around loop).
+let activeBotIndex = 0;
+
+export function currentWorldBotUsername(env = process.env) {
+  const list = listWorldBotUsernames(env);
+  if (!list.length) return WORLD_BOT_USERNAME_DEFAULT;
+  return list[activeBotIndex % list.length];
+}
+
+export function worldBotPoolIndex() {
+  return activeBotIndex;
+}
+
+export function resetWorldBotPool() {
+  activeBotIndex = 0;
+  return currentWorldBotUsername();
+}
+
+export function rotateWorldBot(reason = 'worldbot-error', env = process.env) {
+  const list = listWorldBotUsernames(env);
+  if (list.length <= 1) return currentWorldBotUsername(env);
+  const from = currentWorldBotUsername(env);
+  activeBotIndex = (activeBotIndex + 1) % list.length;
+  const to = currentWorldBotUsername(env);
+  state.lastRotateAt = Date.now();
+  state.lastRotateFrom = from;
+  state.lastRotateReason = String(reason || '').slice(0, 140);
+  console.log(`[WorldBot] 🔁 Switch: @${from} → @${to} (${String(reason || 'error').slice(0, 90)})`);
+  return to;
+}
+
+// Ye error world bot ki taraf se hai (number ki galti nahi) — isi par next
+// bot try karna allowed hai. Owner rule: bina error ke switch nahi.
+export function shouldSwitchWorldBot(result = {}) {
+  const kind = String(result?.kind || '');
+  if (!kind || result?.ok) return false;
+  if (kind === 'aborted' || kind === 'manual_skip') return false;
+  if (kind === 'failed_invalid_number') return false; // number ki galti
+  if (kind === 'worldbot_setup') return false;        // session/setup issue
+  return [
+    'failed_world_bot',
+    'failed_otp_send',
+    'failed_otp_verify',
+    'failed_otp_miss',
+    'delete_failed',
+    'delete_otp_rejected',
+    'delete_button_missing',
+    'delete_account_not_listed',
+  ].includes(kind) || result?.switchBot === true;
 }
 
 export function worldBotConfig(env = process.env) {
@@ -80,7 +156,8 @@ export function worldBotConfig(env = process.env) {
     return Number.isFinite(n) && n >= min ? n : dflt;
   };
   return {
-    username: worldBotUsername(env),
+    username: currentWorldBotUsername(env),
+    usernames: listWorldBotUsernames(env),
     stepTimeoutMs: num('SWIGGY_WORLD_STEP_TIMEOUT_MS', WORLD_BOT_DEFAULTS.stepTimeoutMs),
     pollMs: num('SWIGGY_WORLD_POLL_MS', WORLD_BOT_DEFAULTS.pollMs, 300),
     otpTimeoutMs: num('SWIGGY_WORLD_OTP_TIMEOUT_MS', WORLD_BOT_DEFAULTS.otpTimeoutMs, 5_000),

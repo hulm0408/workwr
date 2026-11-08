@@ -405,6 +405,14 @@ World bots ka default pool: `@SwiggyByworldBot`, `@SwiggyByworld1Bot` …
   intezaar karta reh jata tha = **deadlock** → number aata tha, OTP kabhi nahi
   (aur world bot me type bhi nahi hota tha). Ab `AsyncLocalStorage` se same
   async context me lock re-entrant hai; parallel calls ab bhi serialize hote hain.
+- **REFRESH har second:** OTP Sent ke baad OTP bot (Hermes/Hathi/HardXotp) me
+  `SWIGGY_OTP_REFRESH_MS` (default 1000ms) ke hisaab se REFRESH dabta hai —
+  button 12 screens tak dhoondha jata hai, na mile to `Refresh` (HardXotp me
+  `View Messages`) text bhej diya jata hai. Pehle sirf "latest" screen dekhi
+  jati thi, isliye dusre number ki card ho to refresh hi nahi hota tha.
+- **Duplicate command nahi:** click se screen badal jaye to button ka text
+  dobara nahi bhejta (isliye `OTP Login` do baar nahi likha jata), aur
+  `Cancel` ka jawab aane ka intezaar hota hai (`/cancel` duplicate nahi).
 - **OTP type hota hai:** OTP source se code milte hi bot ko bhej diya jata hai
   (sirf tab nahi jab bot saaf-saaf number/naam maang raha ho) — **ek hi baar**.
   20s = "OTP Sent" confirm; OTP inbox ka wait alag

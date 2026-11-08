@@ -578,6 +578,7 @@ Next: OTP mila to verify · na mila to NEW NUMBER
 * **Ek command, phir bot ka jawab** — agla command tab hi jata hai jab bot ka pichla jawab poora aa chuka ho (`settledScreen`), aur button/label sirf **latest 1-2 messages** se padhe jate hain. Isliye `/start` + `Login` + `OTP Login` ek saath nahi jaate aur `❌ Invalid OTP` / `❌ Invalid Mobile Number` ka spam nahi hota.
 * **Process wahi jo ideal flow me hai** — login se pehle bot ka adhoora OTP/number prompt pehle `Cancel` se saaf hota hai, phir `/start` → `Login` → `OTP Login` → number → OTP. Bot jab OTP/number/naam maang raha ho to **button ka text kabhi nahi bhejta** (warna bot usi ko OTP/number samajh kar `❌ Invalid OTP` / `❌ Invalid Mobile Number` deta tha).
 * **Deadlock-free OTP fetch** — world-bot login jo Telegram lock pakadta hai, usi ke andar OTP fetch (wahi lock maangta hai) re-entrant chalta hai. Isse pehle ye apne hi lock par atka reh jata tha: number aata tha par OTP kabhi fetch/type nahi hota tha.
+* **OTP ke liye REFRESH** — OTP Sent ke baad OTP bot (Hermes/Hathi) me **har second** REFRESH dabta hai (button 12 screens tak dhoondha jata hai; na mile/clic na chale to button ka text `Refresh` type hota hai). OTP aate hi copy karke world bot me type hota hai.
 * **OTP hamesha type hota hai** — OTP source se code aate hi bot ko bheja jata hai (sirf tab nahi jab bot saaf-saaf number/naam maang raha ho), aur **ek hi baar**. Code na aaye to card me saaf reason: `OTP source (Hermes/Firebase) me is number ka code hi nahi aaya`.
 * **Do alag budgets** — `20s` sirf "OTP Sent" confirm karne ka; OTP inbox ka intezaar alag (`SWIGGY_WORLD_OTP_INBOX_TIMEOUT_MS`, default 90s). Number 20s me nahi marti.
 * **Bot ke apne errors maane jate hain** — `❌ Could not send OTP … account suspended` ⇒ number dead (skip, bot na badlo); `… login attempts exceeded` ⇒ number 2 ghante cooldown; 20s wait/retry nahi.
@@ -600,6 +601,7 @@ Helpers `rich-text.js` me hain: `fancy()`, `bracketHeader()`, `headerRule()`, `s
 | `SWIGGY_WORLD_OTP_TIMEOUT_MS` | 20000 | OTP ka intezaar **sirf 20s** — nahi aaya to number skip (bot wahi) |
 | `SWIGGY_WORLD_OTP_SEND_TIMEOUT_MS` | 20000 | Bot "OTP Sent" 20s me confirm na kare → **bot badlo** |
 | `SWIGGY_WORLD_OTP_INBOX_TIMEOUT_MS` | 90000 | OTP **source** (Hermes/Firebase) me code aane ka intezaar — ye number ki life nahi, 20s se alag budget |
+| `SWIGGY_OTP_REFRESH_MS` | 1000 | OTP bot (Hermes/Hathi) me REFRESH kitni der me — OTP Sent ke baad **har second** refresh, OTP aaye to copy karke world bot me |
 | `SWIGGY_WORLD_QUEUE_WAIT_MS` | 45000 | Bot "queue/wait" bole to itna wait (asli run me OTP Sent ~40-60s baad aata hai); isse zyada → **bot badlo** |
 | `SWIGGY_WORLD_TRIGGER` | `auto` | Button **click** → screen na badle to **button ka text likh kar bhej** (`type` = click bilkul nahi) |
 | `SWIGGY_WORLD_CLICK_GRACE_MS` | 4000 | Click ke baad screen badalne ka intezaar, phir text trigger |

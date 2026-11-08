@@ -838,7 +838,13 @@ export async function processSingleNumberViaWorldBot({
   const pollMs = Number(otpCfg.pollMs ?? 1_500);
   const acceptAnyAfterMs = Math.min(15_000, Math.floor(worldOtpInboxMs / 2));
   const telegramTimeoutMs = worldOtpInboxMs;
-  const telegramRefreshMs = Number(otpCfg.telegramOtpRefreshMs ?? 2_500);
+  // 🔄 Owner: "OTP Sent ke baad OTP bot me har second REFRESH dabao, 20s me
+  // OTP aa jaye to copy karke world bot me do." Isliye world-bot flow me
+  // refresh 1s par (purana 2.5s).
+  const telegramRefreshMs = Math.max(
+    800,
+    Number(process.env.SWIGGY_OTP_REFRESH_MS ?? otpCfg.telegramOtpRefreshMs ?? 1_000) || 1_000
+  );
 
   // Har OTP round ka apna baseline: purana SMS/OTP kabhi reuse na ho.
   const makeOtpProvider = () => async () => {

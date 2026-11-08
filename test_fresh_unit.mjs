@@ -3436,13 +3436,21 @@ Thanks`)),
     'worldbot pool: aakhir ke baad wapas pehla bot (wrap-around)');
   wb.resetWorldBotPool();
 
-  // Switch sirf ERROR par — bina error ke nahi.
+  // Owner ka final rule: bot SIRF OTP-send fail / queue>20s / bot na mile par.
   ok(wb.shouldSwitchWorldBot({ ok: false, kind: 'failed_otp_send' }) === true,
-    'worldbot switch: OTP send fail = next bot');
-  ok(wb.shouldSwitchWorldBot({ ok: false, kind: 'failed_world_bot' }) === true,
-    'worldbot switch: bot flow fail = next bot');
-  ok(wb.shouldSwitchWorldBot({ ok: false, kind: 'delete_failed' }) === true,
-    'worldbot switch: delete fail = next bot');
+    'worldbot switch: bot OTP bhej na paye = next bot');
+  ok(wb.shouldSwitchWorldBot({ ok: false, kind: 'queued_timeout' }) === true,
+    'worldbot switch: queue 20s se zyada = next bot');
+  ok(wb.shouldSwitchWorldBot({ ok: false, kind: 'bot_unreachable' }) === true,
+    'worldbot switch: bot hi na mile = next bot');
+  ok(wb.shouldSwitchWorldBot({ ok: false, kind: 'failed_otp_miss' }) === false,
+    'worldbot switch: OTP 20s me nahi aaya = number skip, BOT WAHI');
+  ok(wb.shouldSwitchWorldBot({ ok: false, kind: 'failed_otp_verify' }) === false,
+    'worldbot switch: OTP galat par bot switch nahi');
+  ok(wb.shouldSwitchWorldBot({ ok: false, kind: 'failed_world_bot' }) === false,
+    'worldbot switch: flow atka par bina wajah switch nahi');
+  ok(wb.shouldSwitchWorldBot({ ok: false, kind: 'delete_failed' }) === false,
+    'worldbot switch: delete fail par bot switch nahi');
   ok(wb.shouldSwitchWorldBot({ ok: false, kind: 'aborted' }) === false,
     'worldbot switch: manual STOP/abort par bot switch NAHI');
   ok(wb.shouldSwitchWorldBot({ ok: false, kind: 'manual_skip' }) === false,
@@ -3455,6 +3463,41 @@ Thanks`)),
     'worldbot switch: Telegram session setup pending par bot switch nahi');
   ok(wb.shouldSwitchWorldBot({ ok: false, kind: 'something_else', switchBot: true }) === true,
     'worldbot switch: switchBot flag se explicit switch');
+
+  // ⏱ 20 second rule — OTP, OTP-send aur queue ke budgets.
+  ok(wb.worldBotConfig({}).otpTimeoutMs === 20_000,
+    'worldbot: OTP wait 20 second (owner rule)');
+  ok(wb.worldBotConfig({}).otpSendTimeoutMs === 20_000 && wb.worldBotConfig({}).queueWaitMs === 20_000,
+    'worldbot: OTP-send aur queue ka budget bhi 20s');
+  ok(wb.worldBotQueueKind('Account creation is in queue, please wait') === true,
+    'worldbot: "queue/wait" message pehchanta hai');
+  ok(wb.worldBotQueueKind('OTP sent successfully') === false
+    && wb.worldBotQueueKind('Invalid mobile number') === false,
+  'worldbot: success/error ko galti se queue nahi samajhta');
+  ok(wb.worldBotButtonRole('📋 Copy Code') === 'copyCode'
+    && wb.worldBotButtonRole('Copy JSON') === 'copyCode',
+  'worldbot: Copy Code / Copy JSON button role');
+  ok(wb.worldBotButtonRole('🚪 Logout') === 'permanentLogout',
+    'worldbot: plain logout button bhi pakda jata hai');
+  ok(wb.worldBotPromptKind('What is your name?') === 'askName'
+    && wb.worldBotPromptKind('Your name please') === 'askName',
+  'worldbot: naam ka sawaal (naye account ka saboot) pakda jata hai');
+  ok(wb.worldBotPromptKind('OTP has been sent to your number') === 'otpSent'
+    && wb.worldBotPromptKind('We sent a code to your mobile') === 'otpSent',
+  'worldbot: OTP-sent ke alag alag shabd bhi samajhta hai');
+  ok(wbSrc.includes('async function waitForOtpSent')
+    && wbSrc.includes('async function sendWorldCode')
+    && wbSrc.includes('async function clickCopyCode'),
+  'worldbot: OTP-sent wait + code send confirm + Copy Code fallback');
+  ok(wbSrc.includes("kind: 'queued_timeout'"),
+    'worldbot: queue timeout alag outcome deta hai');
+  ok(wbSrc.includes('recentScreens'),
+    'worldbot: /world me batch ke andar ke screens dikhte hain');
+  ok(pipelineSrc.includes('const worldOtpBudgetMs = Math.min(')
+    && pipelineSrc.includes('20_000'),
+  'worldbot: pipeline OTP wait bhi 20s par capped');
+  ok(/failed_otp_miss[\s\S]{0,400}switchBot: false/.test(pipelineSrc),
+    'worldbot: OTP miss par pipeline bot switch nahi karti');
 
   // Delete fail par bhi retry nahi — bas active bot rotate ho jata hai.
   ok(pipelineSrc.includes('const maxTries = Math.max(1, Math.min(bots.length, 3))'),

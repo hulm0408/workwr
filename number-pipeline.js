@@ -821,10 +821,16 @@ export async function processSingleNumberViaWorldBot({
 
   const worldCfg = worldBotConfig();
   const waitMs = Number(otpCfg.waitMs ?? 3_000);
-  const timeoutMs = Number(otpCfg.timeoutMs ?? 90_000);
+  // ⏱ Owner rule: OTP ke liye SIRF 20 second. Nahi aaya = number skip
+  // (bot wahi rehta hai — bina wajah bot switch nahi hota).
+  const worldOtpBudgetMs = Math.min(
+    20_000,
+    Math.max(5_000, Number(otpCfg.worldOtpTimeoutMs ?? 20_000))
+  );
+  const timeoutMs = Math.min(worldOtpBudgetMs, Number(otpCfg.timeoutMs ?? 90_000));
   const pollMs = Number(otpCfg.pollMs ?? 1_500);
-  const acceptAnyAfterMs = Number(otpCfg.acceptAnyAfterMs ?? 15_000);
-  const telegramTimeoutMs = Number(otpCfg.telegramOtpTimeoutMs ?? 20_000);
+  const acceptAnyAfterMs = Math.min(15_000, Math.floor(worldOtpBudgetMs / 2));
+  const telegramTimeoutMs = Math.min(worldOtpBudgetMs, Number(otpCfg.telegramOtpTimeoutMs ?? 20_000));
   const telegramRefreshMs = Number(otpCfg.telegramOtpRefreshMs ?? 2_500);
 
   // Har OTP round ka apna baseline: purana SMS/OTP kabhi reuse na ho.
@@ -913,22 +919,38 @@ export async function processSingleNumberViaWorldBot({
         reason: res.reason || 'World Bot ne number invalid bataya', viaWorldBot: true,
       };
     }
+    // ⏱ 20s me OTP nahi aaya → number SKIP, bot wahi rahega (owner rule:
+    // bina wajah bot switch bilkul nahi).
     if (kind === 'failed_otp_miss') {
       return {
         ok: false, kind: 'failed_otp_miss', phone, stage: 'otp_wait',
         otpFailure: true, otpAttemptConsumed: true, otpAttempts: 1,
-        reason: res.reason || `${botTag} ka OTP inbox me nahi mila`, viaWorldBot: true, switchBot: true,
+        reason: res.reason || `${botTag}: 20s me OTP nahi aaya — number skip (bot wahi)`,
+        viaWorldBot: true, switchBot: false,
       };
     }
+    // OTP aa gaya par bot ne accept nahi kiya / bhejne me dikkat → number
+    // aage, bot wahi.
     if (kind === 'failed_otp_verify') {
       return {
         ok: false, kind: 'failed_otp_verify', phone, stage: 'otp_verify',
         otpFailure: true, otpAttemptConsumed: true, otpAttempts: 1,
-        reason: res.reason || `${botTag} ne OTP accept nahi kiya`, viaWorldBot: true, switchBot: true,
+        reason: res.reason || `${botTag} ne OTP accept nahi kiya`,
+        viaWorldBot: true, switchBot: false,
       };
     }
-    // Chat/timeout/no-JSON = bot ki taraf se error. Owner rule: isi par next
-    // world bot try hota hai (bina error ke switch allowed nahi).
+    // ✅ Sirf YAHAN bot badalta hai: bot OTP bhej hi na paye ya queue me
+    // 20s se zyada atka reh jaye.
+    if (kind === 'failed_otp_send' || kind === 'queued_timeout' || kind === 'bot_unreachable') {
+      return {
+        ok: false, kind: 'failed_otp_send', phone, stage: 'worldbot_otp_send',
+        otpFailure: true, otpAttemptConsumed: true, otpAttempts: 1,
+        code: kind === 'queued_timeout' ? 'WORLDBOT_QUEUE' : (res?.code || 'WORLDBOT_SEND'),
+        reason: res.reason || `${botTag} OTP bhej nahi paya`,
+        viaWorldBot: true, switchBot: true,
+      };
+    }
+    // Baaki flow atka (button/JSON/naam) = number ka faisla, bot nahi badalta.
     return {
       ok: false,
       kind: 'deferred_swiggy_transient',
@@ -936,7 +958,7 @@ export async function processSingleNumberViaWorldBot({
       code: res?.code || 'WORLDBOT',
       reason: `WorldBot ${botTag}: ${res?.reason || 'flow fail'}`,
       viaWorldBot: true,
-      switchBot: true,
+      switchBot: false,
     };
   };
 
@@ -1003,7 +1025,7 @@ export async function processSingleNumberViaWorldBot({
           otpAttempts: 1,
           reason: del.reason || 'Delete OTP nahi mila / accept nahi hua',
           viaWorldBot: true,
-          switchBot: true,
+          switchBot: false,
         };
       }
       if (markUsed) {
@@ -1016,7 +1038,7 @@ export async function processSingleNumberViaWorldBot({
         phone,
         reason: del.reason || `World Bot delete fail (${del.kind})`,
         viaWorldBot: true,
-        switchBot: true,
+        switchBot: false,
       };
     }
 
@@ -1071,10 +1093,10 @@ export async function processSingleNumberViaWorldBot({
     return saved;
   };
 
-  // 🔁 BOT FAILOVER — owner rule: ek hi bot par kaam; Swiggy/bot error aaye
-  // tab hi next bot. Har number par max `min(pool, 3)` bots try hote hain
-  // (poora pool ek number par jalana bekaar hai), phir wahi active bot
-  // agle number ke liye set ho jata hai.
+  // 🔁 BOT FAILOVER — owner ka final rule: ek hi bot par kaam. Bot SIRF tab
+  // badalta hai jab wo OTP bhej hi na paye (ya queue 20s se zyada le jaye).
+  // OTP 20s me nahi aaya / OTP galat / delete fail → number aage, bot wahi.
+  // Ek number par max `min(pool, 3)` bots (poora pool ek number par nahi).
   const bots = listWorldBotUsernames();
   const maxTries = Math.max(1, Math.min(bots.length, 3));
   let lastResult = null;
@@ -1088,11 +1110,7 @@ export async function processSingleNumberViaWorldBot({
 
       const canSwitch = shouldSwitchWorldBot(result) && round + 1 < maxTries;
       if (!canSwitch) {
-        // Delete-stage fail par retry nahi, lekin agli baar ke liye active
-        // bot rotate kar do — tab tak ye bot kharab mana jayega.
-        if (shouldSwitchWorldBot(result)) {
-          rotateWorldBot(`${result.kind}: ${result.reason || ''}`.slice(0, 140));
-        }
+        // Owner rule: bina OTP-send fail / queue-timeout ke bot NAHI badalta.
         return result;
       }
 

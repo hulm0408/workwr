@@ -57,7 +57,13 @@ export const WORLD_BOT_DEFAULTS = {
   pollMs: 1_500,
   startTimeoutMs: 25_000,
   readLimit: 15,
-  otpTimeoutMs: 90_000,
+  // Owner rule: OTP bhejne ke baad SIRF 20 second. Nahi aaya = number skip.
+  otpTimeoutMs: 20_000,
+  // "OTP Sent" confirmation (bot ki taraf se OTP send) ka budget.
+  otpSendTimeoutMs: 20_000,
+  // Bot "account creation queue me hai" bole to itna wait — isse zyada =
+  // bot badlo.
+  queueWaitMs: 20_000,
 };
 
 const state = {
@@ -66,6 +72,7 @@ const state = {
   lastError: '',
   lastScreenText: '',
   lastScreenButtons: [],
+  recentScreens: [],
   lastChatAt: 0,
   lastOkAt: 0,
   step: 0,
@@ -81,6 +88,7 @@ export function getWorldBotStatus() {
     activeIndex: activeBotIndex,
     activeUsername: pool[activeBotIndex % Math.max(1, pool.length)] || '',
     lastScreenButtons: [...(state.lastScreenButtons || [])],
+    recentScreens: [...(state.recentScreens || [])],
   };
 }
 
@@ -132,22 +140,29 @@ export function rotateWorldBot(reason = 'worldbot-error', env = process.env) {
 
 // Ye error world bot ki taraf se hai (number ki galti nahi) — isi par next
 // bot try karna allowed hai. Owner rule: bina error ke switch nahi.
+// Owner ka final rule (bilkul saaf):
+//   Bot SIRF tab badlo jab —
+//     • bot OTP bhej hi na paye (`failed_otp_send` / `queued_timeout`), ya
+//     • bot hi na mile (`bot_unreachable`)
+//   OTP 20s me nahi aaya → number skip, BOT NAHI badlega.
+//   OTP galat / delete fail / flow atka → bot nahi badlega (number ka faisla).
 export function shouldSwitchWorldBot(result = {}) {
   const kind = String(result?.kind || '');
   if (!kind || result?.ok) return false;
   if (kind === 'aborted' || kind === 'manual_skip') return false;
   if (kind === 'failed_invalid_number') return false; // number ki galti
   if (kind === 'worldbot_setup') return false;        // session/setup issue
-  return [
-    'failed_world_bot',
-    'failed_otp_send',
-    'failed_otp_verify',
-    'failed_otp_miss',
-    'delete_failed',
-    'delete_otp_rejected',
-    'delete_button_missing',
-    'delete_account_not_listed',
-  ].includes(kind) || result?.switchBot === true;
+  if (result?.switchBot === true) return true;
+  return ['failed_otp_send', 'queued_timeout', 'bot_unreachable'].includes(kind);
+}
+
+// Bot ka "wait karo / account creation queue me hai" message — isme ghabrana
+// nahi, 20s tak wait. Isse zyada ho jaye tab hi bot badla jata hai.
+export function worldBotQueueKind(text = '') {
+  const n = norm(text);
+  if (!n) return false;
+  if (/\b(otp sent|invalid (mobile|number|otp)|deleted successfully)\b/.test(n)) return false;
+  return /\b(in\s*queue|queued|queue|que\s*me|wait|ruko|ruk\s*j?ao|thoda\s*waqt|processing|in\s*progress|account\s*creation|creating|ban\s*raha|line\s*me)\b/.test(n);
 }
 
 export function worldBotConfig(env = process.env) {
@@ -161,6 +176,8 @@ export function worldBotConfig(env = process.env) {
     stepTimeoutMs: num('SWIGGY_WORLD_STEP_TIMEOUT_MS', WORLD_BOT_DEFAULTS.stepTimeoutMs),
     pollMs: num('SWIGGY_WORLD_POLL_MS', WORLD_BOT_DEFAULTS.pollMs, 300),
     otpTimeoutMs: num('SWIGGY_WORLD_OTP_TIMEOUT_MS', WORLD_BOT_DEFAULTS.otpTimeoutMs, 5_000),
+    otpSendTimeoutMs: num('SWIGGY_WORLD_OTP_SEND_TIMEOUT_MS', WORLD_BOT_DEFAULTS.otpSendTimeoutMs, 5_000),
+    queueWaitMs: num('SWIGGY_WORLD_QUEUE_WAIT_MS', WORLD_BOT_DEFAULTS.queueWaitMs, 5_000),
     // Delete ke baad "Switch Accounts → Permanently Logged Out" (best-effort).
     logoutAfterDelete: String(env?.SWIGGY_WORLD_LOGOUT_AFTER_DELETE ?? '1') !== '0',
   };
@@ -189,12 +206,15 @@ const norm = (value = '') => plain(value)
 export function worldBotButtonRole(text = '') {
   const n = norm(text);
   if (!n) return '';
+  // "Copy Code" / "Copy JSON" — sabse pehle, kyunki isme "JSON" bhi hota hai.
+  if (/\bcopy\b/.test(n)) return 'copyCode';
   if (/\b(json|tid)\b/.test(n)) return 'jsonLogin';
   if (/\botp\b/.test(n) && /\blogin\b/.test(n)) return 'otpLogin';
   if (/\b(order\s*hub|orders?)\b/.test(n) && !/\bmy\s*orders\b/.test(n)) return 'orderHub';
   if (/\bdelete\b/.test(n) && /\baccount\b/.test(n)) return 'deleteAccount';
   if (/\bswitch\s*accounts?\b/.test(n)) return 'switchAccounts';
   if (/\bpermanent\w*\b/.test(n) && /\blog|out\b/.test(n)) return 'permanentLogout';
+  if (/\b(log\s*out|logout|sign\s*out)\b/.test(n)) return 'permanentLogout';
   if (/\b(permanent\w*\s*log\s*out|log\s*out\s*permanent\w*)\b/.test(n)) return 'permanentLogout';
   if (/\b(cancel|back)\b/.test(n)) return 'cancel';
   if (/\blogin\b/.test(n)) return 'login';
@@ -283,12 +303,15 @@ export function worldBotPromptKind(text = '') {
   if (!n) return '';
   if (/\b(deleted successfully|account deleted|successfully archived|deleted)\b/.test(n)) return 'deleted';
   if (/\b(delete otp|otp sent.{0,40}delete|delete.{0,30}otp)\b/.test(n)) return 'deleteSent';
-  if (/\b(otp was not accepted|invalid otp|otp galat|wrong otp)\b/.test(n)) return 'otpFail';
+  if (/\b(otp was not accepted|invalid otp|otp galat|wrong otp|otp expired)\b/.test(n)) return 'otpFail';
   if (/\b(invalid mobile|invalid number|number galat)\b/.test(n)) return 'invalidNumber';
+  // "OTP sent" ke kai tarah ke shabd: "OTP has been sent", "we sent a code",
+  // "OTP bhej diya" — sab ek hi step hain.
   if (/\b(otp sent|otp bhej|send the 6 digit otp)\b/.test(n)) return 'otpSent';
-  if (/\b(send|enter|type)\b/.test(n) && /\b(name|naam)\b/.test(n)) return 'askName';
-  if (/\b(send|enter|type)\b/.test(n) && /\b(10 digit|10-digit|mobile|number)\b/.test(n)) return 'askNumber';
-  if (/\b(account deleted)\b/.test(n)) return 'deleted';
+  if (/\b(otp|code)\b/.test(n) && /\b(sent|delivered|bhej\w*|gaya|chala gaya)\b/.test(n)) return 'otpSent';
+  // Naam ka sawaal — "What is your name?", "Send your name", "apna naam batao".
+  if (/\b(name|naam)\b/.test(n) && n.split(' ').filter(Boolean).length <= 12) return 'askName';
+  if (/\b(send|enter|type|provide|bhejo|batao)\b/.test(n) && /\b(10 digit|10-digit|mobile|number)\b/.test(n)) return 'askNumber';
   return '';
 }
 
@@ -396,6 +419,19 @@ async function parseScreenMessages(client, entity, limit) {
   if (latest) {
     state.lastScreenText = String(latest.text || '').slice(0, 400);
     state.lastScreenButtons = latest.buttons.map((b) => b.text);
+    // Owner ko pata chale bot exactly kya keh raha hai — /world isi se bharta
+    // hai. Sirf text/buttons yaad rakhte hain (koi JSON/session nahi).
+    const entry = {
+      at: Date.now(),
+      phase: state.phase,
+      text: String(latest.text || '').replace(/\s+/g, ' ').slice(0, 240),
+      buttons: latest.buttons.map((b) => b.text).slice(0, 10),
+    };
+    const last = state.recentScreens[0];
+    if (!last || last.text !== entry.text || last.buttons.join('|') !== entry.buttons.join('|')) {
+      state.recentScreens = [entry, ...state.recentScreens].slice(0, 8);
+      console.log(`[WorldBot] 📺 ${state.phase}: ${entry.text || '(no text)'} · [${entry.buttons.join(' | ') || 'no buttons'}]`);
+    }
   }
   return parsed;
 }
@@ -594,22 +630,16 @@ export async function worldBotLogin({
       before = screenSignature(await parseScreenMessages(client, entity));
       await sendWorldText(client, entity, cleanPhone);
 
-      const numberResult = await waitForReply({
-        client, entity, baseline: before, timeoutMs: cfg.stepTimeoutMs, shouldAbort,
-        what: 'OTP sent confirmation',
-        predicate: (freshList) => {
-          for (const message of freshList) {
-            const kind = worldBotPromptKind(message.text);
-            if (kind === 'otpSent') return { kind: 'otpSent', message };
-            if (kind === 'invalidNumber') return { kind: 'invalidNumber', message };
-          }
-          return null;
-        },
-        pollMs: cfg.pollMs,
-      });
+      // ⏱ Owner rule: OTP send ka budget 20s (queue bola ho to +20s). Isme
+      // OTP Sent na aaye → bot badla jata hai; warna wahi bot chalta rehta hai.
+      const numberResult = await waitForOtpSent({ client, entity, baseline: before, cfg, shouldAbort });
       if (numberResult.kind === 'invalidNumber') {
         await safeCancel(client, entity, cfg).catch(() => {});
         return { ok: false, kind: 'failed_invalid_number', phone: cleanPhone, reason: 'Swiggy World Bot ne number invalid bataya' };
+      }
+      if (!numberResult.ok) {
+        await safeCancel(client, entity, cfg).catch(() => {});
+        return { ok: false, kind: numberResult.kind, phone: cleanPhone, reason: numberResult.reason };
       }
 
       // 5) OTP lao (Firebase inbox se — pipeline deta hai) aur bhejo
@@ -628,7 +658,16 @@ export async function worldBotLogin({
 
       setPhase('otp-verify');
       before = screenSignature(await parseScreenMessages(client, entity));
-      await sendWorldText(client, entity, String(otp.code).trim());
+      const codeDelivered = await sendWorldCode(client, entity, otp.code);
+      if (!codeDelivered) {
+        await safeCancel(client, entity, cfg).catch(() => {});
+        return {
+          ok: false,
+          kind: 'failed_otp_verify',
+          phone: cleanPhone,
+          reason: `OTP aa gaya (${String(otp.code).trim().length} digit) par bot ko bhejne me dikkat — bot nahi badla, number aage badha`,
+        };
+      }
 
       // 6) Outcome: naam ka sawaal = naya account; seedha JSON = purana.
       const outcome = await waitForReply({
@@ -642,6 +681,8 @@ export async function worldBotLogin({
             const kind = worldBotPromptKind(message.text);
             if (kind === 'askName') return { kind: 'askName', message };
             if (kind === 'otpFail') return { kind: 'otpFail', message };
+            // JSON code-block me ho aur uske saath "Copy Code" button ho.
+            if (pickWorldBotButton(message.buttons, 'copyCode')) return { kind: 'copy', message };
           }
           return null;
         },
@@ -669,6 +710,7 @@ export async function worldBotLogin({
               if (json) return { kind: 'json', message, json };
               const kind = worldBotPromptKind(message.text);
               if (kind === 'otpFail') return { kind: 'otpFail', message };
+              if (pickWorldBotButton(message.buttons, 'copyCode')) return { kind: 'copy', message };
             }
             return null;
           },
@@ -693,6 +735,14 @@ export async function worldBotLogin({
           else {
             try { JSON.parse(body); jsonText = body.trim(); } catch {}
           }
+        }
+      }
+      // "Copy Code" button ho to dabao — JSON usi se milta hai.
+      if (!jsonText) {
+        const copied = await clickCopyCode({ client, entity, cfg, shouldAbort }).catch(() => null);
+        if (copied?.json?.text) jsonText = copied.json.text;
+        else if (copied?.message) {
+          jsonText = await downloadJsonFromMessage(client, copied.message).catch(() => '');
         }
       }
       if (!jsonText) {
@@ -737,6 +787,129 @@ export async function worldBotLogin({
       code: error?.code || 'worldbot-error',
     };
   }
+}
+
+// ---------------------------------------------------------------------------
+// Bot ki taraf se OTP send hone ka intezaar.
+// Owner rule:
+//   • 20s me "OTP Sent" nahi aaya            → failed_otp_send (bot badlo)
+//   • bot "queue/wait" bole → 20s tak ruko    → phir queued_timeout (bot badlo)
+// ---------------------------------------------------------------------------
+async function waitForOtpSent({ client, entity, baseline, cfg, shouldAbort }) {
+  const sendBudget = Math.max(5_000, Number(cfg?.otpSendTimeoutMs) || WORLD_BOT_DEFAULTS.otpSendTimeoutMs);
+  const queueBudget = Math.max(5_000, Number(cfg?.queueWaitMs) || WORLD_BOT_DEFAULTS.queueWaitMs);
+  const startedAt = Date.now();
+  let queueFirstAt = 0;
+  let sawQueueText = '';
+  let lastAll = [];
+
+  while (true) {
+    const limit = queueFirstAt ? queueFirstAt + queueBudget : startedAt + sendBudget;
+    if (Date.now() >= limit) break;
+    if (typeof shouldAbort === 'function' && shouldAbort()) {
+      throw new WorldBotError('aborted', 'Owner ne STOP/SKIP kiya');
+    }
+    const all = await parseScreenMessages(client, entity);
+    lastAll = all;
+    const fresh = baseline ? freshMessages(all, baseline) : all;
+    for (const message of fresh) {
+      const kind = worldBotPromptKind(message.text);
+      if (kind === 'otpSent') return { ok: true, kind: 'otpSent', message };
+      if (kind === 'invalidNumber') return { ok: false, kind: 'invalidNumber', message };
+      if (worldBotQueueKind(message.text)) {
+        if (!queueFirstAt) {
+          queueFirstAt = Date.now();
+          sawQueueText = String(message.text || '').replace(/\s+/g, ' ').slice(0, 120);
+          setPhase('otp-queue-wait');
+          console.log(`[WorldBot] ⏳ bot ne queue bataya — ${Math.round(queueBudget / 1000)}s tak wait: ${sawQueueText}`);
+        }
+      }
+    }
+    await sleep(Math.max(300, Number(cfg?.pollMs) || WORLD_BOT_DEFAULTS.pollMs));
+  }
+
+  const tail = lastAll.slice(0, 2).map((m) => String(m.text || '').replace(/\s+/g, ' ').slice(0, 90)).filter(Boolean).join(' || ');
+  if (queueFirstAt) {
+    return {
+      ok: false,
+      kind: 'queued_timeout',
+      reason: `Bot ne ${Math.round(queueBudget / 1000)}s tak sirf queue/wait bataya — OTP send nahi hua${sawQueueText ? ` (${sawQueueText})` : ''}`,
+    };
+  }
+  return {
+    ok: false,
+    kind: 'failed_otp_send',
+    reason: `Bot ne ${Math.round(sendBudget / 1000)}s me OTP Sent confirm nahi kiya${tail ? ` — last: ${tail}` : ''}`,
+  };
+}
+
+// OTP code bot ko bhejo aur confirm karo ki message sach me gaya. Owner ne
+// dekha tha: "OTP aa raha hai par bot OTP enter nahi karta aur bot badal
+// deta hai" — isliye send fail/confirm fail par retry, aur tab bhi na ho to
+// bot NAHI badalta (sirf number aage badhta hai).
+async function sendWorldCode(client, entity, code) {
+  const text = String(code || '').trim();
+  if (!text) return false;
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    try {
+      await sendWorldText(client, entity, text);
+      await sleep(1_000);
+      const recent = await parseScreenMessages(client, entity, 4);
+      if (recent.some((m) => String(m.text || '').includes(text))) return true;
+      console.warn(`[WorldBot] OTP message confirm nahi hua (try ${attempt})`);
+    } catch (e) {
+      console.warn(`[WorldBot] OTP send fail (try ${attempt}): ${e?.message || e}`);
+    }
+    await sleep(1_200);
+  }
+  return false;
+}
+
+// Bot file (.json/.txt) bheje to wahi download karke JSON nikalo.
+async function downloadJsonFromMessage(client, message) {
+  if (!message?.hasDocument) return '';
+  try {
+    const buffer = await client.downloadMedia(message.raw || message, {});
+    if (!buffer) return '';
+    const body = Buffer.isBuffer(buffer) ? buffer.toString('utf8') : String(buffer);
+    const found = extractWorldBotJson(body);
+    if (found) return found.text;
+    try {
+      const parsed = JSON.parse(body);
+      if (looksLikeSessionJson(parsed)) return JSON.stringify(parsed);
+    } catch {}
+  } catch (e) {
+    console.warn('[WorldBot] document download fail:', e?.message || e);
+  }
+  return '';
+}
+
+// JSON text na mile par "Copy Code" button dabao — bot code-block/caption me
+// JSON bhejta hai. Uske baad ke messages me JSON dhoondho.
+async function clickCopyCode({ client, entity, cfg, shouldAbort }) {
+  const screen = await parseScreenMessages(client, entity);
+  const hit = findRoleOnScreens(screen, 'copyCode');
+  if (!hit) return null;
+  console.log(`[WorldBot] 🖱 Copy button: ${hit.button?.text || 'Copy'}`);
+  setPhase('copy-code');
+  await clickWorldButton(hit.button);
+  const found = await waitForReply({
+    client, entity,
+    baseline: screenSignature(screen),
+    timeoutMs: Math.min(15_000, Number(cfg?.stepTimeoutMs) || 15_000),
+    shouldAbort,
+    what: 'JSON (Copy Code ke baad)',
+    pollMs: cfg?.pollMs,
+    predicate: (fresh) => {
+      for (const message of fresh) {
+        if (message.hasDocument) return { kind: 'document', message };
+        const json = extractWorldBotJson(message.text);
+        if (json) return { kind: 'json', message, json };
+      }
+      return null;
+    },
+  }).catch(() => null);
+  return found;
 }
 
 async function safeCancel(client, entity, cfg = {}) {
@@ -808,7 +981,7 @@ export async function worldBotDeleteAccount({
       }
       before = screenSignature(screen);
       await clickWorldButton(deleteHit.button);
-      await waitForReply({
+      const deleteWaiter = () => waitForReply({
         client, entity, baseline: before, timeoutMs: cfg.stepTimeoutMs, shouldAbort,
         what: 'Delete OTP Sent',
         predicate: (freshList) => {
@@ -819,7 +992,26 @@ export async function worldBotDeleteAccount({
           return null;
         },
         pollMs: cfg.pollMs,
-      }).catch(() => {});
+      });
+      let deleteAck = await deleteWaiter().catch(() => null);
+
+      // Bot kabhi pehle confirm poochhta hai ("Haan 💜" / Yes) — tab wahi
+      // dabana padta hai, warna flow wahin atak jata hai.
+      if (!deleteAck) {
+        const confirmScreen = await parseScreenMessages(client, entity);
+        let confirmBtn = null;
+        for (const message of confirmScreen) {
+          const btn = pickWorldBotConfirmButton(message.buttons);
+          if (btn) { confirmBtn = btn; break; }
+        }
+        if (confirmBtn) {
+          setPhase('delete-confirm-click');
+          console.log(`[WorldBot] 🖱 delete confirm: ${confirmBtn.text || 'Haan'}`);
+          before = screenSignature(confirmScreen);
+          await clickWorldButton(confirmBtn).catch(() => {});
+          deleteAck = await deleteWaiter().catch(() => null);
+        }
+      }
 
       // 4) Delete ka number/account dobara chuno (bot kabhi dubara maangta hai)
       setPhase('delete-confirm');

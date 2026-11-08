@@ -3405,6 +3405,26 @@ Thanks`)),
   const wbFlowSrc = await fsp.readFile(new URL('./swiggy-world-bot.js', import.meta.url), 'utf8');
   ok(wbFlowSrc.includes('click ne screen badal di') && wbFlowSrc.includes('doosra variant mat bhejo'),
   'worldbot: click ne screen badli to text/variant dobara nahi bhejta (OTP Login do baar nahi)');
+  // 📺 Bot ka "OTP Sent" kabhi BLANK / PHOTO message hota hai (owner ke logs me
+  // yahi tha) — pehle use "confirm nahi hua" maan kar Cancel + wahi number
+  // dobara jata tha, Swiggy "login attempts exceeded" deta tha aur OTP kabhi
+  // type hi nahi hota tha.
+  ok(wbFlowSrc.includes('message?.media?.caption') && wbFlowSrc.includes('function messageHasMedia'),
+    'worldbot: photo/caption wala reply bhi padha jata hai (text khali ho to bhi)');
+  ok(wbFlowSrc.includes('hasMedia: messageHasMedia(message)')
+    && wbFlowSrc.includes("${m.hasMedia ? 'media' : ''}"),
+  'worldbot: screen signature me media bhi (naya reply detect hota hai)');
+  ok(wbFlowSrc.includes('blankReplyAt') && wbFlowSrc.includes('bot ne reply diya')
+    && wbFlowSrc.includes('confirmedBy: blankReplyMedia ?'),
+  'worldbot: blank/media reply = OTP Sent (Cancel + dobara number nahi)');
+  ok(wbFlowSrc.includes("new WorldBotError('empty-screen'") && wbFlowSrc.includes('attempt <= 3'),
+    'worldbot: Telegram flood wait / khali read par 3 koshish (screen: none se fail nahi)');
+  ok(wbFlowSrc.includes('let clickCallback') && wbFlowSrc.includes('click ka callback aaya'),
+    'worldbot: click ka callback aaya to "OTP Login" text dobara nahi jata');
+  ok(wbFlowSrc.includes('Login button nahi mila — menu reset karke ek aur koshish'),
+    'worldbot: Login button na mile to reset ke baad ek aur koshish (bot switch nahi)');
+  ok(wbFlowSrc.includes('worldReadCache') && wbFlowSrc.includes('Date.now() - worldReadCache.at < 400'),
+    'worldbot: 0.4s read-cache — GetHistory flood wait kam');
   ok(wbFlowSrc.includes('let otpWatermarkForRound = null')
     && wbFlowSrc.includes('otpProvider({ watermark: otpWatermarkForRound, phone: cleanPhone })')
     && wbFlowSrc.includes('otpProvider({ watermark: deleteWatermark, phone: cleanPhone })'),

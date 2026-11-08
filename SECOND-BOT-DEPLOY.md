@@ -413,9 +413,18 @@ World bots ka default pool: `@SwiggyByworldBot`, `@SwiggyByworld1Bot` …
   button 12 screens tak dhoondha jata hai, na mile to `Refresh` (HardXotp me
   `View Messages`) text bhej diya jata hai. Pehle sirf "latest" screen dekhi
   jati thi, isliye dusre number ki card ho to refresh hi nahi hota tha.
-- **Duplicate command nahi:** click se screen badal jaye to button ka text
-  dobara nahi bhejta (isliye `OTP Login` do baar nahi likha jata), aur
-  `Cancel` ka jawab aane ka intezaar hota hai (`/cancel` duplicate nahi).
+- **Duplicate command nahi:** click se screen badal jaye **ya bot ka callback
+  aa jaye** to button ka text dobara nahi bhejta (isliye `OTP Login` do baar
+  nahi likha jata — wahi duplicate Swiggy se `login attempts exceeded` karata
+  tha), aur `Cancel` ka jawab aane ka intezaar hota hai (`/cancel` duplicate
+  nahi).
+- **"OTP Sent" blank/photo ho to bhi sent:** number ke baad bot ka jawab bina
+  text (photo ya khali message) aaya to 3s grace ke baad OTP Sent maan liya
+  jata hai — pehle wahan `Cancel` + dobara number jata tha, number jal jata tha
+  aur OTP kabhi type nahi hota tha.
+- **Flood wait friendly:** `messages.GetHistory` flood wait ya khali read par 3
+  koshish + 0.4s read-cache; `Login button nahi mila — screen: none` par bot
+  switch nahi, pehle menu reset karke ek aur koshish.
 - **OTP type hota hai:** OTP source se code milte hi bot ko bhej diya jata hai
   (sirf tab nahi jab bot saaf-saaf number/naam maang raha ho) — **ek hi baar**.
   20s = "OTP Sent" confirm; OTP inbox ka wait alag

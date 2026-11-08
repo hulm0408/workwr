@@ -3503,6 +3503,19 @@ Thanks`)),
   ok(src.includes("resolvedSourceMode === 'telegram' ? 'telegram' : 'firebase'"),
     'worldbot: combined preset me Hermes number-source allowed');
 
+  // --- 🐞 regression: async status ko await karna zaroori hai ---
+  // Yehi bug tha: `tg` ek Promise tha, isliye login ke baad bhi START kahta
+  // tha "World Bot ke liye spare Telegram account chahiye".
+  const tgSrc = await fsp.readFile(new URL('./telegram-otp-source.js', import.meta.url), 'utf8');
+  ok(/export async function telegramUserClientStatus/.test(tgSrc),
+    'telegram: status function async hai (await zaroori)');
+  {
+    const calls = (autoResumeSrc.match(/telegramUserClientStatus\(\)/g) || []).length;
+    const awaited = (autoResumeSrc.match(/await telegramOtp\.telegramUserClientStatus\(\)/g) || []).length;
+    ok(calls === awaited && calls >= 3,
+      'telegram: START gate / diag / engine note — teeno jagah status ka intezar hota hai');
+  }
+
   // -------------------------------------------------------------------------
   // 📦 SHOP BOT STOCK — @its_shop_bot me stock push
   // Owner: "JAISE 10 ID SEND KARDI TO IS BOT ME WO ID STOCK PAR BHI ADD KARDE,

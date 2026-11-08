@@ -944,7 +944,11 @@ async function launchBatch(ctx, opts = {}) {
   // Telegram account chahiye (bot ke buttons click karne ke liye).
   const worldBotEngine = bs.getSetting('accountEngine') === 'worldbot';
   if (worldBotEngine) {
-    const tg = (() => { try { return telegramOtp.telegramUserClientStatus(); } catch { return {}; } })();
+    // ⚠️ Ye status function ASYNC hai — await ke bina Promise milta tha,
+    // isliye `tg.configured` hamesha undefined nikalti thi aur login hone ke
+    // baad bhi START "spare Telegram account chahiye" bolta reh jata tha.
+    let tg = {};
+    try { tg = await telegramOtp.telegramUserClientStatus(); } catch {}
     if (telegramLoginFlow || tg.loginInProgress) {
       await ctx.answerCbQuery('⏳ Telegram login chal raha hai — pehle complete karo.', { show_alert: true }).catch(() => {});
       await ctx.reply(telegramAccountCard(), kb(telegramLoginRows())).catch(() => {});
@@ -1225,7 +1229,8 @@ async function diagCard() {
   try {
     const engine = bs.getSetting('accountEngine') === 'worldbot' ? 'worldbot' : 'direct';
     const wbStatus = worldBot.getWorldBotStatus();
-    const tg = (() => { try { return telegramOtp.telegramUserClientStatus(); } catch { return {}; } })();
+    let tg = {};
+    try { tg = await telegramOtp.telegramUserClientStatus(); } catch {}
     const wbLine = wbStatus?.phase && wbStatus.phase !== 'idle'
       ? ` · last phase: ${wbStatus.phase}${wbStatus.lastAction ? ` (${wbStatus.lastAction})` : ''}`
       : '';
@@ -1814,8 +1819,10 @@ async function runTelegramLoginFlow(flow) {
       field('Hermes mode', '📨 ON (Telegram only)'),
       field('Hermes test', esc(verifyLine)),
       field('Session', '🔐 secure saved — chat me kabhi nahi dikhegi'),
+      field('World Bot', `✅ isi account se @${esc(worldBot.worldBotUsername())} ke buttons click honge`),
+      field('Shop Bot stock', `✅ isi account se @${esc(shopStock.shopBotConfig().username)} ko JSON files jayengi`),
       ``,
-      sub('Ab START BATCH Hermes se FIND NUMBER karega; Firebase fallback use nahi hoga.'),
+      sub('Ek hi spare account kaafi hai (OTP bot + World Bot + shop stock — sab isi se). Ab START dabao.'),
     ].join('\n')), settingsRows());
   } catch (error) {
     const aborted = flow.cancelled || error?.code === 'TELEGRAM_LOGIN_ABORTED' || /AUTH_USER_CANCEL|cancel\/timeout/i.test(String(error?.message || ''));
@@ -2256,7 +2263,8 @@ bot.action('ap_toggle_engine', async (ctx) => {
     ? '🌍 World Bot ON — account @' + worldBot.worldBotUsername() + ' ke buttons click karke banega (proxy/WAF OFF).'
     : '🌍 Direct API ON — is bot ka apna Swiggy bridge (proxy + WAF solver).';
   if (next === 'worldbot') {
-    const st = (() => { try { return telegramOtp.telegramUserClientStatus(); } catch { return {}; } })();
+    let st = {};
+    try { st = await telegramOtp.telegramUserClientStatus(); } catch {}
     if (!st.configured) note = '⚠️ World Bot ON, par spare Telegram account configured nahi — Settings → Add Telegram Account karo.';
     else if (telegramSettingEnabled()) note += ' ℹ️ Telegram Hermes number-source World Bot mode me OFF hai (numbers Firebase se).';
   }

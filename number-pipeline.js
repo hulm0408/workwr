@@ -25,7 +25,8 @@ import {
   findAccountKeyByPhone,
   getNextAutoUserName,
 } from './store.js';
-import { queueShopStockJson } from './shop-bot-stock.js';
+import { queueShopStockJson, shopStockStatus } from './shop-bot-stock.js';
+import { sessionFileText, writeSessionFile } from './session-file.js';
 import {
   requestSwiggyOtpViaBridge,
   requestSwiggyDeleteOtpViaBridge,
@@ -250,12 +251,15 @@ export function preferOnline(entries) {
 // 10 poore hone par wahi 10 JSON files @its_shop_bot ko documents ki tarah
 // bhej di jaati hain (zip nahi). Koi bhi fail ho to run par asar nahi —
 // queue safe rehti hai aur agle fresh par dobara try hota hai.
-async function pushSessionToShopStock({ accountKey = '', phone = '', report = null } = {}) {
+async function pushSessionToShopStock({ accountKey = '', phone = '', report = null, json = null } = {}) {
   if (!accountKey) return { ok: false, kind: 'no-account' };
   try {
-    const json = getSessionExportJson(accountKey);
-    if (!json) return { ok: false, kind: 'no-json' };
-    return await queueShopStockJson({ accountKey, phone, json, report });
+    // `json` diya ho (World Bot ki "starting se ending tak" copy) to wahi
+    // jaata hai — warna DB export. Isse worker bot aur stock me bilkul same
+    // text jaata hai.
+    const payload = json || getSessionExportJson(accountKey);
+    if (!payload) return { ok: false, kind: 'no-json' };
+    return await queueShopStockJson({ accountKey, phone, json: payload, report });
   } catch (e) {
     console.warn('[Pipeline] shop-stock queue:', e?.message || e);
     return { ok: false, kind: 'exception' };
@@ -401,11 +405,12 @@ export async function processSingleNumber({
   shouldAbort = null,
   shouldSkip = null,
   markUsed = true,
+  sendSession = null,       // async (payload) => bool — JSON file worker bot par
 }) {
   // 🌍 Swiggy World Bot mode — Swiggy ka saara kaam @SwiggyByWorldBot karta
   // hai (koi proxy/WAF/bridge nahi). Alag chhota pipeline.
   if (String(otpCfg?.accountEngine || '').toLowerCase() === 'worldbot') {
-    return processSingleNumberViaWorldBot({ userId, entry, report, otpCfg, shouldAbort, shouldSkip, markUsed });
+    return processSingleNumberViaWorldBot({ userId, entry, report, otpCfg, shouldAbort, shouldSkip, markUsed, sendSession });
   }
   const phone = entry?.phone;
   if (!phone) return { ok: false, kind: 'failed_bad_entry', phone: '', reason: 'Entry me phone nahi hai' };
@@ -785,6 +790,10 @@ export async function processSingleNumberViaWorldBot({
   shouldAbort = null,
   shouldSkip = null,
   markUsed = true,
+  // 📤 JSON file worker bot (isi chat) par bhejne ka rasta — engine deta hai
+  // (fresh-bot ka ui.sendSession). Pipeline khud await karta hai, taaki logout
+  // file bhejne ke BAAD hi ho (owner ka rule), aur engine dobara na bheje.
+  sendSession = null,
 } = {}) {
   const phone = normalizeWorldPhone(entry?.phone);
   if (!phone) return { ok: false, kind: 'failed_bad_entry', phone: '', reason: 'Entry me phone nahi hai' };
@@ -901,7 +910,13 @@ export async function processSingleNumberViaWorldBot({
   // 🅰️ Owner ka naam rule: mobile ke pehle 5 digit → alphabetic (0 → x).
   const autoName = swiggyNameFromPhone(phone);
 
-  const saveWorldSession = async (result, kind) => {
+  // 🗂 + 📤 + 🚪 Owner ka aakhri hissa (Task T):
+  //   login OK → JSON ka "starting se ending tak" hissa → EK file
+  //   → wahi file worker bot (isi chat) par → 10 poore hone par stock
+  //   → file bhejne ke BAAD world bot par Permanently Log Out.
+  // Naya number / naya OTP card yahan kabhi nahi aata — jo number delete hua
+  // wahi login hota hai, aur file usi ka JSON hota hai.
+  const saveWorldSession = async (result, kind, botCfg = null) => {
     const imported = importSessionJson(result.jsonText);
     if (!imported?.success) {
       return {
@@ -913,11 +928,91 @@ export async function processSingleNumberViaWorldBot({
       };
     }
     syncCloudVaultNow(getDb()).catch(() => {});
+
+    // 📄 File ka text: bot ne jo JSON diya uska pehla `{` se aakhri `}` tak.
+    // (JSON na mile to DB export — warna file hi khali chali jati.)
+    let fileText = sessionFileText(result.jsonText);
+    if (!fileText) {
+      try { fileText = sessionFileText(getSessionExportJson(imported.key)); } catch {}
+    }
+    const file = fileText
+      ? writeSessionFile({ phone, accountKey: imported.key, text: fileText })
+      : { ok: false, kind: 'no-json' };
+    if (file.ok) console.log(`[Pipeline] 🗂 JSON file bani: ${file.name} (${file.bytes} bytes) → ${file.path}`);
+
     if (markUsed) {
       markLedger(phone, 'success', { accountKey: imported.key, kind: kind === 'new' ? 'new' : 'after-delete' });
       await markPoolStatus(entry, 'used');
     }
-    await pushSessionToShopStock({ accountKey: imported.key, phone, report: say });
+
+    // 📤 Worker bot par file — await, taaki "bhej diya" ka asli saboot mile
+    // aur logout iske BAAD ho. Fail par ek retry; phir bhi fail to engine
+    // (tally) apna purana rasta try karega — double send nahi hoga kyunki
+    // sessionSent false rahega.
+    let sessionSent = false;
+    let sendReason = '';
+    if (fileText && typeof sendSession === 'function') {
+      for (let attempt = 1; attempt <= 2 && !sessionSent; attempt += 1) {
+        try {
+          const out = await sendSession({
+            phone,
+            accountKey: imported.key,
+            kind: kind === 'new' ? 'fresh_new' : 'fresh_after_delete',
+            account: imported.accountObj || getDb().config.accounts?.[imported.key] || null,
+            jsonText: fileText,
+            fileName: file.ok ? file.name : '',
+            note: attempt > 1 ? 'Dobara try — pehli baar file attach nahi hui thi.' : '',
+          });
+          sessionSent = out !== false;
+          if (!sessionSent) sendReason = 'attach fail';
+        } catch (e) {
+          sendReason = String(e?.message || e).slice(0, 120);
+          console.warn('[Pipeline] worker-bot JSON send:', sendReason);
+        }
+        if (!sessionSent && attempt < 2) await new Promise((r) => setTimeout(r, 1_500));
+      }
+    } else if (!fileText) {
+      sendReason = 'JSON text hi nahi mila';
+    } else {
+      sendReason = 'sendSession available nahi (engine ka UI missing)';
+    }
+    await say(sessionSent
+      ? section('📤 Worker Bot — JSON File Bhej Di', [
+        `📱 <b>Number:</b> <code>${esc(phone)}</code> · 👤 <code>${esc(imported.key)}</code>`,
+        `🗂 File: <code>${esc(file.ok ? file.name : 'json')}</code>${file.ok ? ` · ${file.bytes} bytes` : ''}`,
+        '→ Ab daba kar logout kar raha hoon (file ja chuki hai).',
+      ].join('\n'))
+      : section('⚠️ Worker Bot — File Nahi Gayi', [
+        `📱 <b>Number:</b> <code>${esc(phone)}</code> · 👤 <code>${esc(imported.key)}</code>`,
+        `↳ Wajah: ${esc(sendReason || 'attach fail')}`,
+        sub('JSON bot DB me safe hai — engine dobara bhejne ki koshish karega.'),
+      ].join('\n')));
+
+    // 🚪 File bhejne ke BAAD logout (owner ka rule). Fail ho to JSON par
+    // koi asar nahi — sirf log/card me sach dikhta hai.
+    let loggedOut = false;
+    let logoutReason = '';
+    if (sessionSent) {
+      try {
+        const out = await worldBotPermanentLogout({ phone, shouldAbort, config: botCfg || worldCfg });
+        loggedOut = Boolean(out?.ok);
+        logoutReason = String(out?.reason || out?.kind || '');
+        if (!loggedOut) console.warn(`[Pipeline] logout (send ke baad) skip: ${logoutReason}`);
+      } catch (e) {
+        logoutReason = String(e?.message || e).slice(0, 140);
+        console.warn('[Pipeline] logout (send ke baad):', logoutReason);
+      }
+    }
+
+    // 📦 10 poore ho gaye → stock (@its_shop_bot) me bhi wahi JSON files.
+    const stock = await pushSessionToShopStock({
+      accountKey: imported.key,
+      phone,
+      report: say,
+      json: fileText || null,
+    });
+    const stockPending = Number(stock?.pending ?? shopStockStatus().pending) || 0;
+
     return {
       ok: true,
       kind: kind === 'new' ? 'fresh_new' : 'fresh_after_delete',
@@ -925,6 +1020,15 @@ export async function processSingleNumberViaWorldBot({
       accountKey: imported.key,
       account: imported.accountObj || getDb().config.accounts?.[imported.key] || null,
       viaWorldBot: true,
+      // engine in do flags se duplicate send/logout nahi karta
+      sessionSent,
+      sessionFile: file.ok ? file.name : '',
+      sessionFilePath: file.ok ? file.path : '',
+      sessionBytes: file.ok ? file.bytes : 0,
+      sendReason: sessionSent ? '' : sendReason,
+      loggedOut,
+      logoutReason: loggedOut ? '' : logoutReason,
+      stockPending,
     };
   };
 
@@ -1046,7 +1150,7 @@ export async function processSingleNumberViaWorldBot({
       await say(section('🆕 World Bot — Naya Account (naam poochha)', [
         `📱 <code>${esc(phone)}</code> · @${esc(botUsername)} · JSON aa gaya, save kar raha hoon…`,
       ].join('\n')));
-      return saveWorldSession(first, 'new');
+      return saveWorldSession(first, 'new', cfg);
     }
 
     // ---- ♻️ Purana account — delete → phir fresh login ----
@@ -1128,12 +1232,15 @@ export async function processSingleNumberViaWorldBot({
     if (aborted()) return abortResult('after-delete');
 
     // ---- Fresh login (ab naam poochhna chahiye) ----
-    await say(section('✅ World Bot — Delete Ho Gaya — Fresh Login', [
+    // 🔁 Owner ka rule: yahan NA naya number, na OTP bot se naya card. Jo
+    // number delete hua wahi dobara Login → OTP Login → OTP par jaata hai.
+    await say(section('✅ World Bot — Delete Ho Gaya — Wahi Number Login', [
       `📱 <code>${esc(phone)}</code> · @${esc(botUsername)}`,
-      '→ Main Menu → Login → OTP Login → wahi number → OTP → naam (is baar naya account banega).',
+      '→ Main Menu → Login → OTP Login → <b>wahi number</b> → OTP → naam (is baar naya account banega).',
+      '→ Naya number / naya OTP card nahi — OTP isi number ke card se.',
       autoName ? `📛 Naam: <code>${esc(autoName)}</code> (number ke pehle 5 digit → a–i, 0 → x)` : '',
-      '→ JSON aa gaya to seedha bhej denge — beech me kuch nahi.',
-    ].join('\n')));
+      '→ JSON aa gaya to file banakar worker bot par bhej denge, phir logout.',
+    ].filter(Boolean).join('\n')));
     const again = await worldBotLogin({
       phone,
       otpProvider: makeOtpProvider(),
@@ -1160,19 +1267,8 @@ export async function processSingleNumberViaWorldBot({
       };
     }
 
-    const saved = await saveWorldSession(again, 'after-delete');
-
-    // Owner ka aakhri step: Switch Accounts → account → Permanently Logged Out.
-    // Best-effort — fail ho to fresh session par koi asar nahi.
-    if (saved.ok && cfg.logoutAfterDelete) {
-      try {
-        const out = await worldBotPermanentLogout({ phone, shouldAbort, config: cfg });
-        if (!out?.ok) console.warn(`[Pipeline] worldbot permanent logout skip: ${out?.reason || out?.kind}`);
-      } catch (e) {
-        console.warn('[Pipeline] worldbot permanent logout:', e?.message);
-      }
-    }
-    return saved;
+    // 🗂 file → 📤 worker bot → 🚪 logout → 📦 stock (saveWorldSession ke andar)
+    return saveWorldSession(again, 'after-delete', cfg);
   };
 
   // 🔁 BOT FAILOVER — owner ka final rule: ek hi bot par kaam. Bot SIRF tab

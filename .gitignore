@@ -29,3 +29,6 @@ data/telegram-api.json
 *.session
 telegram.session
 telegram-api.json
+
+# 🗂 Session JSON files (login ke baad banti hain) — credentials, git me kabhi nahi.
+data/session-files/

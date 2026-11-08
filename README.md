@@ -581,6 +581,9 @@ Next: OTP mila to verify · na mila to NEW NUMBER
 * **Naam phone se** — World Bot jab naam poochhe to naam = number ke **pehle 5 digit alphabetic** (1→a, 2→b … 9→i, **0→x**): `12345…` → `abcde`, `92046…` → `ibxdf`, `98765…` → `ihgfe`. Naam me sirf letters, isliye bot ka prompt accept karta hai.
 * **Delete success = turant Main Menu** — "Account Deleted Successfully" aate hi (500ms poll, koi 1.5s settle-wait nahi) `🏠 Main Menu` dabta hai, phir wahi number: `Login` → `OTP Login` → number → OTP → naam → JSON.
 * **Logout par do confirmation** — `Permanently Logged Out` ke baad bot pehle "konsa account" poochhta hai (wo ID) aur phir `✅ Yes / ❌ Cancel` — **Yes** dabta hai, Cancel kabhi nahi. Yes na mile to `logout_not_confirmed` (jhoothi success nahi).
+* **JSON file (starting se ending tak)** — login successful hote hi bot ke message se sirf pehla `{` se aakhri `}` tak ka hissa liya jata hai (header, code fence, "Copy Code" sab hata) aur **ek `.json` file** banti hai (`data/session-files/acc_<number>.json`). Wahi file worker bot par jaati hai — aur **10 poore** hone par wahi 10 files `@its_shop_bot` (stock) me bhi.
+* **File jaane ke BAAD logout** — file worker bot par bhej di jaaye (asli result ka intezaar), uske baad hi `Permanently Logged Out` → `✅ Yes`. File attach fail ho to logout nahi hota aur engine dobara bhejne ki koshish karta hai (double send nahi hota — `sessionSent` flag).
+* **Delete ke baad wahi number** — delete hone ke baad **naya number / OTP bot se naya card nahi** liya jata; jo number delete hua wahi `Login → OTP Login → OTP` par dobara jaata hai, aur usi ka JSON file banta hai.
 * **Delete blocked (charges/dues)** — bot bole "this account can't be deleted because user charges are present" to fresh account us number par ban hi nahi sakta. Tab: **🏠 Main Menu → 🔁 Switch Accounts → woh ID → 🚪 Permanently Logged Out**, phir **naya number** (number skip, bot wahi). Card par: `⛔ Delete Blocked (Charges) — Naya Number`. Bot jab OTP/number/naam maang raha ho to **button ka text kabhi nahi bhejta** (warna bot usi ko OTP/number samajh kar `❌ Invalid OTP` / `❌ Invalid Mobile Number` deta tha).
 * **Deadlock-free OTP fetch** — world-bot login jo Telegram lock pakadta hai, usi ke andar OTP fetch (wahi lock maangta hai) re-entrant chalta hai. Isse pehle ye apne hi lock par atka reh jata tha: number aata tha par OTP kabhi fetch/type nahi hota tha.
 * **OTP ke liye REFRESH** — OTP Sent ke baad OTP bot (Hermes/Hathi) me **har second** REFRESH dabta hai (button 12 screens + window se bahar gaya number-card tak dhoondha jata hai; na mile/click na chale to button ka text `Refresh` type hota hai). OTP aate hi copy karke world bot me type hota hai.
@@ -617,7 +620,7 @@ Helpers `rich-text.js` me hain: `fancy()`, `bracketHeader()`, `headerRule()`, `s
 | `SWIGGY_WORLD_TRIGGER` | `auto` | Button **click** → screen na badle to **button ka text likh kar bhej** (`type` = click bilkul nahi) |
 | `SWIGGY_WORLD_CLICK_GRACE_MS` | 4000 | Click ke baad screen badalne ka intezaar, phir text trigger |
 | `SWIGGY_WORLD_NUMBER_RETRIES` | 1 | OTP send confirm na ho (aur bot ne Cancel bhi na bheja ho) to number **skip nahi** — wahi number itni baar `Login → 2 → number` se dobara issue (max 2, `0` = off) |
-| `SWIGGY_WORLD_LOGOUT_AFTER_DELETE` | 1 | Delete+fresh ke baad `Switch Accounts → Permanently Logged Out` try kare |
+| `SWIGGY_WORLD_LOGOUT_AFTER_DELETE` | 1 | JSON file worker bot par jaane ke baad `Switch Accounts → Permanently Logged Out` try kare |
 | `SHOP_BOT_STOCK_ENABLED` | 1 | Har fresh JSON ko `@its_shop_bot` ke stock me bheje (`0` = band) |
 | `SHOP_BOT_USERNAME` | `its_shop_bot` | Stock lene wala shop bot |
 | `SHOP_BOT_PICK_PRODUCT` | 1 | Shop bot ke **Swiggy/Twing** product button khud dabaye |

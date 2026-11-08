@@ -8,6 +8,81 @@
 export const DIVIDER = '';
 export const SECTION_GAP = '\n';
 
+// ---------------------------------------------------------------------------
+// 🔤 FANCY FONT (Unicode "bold sans") — owner ne in bots jaisa alag font manga:
+//   "inke bot me kya alag font use ki gayi hai, mere bot me wohi tatti font"
+// Ye maths bold glyphs hain (𝗧𝗛𝗜𝗦 𝗝𝗔𝗜𝗦𝗔) — Telegram har device par dikhata hai.
+// Sirf HEADINGS/labels par lagta hai; numbers/OTP/JSON bilkul plain rehte hain
+// taaki copy-paste aur padhna kharab na ho.
+// ---------------------------------------------------------------------------
+const FANCY_BOLD_OFFSETS = {
+  upperA: 0x1D5D4, // 𝐀..𝐙 sans-serif bold
+  lowerA: 0x1D5EE, // 𝐚..𝐳
+  digit0: 0x1D7EC, // 𝟎..𝟗
+};
+
+export function fancy(text = '') {
+  return String(text ?? '').replace(/[A-Za-z0-9]/g, (ch) => {
+    const code = ch.charCodeAt(0);
+    if (ch >= 'A' && ch <= 'Z') return String.fromCodePoint(FANCY_BOLD_OFFSETS.upperA + (code - 65));
+    if (ch >= 'a' && ch <= 'z') return String.fromCodePoint(FANCY_BOLD_OFFSETS.lowerA + (code - 97));
+    return String.fromCodePoint(FANCY_BOLD_OFFSETS.digit0 + (code - 48));
+  });
+}
+
+// Ulta: fancy glyphs ko wapas ASCII me (stage/regex matching ke liye).
+const FANCY_TO_ASCII = (() => {
+  const map = new Map();
+  const pairs = [
+    [0x1D5D4, 'A'], [0x1D5EE, 'a'], [0x1D7EC, '0'], // sans-serif bold
+    [0x1D400, 'A'], [0x1D41A, 'a'], [0x1D7CE, '0'], // bold
+    [0x1D63C, 'A'], [0x1D656, 'a'], [0x1D7F6, '0'], // sans-serif bold italic
+  ];
+  for (const [base, start] of pairs) {
+    const size = start === '0' ? 10 : 26;
+    for (let i = 0; i < size; i += 1) {
+      map.set(base + i, String.fromCharCode(start.charCodeAt(0) + i));
+    }
+  }
+  return map;
+})();
+
+export function plain(text = '') {
+  return String(text ?? '').replace(/[\uD835][\uDC00-\uDFFF]/g, (ch) => FANCY_TO_ASCII.get(ch.codePointAt(0)) || ch);
+}
+
+// Header line: —[ ⚡ YOUR NUMBER ]—   (jaisa in bots ka style hai)
+export function bracketHeader(title, { time = '', width = 14 } = {}) {
+  const head = `—[ ${esc(fancy(String(title || '')))} ]—`;
+  return time ? `${head} <code>${esc(time)}</code>` : head;
+}
+
+export function headerRule(width = 14) {
+  return '─'.repeat(Math.max(3, Number(width) || 14));
+}
+
+// "02:28" jaisa chhota timestamp (owner IST me padhta hai).
+export function stamp(date = new Date(), { timeZone = 'Asia/Kolkata' } = {}) {
+  try {
+    const d = date instanceof Date ? date : new Date(date);
+    if (Number.isNaN(d.getTime())) return '';
+    return new Intl.DateTimeFormat('en-GB', {
+      hour: '2-digit', minute: '2-digit', hour12: false, timeZone,
+    }).format(d);
+  } catch {
+    return '';
+  }
+}
+
+// Collapsible detail block (Telegram expandable blockquote) — lambi "poori
+// duniya ki information" chhup jati hai, card saaf rehta hai.
+export function details(lines = [], { title = '' } = {}) {
+  const body = (Array.isArray(lines) ? lines : [lines]).filter(Boolean).join('\n');
+  if (!body) return '';
+  const head = title ? `${heading(title)}\n` : '';
+  return `<blockquote expandable>${head}${body}</blockquote>`;
+}
+
 export function esc(str = '') {
   return String(str ?? '')
     .replace(/&(?!(?:amp|lt|gt|quot|apos|#39|#\d+);)/g, '&amp;')
@@ -16,7 +91,8 @@ export function esc(str = '') {
     .replace(/"/g, '&quot;');
 }
 
-// Bold heading
+// Bold heading. Body ke andar wala text plain bold rehta hai (search/copy
+// ke liye), fancy font sirf card header (section) aur field labels par lagta hai.
 export function heading(text) {
   return `<b>${esc(text)}</b>`;
 }
@@ -45,13 +121,15 @@ export function progressBar(done = 0, total = 0, width = 10) {
 
 // Ek hi compact status card: title + flow + abhi kya ho raha hai + progress.
 // Body pehle se trusted internal HTML hai; caller sirf chhoti lines dega.
-export function statusCard(title, lines = []) {
-  return section(title, (Array.isArray(lines) ? lines : [lines]).filter(Boolean).join('\n'));
+// `stamp` (Date) do to header par right-side time chip aa jata hai.
+export function statusCard(title, lines = [], { stamp: when = null } = {}) {
+  const body = (Array.isArray(lines) ? lines : [lines]).filter(Boolean).join('\n');
+  return when ? sectionStamp(title, body, when) : section(title, body);
 }
 
-// Field line: <b>Label:</b> value
+// Field line: <b>LABEL:</b> value  (label fancy font me, value plain)
 export function field(label, value) {
-  return `<b>${esc(label)}:</b> ${esc(value)}`;
+  return `<b>${esc(fancy(label))}:</b> ${esc(value)}`;
 }
 
 // Bullet item
@@ -60,9 +138,17 @@ export function bullet(text) {
 }
 
 // Bordered section block (Telegram <blockquote> renders as a card with a left border).
+// Title ab in bots jaisa:  —[ ⚡ TITLE ]—  + niche patli line.
 // `body` is trusted internal HTML already built with esc()/field()/table()/heading()/sub().
 export function section(title, body) {
-  const t = title ? `${heading(title)}\n` : '';
+  const t = title ? `${bracketHeader(title)}\n${headerRule()}\n` : '';
+  return `<blockquote>${t}${body}</blockquote>\n`;
+}
+
+// Same card, par header ke saath time chip (in bots ka right-side timestamp).
+export function sectionStamp(title, body, date = new Date()) {
+  const time = stamp(date);
+  const t = title ? `${bracketHeader(title, { time })}\n${headerRule()}\n` : '';
   return `<blockquote>${t}${body}</blockquote>\n`;
 }
 

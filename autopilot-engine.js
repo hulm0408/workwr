@@ -56,7 +56,7 @@ import {
 import { getOtpBotProfile, normalizeOtpBotProfileId } from './otp-bot-profiles.js';
 import * as wafPool from './waf-pool.js';
 import * as proxyPool from './proxy-pool.js';
-import { esc, section, sub, field, mono, progressBar, statusCard } from './rich-text.js';
+import { esc, section, sub, field, mono, plain, progressBar, statusCard } from './rich-text.js';
 
 const envInt = (key, dflt) => {
   const v = Number(process.env[key]);
@@ -786,7 +786,7 @@ function fmtDuration(ms) {
 }
 
 function plainStageText(raw = '') {
-  return String(raw || '')
+  return plain(String(raw || ''))
     .replace(/<br\s*\/?>/gi, '\n')
     .replace(/<[^>]+>/g, ' ')
     .replace(/&amp;/g, '&')
@@ -802,15 +802,20 @@ function truncateUiText(value = '', max = 96) {
   return text.length > max ? `${text.slice(0, Math.max(0, max - 1)).trim()}…` : text;
 }
 
+// Card header do shaklon me aa sakta hai: purana <b>Title</b> ya naya
+// —[ ⚡ TITLE ]— (fancy font). Dono ko same tarah padho, warna stage galat
+// step par atak jata hai.
 function stageParts(stageText = '') {
   const raw = String(stageText || '');
   const titleMatch = raw.match(/<b>([\s\S]*?)<\/b>/i);
-  const title = plainStageText(titleMatch?.[1] || '');
+  const bracketMatch = raw.match(/—\[\s*([\s\S]*?)\s*\]—/u);
+  const title = plainStageText(titleMatch?.[1] || bracketMatch?.[1] || '');
   const lines = raw
     .split(/\n+/)
     .map((line) => plainStageText(line).replace(/^[›•·-]\s*/, '').trim())
     .filter(Boolean)
-    .filter((line) => line !== title && !/^(processed|fresh sessions|skipped|failed|parallel lanes|proxy|pool)\b/i.test(line) && !/number\s*:/i.test(line));
+    .filter((line) => !/^—\[[\s\S]*\]—$/u.test(line) && !/^[─\-—_=]{3,}$/u.test(line))
+    .filter((line) => plainStageText(line) !== title && !/^(processed|fresh sessions|skipped|failed|parallel lanes|proxy|pool)\b/i.test(line) && !/number\s*:/i.test(line));
   return { title, detail: truncateUiText(lines[0] || '', 104) };
 }
 
@@ -1051,7 +1056,8 @@ export function formatCompactAutopilotCard(snap = state, { stageText = '', final
     const latest = s.freshAccounts.slice(-5);
     lines.push(`<b>Latest:</b> ${latest.map((a) => mono(a.phone)).join(' · ')}${s.freshAccounts.length > latest.length ? ` <i>+${s.freshAccounts.length - latest.length} aur</i>` : ''}`);
   }
-  return statusCard(title, lines);
+  // Live card par right-side time chip (in bots jaisa) — final card par nahi.
+  return statusCard(title, lines, final ? {} : { stamp: new Date() });
 }
 
 function statsLines() {

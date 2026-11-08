@@ -3379,6 +3379,12 @@ Thanks`)),
     'worldbot: OTP Sent detect');
   ok(wb.worldBotPromptKind('Send your 10-digit Swiggy number.') === 'askNumber',
     'worldbot: number prompt detect');
+  // Asli bot ka lamba naam-prompt (owner ke log se) — pehle 12-word limit ki
+  // wajah se miss hota tha, isliye naya account banne par naam hi nahi jata tha.
+  ok(wb.worldBotPromptKind('🆕 New Account Detected!\n\nTell us the name to set on your Swiggy account.') === 'askName',
+    'worldbot: asli lamba "New Account Detected… name" prompt detect hota hai');
+  ok(wb.worldBotPromptKind('Login JSON\nTap Copy on the code block below\n{"name":"x","mobile":"9"}') === '',
+    'worldbot: JSON message ko galti se naam ka prompt nahi samajhta');
   ok(wb.worldBotPromptKind('Send your name') === 'askName',
     'worldbot: naam ka sawaal = NAYA account');
   ok(wb.worldBotPromptKind('Invalid Mobile Number') === 'invalidNumber',
@@ -3550,9 +3556,25 @@ Thanks`)),
     'worldbot: queue timeout alag outcome deta hai');
   ok(wbSrc.includes('recentScreens'),
     'worldbot: /world me batch ke andar ke screens dikhte hain');
-  ok(pipelineSrc.includes('const worldOtpBudgetMs = Math.min(')
-    && pipelineSrc.includes('20_000'),
-  'worldbot: pipeline OTP wait bhi 20s par capped');
+  // ⏱ Do alag budgets: 20s = "OTP Sent" confirm; inbox = code aane ka intezaar
+  // (number ki life nahi) — owner ne saaf kaha tha.
+  ok(pipelineSrc.includes('const worldOtpInboxMs = Math.min(')
+    && pipelineSrc.includes('SWIGGY_WORLD_OTP_INBOX_TIMEOUT_MS')
+    && pipelineSrc.includes('90_000'),
+  'worldbot: OTP inbox ka intezaar alag budget (90s default), 20s par capped nahi');
+  ok(!pipelineSrc.includes('const worldOtpBudgetMs = Math.min('),
+    'worldbot: purana 20s inbox cap hata diya');
+  // 📨 "bot OTP type hi nahi kar raha" — OTP mila to type hota hai, aur sirf
+  // EK baar (purana "OTP Sent" message dekh kar dobara nahi).
+  ok(wbSrc.includes("setPhase('otp-type')") && wbSrc.includes("return { ok: true, reason: 'typed' }"),
+    'worldbot: OTP mila to bot ko TYPE hota hai (guard se skip nahi)');
+  ok(wbSrc.includes("bot-${awaiting}-maang-raha-hai") && wbSrc.includes('OTP screen saaf nahi mili'),
+    'worldbot: OTP sirf tab skip jab bot number/naam maang raha ho');
+  ok(wbSrc.includes('SIRF latest screen dekho'),
+    'worldbot: OTP ek hi baar jata hai (latest screen se verify)');
+  ok(wbSrc.includes('OTP source (Hermes/Firebase) me is number ka code hi nahi aaya')
+    && wbSrc.includes("code: 'OTP_SOURCE_EMPTY'"),
+  'worldbot: OTP source khali ho to saaf reason (bot ne type nahi kiya kyunki code hi nahi tha)');
   ok(/failed_otp_miss[\s\S]{0,400}switchBot: false/.test(pipelineSrc),
     'worldbot: OTP miss par pipeline bot switch nahi karti');
 

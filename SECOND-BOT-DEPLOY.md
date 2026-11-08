@@ -399,6 +399,11 @@ World bots ka default pool: `@SwiggyByworldBot`, `@SwiggyByworld1Bot` …
 - **Bot ke apne refuse:** `❌ Could not send OTP … account suspended` = number
   dead (skip, bot wahi) · `… login attempts exceeded` = number 2 ghante cooldown.
   Aise case me 20s wait ya retry nahi hota.
+- **OTP type hota hai:** OTP source se code milte hi bot ko bhej diya jata hai
+  (sirf tab nahi jab bot saaf-saaf number/naam maang raha ho) — **ek hi baar**.
+  20s = "OTP Sent" confirm; OTP inbox ka wait alag
+  (`SWIGGY_WORLD_OTP_INBOX_TIMEOUT_MS`, default 90s). Code na mile to reason
+  card me: "OTP source me code hi nahi aaya".
 - **Queue:** bot "queue/wait" bole to 45s tak wait (`SWIGGY_WORLD_QUEUE_WAIT_MS`)
   — asli run me queue ke baad OTP Sent ~40-60s me aata hai.
 - **Button trigger:** pehle click; screen na badle to **usi button ka text likh kar

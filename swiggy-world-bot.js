@@ -355,7 +355,12 @@ export function worldBotPromptKind(text = '') {
   if (/\b(otp sent|otp bhej|send the 6 digit otp)\b/.test(n)) return 'otpSent';
   if (/\b(otp|code)\b/.test(n) && /\b(sent|delivered|bhej\w*|gaya|chala gaya)\b/.test(n)) return 'otpSent';
   // Naam ka sawaal — "What is your name?", "Send your name", "apna naam batao".
-  if (/\b(name|naam)\b/.test(n) && n.split(' ').filter(Boolean).length <= 12) return 'askName';
+  // Asli bot lamba likhta hai: "🆕 New Account Detected! Tell us the name to
+  // set on your Swiggy account." — pehle 12-word limit ki wajah se ye miss ho
+  // jata tha aur bot naam ka intezaar karta reh jata tha.
+  if (/\b(name|naam)\b/.test(n)
+    && !/\b(otp|code|10\s?-?digit|mobile\s*number|send your 10)\b/.test(n)
+    && n.split(' ').filter(Boolean).length <= 30) return 'askName';
   if (/\b(send|enter|type|provide|bhejo|batao)\b/.test(n) && /\b(10 digit|10-digit|mobile|number)\b/.test(n)) return 'askNumber';
   return '';
 }
@@ -759,9 +764,10 @@ export async function worldBotLogin({
 
       // 1) /start → main menu (pehle pichla adhoora flow saaf: OTP/number prompt)
       setPhase('start');
-      await worldResetToMenu(client, entity, cfg);
+      const cleanMenu = await worldResetToMenu(client, entity, cfg);
       let before = screenSignature(await parseScreenMessages(client, entity));
-      await sendWorldText(client, entity, '/start').catch(() => {});
+      // Reset ne /start bhej diya hota hai — dobara sirf tab jab menu saaf na hua ho.
+      if (!cleanMenu) await sendWorldText(client, entity, '/start').catch(() => {});
       await waitForReply({
         client, entity, baseline: before, timeoutMs: cfg.startTimeoutMs, shouldAbort,
         what: 'main menu',
@@ -877,15 +883,25 @@ export async function worldBotLogin({
       setPhase('otp-wait');
       await reportCard(report, [
         '🌍 <b>World Bot — OTP Sent</b>',
-        `📱 <code>${cleanPhone}</code> · OTP Firebase inbox se aa raha hai…`,
+        `📱 <code>${cleanPhone}</code> · ab OTP inbox se code ka intezaar (20s confirm ho gaya, inbox apna alag budget)`,
       ].join('\n'));
       if (typeof otpProvider !== 'function') throw new WorldBotError('no-otp-provider', 'OTP provider missing');
       const otp = await otpProvider();
       if (!otp?.code) {
         await safeCancel(client, entity, cfg).catch(() => {});
         if (otp?.aborted) return { ok: false, kind: 'aborted', phone: cleanPhone, reason: 'OTP wait abort' };
-        return { ok: false, kind: 'failed_otp_miss', phone: cleanPhone, reason: otp?.error || 'OTP inbox me nahi mila' };
+        // 👀 Owner ko saaf pata chale ki OTP SOURCE me code hi nahi aaya
+        // (bot ne type nahi kiya isliye nahi — code hi nahi mila tha).
+        console.warn(`[WorldBot] OTP inbox me code nahi aaya (${cleanPhone}) — ${otp?.error || 'source empty'}`);
+        return {
+          ok: false,
+          kind: 'failed_otp_miss',
+          phone: cleanPhone,
+          code: 'OTP_SOURCE_EMPTY',
+          reason: otp?.error || 'OTP source (Hermes/Firebase) me is number ka code hi nahi aaya — bot ne type nahi kiya kyunki code hi nahi tha',
+        };
       }
+      console.log(`[WorldBot] OTP mila (${cleanPhone}) — bot ko type kar raha hoon`);
 
       // 🛡️ OTP kabhi "123 456" / "+91 123456" jaisa aata hai — sirf digits.
       // Aur wahi purana code dobara bhejna = bot "invalid OTP" dega, number
@@ -914,14 +930,15 @@ export async function worldBotLogin({
 
       setPhase('otp-verify');
       before = screenSignature(await parseScreenMessages(client, entity));
-      const codeDelivered = await sendWorldCode(client, entity, otpCode);
-      if (!codeDelivered) {
+      const typed = await sendWorldCode(client, entity, otpCode, cfg);
+      if (!typed.ok) {
         await safeCancel(client, entity, cfg).catch(() => {});
         return {
           ok: false,
           kind: 'failed_otp_verify',
           phone: cleanPhone,
-          reason: `OTP aa gaya (${String(otp.code).trim().length} digit) par bot ko bhejne me dikkat — bot nahi badla, number aage badha`,
+          code: typed.reason,
+          reason: `OTP aa gaya (${otpCode.length} digit) par bot ne nahi liya [${typed.reason}] — bot nahi badla, number aage badha`,
         };
       }
 
@@ -1126,34 +1143,61 @@ async function waitForOtpSent({ client, entity, baseline, cfg, shouldAbort }) {
   };
 }
 
-// OTP code bot ko bhejo aur confirm karo ki message sach me gaya. Owner ne
-// dekha tha: "OTP aa raha hai par bot OTP enter nahi karta aur bot badal
-// deta hai" — isliye send fail/confirm fail par retry, aur tab bhi na ho to
-// bot NAHI badalta (sirf number aage badhta hai).
-async function sendWorldCode(client, entity, code) {
+// OTP code bot ko bhejo. Owner ki shikayat: "bot to OTP type hi nahi kar
+// raha" — isliye yahan OTP bhejna kabhi skip nahi hota. Sirf ek hi soorat me
+// nahi bhejte: bot saaf-saaf NUMBER ya NAAM maang raha ho (tab 6 digit jane
+// ka matlab nahi).
+//   return { ok, reason }
+async function sendWorldCode(client, entity, code, cfg = {}) {
   const text = String(code || '').trim();
-  if (!text) return false;
-  // Bot number/naam maang raha ho to OTP bhejna bekaar (aur ganda) hai.
-  try {
-    const awaiting = worldBotAwaitingKind(await parseScreenMessages(client, entity));
-    if (awaiting && awaiting !== 'otp') {
-      console.warn(`[WorldBot] OTP send skip — bot abhi ${awaiting} par hai`);
-      return false;
-    }
-  } catch {}
+  const pollMs = Math.max(300, Number(cfg?.pollMs) || 1_500);
+  if (!text) return { ok: false, reason: 'otp-empty' };
+
+  // "OTP Sent" message parse hone me kabhi 1-2s lag jate hain — 4s tak dekho.
+  let awaiting = '';
+  const lookUntil = Date.now() + 4_000;
+  for (;;) {
+    awaiting = worldBotAwaitingKind(await parseScreenMessages(client, entity));
+    if (awaiting === 'otp' || awaiting === 'number' || awaiting === 'name') break;
+    if (Date.now() >= lookUntil) break;
+    await sleep(pollMs);
+  }
+  if (awaiting === 'number' || awaiting === 'name') {
+    console.warn(`[WorldBot] OTP type nahi kiya — bot abhi ${awaiting} maang raha hai`);
+    return { ok: false, reason: `bot-${awaiting}-maang-raha-hai` };
+  }
+  if (awaiting !== 'otp') {
+    // Screen saaf/mixed hai — phir bhi OTP bhejte hain (ye hi asli kaam hai).
+    console.warn('[WorldBot] OTP screen saaf nahi mili — phir bhi OTP bhej raha hoon');
+  }
+
   for (let attempt = 1; attempt <= 2; attempt += 1) {
     try {
+      setPhase('otp-type');
       await sendWorldText(client, entity, text);
-      await sleep(1_000);
-      const recent = await parseScreenMessages(client, entity, 4);
-      if (recent.some((m) => String(m.text || '').includes(text))) return true;
-      console.warn(`[WorldBot] OTP message confirm nahi hua (try ${attempt})`);
+      console.log(`[WorldBot] ⌨️ OTP type kiya (try ${attempt})`);
     } catch (e) {
       console.warn(`[WorldBot] OTP send fail (try ${attempt}): ${e?.message || e}`);
+      await sleep(1_200);
+      continue;
     }
-    await sleep(1_200);
+    // Bot ne OTP accept kiya? SIRF latest screen dekho — purana "OTP Sent"
+    // message neeche pada rehta hai, usse "abhi bhi OTP maang raha hai" galat
+    // samajh kar OTP do baar chala jata tha.
+    const verifyUntil = Date.now() + 6_000;
+    while (Date.now() < verifyUntil) {
+      const recent = await parseScreenMessages(client, entity, 4);
+      const kinds = recent.slice(0, 2).map((m) => worldBotPromptKind(m.text));
+      if (kinds.includes('otpFail')) {
+        console.warn('[WorldBot] bot ne OTP reject kiya — dobara try');
+        break;
+      }
+      if (worldBotPromptKind(recent[0]?.text) !== 'otpSent') return { ok: true, reason: 'typed' };
+      await sleep(pollMs);
+    }
+    if (attempt === 2) break;
   }
-  return false;
+  return { ok: false, reason: 'otp-not-accepted' };
 }
 
 // Bot file (.json/.txt) bheje to wahi download karke JSON nikalo.

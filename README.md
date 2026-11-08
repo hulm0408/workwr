@@ -576,6 +576,8 @@ Next: OTP mila to verify · na mila to NEW NUMBER
 * **Labels fancy, values plain** — `𝗬𝗼𝘂𝗿 𝗡𝘂𝗺𝗯𝗲𝗿:` ke aage number saada rehta hai.
 * **Numbers / OTP / JSON kabhi fancy nahi** — copy-paste aur padhna kharab na ho (`mono()` inhe `<code>` me rakhta hai).
 * **Process wahi jo ideal flow me hai** — login se pehle bot ka adhoora OTP/number prompt pehle `Cancel` se saaf hota hai, phir `/start` → `Login` → `OTP Login` → number → OTP. Bot jab OTP/number/naam maang raha ho to **button ka text kabhi nahi bhejta** (warna bot usi ko OTP/number samajh kar `❌ Invalid OTP` / `❌ Invalid Mobile Number` deta tha).
+* **OTP hamesha type hota hai** — OTP source se code aate hi bot ko bheja jata hai (sirf tab nahi jab bot saaf-saaf number/naam maang raha ho), aur **ek hi baar**. Code na aaye to card me saaf reason: `OTP source (Hermes/Firebase) me is number ka code hi nahi aaya`.
+* **Do alag budgets** — `20s` sirf "OTP Sent" confirm karne ka; OTP inbox ka intezaar alag (`SWIGGY_WORLD_OTP_INBOX_TIMEOUT_MS`, default 90s). Number 20s me nahi marti.
 * **Bot ke apne errors maane jate hain** — `❌ Could not send OTP … account suspended` ⇒ number dead (skip, bot na badlo); `… login attempts exceeded` ⇒ number 2 ghante cooldown; 20s wait/retry nahi.
 * **Lambi detail collapsible** — `/world` ke last 5 screens `<blockquote expandable>` me: card chhota rehta hai, kholne par poora detail.
 
@@ -595,6 +597,7 @@ Helpers `rich-text.js` me hain: `fancy()`, `bracketHeader()`, `headerRule()`, `s
 | `SWIGGY_WORLD_STEP_TIMEOUT_MS` | 45000 | World Bot ke ek step (button/JSON) ka budget |
 | `SWIGGY_WORLD_OTP_TIMEOUT_MS` | 20000 | OTP ka intezaar **sirf 20s** — nahi aaya to number skip (bot wahi) |
 | `SWIGGY_WORLD_OTP_SEND_TIMEOUT_MS` | 20000 | Bot "OTP Sent" 20s me confirm na kare → **bot badlo** |
+| `SWIGGY_WORLD_OTP_INBOX_TIMEOUT_MS` | 90000 | OTP **source** (Hermes/Firebase) me code aane ka intezaar — ye number ki life nahi, 20s se alag budget |
 | `SWIGGY_WORLD_QUEUE_WAIT_MS` | 45000 | Bot "queue/wait" bole to itna wait (asli run me OTP Sent ~40-60s baad aata hai); isse zyada → **bot badlo** |
 | `SWIGGY_WORLD_TRIGGER` | `auto` | Button **click** → screen na badle to **button ka text likh kar bhej** (`type` = click bilkul nahi) |
 | `SWIGGY_WORLD_CLICK_GRACE_MS` | 4000 | Click ke baad screen badalne ka intezaar, phir text trigger |

@@ -821,16 +821,23 @@ export async function processSingleNumberViaWorldBot({
 
   const worldCfg = worldBotConfig();
   const waitMs = Number(otpCfg.waitMs ?? 3_000);
-  // ⏱ Owner rule: OTP ke liye SIRF 20 second. Nahi aaya = number skip
-  // (bot wahi rehta hai — bina wajah bot switch nahi hota).
-  const worldOtpBudgetMs = Math.min(
-    20_000,
-    Math.max(5_000, Number(otpCfg.worldOtpTimeoutMs ?? 20_000))
+  // ⏱ Do ALAG budgets — owner ne saaf kaha: "number ki life 20 second nahi".
+  //   • 20s  = bot ke screen par "OTP Sent" confirm hone ka budget
+  //            (worldBotLogin → waitForOtpSent)
+  //   • inbox = OTP SOURCE (Hermes/Firebase) me code aane ka intezaar — ye
+  //            number ki jaan nahi, isliye 90s default (env se badla ja sakta).
+  const worldOtpInboxMs = Math.min(
+    180_000,
+    Math.max(30_000, Number(
+      otpCfg.worldOtpInboxTimeoutMs
+      ?? process.env.SWIGGY_WORLD_OTP_INBOX_TIMEOUT_MS
+      ?? 90_000
+    ) || 90_000)
   );
-  const timeoutMs = Math.min(worldOtpBudgetMs, Number(otpCfg.timeoutMs ?? 90_000));
+  const timeoutMs = worldOtpInboxMs;
   const pollMs = Number(otpCfg.pollMs ?? 1_500);
-  const acceptAnyAfterMs = Math.min(15_000, Math.floor(worldOtpBudgetMs / 2));
-  const telegramTimeoutMs = Math.min(worldOtpBudgetMs, Number(otpCfg.telegramOtpTimeoutMs ?? 20_000));
+  const acceptAnyAfterMs = Math.min(15_000, Math.floor(worldOtpInboxMs / 2));
+  const telegramTimeoutMs = worldOtpInboxMs;
   const telegramRefreshMs = Number(otpCfg.telegramOtpRefreshMs ?? 2_500);
 
   // Har OTP round ka apna baseline: purana SMS/OTP kabhi reuse na ho.
@@ -925,7 +932,7 @@ export async function processSingleNumberViaWorldBot({
       return {
         ok: false, kind: 'failed_otp_miss', phone, stage: 'otp_wait',
         otpFailure: true, otpAttemptConsumed: true, otpAttempts: 1,
-        reason: res.reason || `${botTag}: 20s me OTP nahi aaya — number skip (bot wahi)`,
+        reason: res.reason || `${botTag}: OTP inbox me ${Math.round(worldOtpInboxMs / 1000)}s me code nahi aaya — number skip (bot wahi)`,
         viaWorldBot: true, switchBot: false,
       };
     }

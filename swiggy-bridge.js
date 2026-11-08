@@ -3948,7 +3948,7 @@ function closeBridgeSessionCleanly(session) {
   } catch {}
 }
 
-export async function requestSwiggyOtpViaBridge(userId, phone, targetAcc = '', targetAccName = null) {
+async function requestSwiggyOtpViaBridgeRaw(userId, phone, targetAcc = '', targetAccName = null) {
   const cleanPhone = normalizeIndianMobileNumber(phone) || '';
 
   if (cleanPhone.length !== 10) {

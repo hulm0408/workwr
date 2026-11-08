@@ -38,6 +38,10 @@ export const WORLD_BOT_POOL_DEFAULT = [
 
 const normHandle = (value = '') => String(value || '').trim().replace(/^@+/, '');
 
+// Ek hi OTP dobara bhejne ka koi matlab nahi (bot "invalid OTP" dega aur number
+// waste hoga). Isliye phone+code ka record — sirf memory me.
+const usedOtpCodes = new Set();
+
 export function listWorldBotUsernames(env = process.env) {
   const multi = String(env?.SWIGGY_WORLD_BOT_USERNAMES || '').trim();
   if (multi) {
@@ -96,6 +100,17 @@ function setPhase(phase, extra = {}) {
   state.phase = phase;
   state.lastChatAt = Date.now();
   Object.assign(state, extra);
+}
+
+// Har naye number/attempt par purana error/typed-text saaf — warna pichhle
+// attempt ka "lastError" naye number par galat report ho jata tha.
+export function resetWorldBotRunState() {
+  state.lastError = '';
+  state.lastTypedText = '';
+  state.lastTypedAt = 0;
+  state.lastTrigger = '';
+  state.step = 0;
+  return true;
 }
 
 function setError(error) {
@@ -178,6 +193,12 @@ export function worldBotConfig(env = process.env) {
     otpTimeoutMs: num('SWIGGY_WORLD_OTP_TIMEOUT_MS', WORLD_BOT_DEFAULTS.otpTimeoutMs, 5_000),
     otpSendTimeoutMs: num('SWIGGY_WORLD_OTP_SEND_TIMEOUT_MS', WORLD_BOT_DEFAULTS.otpSendTimeoutMs, 5_000),
     queueWaitMs: num('SWIGGY_WORLD_QUEUE_WAIT_MS', WORLD_BOT_DEFAULTS.queueWaitMs, 5_000),
+    // Button trigger: 'auto' = pehle click; screen na badle to button ka TEXT
+    // type karke action trigger. 'type' = click bilkul nahi, seedha text.
+    trigger: ['click', 'type', 'auto'].includes(String(env?.SWIGGY_WORLD_TRIGGER || '').trim().toLowerCase())
+      ? String(env.SWIGGY_WORLD_TRIGGER).trim().toLowerCase()
+      : 'auto',
+    clickGraceMs: num('SWIGGY_WORLD_CLICK_GRACE_MS', 4_000, 1_000),
     // Delete ke baad "Switch Accounts → Permanently Logged Out" (best-effort).
     logoutAfterDelete: String(env?.SWIGGY_WORLD_LOGOUT_AFTER_DELETE ?? '1') !== '0',
   };
@@ -315,6 +336,58 @@ export function worldBotPromptKind(text = '') {
   return '';
 }
 
+// ---------------------------------------------------------------------------
+// 🛡️ MISTAKE-PROOF HELPERS (pure — tests inhe seedha check karte hain)
+// ---------------------------------------------------------------------------
+
+// Button ka TEXT type karke action trigger karne ke variants.
+// Owner: "instead of clicking button read all the text of button and type that
+// text to trigger that" — pehle poora text, phir bina emoji, phir simple.
+export function worldButtonTypeVariants(text = '') {
+  const raw = String(text || '').trim();
+  if (!raw) return [];
+  const noEmoji = raw
+    .replace(/[\p{Extended_Pictographic}\uFE0F\u200D]/gu, ' ')
+    .replace(/[\u2190-\u21FF\u2600-\u27BF]/g, ' ')
+    .replace(/[^\p{L}\p{N}\s&/+.-]+/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const lower = noEmoji.toLowerCase();
+  const out = [...new Set([raw, noEmoji, lower].filter(Boolean))];
+  return out;
+}
+
+// OTP kabhi "123 456", "+1 234", ya copy-paste me spaces ke saath aata hai.
+// Sirf 4-8 digit hi valid OTP — warna bot ko galat text chala jata hai.
+export function normalizeOtpCode(value = '') {
+  const digits = String(value ?? '').replace(/\D/g, '');
+  if (digits.length < 4 || digits.length > 8) return '';
+  return digits;
+}
+
+// JSON mila par adhoora (token/tid/cookies kuch bhi nahi) → uska koi kaam nahi.
+export function isValidWorldSessionJson(value) {
+  const obj = typeof value === 'string' ? (() => { try { return JSON.parse(value); } catch { return null; } })() : value;
+  return Boolean(looksLikeSessionJson(obj));
+}
+
+// Kisi bhi error ko samajhne layak category me baanto — isse pata chalta hai
+// bot badalna hai, session dobara login karna hai, ya sirf number defer karna.
+export function classifyWorldBotError(error = {}) {
+  const raw = String(error?.message ?? error ?? '');
+  const code = String(error?.code || '').toUpperCase();
+  if (code === 'WORLDBOT_ABORTED' || /owner ne stop|aborted|stop\/skip/i.test(raw)) return 'aborted';
+  if (/AUTH_KEY_UNREGISTERED|SESSION_REVOKED|SESSION_EXPIRED|USER_DEACTIVATED|AUTH_KEY_DUPLICATED|SESSION_PASSWORD_NEEDED/i.test(raw)) {
+    return 'worldbot_setup';
+  }
+  if (/FLOOD(_PREMIUM)?_WAIT/i.test(raw)) return 'flood_wait';
+  if (/USERNAME_NOT_OCCUPIED|USERNAME_INVALID|no user has|could not find|cannot find any entity|CHANNEL_PRIVATE|PEER_ID_INVALID|USER_BANNED/i.test(raw)) {
+    return 'bot_unreachable';
+  }
+  if (/ETIMEDOUT|ECONNRESET|ENOTFOUND|ECONNREFUSED|socket|network|connection/i.test(raw)) return 'network';
+  return 'failed_world_bot';
+}
+
 export function normalizeWorldPhone(value = '') {
   const digits = String(value || '').replace(/\D/g, '');
   return digits.length > 10 ? digits.slice(-10) : digits;
@@ -391,9 +464,19 @@ function messageHasDocument(message) {
 }
 
 async function readWorldMessages(client, entity, limit = WORLD_BOT_DEFAULTS.readLimit) {
-  const messages = await client.getMessages(entity, { limit: Math.max(1, Number(limit) || 10) });
-  const arr = Array.isArray(messages) ? messages : [...(messages || [])];
-  return arr;
+  const take = Math.max(1, Number(limit) || 10);
+  let lastError = null;
+  // Network/TIMEOUT par 2 koshish — ek hiccup se poora number na jaye.
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    try {
+      const messages = await client.getMessages(entity, { limit: take });
+      return Array.isArray(messages) ? messages : [...(messages || [])];
+    } catch (error) {
+      lastError = error;
+      if (attempt === 1) await sleep(700);
+    }
+  }
+  throw lastError;
 }
 
 async function parseScreenMessages(client, entity, limit) {
@@ -484,9 +567,26 @@ async function waitForReply({ client, entity, predicate, baseline, timeoutMs, sh
 }
 
 async function sendWorldText(client, entity, text) {
-  await client.sendMessage(entity, { message: String(text) });
-  state.lastAction = `send:${String(text).slice(0, 24)}`;
-  state.lastChatAt = Date.now();
+  const payload = String(text);
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    try {
+      await client.sendMessage(entity, { message: payload });
+      state.lastAction = `send:${payload.slice(0, 24)}`;
+      state.lastChatAt = Date.now();
+      return true;
+    } catch (error) {
+      // Telegram "FLOOD_WAIT_34" = 34s ruk kar dobara bhejo (account ki limit).
+      const flood = /FLOOD(?:_PREMIUM)?_WAIT_(\d+)/i.exec(String(error?.message || error));
+      if (flood && attempt === 1) {
+        const waitMs = Math.min(45_000, (Number(flood[1]) + 2) * 1_000);
+        console.warn(`[WorldBot] ⏳ Telegram flood wait ${Math.round(waitMs / 1000)}s — phir dobara bhejunga`);
+        await sleep(waitMs);
+        continue;
+      }
+      throw error;
+    }
+  }
+  return false;
 }
 
 async function clickWorldButton(entry) {
@@ -535,10 +635,19 @@ async function ensureWorldScreen(client, entity, role, { cfg, shouldAbort, what 
   return reply;
 }
 
-async function clickRole(client, entity, role, { cfg, shouldAbort, what } = {}) {
+async function clickRole(client, entity, role, { cfg, shouldAbort, what, predicate = null, timeoutMs = null } = {}) {
   const hit = await ensureWorldScreen(client, entity, role, { cfg, shouldAbort, what });
   if (!hit) throw new WorldBotError('no-button', `"${role}" button nahi mila — screen: ${state.lastScreenButtons.join(' | ') || 'none'}`);
-  await clickWorldButton(hit.button);
+  // Click na chale to usi button ka text type karke trigger (owner rule).
+  const pred = predicate || ((fresh) => (fresh && fresh.length ? true : null));
+  await clickOrType({
+    client, entity, entry: hit.button, cfg, shouldAbort,
+    what: what || role, predicate: pred,
+    timeoutMs: Math.min(Number(timeoutMs) || Number(cfg?.stepTimeoutMs) || 15_000, 15_000),
+  }).catch((e) => {
+    if (e?.code === 'aborted') throw e;
+    console.warn(`[WorldBot] "${role}" trigger: ${e?.message || e}`);
+  });
   return hit;
 }
 
@@ -564,6 +673,7 @@ export async function worldBotLogin({
   if (!isWorldBotPhoneValid(cleanPhone)) {
     return { ok: false, kind: 'failed_invalid_number', phone: cleanPhone, reason: '10-digit Indian mobile chahiye (6-9 se shuru)' };
   }
+  resetWorldBotRunState();
   state.phone = cleanPhone;
   state.username = cfg.username;
   setPhase('login-start', { lastError: '', step: 0 });
@@ -593,12 +703,10 @@ export async function worldBotLogin({
       before = screenSignature(await parseScreenMessages(client, entity));
       const loginHit = findRoleOnScreens(await parseScreenMessages(client, entity), 'login');
       if (!loginHit) throw new WorldBotError('no-login-button', `Login button nahi mila — screen: ${(state.lastScreenButtons || []).join(' | ') || 'none'}`);
-      await clickWorldButton(loginHit.button);
-      await waitForReply({
-        client, entity, baseline: before, timeoutMs: cfg.stepTimeoutMs, shouldAbort,
+      await clickOrType({
+        client, entity, entry: loginHit.button, cfg, shouldAbort, baseline: before,
         what: 'login method screen',
         predicate: (freshList, all) => findRoleOnScreens([...freshList, ...all], 'otpLogin'),
-        pollMs: cfg.pollMs,
       });
 
       // 3) 📲 OTP Login → number maango
@@ -606,18 +714,17 @@ export async function worldBotLogin({
       before = screenSignature(await parseScreenMessages(client, entity));
       const otpBtn = findRoleOnScreens(await parseScreenMessages(client, entity), 'otpLogin');
       if (!otpBtn) throw new WorldBotError('no-otp-login', 'OTP Login button nahi mila');
-      await clickWorldButton(otpBtn.button);
 
-      // 4) number bhejo
+      // 4) number prompt (click na chale to "OTP Login" text type hoga)
       setPhase('send-number');
-      const numberPrompt = await waitForReply({
-        client, entity, baseline: before, timeoutMs: cfg.stepTimeoutMs, shouldAbort,
+      const numberPrompt = await clickOrType({
+        client, entity, entry: otpBtn.button, cfg, shouldAbort, baseline: before,
         what: 'number prompt',
+        timeoutMs: Math.min(20_000, cfg.stepTimeoutMs),
         predicate: (freshList, all) => {
           const allText = [...freshList, ...all].map((m) => m.text).join('\n');
           return worldBotPromptKind(allText) === 'askNumber' ? true : null;
         },
-        pollMs: cfg.pollMs,
       }).then(() => true).catch(() => true); // prompt na mile to bhi number bhej do
 
       await reportCard(report, [
@@ -656,9 +763,34 @@ export async function worldBotLogin({
         return { ok: false, kind: 'failed_otp_miss', phone: cleanPhone, reason: otp?.error || 'OTP inbox me nahi mila' };
       }
 
+      // 🛡️ OTP kabhi "123 456" / "+91 123456" jaisa aata hai — sirf digits.
+      // Aur wahi purana code dobara bhejna = bot "invalid OTP" dega, number
+      // waste. Isliye normalize + reuse guard.
+      const otpCode = normalizeOtpCode(otp.code);
+      if (!otpCode) {
+        await safeCancel(client, entity, cfg).catch(() => {});
+        return {
+          ok: false,
+          kind: 'failed_otp_miss',
+          phone: cleanPhone,
+          reason: `OTP galat shakl me aaya: "${String(otp.code).slice(0, 12)}" — number skip (bot wahi)`,
+        };
+      }
+      if (usedOtpCodes.has(`${cleanPhone}:${otpCode}`)) {
+        await safeCancel(client, entity, cfg).catch(() => {});
+        return {
+          ok: false,
+          kind: 'failed_otp_miss',
+          phone: cleanPhone,
+          reason: 'Wahi purana OTP dobara mila — number skip (bot wahi)',
+        };
+      }
+      usedOtpCodes.add(`${cleanPhone}:${otpCode}`);
+      if (usedOtpCodes.size > 500) usedOtpCodes.clear();
+
       setPhase('otp-verify');
       before = screenSignature(await parseScreenMessages(client, entity));
-      const codeDelivered = await sendWorldCode(client, entity, otp.code);
+      const codeDelivered = await sendWorldCode(client, entity, otpCode);
       if (!codeDelivered) {
         await safeCancel(client, entity, cfg).catch(() => {});
         return {
@@ -760,7 +892,18 @@ export async function worldBotLogin({
         }).catch(() => null);
         if (late) jsonText = late.text;
       }
-      if (!jsonText) throw new WorldBotError('no-json', 'Login ho gaya par JSON na mila (neither file nor code block)');
+      if (!jsonText) throw new WorldBotError('no-json', 'Login ho gaya par JSON na mila (na file, na code block)');
+      // 🛡️ JSON mila par adhoora (token/tid/cookies kuch nahi) → aage bhejne ka
+      // koi matlab nahi. Ek baar Copy Code se dobara try, warna saaf message.
+      if (!isValidWorldSessionJson(jsonText)) {
+        const retried = await clickCopyCode({ client, entity, cfg, shouldAbort }).catch(() => null);
+        const retriedText = retried?.json?.text || (retried?.message ? await downloadJsonFromMessage(client, retried.message).catch(() => '') : '');
+        if (retriedText && isValidWorldSessionJson(retriedText)) {
+          jsonText = retriedText;
+        } else {
+          throw new WorldBotError('bad-json', `JSON adhoora/parse fail (${jsonText.length} chars) — token/tid/cookies kuch nahi mila`);
+        }
+      }
 
       state.lastOkAt = Date.now();
       setPhase('done');
@@ -778,13 +921,25 @@ export async function worldBotLogin({
     });
   } catch (error) {
     setError(error);
-    console.warn(`[WorldBot] login fail (${cleanPhone}): ${error?.message || error}`);
+    // 🛡️ Har error ek jaisa nahi hota — category se pata chalta hai ki bot
+    // badalna hai (bot_unreachable), session dobara login karna hai
+    // (worldbot_setup), ya sirf number defer karna hai (flood/network).
+    const category = classifyWorldBotError(error);
+    console.warn(`[WorldBot] login fail (${cleanPhone}) [${category}]: ${error?.message || error}`);
+    const kind = category === 'aborted'
+      ? 'aborted'
+      : category === 'worldbot_setup'
+        ? 'worldbot_setup'
+        : category === 'bot_unreachable'
+          ? 'bot_unreachable'
+          : 'failed_world_bot';
     return {
       ok: false,
-      kind: error?.code === 'aborted' ? 'aborted' : 'failed_world_bot',
+      kind,
       phone: cleanPhone,
       reason: String(error?.message || error).slice(0, 220),
-      code: error?.code || 'worldbot-error',
+      code: error?.code || category,
+      errorCategory: category,
     };
   }
 }
@@ -892,14 +1047,12 @@ async function clickCopyCode({ client, entity, cfg, shouldAbort }) {
   if (!hit) return null;
   console.log(`[WorldBot] 🖱 Copy button: ${hit.button?.text || 'Copy'}`);
   setPhase('copy-code');
-  await clickWorldButton(hit.button);
-  const found = await waitForReply({
-    client, entity,
+  // Click na chale to "Copy Code" text type karke bhi try.
+  const found = await clickOrType({
+    client, entity, entry: hit.button, cfg, shouldAbort,
     baseline: screenSignature(screen),
-    timeoutMs: Math.min(15_000, Number(cfg?.stepTimeoutMs) || 15_000),
-    shouldAbort,
     what: 'JSON (Copy Code ke baad)',
-    pollMs: cfg?.pollMs,
+    timeoutMs: Math.min(15_000, Number(cfg?.stepTimeoutMs) || 15_000),
     predicate: (fresh) => {
       for (const message of fresh) {
         if (message.hasDocument) return { kind: 'document', message };
@@ -912,10 +1065,88 @@ async function clickCopyCode({ client, entity, cfg, shouldAbort }) {
   return found;
 }
 
+// ---------------------------------------------------------------------------
+// BUTTON TRIGGER — pehle click; screen na badle to USI button ka POORA TEXT
+// likh kar bhej do (owner ka rule). Do-guna trigger se bachne ke liye typing se
+// pehle screen dobara padhi jati hai.
+// ---------------------------------------------------------------------------
+async function clickOrType({
+  client, entity, entry, cfg, shouldAbort, what,
+  predicate, baseline = null, timeoutMs = null, maxTypedTries = 2,
+}) {
+  const total = Math.max(5_000, Number(timeoutMs) || Number(cfg?.stepTimeoutMs) || WORLD_BOT_DEFAULTS.stepTimeoutMs);
+  const grace = Math.min(total, Math.max(1_000, Number(cfg?.clickGraceMs) || 4_000));
+  const before = baseline || screenSignature(await parseScreenMessages(client, entity));
+  const label = String(entry?.text || '').trim();
+
+  if (cfg?.trigger !== 'type') {
+    try {
+      await clickWorldButton(entry);
+      const hit = await waitForReply({
+        client, entity, baseline: before, timeoutMs: grace, shouldAbort,
+        what: `${what} (click)`, predicate, pollMs: cfg?.pollMs,
+      });
+      state.lastTrigger = 'click';
+      return hit;
+    } catch (e) {
+      if (e?.code === 'aborted') throw e;
+      console.warn(`[WorldBot] click se "${label || what}" trigger nahi hua — text se try karunga`);
+    }
+  }
+
+  // ⚠️ Typing se pehle screen DO baar aur dekho (turant + 1.2s baad): ho sakta
+  // hai click ka jawab 4s ke baad aaya ho — tab type karna double action
+  // (jaise delete 2 baar) kar deta hai. Isliye predicate dobara check hota hai.
+  for (const waitMs of [0, 700, 1_200]) {
+    if (waitMs) await sleep(waitMs);
+    try {
+      const now = await parseScreenMessages(client, entity);
+      const late = predicate ? predicate(freshMessages(now, before), now) : null;
+      if (late) {
+        state.lastTrigger = 'click-late';
+        console.log('[WorldBot] click ka jawab der se aaya — type skip (double action se bachaav)');
+        return late;
+      }
+    } catch {}
+  }
+
+  const variants = worldButtonTypeVariants(label).slice(0, Math.max(1, maxTypedTries));
+  let lastError = null;
+  for (const variant of variants) {
+    // Wahi text 8s ke andar dobara na bhejo (double trigger).
+    if (state.lastTypedText === variant && Date.now() - (Number(state.lastTypedAt) || 0) < 8_000) {
+      console.warn(`[WorldBot] "${variant}" abhi hi type kiya tha — skip`);
+      continue;
+    }
+    try {
+      setPhase(`type-${String(variant).toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '-').slice(0, 18) || 'button'}`);
+      await sendWorldText(client, entity, variant);
+      state.lastTypedText = variant;
+      state.lastTypedAt = Date.now();
+      console.log(`[WorldBot] ⌨️ type trigger: "${variant}"`);
+      const hit = await waitForReply({
+        client, entity, baseline: before, timeoutMs: Math.min(total, 25_000), shouldAbort,
+        what: `${what} (typed "${variant}")`, predicate, pollMs: cfg?.pollMs,
+      });
+      state.lastTrigger = 'type';
+      return hit;
+    } catch (e) {
+      if (e?.code === 'aborted') throw e;
+      lastError = e;
+    }
+  }
+  throw lastError || new WorldBotError('no-button', `"${label || what}" ko click ya type se trigger nahi kar paya`);
+}
+
 async function safeCancel(client, entity, cfg = {}) {
   const hit = findRoleOnScreens(await parseScreenMessages(client, entity), 'cancel');
   if (!hit) return false;
-  await clickWorldButton(hit.button);
+  try {
+    await clickWorldButton(hit.button);
+  } catch (e) {
+    // Click fail → "Cancel" text type karke bhi try (owner rule).
+    await sendWorldText(client, entity, String(hit.button?.text || 'Cancel').trim()).catch(() => {});
+  }
   await sleep(Math.min(1_500, cfg.pollMs || 1_500));
   return true;
 }
@@ -932,6 +1163,7 @@ export async function worldBotDeleteAccount({
 } = {}) {
   const cfg = { ...worldBotConfig(), ...(config || {}) };
   const cleanPhone = normalizeWorldPhone(phone);
+  resetWorldBotRunState();
   setPhase('delete-start');
   try {
     return await withTelegramUserClient(async ({ client }) => {
@@ -961,15 +1193,33 @@ export async function worldBotDeleteAccount({
         if (btn) { accountBtn = btn; break; }
       }
       if (!accountBtn) {
-        return { ok: false, kind: 'delete_account_not_listed', phone: cleanPhone, reason: 'Order Hub me ye number listed nahi mila' };
+        // 🛡️ Kabhi Order Hub list khaali/late aati hai — /start se dobara
+        // Order Hub khol kar ek baar aur dekho (number waste na ho).
+        console.log(`[WorldBot] 🔁 account list me ${cleanPhone} nahi mila — /start se retry`);
+        await sendWorldText(client, entity, '/start').catch(() => {});
+        await sleep(Math.min(2_000, cfg.pollMs * 2));
+        await clickRole(client, entity, 'orderHub', { cfg, shouldAbort, what: 'Order Hub (retry)' }).catch(() => {});
+        await waitForReply({
+          client, entity, baseline: screenSignature(await parseScreenMessages(client, entity)),
+          timeoutMs: Math.min(15_000, cfg.stepTimeoutMs), shouldAbort,
+          what: 'Order Hub accounts (retry)',
+          predicate: (freshList, all) => [...freshList, ...all].some((m) => findWorldBotAccountButton(m.buttons, cleanPhone)) ? true : null,
+          pollMs: cfg.pollMs,
+        }).catch(() => {});
+        screen = await parseScreenMessages(client, entity);
+        for (const message of screen) {
+          const btn = findWorldBotAccountButton(message.buttons, cleanPhone);
+          if (btn) { accountBtn = btn; break; }
+        }
+      }
+      if (!accountBtn) {
+        return { ok: false, kind: 'delete_account_not_listed', phone: cleanPhone, reason: `Order Hub me ye number listed nahi mila (buttons: ${(state.lastScreenButtons || []).join(' | ').slice(0, 120) || 'none'})` };
       }
       before = screenSignature(screen);
-      await clickWorldButton(accountBtn);
-      await waitForReply({
-        client, entity, baseline: before, timeoutMs: cfg.stepTimeoutMs, shouldAbort,
+      await clickOrType({
+        client, entity, entry: accountBtn, cfg, shouldAbort, baseline: before,
         what: 'account menu (Delete Account)',
         predicate: (freshList, all) => findRoleOnScreens([...freshList, ...all], 'deleteAccount'),
-        pollMs: cfg.pollMs,
       }).catch(() => {});
 
       // 3) Delete Account
@@ -980,20 +1230,24 @@ export async function worldBotDeleteAccount({
         return { ok: false, kind: 'delete_button_missing', phone: cleanPhone, reason: 'Delete Account button nahi mila — screen: ' + (state.lastScreenButtons.join(' | ') || 'none') };
       }
       before = screenSignature(screen);
-      await clickWorldButton(deleteHit.button);
+      const deletePredicate = (freshList) => {
+        for (const message of freshList) {
+          const kind = worldBotPromptKind(message.text);
+          if (kind === 'deleteSent' || kind === 'askNumber' || kind === 'otpSent') return kind;
+        }
+        return null;
+      };
       const deleteWaiter = () => waitForReply({
         client, entity, baseline: before, timeoutMs: cfg.stepTimeoutMs, shouldAbort,
         what: 'Delete OTP Sent',
-        predicate: (freshList) => {
-          for (const message of freshList) {
-            const kind = worldBotPromptKind(message.text);
-            if (kind === 'deleteSent' || kind === 'askNumber' || kind === 'otpSent') return kind;
-          }
-          return null;
-        },
+        predicate: deletePredicate,
         pollMs: cfg.pollMs,
       });
-      let deleteAck = await deleteWaiter().catch(() => null);
+      // 🔘 Click; screen na badle to "Delete Account" text type karke trigger.
+      let deleteAck = await clickOrType({
+        client, entity, entry: deleteHit.button, cfg, shouldAbort, baseline: before,
+        what: 'Delete OTP Sent', predicate: deletePredicate,
+      }).catch(() => null);
 
       // Bot kabhi pehle confirm poochhta hai ("Haan 💜" / Yes) — tab wahi
       // dabana padta hai, warna flow wahin atak jata hai.
@@ -1008,8 +1262,10 @@ export async function worldBotDeleteAccount({
           setPhase('delete-confirm-click');
           console.log(`[WorldBot] 🖱 delete confirm: ${confirmBtn.text || 'Haan'}`);
           before = screenSignature(confirmScreen);
-          await clickWorldButton(confirmBtn).catch(() => {});
-          deleteAck = await deleteWaiter().catch(() => null);
+          deleteAck = await clickOrType({
+            client, entity, entry: confirmBtn, cfg, shouldAbort, baseline: before,
+            what: 'Delete OTP Sent (confirm ke baad)', predicate: deletePredicate,
+          }).catch(() => null);
         }
       }
 
@@ -1025,8 +1281,10 @@ export async function worldBotDeleteAccount({
       })();
       if (againBtn) {
         before = screenSignature(screen);
-        await clickWorldButton(againBtn);
-        await sleep(Math.min(2_000, cfg.pollMs * 2));
+        await clickOrType({
+          client, entity, entry: againBtn, cfg, shouldAbort, baseline: before, timeoutMs: 12_000,
+          what: 'delete account dobara chuno', predicate: deletePredicate,
+        }).catch(() => {});
       }
 
       // 5) Delete OTP
@@ -1045,8 +1303,12 @@ export async function worldBotDeleteAccount({
           reason: otp?.error || 'Delete OTP inbox me nahi mila',
         };
       }
+      const deleteCode = normalizeOtpCode(otp.code);
+      if (!deleteCode) {
+        return { ok: false, kind: 'deferred_delete_otp_miss', phone: cleanPhone, reason: `Delete OTP galat shakl me aaya: "${String(otp.code).slice(0, 12)}"` };
+      }
       before = screenSignature(await parseScreenMessages(client, entity));
-      await sendWorldText(client, entity, String(otp.code).trim());
+      await sendWorldText(client, entity, deleteCode);
 
       // 6) Result
       setPhase('delete-verify');
@@ -1074,8 +1336,11 @@ export async function worldBotDeleteAccount({
         const confirm = pickWorldBotConfirmButton(result.message?.buttons || []);
         if (confirm) {
           setPhase('delete-remove-confirm');
-          await clickWorldButton(confirm);
-          await sleep(Math.min(1_500, cfg.pollMs));
+          await clickOrType({
+            client, entity, entry: confirm, cfg, shouldAbort, timeoutMs: 10_000,
+            what: 'delete remove confirm',
+            predicate: (fresh) => (fresh && fresh.length ? true : null),
+          }).catch(() => {});
         }
       } catch (e) {
         console.warn('[WorldBot] delete remove-confirm:', e?.message);
@@ -1088,13 +1353,22 @@ export async function worldBotDeleteAccount({
     });
   } catch (error) {
     setError(error);
-    console.warn(`[WorldBot] delete fail (${cleanPhone}): ${error?.message || error}`);
+    const category = classifyWorldBotError(error);
+    console.warn(`[WorldBot] delete fail (${cleanPhone}) [${category}]: ${error?.message || error}`);
+    const kind = category === 'aborted'
+      ? 'aborted'
+      : category === 'worldbot_setup'
+        ? 'worldbot_setup'
+        : category === 'bot_unreachable'
+          ? 'bot_unreachable'
+          : 'delete_failed';
     return {
       ok: false,
-      kind: error?.code === 'aborted' ? 'aborted' : 'delete_failed',
+      kind,
       phone: cleanPhone,
       reason: String(error?.message || error).slice(0, 220),
-      code: error?.code || 'worldbot-error',
+      code: error?.code || category,
+      errorCategory: category,
     };
   }
 }
@@ -1110,6 +1384,7 @@ export async function worldBotPermanentLogout({
 } = {}) {
   const cfg = { ...worldBotConfig(), ...(config || {}) };
   const cleanPhone = normalizeWorldPhone(phone);
+  resetWorldBotRunState();
   setPhase('logout-start');
   try {
     return await withTelegramUserClient(async ({ client }) => {
@@ -1121,14 +1396,13 @@ export async function worldBotPermanentLogout({
         await clickRole(client, entity, 'orderHub', { cfg, shouldAbort, what: 'Order Hub' }).catch(() => {});
         await sleep(cfg.pollMs);
       } else {
-        await clickWorldButton(switchHit.button);
+        await clickOrType({
+          client, entity, entry: switchHit.button, cfg, shouldAbort, baseline: before,
+          what: 'account switcher',
+          timeoutMs: Math.min(20_000, cfg.stepTimeoutMs),
+          predicate: (freshList, all) => [...freshList, ...all].some((m) => findWorldBotAccountButton(m.buttons, cleanPhone)) ? true : null,
+        }).catch(() => {});
       }
-      await waitForReply({
-        client, entity, baseline: before, timeoutMs: Math.min(20_000, cfg.stepTimeoutMs), shouldAbort,
-        what: 'account switcher',
-        predicate: (freshList, all) => [...freshList, ...all].some((m) => findWorldBotAccountButton(m.buttons, cleanPhone)) ? true : null,
-        pollMs: cfg.pollMs,
-      }).catch(() => {});
 
       let screen = await parseScreenMessages(client, entity);
       let accountBtn = null;
@@ -1137,20 +1411,36 @@ export async function worldBotPermanentLogout({
         if (btn) { accountBtn = btn; break; }
       }
       if (!accountBtn) return { ok: false, kind: 'logout_account_not_listed', phone: cleanPhone, reason: 'Switch Accounts me number nahi mila' };
-      await clickWorldButton(accountBtn);
-      await sleep(cfg.pollMs);
+      await clickOrType({
+        client, entity, entry: accountBtn, cfg, shouldAbort,
+        baseline: screenSignature(screen),
+        what: 'logout ke liye account chuno', timeoutMs: 15_000,
+        predicate: (freshList, all) => findRoleOnScreens([...freshList, ...all], 'permanentLogout'),
+      }).catch(() => {});
 
       screen = await parseScreenMessages(client, entity);
       const logoutHit = findRoleOnScreens(screen, 'permanentLogout');
       if (!logoutHit) return { ok: false, kind: 'logout_button_missing', phone: cleanPhone, reason: 'Permanently Logged Out button nahi mila' };
-      await clickWorldButton(logoutHit.button);
+      await clickOrType({
+        client, entity, entry: logoutHit.button, cfg, shouldAbort,
+        baseline: screenSignature(screen),
+        what: 'Permanently Logged Out', timeoutMs: 15_000,
+        predicate: (fresh) => (fresh && fresh.length ? true : null),
+      }).catch(() => {});
       state.lastOkAt = Date.now();
       setPhase('logout-done');
       return { ok: true, kind: 'logged_out', phone: cleanPhone };
     });
   } catch (error) {
     setError(error);
-    return { ok: false, kind: 'logout_failed', phone: cleanPhone, reason: String(error?.message || error).slice(0, 200) };
+    const category = classifyWorldBotError(error);
+    return {
+      ok: false,
+      kind: category === 'aborted' ? 'aborted' : category === 'bot_unreachable' ? 'bot_unreachable' : 'logout_failed',
+      phone: cleanPhone,
+      reason: String(error?.message || error).slice(0, 200),
+      errorCategory: category,
+    };
   }
 }
 

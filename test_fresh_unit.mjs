@@ -3546,6 +3546,69 @@ Thanks`)),
   ok(src.includes("resolvedSourceMode === 'telegram' ? 'telegram' : 'firebase'"),
     'worldbot: combined preset me Hermes number-source allowed');
 
+  // -------------------------------------------------------------------------
+  // ⌨️ CLICK-OR-TYPE + 🛡️ mistake-proofing
+  // Owner: "instead of clicking button read all the text of button and type
+  // that text to trigger that" + "har possibilities of mistakes sochlo".
+  // -------------------------------------------------------------------------
+  ok(JSON.stringify(wb.worldButtonTypeVariants('🔐 Login')) === JSON.stringify(['🔐 Login', 'Login', 'login']),
+    'worldbot: button ka poora text + bina emoji + simple roop type hota hai');
+  ok(wb.worldButtonTypeVariants('🤵 Order Hub')[1] === 'Order Hub',
+    'worldbot: "Order Hub" bina emoji type hota hai');
+  ok(wb.worldButtonTypeVariants('').length === 0, 'worldbot: khali text par type-variant nahi');
+  ok(wb.worldBotConfig({}).trigger === 'auto' && wb.worldBotConfig({ SWIGGY_WORLD_TRIGGER: 'type' }).trigger === 'type',
+    'worldbot: trigger auto/type/click (default auto)');
+  ok(wbSrc.includes('async function clickOrType') && wbSrc.includes('worldButtonTypeVariants'),
+    'worldbot: click-or-type trigger maujood');
+  ok((wbSrc.match(/clickOrType\(/g) || []).length >= 8,
+    'worldbot: login/OTP/Order Hub/delete/logout/Copy — sab click-or-type');
+  ok(wbSrc.includes("state.lastTrigger = 'type'") && wbSrc.includes('lastTypedText'),
+    'worldbot: type se trigger hone par status me dikhta hai');
+  ok(wbSrc.includes('type skip') && wbSrc.includes('click ka jawab der se aaya'),
+    'worldbot: der se aaye click par type skip (double delete/action se bachaav)');
+  ok(wbSrc.includes("state.lastTypedText === variant") && wbSrc.includes('8_000'),
+    'worldbot: wahi text 8s me dobara nahi bhejta');
+
+  // OTP code safety
+  ok(wb.normalizeOtpCode(' 123 456 ') === '123456' && wb.normalizeOtpCode('abc') === ''
+    && wb.normalizeOtpCode('12') === '' && wb.normalizeOtpCode('12345678') === '12345678',
+  'worldbot: OTP sirf 4-8 digits (spaces/paste se bachaav)');
+  ok(wbSrc.includes('usedOtpCodes') && wbSrc.includes('Wahi purana OTP dobara mila'),
+    'worldbot: purana OTP dobara nahi bhejta');
+
+  // Error categories — kaunsi galti par kya karna hai
+  ok(wb.classifyWorldBotError(new Error('FLOOD_WAIT_34')) === 'flood_wait',
+    'worldbot error: flood wait alag (number defer)');
+  ok(wb.classifyWorldBotError(new Error('AUTH_KEY_UNREGISTERED')) === 'worldbot_setup',
+    'worldbot error: session dead = dobara Telegram login');
+  ok(wb.classifyWorldBotError(new Error('Cannot find any entity corresponding to "SwiggyByworldBot"')) === 'bot_unreachable',
+    'worldbot error: bot hi na mile = next bot');
+  ok(wb.classifyWorldBotError(new Error('ETIMEDOUT')) === 'network',
+    'worldbot error: network = defer, bot switch nahi');
+  ok(wb.classifyWorldBotError(new Error('kuch bhi')) === 'failed_world_bot',
+    'worldbot error: baaki sab = flow fail (number ka faisla)');
+  ok(wbSrc.includes('classifyWorldBotError(error)') && wbSrc.includes("category === 'worldbot_setup'"),
+    'worldbot: login/delete/logout — teeno error classify karte hain');
+
+  // JSON safety + network retry + flood retry
+  ok(wb.isValidWorldSessionJson('{"tid":"a.b"}') === true
+    && wb.isValidWorldSessionJson('{"foo":1}') === false
+    && wb.isValidWorldSessionJson('kuch nahi') === false,
+  'worldbot: adhoora JSON reject hota hai (dobara copy try)');
+  ok(wbSrc.includes('bad-json') && wbSrc.includes('retriedText'),
+    'worldbot: invalid JSON par Copy Code se ek retry');
+  ok(wbSrc.includes('FLOOD(?:_PREMIUM)?_WAIT') && wbSrc.includes('flood wait'),
+    'worldbot: Telegram flood wait par ruk kar dobara bhejta hai');
+  ok(wbSrc.includes('for (let attempt = 1; attempt <= 2; attempt += 1)'),
+    'worldbot: screen read network hiccup par retry');
+  ok(wbSrc.includes('Order Hub (retry)'),
+    'worldbot: account list me number na mile to /start se retry');
+  ok(wbSrc.includes('resetWorldBotRunState'), 'worldbot: har number par purana error/typed-text reset');
+  ok(pipelineSrc.includes('rotateOnly'),
+    'worldbot: delete ke waqt bot unreachable = sirf rotate, number retry nahi');
+  ok(pipelineSrc.includes("kind === 'worldbot_setup' ||"),
+    'worldbot: classified setup error = batch saaf message ke saath rukta hai');
+
   // --- 🐞 regression: async status ko await karna zaroori hai ---
   // Yehi bug tha: `tg` ek Promise tha, isliye login ke baad bhi START kahta
   // tha "World Bot ke liye spare Telegram account chahiye".

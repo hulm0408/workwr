@@ -31,6 +31,10 @@ hai.
 > Ek run me source **locked** rehta hai: START par jo chuna wahi numbers + OTP deta hai aur dusra source bilkul try nahi hota; Firebase mode deliberately select ho tabhi saved ACTIVE Firebase sources use hotay hain.
 >
 > World bots (`@SwiggyByworldBot`, `@SwiggyByworld1Bot … 5Bot`) **saare same** hain.
+> Har button pehle **click** hota hai; click se screen na badle to **usi button ka poora
+> text likh kar bhej diya jata hai** (`🔐 Login` → `Login` → `login`). `/world` me
+> `⌨️ Trigger: type` dikh jayega.
+>
 > Bot **sirf tab** badalta hai jab wo `OTP Sent` 20s me confirm na kar paye ya
 > "queue/wait" me 20s se zyada atka rahe. **OTP 20s me nahi aaya = number skip,
 > bot wahi.** OTP galat / delete fail / flow atka par bhi bot nahi badalta.
@@ -532,6 +536,27 @@ stock queue me jaata hai:
 
 Batch size fix **10** hai (min 10, max 10) — env se badal nahi sakta.
 
+### 🛡️ Mistake-proofing — kya galat ho sakta hai, aur uska ilaaj
+
+| Galti / rukawat | Bot kya karta hai |
+|---|---|
+| Button **click kaam na kare** (bot callback ignore kare) | Usi button ka **poora text type** karke trigger (pehle emoji ke saath, phir bina) |
+| Click ka **jawab der se** aaye | Type **skip** ho jata hai — double `Delete Account`/double action nahi |
+| Wahi text 8s ke andar dobara | Dobara nahi bhejta (duplicate action guard) |
+| OTP `123 456` / paste me spaces | Sirf **digits** nikal kar bhejta hai |
+| Wahi **purana OTP** dobara aaye | Number skip (bot wahi) — galat OTP se number nahi jalta |
+| OTP 20s me nahi aaya | **Number skip**, bot wahi |
+| Bot OTP **bhej hi na paye** / queue 20s+ | **Next bot** (ek number par max 3) |
+| Bot hi na mile (username galat/block) | **Next bot** |
+| Telegram `FLOOD_WAIT` | Ruk kar (max 45s) wahi message dobara |
+| Network hiccup (screen read) | 2 retry, phir agla step |
+| Session dead (`AUTH_KEY_UNREGISTERED`) | Batch saaf message ke saath rukta hai → Settings → Add Telegram Account |
+| JSON **adhoora** mila | `Copy Code` se ek retry, phir saaf error |
+| Delete ke baad number list me nahi | `/start` → Order Hub **retry**, phir hi skip |
+| Bot `Haan`/confirm maange | Khud click/type karta hai |
+| Logout ka naam alag ho | `permanently logged out` / `logout` / `sign out` — sab match |
+| Bot switch storm | Sirf 3 hi soorat me switch, ek number par max 3 bot |
+
 ## Env knobs (optional — defaults acche hain)
 
 | Var | Default | Matlab |
@@ -547,6 +572,8 @@ Batch size fix **10** hai (min 10, max 10) — env se badal nahi sakta.
 | `SWIGGY_WORLD_OTP_TIMEOUT_MS` | 20000 | OTP ka intezaar **sirf 20s** — nahi aaya to number skip (bot wahi) |
 | `SWIGGY_WORLD_OTP_SEND_TIMEOUT_MS` | 20000 | Bot "OTP Sent" 20s me confirm na kare → **bot badlo** |
 | `SWIGGY_WORLD_QUEUE_WAIT_MS` | 20000 | Bot "queue/wait" bole to itna wait; isse zyada → **bot badlo** |
+| `SWIGGY_WORLD_TRIGGER` | `auto` | Button **click** → screen na badle to **button ka text likh kar bhej** (`type` = click bilkul nahi) |
+| `SWIGGY_WORLD_CLICK_GRACE_MS` | 4000 | Click ke baad screen badalne ka intezaar, phir text trigger |
 | `SWIGGY_WORLD_LOGOUT_AFTER_DELETE` | 1 | Delete+fresh ke baad `Switch Accounts → Permanently Logged Out` try kare |
 | `SHOP_BOT_STOCK_ENABLED` | 1 | Har fresh JSON ko `@its_shop_bot` ke stock me bheje (`0` = band) |
 | `SHOP_BOT_USERNAME` | `its_shop_bot` | Stock lene wala shop bot |

@@ -901,7 +901,7 @@ export async function processSingleNumberViaWorldBot({
     // Setup problem (spare Telegram session missing/dead) = config issue, not
     // number issue. Engine ise alag handle karta hai (batch clear message ke
     // saath rukta hai, numbers jalte nahi).
-    if (/session authorized nahi|setup missing|api_id|api_hash|login chal raha|telegram account/i.test(String(res?.reason || ''))) {
+    if (kind === 'worldbot_setup' || /session authorized nahi|setup missing|api_id|api_hash|login chal raha|telegram account|AUTH_KEY_UNREGISTERED|SESSION_REVOKED|SESSION_EXPIRED/i.test(String(res?.reason || ''))) {
       return {
         ok: false,
         kind: 'worldbot_setup',
@@ -1032,13 +1032,17 @@ export async function processSingleNumberViaWorldBot({
         markLedger(phone, 'skipped', { reason: del.reason || 'worldbot delete blocked', kind: 'worldbot-delete' });
         await markPoolStatus(entry, 'skipped');
       }
+      // Bot hi na mile to is number ko dobara try nahi karte, par agli baar
+      // ke liye bot rotate kar dete hain (bot ki galti, number ki nahi).
+      const rotateOnly = del.kind === 'bot_unreachable';
       return {
         ok: false,
-        kind: 'skipped_delete_blocked',
+        kind: del.kind === 'bot_unreachable' ? 'bot_unreachable' : 'skipped_delete_blocked',
         phone,
         reason: del.reason || `World Bot delete fail (${del.kind})`,
         viaWorldBot: true,
         switchBot: false,
+        rotateOnly,
       };
     }
 
@@ -1108,6 +1112,12 @@ export async function processSingleNumberViaWorldBot({
       if (result?.ok) return result;
       lastResult = result;
 
+      // rotateOnly = is number par retry nahi, bas agle number ke liye bot
+      // badal do (jaise delete ke waqt bot hi na mile).
+      if (result?.rotateOnly) {
+        rotateWorldBot(`${result.kind}: ${result.reason || ''}`.slice(0, 140));
+        return result;
+      }
       const canSwitch = shouldSwitchWorldBot(result) && round + 1 < maxTries;
       if (!canSwitch) {
         // Owner rule: bina OTP-send fail / queue-timeout ke bot NAHI badalta.

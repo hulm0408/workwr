@@ -387,6 +387,13 @@ World bots ka default pool: `@SwiggyByworldBot`, `@SwiggyByworld1Bot` …
   flow atka, STOP/SKIP, invalid number, Telegram setup pending.
 - OTP ka wait hamesha **20 second** — OTP aane par turant enter hota hai (send
   confirm hota hai; na jaye to wahi OTP dobara, bot nahi badalta).
+- **Button trigger:** pehle click; screen na badle to **usi button ka text likh kar
+  bhej** diya jata hai (`🔐 Login` → `Login` → `login`). Click ka jawab der se aaye to
+  type skip (double action nahi). `SWIGGY_WORLD_TRIGGER=type` = click hi nahi.
+- **Bachaav:** OTP sirf digits (spaces/paste safe), purana OTP dobara nahi bhejta,
+  JSON adhoora ho to `Copy Code` retry, delete me number na mile to `/start` retry,
+  `FLOOD_WAIT` par ruk kar dobara, network hiccup par 2 retry, session dead par
+  batch saaf message ke saath rukta hai.
 - Pool badalna ho to env: `SWIGGY_WORLD_BOT_USERNAMES=A_bot,B_bot` (CSV).
 
 #### 📦 Shop Bot stock (@its_shop_bot)

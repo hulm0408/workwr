@@ -406,6 +406,13 @@ World bots ka default pool: `@SwiggyByworldBot`, `@SwiggyByworld1Bot` …
   card me: "OTP source me code hi nahi aaya".
 - **Queue:** bot "queue/wait" bole to 45s tak wait (`SWIGGY_WORLD_QUEUE_WAIT_MS`)
   — asli run me queue ke baad OTP Sent ~40-60s me aata hai.
+- **Ek command → bot ka jawab → agla command:** har step se pehle `settledScreen()`
+  bot ke latest message ka id rukne tak wait karta hai. Button role sirf **latest
+  1-2 messages** me dhoondha jata hai (poori purani chat me nahi) — warna purane
+  menu se hi "step ho gaya" maan kar bot ko 3-4 command ek saath chali jati thi
+  (`/start` + `Login` + `OTP Login` ek hi second me → `❌ Invalid OTP`).
+- **Cancel/menu/ready** jo message aaye, uske neeche pada purana OTP prompt
+  ignore hota hai (dobara `/cancel` nahi jata).
 - **Button trigger:** pehle click; screen na badle to **usi button ka text likh kar
   bhej** diya jata hai (`🔐 Login` → `Login` → `login`). Click ka jawab der se aaye to
   type skip (double action nahi). `SWIGGY_WORLD_TRIGGER=type` = click hi nahi.

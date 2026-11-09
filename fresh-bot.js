@@ -717,7 +717,7 @@ function sessionLifeLine(exportData = {}) {
 // 📄 `jsonText`/`fileName` diye jaate hain to BILKUL wahi text/file jaati hai
 // (World-bot pipeline khud "starting se ending tak" ki file banati hai —
 // Task T). Warna purana rasta: DB se export karke pretty JSON.
-async function deliverSessionJson(chatId, { phone, accountKey, kind, account, note = '', jsonText: rawJsonText = '', fileName = '' } = {}) {
+async function deliverSessionJson(chatId, { phone, accountKey, kind, account, note = '', jsonText: rawJsonText = '', fileName = '', buffer: givenBuffer = null, source = '' } = {}) {
   if (!chatId) return false;
   const typeText = kind === 'fresh_after_delete'
     ? '♻️ Delete + Fresh'
@@ -754,7 +754,13 @@ async function deliverSessionJson(chatId, { phone, accountKey, kind, account, no
 
   const jsonText = givenText || JSON.stringify(exportData, null, 2);
   const filename = String(fileName || '').trim() || `${phone || accountKey || 'session'}.json`;
-  const sent = await sendSessionFile(chatId, { jsonText, filename, caption });
+  // 📎 World Bot ke "Export Login JSON" document ke asli bytes — diye ho to
+  // bilkul wahi file jaati hai (owner Part 43: document, text nahi).
+  const docBuffer = Buffer.isBuffer(givenBuffer) && givenBuffer.length ? givenBuffer : null;
+  if (source === 'export-document' && docBuffer) {
+    console.log(`[FreshBot] 📎 session file bot ke export document se: ${filename} (${docBuffer.length} bytes)`);
+  }
+  const sent = await sendSessionFile(chatId, { jsonText, filename, caption, buffer: docBuffer });
   if (sent.ok) return true;
 
   // Document attach nahi hua. Pehle owner ne bola tha "JSON turant chat me" —
@@ -794,8 +800,10 @@ async function deliverSessionJson(chatId, { phone, accountKey, kind, account, no
 // aakhri fallback saaf message hai (raw text nahi, jab tak
 // JSON_TEXT_FALLBACK=1 na ho).
 // -----------------------------------------------------------------------------
-async function sendSessionFile(chatId, { jsonText = '', filename = 'session.json', caption = '' } = {}) {
-  const buffer = Buffer.from(String(jsonText || ''), 'utf8');
+async function sendSessionFile(chatId, { jsonText = '', filename = 'session.json', caption = '', buffer: givenBuffer = null } = {}) {
+  const buffer = Buffer.isBuffer(givenBuffer) && givenBuffer.length
+    ? givenBuffer
+    : Buffer.from(String(jsonText || ''), 'utf8');
   const attempts = [
     { label: 'buffer+filename', doc: buffer, extra: { filename } },
     { label: 'source+filename', doc: { source: buffer, filename }, extra: {} },

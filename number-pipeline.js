@@ -56,6 +56,7 @@ import {
   worldBotLogin,
   worldBotDeleteAccount,
   worldBotPermanentLogout,
+  worldBotExportLoginJson,
   worldBotConfig,
   WORLD_BOT_DEFAULT_NAME,
   normalizeWorldPhone,
@@ -918,7 +919,34 @@ export async function processSingleNumberViaWorldBot({
   // Naya number / naya OTP card yahan kabhi nahi aata — jo number delete hua
   // wahi login hota hai, aur file usi ka JSON hota hai.
   const saveWorldSession = async (result, kind, botCfg = null) => {
-    const imported = importSessionJson(result.jsonText);
+    // 📤 Owner ka Part 5–6: JSON ka asli source bot ka "Export Login JSON"
+    // DOCUMENT hai (swiggy-login-3.json), na ki chat ka text. Login se JSON
+    // mil gaya ho aur export bhi available ho to document ko tarjeeh dete hain
+    // (wahi file aage jaati hai, naam bhi bot ka). Export na mile/chale to
+    // login ke JSON par wahi purana rasta chalta hai — number nahi jalta.
+    const exportEnabled = String(botCfg?.exportJson ?? process.env.SWIGGY_WORLD_EXPORT_JSON ?? '1') !== '0';
+    let exported = result?.export && result.export.ok ? result.export : null;
+    if (!exported && exportEnabled) {
+      try {
+        const out = await worldBotExportLoginJson({
+          phone,
+          shouldAbort,
+          config: {
+            ...(botCfg || worldCfg),
+            exportTimeoutMs: Number(process.env.SWIGGY_WORLD_EXPORT_TIMEOUT_MS || 0) || undefined,
+          },
+        });
+        if (out?.ok) {
+          exported = out;
+          console.log(`[Pipeline] 📤 Export Login JSON mila: ${out.fileName} (${out.bytes} bytes${out.viaDocument ? ', asli document' : ', text'})`);
+        } else {
+          console.warn(`[Pipeline] 📤 Export Login JSON skip (${out?.kind}): ${String(out?.reason || '').slice(0, 160)} — login ke JSON se file banegi`);
+        }
+      } catch (e) {
+        console.warn('[Pipeline] 📤 Export Login JSON fail:', String(e?.message || e).slice(0, 160));
+      }
+    }
+    const imported = importSessionJson(exported?.text || result.jsonText);
     if (!imported?.success) {
       return {
         ok: false,
@@ -932,12 +960,21 @@ export async function processSingleNumberViaWorldBot({
 
     // 📄 File ka text: bot ne jo JSON diya uska pehla `{` se aakhri `}` tak.
     // (JSON na mile to DB export — warna file hi khali chali jati.)
-    let fileText = sessionFileText(result.jsonText);
+    let fileText = sessionFileText(exported?.text || result.jsonText);
     if (!fileText) {
       try { fileText = sessionFileText(getSessionExportJson(imported.key)); } catch {}
     }
+    // Bot ka apna file naam ("swiggy-login-3.json") diya ho to wahi file banti
+    // hai — owner ko wahi naam dikhna chahiye jo bot ne bheja tha.
     const file = fileText
-      ? writeSessionFile({ phone, accountKey: imported.key, text: fileText })
+      // Disk par naam unique (warna do accounts ki "swiggy-login-3.json" ek
+      // dusre ko overwrite kar deti) — par Telegram par bot ka hi naam jaata hai.
+      ? writeSessionFile({
+        phone,
+        accountKey: imported.key,
+        text: fileText,
+        name: exported?.fileName ? `${imported.key}-${exported.fileName}` : '',
+      })
       : { ok: false, kind: 'no-json' };
     if (file.ok) console.log(`[Pipeline] 🗂 JSON file bani: ${file.name} (${file.bytes} bytes) → ${file.path}`);
 
@@ -961,7 +998,14 @@ export async function processSingleNumberViaWorldBot({
             kind: kind === 'new' ? 'fresh_new' : 'fresh_after_delete',
             account: imported.accountObj || getDb().config.accounts?.[imported.key] || null,
             jsonText: fileText,
-            fileName: file.ok ? file.name : '',
+            fileName: exported?.fileName || (file.ok ? file.name : ''),
+            // 📤 Yahan se pata chalta hai ki file bot ke export document se
+            // bani ya login ke JSON text se (owner ke Part 45 ka record).
+            source: exported ? (exported.viaDocument ? 'export-document' : 'export-text') : 'login-json',
+            bytes: file.ok ? file.bytes : 0,
+            // 📎 Bot ke document ke asli bytes (text se dobara banane ki
+            // zaroorat nahi — owner Part 43: file hi jaaye).
+            buffer: exported?.buffer && Buffer.isBuffer(exported.buffer) && exported.buffer.length ? exported.buffer : null,
             note: attempt > 1 ? 'Dobara try — pehli baar file attach nahi hui thi.' : '',
           });
           sessionSent = out !== false;
@@ -1024,6 +1068,7 @@ export async function processSingleNumberViaWorldBot({
       // engine in do flags se duplicate send/logout nahi karta
       sessionSent,
       sessionFile: file.ok ? file.name : '',
+      sessionSource: exported ? (exported.viaDocument ? 'export-document' : 'export-text') : 'login-json',
       sessionFilePath: file.ok ? file.path : '',
       sessionBytes: file.ok ? file.bytes : 0,
       sendReason: sessionSent ? '' : sendReason,
@@ -1202,7 +1247,8 @@ export async function processSingleNumberViaWorldBot({
         first.kind === 'name_rejected'
           ? '→ Bot ne naam accept nahi kiya — naya number nahi, /start nahi.'
           : '→ Bot ka jawab Telegram flood wait me late aaya (OTP accept ho gaya tha) — number skip nahi kar raha.',
-        '→ Ab wahi number dobara: Main Menu → Login → OTP Login → number → OTP.',
+        '→ Ab wahi number dobara: pehle bot ka late jawab dekha jayega (naam/JSON).',
+        '→ /start aur Cancel tab tak <b>band</b> hain — warna World Bot "Login Cancelled" de deta hai.',
       ].join('\n')));
       first = await loginOnce(true);
     }

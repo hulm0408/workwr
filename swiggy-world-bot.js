@@ -60,25 +60,34 @@ export function listWorldBotUsernames(env = process.env) {
 // default naam — "Sudhani Kumar". Jaise hi bot "New Account Detected" bole,
 // yahi naam chala jata hai (digit-mapping sirf fallback hai, agar bot is naam
 // ko reject kar de).
-export const WORLD_BOT_DEFAULT_NAME = 'Sudhani Kumar';
+// Owner ka default naam. Spec me "Sudha Kumari" likha aa sakta hai — naam
+// badalna ho to env se (SWIGGY_WORLD_NAME), code chhedne ki zaroorat nahi.
+export const WORLD_BOT_DEFAULT_NAME = String(process.env.SWIGGY_WORLD_NAME || '').trim() || 'Sudhani Kumar';
 
 export const WORLD_BOT_DEFAULTS = {
-  stepTimeoutMs: 45_000,
+  // ⏳ Owner ka rule (2026-11-09): "fixed input ka koi time limit nahi — bot
+  // output dega, usko samajh kar next input dena hai". Isliye step ka budget
+  // badha diya (45s → 5 min). Sirf OTP/queue ke 20s rule hain, wo neeche.
+  stepTimeoutMs: 300_000,
   pollMs: 1_500,
-  startTimeoutMs: 25_000,
+  startTimeoutMs: 120_000,
   readLimit: 15,
   // Owner rule: OTP bhejne ke baad SIRF 20 second. Nahi aaya = number skip.
   otpTimeoutMs: 20_000,
   // "OTP Sent" confirmation (bot ki taraf se OTP send) ka budget.
   otpSendTimeoutMs: 20_000,
-  // Bot "account creation queue me hai" bole to itna wait — isse zyada =
-  // bot badlo. 👀 Owner ke asli run me queue message ke ~40-60s baad OTP Sent
-  // aata hai, isliye 20s bahut kam pad raha tha (bot bekaar rotate hota tha
-  // aur pending OTP chhoot jata tha) → default 45s.
-  queueWaitMs: 45_000,
+  // ⏱ Owner ka naya rule (2026-11-09): "jab baat OTP aur queue ki ho tab bas
+  // 20 second" — OTP/queue ka apna chhota budget, baaki sab steps ka koi
+  // limit nahi. (20s = OTP bot app refresh karke code bhejne ka window.)
+  queueWaitMs: 20_000,
   // OTP send confirm na ho (aur bot ne Cancel bhi na bheja ho) to number SKIP
   // nahi hota — wahi number itni baar dobara issue hota hai (Login → 2 → number).
   numberRetries: 1,
+  // ⏱ OTP type karne ke BAAD bot ka jawab (naam/JSON) ka budget. Account
+  // creation Swiggy par queue me hoti hai — 45s bahut kam padta tha aur hum
+  // beech me /start bhej kar poora login cancel kar dete the (owner:
+  // "Cancel kiu ho ja raha"). 20s sirf OTP SOURCE ka rule hai, ye alag.
+  otpVerifyWaitMs: 300_000,
   // ⏱ Telegram flood wait ke baad bot ka jawab late padha jata hai. Step ka
   // budget khatam hone par turant "fail" na karo — itni der dheemi scan
   // chalti hai (delete/login result ke liye). Warna delete ho chuka account
@@ -131,6 +140,51 @@ export function resetWorldBotRunState() {
 
 function setError(error) {
   state.lastError = String(error?.message || error || '').slice(0, 240);
+}
+
+// ---------------------------------------------------------------------------
+// ⛔ LOGIN GUARD — "Cancel kiu ho ja raha?"
+//
+// Owner ka log (2026-11-09): number → OTP type → bot account bana raha tha →
+// humne /start bhej diya → World Bot ne "❌ Login Cancelled / No account was
+// logged in" bhej diya, aur account bekaar. Uske baad dobara Login → OTP Login
+// → number → Cancel.
+//
+// Rule: jab tak koi login flow KHULA hai (number/OTP bheja gaya hai aur bot ka
+// final jawab — naam/JSON/Cancel — nahi aaya), /start aur Cancel bilkul nahi.
+// Bas intezaar. OTP 20s ka rule sirf OTP SOURCE ka hai, yahan account creation
+// ka waqt alag hai.
+// ---------------------------------------------------------------------------
+function markLoginFlowOpen(extra = {}) {
+  state.loginFlowAt = Date.now();
+  Object.assign(state, extra);
+}
+
+function closeLoginFlow() {
+  state.loginFlowAt = 0;
+  state.otpTypedAt = 0;
+  state.loginFlowPhone = '';
+}
+
+function worldLoginFlowOpenMs(cfg = {}) {
+  const guardMs = Math.max(60_000, Number(cfg?.loginGuardMs) || 300_000);
+  const at = Number(state.loginFlowAt) || 0;
+  if (!at) return 0;
+  // Flow kisi DUSRE number ka hai — us par naya /start chal sakta hai
+  // (purana pending account chhod diya gaya).
+  const flowPhone = String(state.loginFlowPhone || '');
+  const nowPhone = String(state.phone || '');
+  if (flowPhone && nowPhone && flowPhone !== nowPhone) return 0;
+  const left = guardMs - (Date.now() - at);
+  return left > 0 ? left : 0;
+}
+
+export function worldBotLoginFlowInfo() {
+  return {
+    openForMs: worldLoginFlowOpenMs(worldBotConfig()),
+    loginFlowAt: Number(state.loginFlowAt) || 0,
+    otpTypedAt: Number(state.otpTypedAt) || 0,
+  };
 }
 
 export function worldBotUsername(env = process.env) {
@@ -209,16 +263,27 @@ export function worldBotConfig(env = process.env) {
     username: currentWorldBotUsername(env),
     usernames: listWorldBotUsernames(env),
     stepTimeoutMs: num('SWIGGY_WORLD_STEP_TIMEOUT_MS', WORLD_BOT_DEFAULTS.stepTimeoutMs),
+    // Main menu / start ka apna budget (step se alag).
+    startTimeoutMs: num('SWIGGY_WORLD_START_TIMEOUT_MS', WORLD_BOT_DEFAULTS.startTimeoutMs, 5_000),
     pollMs: num('SWIGGY_WORLD_POLL_MS', WORLD_BOT_DEFAULTS.pollMs, 300),
     otpTimeoutMs: num('SWIGGY_WORLD_OTP_TIMEOUT_MS', WORLD_BOT_DEFAULTS.otpTimeoutMs, 5_000),
     otpSendTimeoutMs: num('SWIGGY_WORLD_OTP_SEND_TIMEOUT_MS', WORLD_BOT_DEFAULTS.otpSendTimeoutMs, 5_000),
+    // OTP type karne ke baad bot ke jawab (naam/JSON) ka budget — account
+    // creation me waqt lagta hai. Default 90s (30s–240s clamp).
+    otpVerifyWaitMs: Math.max(30_000, Math.min(900_000,
+      num('SWIGGY_WORLD_OTP_VERIFY_WAIT_MS', WORLD_BOT_DEFAULTS.otpVerifyWaitMs, 30_000))),
+    // Itne waqt tak /start aur Cancel band rehte hain jab login flow khula ho
+    // (number/OTP bheja gaya ho par jawab na aaya ho) — warna World Bot
+    // "❌ Login Cancelled" de deta hai.
+    loginGuardMs: Math.max(60_000, Math.min(1_800_000,
+      num('SWIGGY_WORLD_LOGIN_GUARD_MS', 600_000, 60_000))),
     queueWaitMs: num('SWIGGY_WORLD_QUEUE_WAIT_MS', WORLD_BOT_DEFAULTS.queueWaitMs, 5_000),
     // Button trigger: 'auto' = pehle click; screen na badle to button ka TEXT
     // type karke action trigger. 'type' = click bilkul nahi, seedha text.
     trigger: ['click', 'type', 'auto'].includes(String(env?.SWIGGY_WORLD_TRIGGER || '').trim().toLowerCase())
       ? String(env.SWIGGY_WORLD_TRIGGER).trim().toLowerCase()
       : 'auto',
-    clickGraceMs: num('SWIGGY_WORLD_CLICK_GRACE_MS', 4_000, 1_000),
+    clickGraceMs: num('SWIGGY_WORLD_CLICK_GRACE_MS', 6_000, 1_000),
     // OTP inbox (Hermes/Firebase) me code aane ka intezaar — 20s se alag.
     otpInboxTimeoutMs: Math.max(30_000, Math.min(180_000,
       num('SWIGGY_WORLD_OTP_INBOX_TIMEOUT_MS', 90_000, 30_000))),
@@ -258,6 +323,14 @@ export function worldBotButtonRole(text = '') {
   if (!n) return '';
   // "Copy Code" / "Copy JSON" — sabse pehle, kyunki isme "JSON" bhi hota hai.
   if (/\bcopy\b/.test(n)) return 'copyCode';
+  // 📤 "Export Login JSON" — isme "JSON" bhi hai, isliye `jsonLogin` se PEHLE.
+  // Owner ka flow: My Swiggy Accounts → account → "Export Login JSON" → bot ek
+  // ASLI .json document bhejta hai ("swiggy-login-3.json"). Pehle is button ka
+  // koi role hi nahi tha, isliye export step kabhi chalta hi nahi tha.
+  if (/\bexport\b/.test(n) && /\b(json|login|session)\b/.test(n)) return 'exportJson';
+  // "Delete All Accounts" (My Swiggy Accounts screen) — `deleteAccount` se
+  // alag, warna ek button se saare accounts ud jate the.
+  if (/\bdelete\b/.test(n) && /\ball\b/.test(n) && /\baccounts?\b/.test(n)) return 'deleteAllAccounts';
   if (/\b(json|tid)\b/.test(n)) return 'jsonLogin';
   if (/\botp\b/.test(n) && /\blogin\b/.test(n)) return 'otpLogin';
   if (/\b(order\s*hub|orders?)\b/.test(n) && !/\bmy\s*orders\b/.test(n)) return 'orderHub';
@@ -375,9 +448,18 @@ export function worldBotDeleteBlockedInfo(text = '') {
     || /\bdelet\w*\b.{0,40}\b(not\s+possible|not\s+allowed|failed)\b/.test(n);
   const chargeWords = /\b(user\s+charges?|charges?|dues?|pending\s+(amount|payment|order|bill|dues)|wallet\s*balance|outstanding|balance\s+amount)\b/.test(n);
   if (!cannotDelete && !(chargeWords && /\bdelet/.test(n))) return null;
+  // ⚠️ Owner ke Part 8 me delete failure ke do alag karan hain:
+  //   • charges/dues  → is number par fresh account ban hi nahi sakta (skip)
+  //   • session expired → pehle LOGIN karo, phir delete (number jalao mat)
+  // Dono ko ek hi "deleteBlocked" me mila dena galat tha.
+  const sessionExpired = /\bsession (?:has )?expired\b|\bjson\s*\/?\s*session has expired\b|\blogin again\b/.test(n);
   return {
     kind: 'deleteBlocked',
-    reason: `Account delete nahi ho sakta${chargeWords ? ' (charges/dues pending)' : ''}: ${raw.replace(/\s+/g, ' ').slice(0, 160)}`,
+    code: sessionExpired ? 'session_expired' : 'charges',
+    sessionExpired,
+    reason: sessionExpired
+      ? `Account delete nahi hua — Swiggy session expire ho gaya (pehle login, phir delete): ${raw.replace(/\s+/g, ' ').slice(0, 160)}`
+      : `Account delete nahi ho sakta${chargeWords ? ' (charges/dues pending)' : ''}: ${raw.replace(/\s+/g, ' ').slice(0, 160)}`,
     text: raw.replace(/\s+/g, ' ').slice(0, 200),
   };
 }
@@ -391,10 +473,12 @@ export function worldBotLooksLikeNamePrompt(text = '', buttons = []) {
   const raw = String(text || '');
   const n = norm(raw);
   if (!n) return false;
-  // 🆕 "New Account Detected" jaisa marker sabse strong signal hai — isme
-  // "OTP verified" / "number" / Cancel button bhi hote hain, phir bhi ye naam
-  // ka hi step hai (yehi wajah thi ki naam ka prompt miss ho raha tha).
-  if (/\bnew account detected\b/.test(n)
+  // 🆕 "New Account Detected!" = pakka naam ka step — is par button ho ya
+  // digit ho, dono se pehle ise accept karo (asli bot ise inline button ke
+  // saath bhi bhejta hai, aur pehle guess wahin mar jata tha). Isme
+  // "OTP verified" / "number is not registered" bhi likha hota hai, phir bhi
+  // ye naam ka hi step hai (pehle yahi wajah thi ki prompt miss ho raha tha).
+  if (/\bnew account detected\b|\baccount detected\b/.test(n)
     || (/\b(name|naam)\b/.test(n) && /\b(new|naya)\s+(swiggy\s+)?account\b/.test(n))) return true;
   if (Array.isArray(buttons) && buttons.length) return false;   // button wali screen = menu/confirm
   if (/\b(invalid|error|fail|failed|could not|cannot|suspended|expired|cancel|blocked|charge|due)\b/.test(n)) return false;
@@ -435,6 +519,18 @@ export function worldBotPromptKind(text = '') {
   if (/\b(deleted successfully|account deleted|successfully archived|deleted)\b/.test(n)) return 'deleted';
   if (/\b(otp was not accepted|invalid otp|otp galat|wrong otp|otp expired)\b/.test(n)) return 'otpFail';
   if (/\b(invalid mobile|invalid number|number galat)\b/.test(n)) return 'invalidNumber';
+  // 🔌 SESSION EXPIRED — owner ka Part 8: "Session Expired / Your Swiggy
+  // JSON/session has expired / You have been logged out automatically /
+  // Please Login again (OTP or fresh JSON)." Ye Permanent Logout NAHI hai aur
+  // Delete failure se bhi alag state hai — isliye sabse pehle yahan.
+  // ("logged out automatically" me "logged out" hai, par ye logout-success
+  // nahi — warna account "logged out" maan liya jata aur naya number aa jata.)
+  if (/\bsession (?:has )?expired\b/.test(n)
+    || /\bjson\s*\/?\s*session (?:has )?expired\b/.test(n)
+    || /\blogged out automatically\b/.test(n)
+    || /\bplease login again\b.{0,40}\b(otp|fresh json)\b/.test(n)) return 'sessionExpired';
+  // 📤 Bot ne JSON file export kar di — "swiggy-login-3.json · 1.2 KB".
+  if (/\bswiggy-login-\d+\.json\b/.test(n)) return 'exportSent';
   // 🗑 Permanent logout ka apna jawab (transcript: "🗑 Permanent Logout Successful").
   if (/\b(permanent logout successful|logged out successfully|logout successful)\b/.test(n)) return 'logoutOk';
   // ❌ Login cancel — transcript: "❌ Login Cancelled / No account was logged in."
@@ -447,6 +543,12 @@ export function worldBotPromptKind(text = '') {
   if (/\b(login json|tap copy)\b/.test(n) || /(tid|access[_\s-]?token|cookies?)/i.test(n) && /\{/.test(String(text || ''))) return 'loginJson';
   // ⏳ Swiggy rate limit / account creation queue — flow rukta nahi, wait.
   if (/\b(rate limit|rate-limit)\b/.test(n) && /\b(queue|que me|queued|create|creation|ban)\b/.test(n)) return 'queued';
+  // 📇 "My Swiggy Accounts" — saved accounts ki list (Expired / Logged in /
+  // Saved + "Delete All Accounts"). ⚠️ Logout/delete ke result me bhi "My
+  // Swiggy Accounts" likha hota hai ("The account has been removed from My
+  // Swiggy Accounts") — wahan ye list NAHI hai, isliye result words exclude.
+  if (/\bmy swiggy accounts\b/.test(n)
+    && !/\b(logout|logged out|removed|deleted|success)\b/.test(n)) return 'accountsList';
   // 🏠 Main Menu — "Main Menu / Pick a feature".
   if (/\b(main menu|pick a feature)\b/.test(n)) return 'menu';
   // ❌ Bot ne khud OTP bhejne se mana kar diya — "Could not send OTP.
@@ -481,6 +583,19 @@ export function worldBotPromptKind(text = '') {
   }
   if (/\b(otp sent|otp bhej|send the 6 digit otp)\b/.test(n)) return 'otpSent';
   if (/\b(otp|code)\b/.test(n) && /\b(sent|delivered|bhej\w*|gaya|chala gaya)\b/.test(n)) return 'otpSent';
+  // 🆕 ACCOUNT-CREATION screen — "🆕 New Account Detected!". Isme "name"
+  // shabd hi nahi hota, isliye pehle koi bhi branch ise match nahi karti thi:
+  // kind = '' → naam ka step pehchanai hi nahi jati thi → naam kabhi type nahi
+  // hota tha aur OTP naam ki jagah chala jata tha. Ab ye seedha naam ka step hai.
+  if (/\bnew account detected\b|\baccount detected\b/.test(n)) return 'askName';
+  // ✅ Naam ACCEPT ho gaya — "✅ Name set: Sudhani Kumar" / "Naam set ho gaya" /
+  // "Name updated". Pehle ye bhi `askName` banta tha, isliye naam accept hone
+  // ke baad bhi agla candidate naam chala jata tha (4 naam jal kar
+  // `name_rejected`) — JSON ek message door hota tha.
+  // ⚠️ "Tell us the name to set…" yahan nahi aana chahiye → wo request verbs
+  // (tell us / send / enter / batao) wale case exclude hain.
+  if (/\b(name|naam)\b\s*(?::|—|-|is|=)?\s*(set|saved|updated|accepted|confirmed|successfully|ho gaya|lag gaya)\b/.test(n)
+    && !/\b(tell us|send|enter|type|what is|batao|likho|daalo)\b/.test(n)) return 'nameOk';
   // ❌ Naam reject ho gaya — bot ka jawab: "❌ Invalid name", "Name must be
   // 3-20 letters", "Naam galat hai, dobara bhejo". Isse pehle hum ise miss kar
   // dete the aur 90s tak JSON ka intezaar karke /start bhej dete the (owner:
@@ -593,6 +708,177 @@ export function worldBotAwaitingKind(messages = []) {
     if (kind === 'askName') return 'name';
   }
   return '';
+}
+
+// Screen par bot ne kaun se 10-digit number likhe hain (OTP Sent to 98…).
+// Naam ka step kisi number ka ho sakta hai — galat number ka account apne
+// naam se complete karna nahi chahiye.
+function worldBotNumbersOnScreen(messages = []) {
+  const out = new Set();
+  for (const m of (Array.isArray(messages) ? messages : []).slice(0, 6)) {
+    if (!m || m.out) continue;
+    const text = String(m.text || '');
+    for (const hit of text.matchAll(/(?:\+?91[\s-]?)?\b([6-9]\d{9})\b/g)) out.add(hit[1]);
+  }
+  return out;
+}
+
+// 👤 Bot ka naam ka sawaal abhi SCREEN par khada hai?
+//
+// Owner ka case (2026-11-09): bot "🆕 New Account Detected! Tell us the name to
+// set on your Swiggy account." par khada tha, par humne naam sirf *naye*
+// (fresh) messages me dhoondha — wahi message pehle se screen par tha, isliye
+// kabhi match nahi hua: naam type hi nahi hua, 45s+90s baad "login fail" aur
+// number jal gaya. Ab screen par dikhe to seedha naam bhejte hain.
+//   strict = sirf asli naam-prompt kind (guess nahi) — reset/cancel wale
+//   faislon ke liye, taaki koi normal message galti se "naam" na bane.
+export function worldBotNamePromptOnScreen(messages = [], { strict = false } = {}) {
+  const list = (Array.isArray(messages) ? messages : []).filter((m) => m && !m.out);
+  if (!list.length) return null;
+  const latest = list[0];
+  const kind = worldBotPromptKind(latest.text);
+  if (kind === 'askName') return latest;
+  // 🆕 "New Account Detected" line — strict mode me bhi naam ka step hai
+  // (isme "name" shabd nahi hota, isliye pehle yahan miss ho jata tha).
+  if (/\bnew account detected\b/.test(norm(latest.text))) return latest;
+  if (!strict && !kind && worldBotLooksLikeNamePrompt(latest.text, latest.buttons)) return latest;
+  // Latest message blank/media ho (bot ne text ke bina kuch bheja) to ek
+  // message peecha dekho — bot ka naam ka sawaal usi ke upar ho sakta hai.
+  const latestBlank = !String(latest.text || '').trim() && !(latest.buttons || []).length;
+  if (latestBlank) {
+    for (const m of list.slice(1, 3)) {
+      if (worldBotPromptKind(m.text) === 'askName') return m;
+    }
+    if (!strict) {
+      for (const m of list.slice(1, 3)) {
+        if (!worldBotPromptKind(m.text) && worldBotLooksLikeNamePrompt(m.text, m.buttons)) return m;
+      }
+    }
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// 📇 MY SWIGGY ACCOUNTS — saved accounts ki list, account detail aur bot ke
+// 4 alag-alag jawab (owner ke Part 8: login cancelled / session expired /
+// delete failure / permanent logout — inhe kabhi mila dena galat hai).
+// ---------------------------------------------------------------------------
+const WORLD_ACCOUNT_STATUS_RULES = [
+  [/\blogged\s*in\b|\blogin\s*active\b|\bactive\b/i, 'logged_in'],
+  [/\bsaved\b/i, 'saved'],
+  [/\bexpired?\b/i, 'expired'],
+  [/\blogged\s*out\b|\bnot\s*logged\s*in\b/i, 'logged_out'],
+];
+
+// "Expired" / "Logged in" / "Saved" — account button ya screen text se.
+export function worldBotAccountStatus(text = '') {
+  const raw = String(text || '');
+  for (const [re, status] of WORLD_ACCOUNT_STATUS_RULES) if (re.test(raw)) return status;
+  return '';
+}
+
+// "My Swiggy Accounts" screen ke buttons → saved account list.
+// Button ka text hi asli number deta hai ("📱 9876543210 · Logged in"), isliye
+// sirf 10-digit wale buttons account maane jate hain (Main Menu/Delete All
+// Accounts/Cancel chhoot jate hain).
+export function worldBotAccountsFromScreens(messages = []) {
+  const seen = new Set();
+  const out = [];
+  for (const message of (Array.isArray(messages) ? messages : [])) {
+    if (!message || message.out) continue;
+    for (const entry of (message.buttons || [])) {
+      const text = String(entry?.text || '');
+      const phone = (text.match(/(?:^|\D)([6-9]\d{9})(?:\D|$)/) || [])[1] || '';
+      if (!phone || seen.has(phone)) continue;
+      seen.add(phone);
+      out.push({
+        phone,
+        label: text,
+        status: worldBotAccountStatus(text) || worldBotAccountStatus(message.text),
+        entry,
+        messageId: message.id,
+      });
+    }
+  }
+  return out;
+}
+
+// Account DETAIL screen (Name · Mobile · Status + Export Login JSON / Login /
+// Permanent Logout). Sirf wahi screen detail maani jati hai jisme in teen me se
+// koi button ho — warna koi bhi list ke upar khada message detail ban jata.
+export function worldBotAccountDetailFromScreens(messages = [], phone = '') {
+  const list = (Array.isArray(messages) ? messages : []).filter((m) => m && !m.out);
+  const wanted = String(phone || '').replace(/\D/g, '').slice(-10);
+  for (const message of list.slice(0, 3)) {
+    const roles = new Set((message.buttons || []).map((b) => b.role || worldBotButtonRole(b.text)));
+    const isDetail = roles.has('exportJson') || roles.has('permanentLogout')
+      || (roles.has('login') && roles.has('exportJson'));
+    if (!isDetail) continue;
+    const text = String(message.text || '');
+    const mobile = (text.match(/(?:mobile|number|phone|📱)\s*[:\-]?\s*(\+?\d[\d\s-]{8,})/i) || [])[1] || '';
+    const digits = String(mobile || '').replace(/\D/g, '').slice(-10) || (text.match(/\b([6-9]\d{9})\b/) || [])[1] || '';
+    if (wanted && digits && digits !== wanted) continue;
+    const name = ((text.match(/(?:name|naam)\s*[:\-]\s*([^\n·|]+)/i) || [])[1]
+      || (text.match(/👤\s*([^\n·|]+)/) || [])[1] || '').replace(/\s+/g, ' ').trim();
+    return {
+      phone: digits || wanted,
+      name: name.slice(0, 60),
+      status: worldBotAccountStatus(text),
+      text: text.replace(/\s+/g, ' ').slice(0, 300),
+      buttons: (message.buttons || []).map((b) => b.text),
+      roles: [...roles],
+      messageId: message.id,
+      at: message.dateMs || 0,
+    };
+  }
+  return null;
+}
+
+// Bot ke jawab ka "outcome" — 4 states alag rehte hain, ek me do nahi.
+export function worldBotOutcome(text = '') {
+  const kind = worldBotPromptKind(text);
+  if (kind === 'cancelled') return 'login_cancelled';
+  if (kind === 'sessionExpired') return 'session_expired';
+  if (kind === 'deleteBlocked') {
+    return worldBotDeleteBlockedInfo(text)?.code === 'session_expired' ? 'session_expired' : 'delete_refused';
+  }
+  if (kind === 'logoutOk') return 'permanent_logout';
+  if (kind === 'deleted') return 'account_deleted';
+  if (kind === 'loginOk' || kind === 'loginJson' || kind === 'exportSent') return 'login_ok';
+  return '';
+}
+
+// Export file ka naam bot se: "DocumentAttributeFilename.fileName".
+function messageDocumentName(message) {
+  try {
+    const doc = message?.document || message?.media?.document || null;
+    const attrs = (doc && doc.attributes) || (message?.media?.document && message.media.document.attributes) || [];
+    for (const attribute of (Array.isArray(attrs) ? attrs : [])) {
+      const name = attribute?.fileName || attribute?.file_name || attribute?.attributes?.fileName;
+      if (name) return String(name).trim();
+    }
+    const direct = message?.fileName || doc?.name || message?.media?.document?.name || '';
+    if (direct) return String(direct).trim();
+  } catch {}
+  return '';
+}
+
+function messageDocumentSize(message) {
+  try {
+    const doc = message?.document || message?.media?.document || null;
+    const size = Number(doc?.size ?? message?.media?.document?.size ?? 0);
+    return Number.isFinite(size) && size > 0 ? size : 0;
+  } catch {
+    return 0;
+  }
+}
+
+// Export ka default naam jab bot apna filename na de (owner ke screenshot me
+// "swiggy-login-3.json" tha — koi bhi JSON naam chalega, par .json hi).
+export function worldBotExportFileName(phone = '', fallbackIndex = 3) {
+  const digits = String(phone || '').replace(/\D/g, '');
+  const suffix = digits ? digits.slice(-4) : String(Number(fallbackIndex) || 3);
+  return `swiggy-login-${suffix}.json`;
 }
 
 // OTP send confirm na hua ho (aur bot ne Cancel bhi na bheja) to number skip
@@ -870,6 +1156,8 @@ export const _readWorldMessagesForTests = (client, entity, limit) => readWorldMe
 export const _parseScreenMessagesForTests = (client, entity, limit, readOpts) => parseScreenMessages(client, entity, limit, readOpts);
 export const _messageTextOfForTests = (message) => messageTextOf(message);
 export const _waitForReplyForTests = (opts) => waitForReply(opts);
+export const _waitForOtpSentForTests = (opts) => waitForOtpSent(opts);
+export const _sendWorldCodeForTests = (client, entity, code, cfg) => sendWorldCode(client, entity, code, cfg);
 
 export function worldBotReadInfo() {
   return {
@@ -1001,6 +1289,12 @@ async function parseScreenMessages(client, entity, limit, readOpts = {}) {
       try { keys = Object.keys(latest.raw || {}).slice(0, 14).join(','); } catch {}
       console.warn(`[WorldBot] 📭 screen par kuch nahi (id ${latest.id}, out=${latest.out}) — keys: ${keys || 'n/a'}`);
     }
+    // ⛔ Guard khol do jab bot khud flow khatam kar de (cancel/menu/login ok)
+    // — warna /start hamesha band rahega.
+    const latestKind = worldBotPromptKind(latest.text);
+    if (latestKind === 'cancelled' || latestKind === 'menu' || latestKind === 'loginOk' || latestKind === 'deleted') {
+      if (Number(state.loginFlowAt)) closeLoginFlow();
+    }
     state.lastScreenText = String(latest.text || '').slice(0, 400);
     state.lastScreenButtons = latest.buttons.map((b) => b.text);
     // Owner ko pata chale bot exactly kya keh raha hai — /world isi se bharta
@@ -1076,7 +1370,11 @@ async function scanForLateReply({
       console.log(`[WorldBot] 🕰 late reply mil gaya — "${what}" PASS`);
       return hit;
     }
-    await sleep(3_000);
+    // Fixed 3s sleep chhote grace (speed fix) ko bhi 3s tak kheench deta tha —
+    // ab bachi hui window se zyada nahi sote.
+    const left = deadline - Date.now();
+    if (left <= 0) break;
+    await sleep(Math.min(3_000, Math.max(200, left)));
   }
   return null;
 }
@@ -1085,6 +1383,9 @@ async function scanForLateReply({
 // return ho jata hai; timeout par WorldBotError('worldbot-timeout').
 async function waitForReply({
   client, entity, predicate, baseline, timeoutMs, shouldAbort, what = 'reply', pollMs, graceMs,
+  // graceCapMs: flood na hua ho to late scan ki limit (default 20s). Tests
+  // ise chhota de kar fast check karte hain.
+  graceCapMs,
 }) {
   const budget = Math.max(1_000, Number(timeoutMs) || WORLD_BOT_DEFAULTS.stepTimeoutMs);
   // ⏱ Flood wait se kha Liya gaya waqt deadline me wapas jata hai (max 3x).
@@ -1114,7 +1415,20 @@ async function waitForReply({
   }
   // Deadline khatam — par flood ke baad jawab late aata hai, isliye ek
   // aakhri dheemi scan (default 45s).
-  const grace = graceMs === undefined ? 45_000 : Number(graceMs) || 0;
+  //
+  // ⚡ Owner ki shikayat (2026-11-09): "bot bahut time le raha hai". Wajah:
+  // har step ke timeout ke BAAD poora 45–90s ka late scan baithta tha, chahe
+  // Telegram ne ek second bhi flood wait nahi diya ho. Agar poore wait me
+  // koi read block nahi hua (flood = 0), to bot ka jawab aana hi tha aur nahi
+  // aaya — usme 90s aur baithna sirf waqt barbaad hai. Tab chhota scan.
+  // Flood ne waqt khaya ho tab poora grace (wahan late reply ka asli risk hai).
+  const graceWanted = graceMs === undefined ? 45_000 : Number(graceMs) || 0;
+  const floodStole = extraMs >= 1_500 || (Number(worldReadCache.lastFloodMs) || 0) > 1_500;
+  const graceCap = Number(graceCapMs) >= 0 && graceCapMs !== undefined ? Number(graceCapMs) : 20_000;
+  const grace = graceWanted ? (floodStole ? graceWanted : Math.min(graceWanted, graceCap)) : 0;
+  if (grace && grace < graceWanted) {
+    console.log(`[WorldBot] ⚡ flood 0 tha — "${what}" ka late scan ${Math.round(grace / 1000)}s hi (${Math.round(graceWanted / 1000)}s ki jagah)`);
+  }
   const late = await scanForLateReply({
     client, entity, predicate, baseline, graceMs: grace, shouldAbort, what,
   }).catch(() => null);
@@ -1265,7 +1579,12 @@ function findRoleOnScreens(messages, role) {
 async function ensureWorldScreen(client, entity, role, { cfg, shouldAbort, what } = {}) {
   const hit = findRoleOnScreens(await parseScreenMessages(client, entity), role);
   if (hit) return hit;
-  // Kuch nahi mila to /start bhej kar main menu maango.
+  // Kuch nahi mila to /start bhej kar main menu maango — par khula login ho
+  // to /start usko cancel kar deta hai (owner: "Cancel kiu ho ja raha").
+  if (worldLoginFlowOpenMs(cfg) > 0) {
+    console.warn('[WorldBot] ⛔ /start nahi bhej raha — login khula hai (Login Cancelled se bachaav)');
+    return null;
+  }
   const before = screenSignature(await parseScreenMessages(client, entity));
   await sendWorldText(client, entity, '/start');
   const reply = await waitForReply({
@@ -1301,6 +1620,53 @@ function reportCard(report, html) {
   try { return Promise.resolve(report(html)).catch(() => {}); } catch { return Promise.resolve(); }
 }
 
+// JSON nikaalo — message text → document download → "Copy Code" → recovery.
+// Naya account (naam wala rasta) aur purana account (seedha JSON) dono yahi
+// use karte hain, taaki naam ke baad JSON kabhi chhoot na jaye.
+async function resolveWorldJsonText({ client, entity, cfg = {}, shouldAbort = null, final = null }) {
+  setPhase('json');
+  let jsonText = final?.json?.text || '';
+  if (!jsonText && final?.message?.hasDocument) {
+    const buffer = await client.downloadMedia(final.message.raw, {}).catch(() => null);
+    if (buffer) {
+      const body = Buffer.isBuffer(buffer) ? buffer.toString('utf8') : String(buffer);
+      const found = extractWorldBotJson(body);
+      if (found) jsonText = found.text;
+      else {
+        try { JSON.parse(body); jsonText = body.trim(); } catch {}
+      }
+    }
+  }
+  // "Copy Code" button ho to dabao — JSON usi se milta hai.
+  if (!jsonText) {
+    const copied = await clickCopyCode({ client, entity, cfg, shouldAbort }).catch(() => null);
+    if (copied?.json?.text) jsonText = copied.json.text;
+    else if (copied?.message) {
+      jsonText = await downloadJsonFromMessage(client, copied.message).catch(() => '');
+    }
+  }
+  if (!jsonText) {
+    // 🔎 JSON recovery: Copy button → aakhri 15 messages → 12s ka wait.
+    const recovered = await recoverWorldBotJson({ client, entity, cfg, shouldAbort }).catch(() => null);
+    if (recovered?.jsonText) {
+      jsonText = recovered.jsonText;
+      console.log(`[WorldBot] 🔎 JSON recovery mil gaya (${recovered.via})`);
+    }
+  }
+  if (!jsonText) throw new WorldBotError('no-json', 'Login ho gaya par JSON na mila (na file, na code block)');
+  // 🛡️ JSON mila par adhoora (token/tid/cookies kuch nahi) → ek aur Copy Code.
+  if (!isValidWorldSessionJson(jsonText)) {
+    const retried = await clickCopyCode({ client, entity, cfg, shouldAbort }).catch(() => null);
+    const retriedText = retried?.json?.text || (retried?.message ? await downloadJsonFromMessage(client, retried.message).catch(() => '') : '');
+    if (retriedText && isValidWorldSessionJson(retriedText)) {
+      jsonText = retriedText;
+    } else {
+      throw new WorldBotError('bad-json', `JSON adhoora/parse fail (${jsonText.length} chars) — token/tid/cookies kuch nahi mila`);
+    }
+  }
+  return jsonText;
+}
+
 // ---------------------------------------------------------------------------
 // Login: /start → Login → OTP Login → number → OTP → (name) → JSON
 // ---------------------------------------------------------------------------
@@ -1327,6 +1693,146 @@ export async function worldBotLogin({
   try {
     return await withWorldBotClient(async ({ client }) => {
       const entity = await getWorldEntity(client, cfg.username);
+
+      // 👤 Sabse pehle: bot pehle se NAAM par khada hai?
+      // (Pichhle attempt me OTP accept ho gaya par naam type nahi hua — owner
+      // ka 2026-11-09 wala case. Aise me naya OTP/naya number lena bilkul
+      // galat hai: account aadha bana hua hai, bas naam chahiye.)
+      const preScreen = await parseScreenMessages(client, entity, 8, { fresh: true }).catch(() => []);
+      const preName = worldBotNamePromptOnScreen(preScreen, { strict: true });
+      // Bot ke messages me koi DUSRA number likha ho to ye pichhle number ka
+      // aadha-bana account hai — usme apna naam nahi daalna.
+      // Sirf LATEST 2 bot messages dekho — chat me pichhle number ka card pada
+      // rehta hai, usse guard galat fire ho kar aadha bana account cancel ho
+      // jata tha.
+      const otherNumber = [...worldBotNumbersOnScreen(preScreen.filter((m) => !m.out).slice(0, 2))]
+        .find((n) => n !== cleanPhone);
+      if (preName && otherNumber) {
+        console.warn(`[WorldBot] 👤 naam ka step hai par screen par dusra number (${otherNumber}) — is account me naam nahi bharunga`);
+        // /cancel se aadha bana account mar jata tha — pehle Main Menu button.
+        const menuBtn = findRoleOnScreens(preScreen, 'mainMenu');
+        if (menuBtn) await clickWorldButton(menuBtn.button).catch(() => {});
+        await sleep(400);
+      } else if (preName) {
+        setPhase('send-name');
+        console.log(`[WorldBot] 👤 bot pehle se naam maang raha hai — seedha naam bhej raha hoon (naya OTP/number nahi)`);
+        await reportCard(report, [
+          '🌍 <b>Swiggy World Bot — Naam ka step</b>',
+          `📱 <code>${cleanPhone}</code> · bot "New Account Detected" par khada hai, naam bhej raha hoon…`,
+        ].join('\n'));
+        const nameRes = await submitWorldBotName({
+          client, entity, cfg, shouldAbort, nameProvider, phone: cleanPhone,
+        });
+        if (nameRes.ok) {
+          const jsonText = await resolveWorldJsonText({ client, entity, cfg, shouldAbort, final: nameRes.final });
+          state.lastOkAt = Date.now();
+          setPhase('done');
+          console.log(`[WorldBot] ✅ Login ready: ${cleanPhone} · NEW (naam seedha screen se) · JSON ${jsonText.length} chars`);
+          return {
+            ok: true, kind: 'fresh_new', phone: cleanPhone, askedName: true, jsonText,
+            viaWorldBot: true, username: cfg.username,
+            screenButtons: [...(state.lastScreenButtons || [])],
+          };
+        }
+        console.warn(`[WorldBot] 👤 naam step fail (${nameRes.kind}): ${nameRes.reason} — normal login flow`);
+        await safeCancel(client, entity, cfg).catch(() => {});
+        return {
+          ok: false,
+          kind: nameRes.kind === 'name_rejected' ? 'name_rejected' : 'no-json',
+          phone: cleanPhone,
+          askedName: true,
+          code: nameRes.kind === 'name_rejected' ? 'WORLDBOT_NAME_REJECTED' : 'WORLDBOT_JSON_MISSING',
+          reason: `${nameRes.reason || 'naam step fail'} — account bana hua hai, wahi number se JSON le sakte hain`,
+        };
+      }
+
+      // 🛡️ NAAM RESCUE — jab bhi screen par "🆕 New Account Detected!" dikhe,
+      // matlab account aadha ban chuka hai: naam bhejo aur JSON lo. Isse fail
+      // hone se pehle bhi call karte hain, taaki naam kabhi chhoot na jaye.
+      const rescueNameStep = async () => {
+        const screen = await parseScreenMessages(client, entity, 8, { fresh: true }).catch(() => []);
+        if (!worldBotNamePromptOnScreen(screen, { strict: true })) return null;
+        setPhase('send-name');
+        console.log('[WorldBot] 👤 naam ka step dikha — naam bhej raha hoon (JSON ke saath)');
+        const nameRes = await submitWorldBotName({
+          client, entity, cfg, shouldAbort, nameProvider, phone: cleanPhone,
+        }).catch(() => null);
+        if (!nameRes?.ok) return null;
+        const jsonText = await resolveWorldJsonText({ client, entity, cfg, shouldAbort, final: nameRes.final });
+        state.lastOkAt = Date.now();
+        closeLoginFlow();
+        setPhase('done');
+        console.log(`[WorldBot] ✅ Login ready (naam rescue): ${cleanPhone} · NEW · JSON ${jsonText.length} chars`);
+        return {
+          ok: true, kind: 'fresh_new', phone: cleanPhone, askedName: true, jsonText,
+          viaWorldBot: true, username: cfg.username,
+          screenButtons: [...(state.lastScreenButtons || [])],
+        };
+      };
+
+      // ⏳ Pichhla login abhi KHULA hai (is WAHI number par number/OTP gaya
+      // tha) aur screen par kuch nahi — bot account bana raha hoga. /start
+      // ya Cancel bhejna usko cancel kar deta hai (owner: "Cancel kiu ho ja
+      // raha, 20s to diye hain"). Pehle itna intezaar ki bot apna jawab de de:
+      // naam aaya → naam + JSON (account bach gaya), JSON aaya → wahi.
+      if (worldLoginFlowOpenMs(cfg) > 0) {
+        const sameFlowPhone = !state.loginFlowPhone || state.loginFlowPhone === cleanPhone;
+        if (sameFlowPhone) {
+          setPhase('login-wait');
+          const waitMs = Math.max(1_000, Math.min(120_000, Number(cfg.otpVerifyWaitMs) || 90_000));
+          console.log(`[WorldBot] ⏳ login khula hai — /start nahi, ${Math.round(waitMs / 1000)}s tak bot ka jawab dekh raha hoon (${cleanPhone})`);
+          const openBaseline = screenSignature(await parseScreenMessages(client, entity).catch(() => []));
+          const late = await waitForReply({
+            client, entity, baseline: openBaseline, timeoutMs: waitMs, shouldAbort,
+            what: 'khula login ka jawab', graceMs: 0, pollMs: cfg.pollMs,
+            predicate: (freshList, all) => {
+              for (const message of freshList) {
+                if (message.hasDocument) return { kind: 'document', message };
+                const json = extractWorldBotJson(message.text);
+                if (json) return { kind: 'json', message, json };
+                const kind = worldBotPromptKind(message.text);
+                if (kind === 'askName') return { kind: 'askName', message };
+                if (kind === 'otpFail') return { kind: 'otpFail', message };
+                if (kind === 'cancelled') return { kind: 'cancelled', message };
+              }
+              const nm = worldBotNamePromptOnScreen(all, { strict: true });
+              if (nm) return { kind: 'askName', message: nm, fromScreen: true };
+              return null;
+            },
+          }).catch(() => null);
+          if (late?.kind === 'askName') {
+            const nameRes = await submitWorldBotName({
+              client, entity, cfg, shouldAbort, nameProvider, phone: cleanPhone,
+            }).catch(() => null);
+            if (nameRes?.ok) {
+              const jsonText = await resolveWorldJsonText({ client, entity, cfg, shouldAbort, final: nameRes.final });
+              state.lastOkAt = Date.now();
+              closeLoginFlow();
+              setPhase('done');
+              console.log(`[WorldBot] ✅ Login ready (late naam): ${cleanPhone} · NEW · JSON ${jsonText.length} chars`);
+              return {
+                ok: true, kind: 'fresh_new', phone: cleanPhone, askedName: true, jsonText,
+                viaWorldBot: true, username: cfg.username,
+                screenButtons: [...(state.lastScreenButtons || [])],
+              };
+            }
+          } else if (late && ['json', 'document'].includes(late.kind)) {
+            const jsonText = await resolveWorldJsonText({ client, entity, cfg, shouldAbort, final: late });
+            state.lastOkAt = Date.now();
+            closeLoginFlow();
+            setPhase('done');
+            console.log(`[WorldBot] ✅ Login ready (late JSON): ${cleanPhone} · OLD · JSON ${jsonText.length} chars`);
+            return {
+              ok: true, kind: 'existing_account', phone: cleanPhone, askedName: false, jsonText,
+              viaWorldBot: true, username: cfg.username,
+              screenButtons: [...(state.lastScreenButtons || [])],
+            };
+          } else if (late?.kind === 'cancelled') {
+            closeLoginFlow();
+            console.warn('[WorldBot] ⛔ bot ne khud login cancel kar diya (Login Cancelled) — flow band');
+          }
+        }
+      }
 
       // 1) Main menu — delete ke baad owner ka flow: Main Menu → Login → OTP
       // Login → number. `/start` sirf tab jab Main Menu/Login kuch na mile.
@@ -1464,6 +1970,9 @@ export async function worldBotLogin({
             console.warn(`[WorldBot] ⚠️ OTP watermark fail: ${String(error?.message || error).slice(0, 90)}`);
           }
         }
+        // ⛔ yahan se login flow KHULA hai — jab tak naam/JSON/Cancel na aaye,
+        // /start ya Cancel nahi jayega (warna bot Login Cancelled deta hai).
+        markLoginFlowOpen({ loginFlowPhone: cleanPhone });
         await sendWorldText(client, entity, cleanPhone);
 
         // ⏱ Owner rule: OTP send ka budget 20s (queue bola ho to +20s).
@@ -1510,6 +2019,27 @@ export async function worldBotLogin({
         };
       }
 
+      // 👤 Bot ne seedha naam maang liya (OTP ke bina) — seedha naam + JSON.
+      if (numberResult?.kind === 'nameFirst') {
+        setPhase('send-name');
+        console.log('[WorldBot] 👤 number ke baad bot ne seedha naam maanga — OTP type skip, naam bhej raha hoon');
+        const nameFirstRes = await submitWorldBotName({
+          client, entity, cfg, shouldAbort, nameProvider, phone: cleanPhone,
+        }).catch((e) => ({ ok: false, kind: 'no-json', reason: String(e?.message || e) }));
+        if (nameFirstRes?.ok) {
+          const jsonText = await resolveWorldJsonText({ client, entity, cfg, shouldAbort, final: nameFirstRes.final });
+          state.lastOkAt = Date.now();
+          closeLoginFlow();
+          setPhase('done');
+          console.log(`[WorldBot] ✅ Login ready: ${cleanPhone} · NEW (naam) · JSON ${jsonText.length} chars`);
+          return {
+            ok: true, kind: 'fresh_new', phone: cleanPhone, askedName: true, jsonText,
+            viaWorldBot: true, username: cfg.username,
+            screenButtons: [...(state.lastScreenButtons || [])],
+          };
+        }
+      }
+
       // 5) OTP lao (Firebase inbox se — pipeline deta hai) aur bhejo
       setPhase('otp-wait');
       await reportCard(report, [
@@ -1532,6 +2062,10 @@ export async function worldBotLogin({
       ]);
       console.log(`[WorldBot] 🔎 OTP fetch khatam (${Date.now() - fetchStartedAt}ms) — ${otp?.code ? 'code mila' : 'code nahi mila'}`);
       if (!otp?.code) {
+        // 🛡️ OTP nahi mila, par bot naam maang raha ho to account ban chuka
+        // hai (pichhle attempt ka OTP accept hua tha) — naam + JSON le lo.
+        const rescueMiss = await rescueNameStep().catch(() => null);
+        if (rescueMiss?.ok) return rescueMiss;
         await safeCancel(client, entity, cfg).catch(() => {});
         if (otp?.aborted) return { ok: false, kind: 'aborted', phone: cleanPhone, reason: 'OTP wait abort' };
         // 👀 Owner ko saaf pata chale ki OTP SOURCE me code hi nahi aaya
@@ -1574,8 +2108,37 @@ export async function worldBotLogin({
 
       setPhase('otp-verify');
       before = screenSignature(await parseScreenMessages(client, entity));
+      // 👤 Bot OTP pehle hi le chuka hai aur naam maang raha hai → 6-digit OTP
+      // ko naam samajh kar bhejna sabse badi galti hoti (bot use reject karta
+      // hai). Seedha naam bhejo.
+      const nameNow = worldBotNamePromptOnScreen(
+        await parseScreenMessages(client, entity, 8, { fresh: true }).catch(() => []),
+        { strict: true }
+      );
+      if (nameNow) {
+        console.log('[WorldBot] 👤 bot naam maang raha hai — OTP type skip, seedha naam bhej raha hoon');
+        const earlyName = await submitWorldBotName({
+          client, entity, cfg, shouldAbort, nameProvider, phone: cleanPhone,
+        }).catch((e) => ({ ok: false, kind: 'no-json', reason: String(e?.message || e) }));
+        if (earlyName?.ok) {
+          const jsonText = await resolveWorldJsonText({ client, entity, cfg, shouldAbort, final: earlyName.final });
+          state.lastOkAt = Date.now();
+          setPhase('done');
+          console.log(`[WorldBot] ✅ Login ready: ${cleanPhone} · NEW (naam) · JSON ${jsonText.length} chars`);
+          return {
+            ok: true, kind: 'fresh_new', phone: cleanPhone, askedName: true, jsonText,
+            viaWorldBot: true, username: cfg.username,
+            screenButtons: [...(state.lastScreenButtons || [])],
+          };
+        }
+      }
       const typed = await sendWorldCode(client, entity, otpCode, cfg);
+      if (typed.ok) markLoginFlowOpen({ otpTypedAt: Date.now() });
       if (!typed.ok) {
+        // 🛡️ Fail karne se pehle ek aakhri chance: bot agar naam maang raha hai to
+        // account ban chuka hai — naam bhejo aur JSON lo (Cancel nahi).
+        const rescue = await rescueNameStep().catch(() => null);
+        if (rescue?.ok) return rescue;
         await safeCancel(client, entity, cfg).catch(() => {});
         if (typed.reason === 'bot-login-cancelled' || String(typed.reason || '').startsWith('bot-SWIGGY_')) {
           return {
@@ -1596,11 +2159,21 @@ export async function worldBotLogin({
       }
 
       // 6) Outcome: naam ka sawaal = naya account; seedha JSON = purana.
+      //
+      // ⏳ Owner ka rule (2026-11-09): "fixed input ka koi time limit nahi —
+      // bot output dega, usko samajh kar next input dena hai". Isliye jaldi
+      // fail karne wale short-cut (jaise menu ka 6s guess) hata diye hain —
+      // sirf lamba budget aur seedha wait.
+      // ⏱ Account creation me waqt lagta hai — 45s ke step budget ki jagah
+      // alag (bada) budget. Owner: "20s to diye hain" — haan, 20s sirf OTP
+      // SOURCE ka rule hai; OTP type karne ke baad Swiggy ka jawab isse alag
+      // budget me aata hai, aur tab tak /start/Cancel bilkul nahi.
+      const verifyWait = Math.max(Number(cfg.stepTimeoutMs) || 0, Number(cfg.otpVerifyWaitMs) || 90_000);
       const outcome = await waitForReply({
-        client, entity, baseline: before, timeoutMs: cfg.stepTimeoutMs, shouldAbort,
+        client, entity, baseline: before, timeoutMs: verifyWait, shouldAbort,
         what: 'login result',
         graceMs: Number(cfg.lateReplyGraceMs) || 90_000,
-        predicate: (freshList) => {
+        predicate: (freshList, all) => {
           for (const message of freshList) {
             if (message.hasDocument) return { kind: 'document', message };
             const json = extractWorldBotJson(message.text);
@@ -1617,6 +2190,14 @@ export async function worldBotLogin({
               console.log(`[WorldBot] 🔤 naam ka prompt (guess): ${String(message.text || '').replace(/\s+/g, ' ').slice(0, 80)}`);
               return { kind: 'askName', message, guessed: true };
             }
+          }
+          // 👤 Screen par pehle se khada naam prompt (fresh me nahi aaya kyunki
+          // baseline me tha — owner ka asli case). Isse 45s+90s ka wait bachta
+          // hai aur naam turant type hota hai.
+          const onScreenName = worldBotNamePromptOnScreen(all, { strict: true });
+          if (onScreenName) {
+            console.log('[WorldBot] 👤 screen par naam ka prompt hai — seedha naam bhej raha hoon');
+            return { kind: 'askName', message: onScreenName, fromScreen: true };
           }
           return null;
         },
@@ -1659,52 +2240,11 @@ export async function worldBotLogin({
         return { ok: false, kind: 'failed_otp_verify', phone: cleanPhone, reason: 'World Bot ne OTP accept nahi kiya' };
       }
 
-      // 7) JSON nikaalo (file ya text)
-      setPhase('json');
-      let jsonText = final.json?.text || '';
-      if (!jsonText && final.message?.hasDocument) {
-        const buffer = await client.downloadMedia(final.message.raw, {});
-        if (buffer) {
-          const body = Buffer.isBuffer(buffer) ? buffer.toString('utf8') : String(buffer);
-          const found = extractWorldBotJson(body);
-          if (found) jsonText = found.text;
-          else {
-            try { JSON.parse(body); jsonText = body.trim(); } catch {}
-          }
-        }
-      }
-      // "Copy Code" button ho to dabao — JSON usi se milta hai.
-      if (!jsonText) {
-        const copied = await clickCopyCode({ client, entity, cfg, shouldAbort }).catch(() => null);
-        if (copied?.json?.text) jsonText = copied.json.text;
-        else if (copied?.message) {
-          jsonText = await downloadJsonFromMessage(client, copied.message).catch(() => '');
-        }
-      }
-      if (!jsonText) {
-        // 🔎 JSON recovery: Copy button → aakhri 15 messages → 12s ka wait.
-        // (Kabhi JSON agle message me ya edit hokar aata hai; pehle seedha
-        // `no-json` ho kar flow /start par chala jata tha.)
-        const recovered = await recoverWorldBotJson({ client, entity, cfg, shouldAbort }).catch(() => null);
-        if (recovered?.jsonText) {
-          jsonText = recovered.jsonText;
-          console.log(`[WorldBot] 🔎 JSON recovery mil gaya (${recovered.via})`);
-        }
-      }
-      if (!jsonText) throw new WorldBotError('no-json', 'Login ho gaya par JSON na mila (na file, na code block)');
-      // 🛡️ JSON mila par adhoora (token/tid/cookies kuch nahi) → aage bhejne ka
-      // koi matlab nahi. Ek baar Copy Code se dobara try, warna saaf message.
-      if (!isValidWorldSessionJson(jsonText)) {
-        const retried = await clickCopyCode({ client, entity, cfg, shouldAbort }).catch(() => null);
-        const retriedText = retried?.json?.text || (retried?.message ? await downloadJsonFromMessage(client, retried.message).catch(() => '') : '');
-        if (retriedText && isValidWorldSessionJson(retriedText)) {
-          jsonText = retriedText;
-        } else {
-          throw new WorldBotError('bad-json', `JSON adhoora/parse fail (${jsonText.length} chars) — token/tid/cookies kuch nahi mila`);
-        }
-      }
+      // 7) JSON nikaalo (file ya text) — naam wale raste me bhi yahi helper.
+      const jsonText = await resolveWorldJsonText({ client, entity, cfg, shouldAbort, final });
 
       state.lastOkAt = Date.now();
+      closeLoginFlow();
       setPhase('done');
       console.log(`[WorldBot] ✅ Login ready: ${cleanPhone} · ${askedName ? 'NEW (name poochha)' : 'OLD (name nahi poochha)'} · JSON ${jsonText.length} chars`);
       return {
@@ -1787,6 +2327,8 @@ async function waitForOtpSent({ client, entity, baseline, cfg, shouldAbort }) {
   // tha aur OTP kabhi type hi nahi hota tha. Ab aisa reply = OTP Sent.
   let blankReplyAt = 0;
   let blankReplyMedia = false;
+  // 🚪 blank reply + login menu = number accept nahi hua (neeche dekho).
+  let menuStuckAt = 0;
   // 🐢 Flood wait se kha Liya gaya waqt 20s ke budget me se nahi jayega —
   // warna bot ka "OTP Sent" aane se pehle hi hum Cancel + dobara number
   // bhej dete the (Swiggy: login attempts exceeded).
@@ -1811,6 +2353,9 @@ async function waitForOtpSent({ client, entity, baseline, cfg, shouldAbort }) {
       if (blocked) return { ok: false, kind: blocked.kind, code: blocked.code, reason: blocked.reason, message };
       const kind = worldBotPromptKind(message.text);
       if (kind === 'otpSent') return { ok: true, kind: 'otpSent', message };
+      // 👤 Bot ne OTP maangne ke bajaye seedha NAAM maang liya (account pehle
+      // hi bana hua tha) — "OTP Sent nahi aaya" maan kar number jalana galat.
+      if (kind === 'askName') return { ok: true, kind: 'nameFirst', message };
       if (kind === 'invalidNumber') return { ok: false, kind: 'invalidNumber', message };
       // Bot ka jawab aaya par text nahi (photo/blank) — ise turant "OTP Sent"
       // mat maano. Owner ke log me yahi hua: blank reply ke 3s baad hum OTP
@@ -1856,6 +2401,10 @@ async function waitForOtpSent({ client, entity, baseline, cfg, shouldAbort }) {
       if (worldBotHasPromptKind(recent, 'cancelled')) {
         return { ok: false, kind: 'login_cancelled', code: 'WORLDBOT_LOGIN_CANCELLED', reason: 'Bot ne login cancel kar diya (screen: Login Cancelled)' };
       }
+      // ⚠️ World Bot ke screens aksar `(no text)` hote hain — blank/media reply
+      // par yahan OTP Sent maan lete hain (warna OTP kabhi type hi nahi hota;
+      // owner: "ab otp hi enter nahi hota"). Naam/JSON ka jawab baad me
+      // alag se handle hota hai, isliye isse kuch nahi bigadta.
       console.log('[WorldBot] ✅ OTP Sent confirm (blank/media reply, screen khali) — ab OTP bot se code');
       return { ok: true, kind: 'otpSent', confirmedBy: blankReplyMedia ? 'media-reply' : 'blank-reply' };
     }
@@ -1911,40 +2460,78 @@ async function sendWorldCode(client, entity, code, cfg = {}) {
     console.warn('[WorldBot] OTP type nahi kiya — bot ne login cancel kar diya (Login Cancelled screen)');
     return { ok: false, reason: 'bot-login-cancelled' };
   }
-  if (awaiting === 'number' || awaiting === 'name') {
-    console.warn(`[WorldBot] OTP type nahi kiya — bot abhi ${awaiting} maang raha hai`);
-    return { ok: false, reason: `bot-${awaiting}-maang-raha-hai` };
+  // 🆕 Bot "New Account Detected" par khada ho to 6-digit OTP uske naam ki
+  // jagah chala jata tha (Swiggy: "Invalid name") — pehle naam bhejte hain.
+  const detectedName = /\bnew account detected\b/.test(lookText.toLowerCase());
+  if (awaiting === 'number' || awaiting === 'name' || detectedName) {
+    const pending = awaiting || 'name';
+    console.warn(`[WorldBot] OTP type nahi kiya — bot abhi ${pending} maang raha hai`);
+    return { ok: false, reason: `bot-${pending}-maang-raha-hai` };
   }
   if (awaiting !== 'otp') {
-    // Screen saaf/mixed hai — phir bhi OTP bhejte hain (ye hi asli kaam hai).
+    // ⚠️ Owner ka rule (2026-11-09): "OTP aa jaye to TYPE karo". World Bot ke
+    // screens aksar `(no text)` aate hain — sirf buttons padh kar ye maan lena
+    // ki "number prompt aaya hi nahi" GALAT tha: isi wajah se OTP enter hi
+    // nahi hota tha. Screen kuch bhi dikhaye, code mila hai to bhejte hain.
     console.warn('[WorldBot] OTP screen saaf nahi mili — phir bhi OTP bhej raha hoon');
   }
 
+  // ⏳ OTP type karne ke baad bot ka jawab kabhi 6s me nahi aata (Swiggy account
+  // creation 10-60s leti hai). Pehle yahan sirf 6s thi: timeout par OTP DOBARA
+  // bhej dete the, phir `otp-not-accepted` → `safeCancel` → World Bot
+  // "❌ Login Cancelled" — aur bot jo naam maang raha hota tha wo kabhi type
+  // hi nahi hota. Ab: jawab aane tak wait (owner: koi time limit nahi), OTP
+  // dobara sirf tab jab bot khud kahe "Invalid OTP".
+  const verifyBudget = Math.max(20_000, Number(cfg?.otpVerifyWaitMs) || 300_000);
   for (let attempt = 1; attempt <= 2; attempt += 1) {
     try {
       setPhase('otp-type');
       await sendWorldText(client, entity, text);
+      // ⛔ OTP type ho gaya = login flow khula hai (Cancel//start band).
+      markLoginFlowOpen({ otpTypedAt: Date.now() });
       console.log(`[WorldBot] ⌨️ OTP type kiya (try ${attempt})`);
     } catch (e) {
       console.warn(`[WorldBot] OTP send fail (try ${attempt}): ${e?.message || e}`);
       await sleep(1_200);
       continue;
     }
-    // Bot ne OTP accept kiya? SIRF latest screen dekho — purana "OTP Sent"
-    // message neeche pada rehta hai, usse "abhi bhi OTP maang raha hai" galat
-    // samajh kar OTP do baar chala jata tha.
-    const verifyUntil = Date.now() + 6_000;
+    // Is waqt ka latest message id — iske baad koi bhi naya message = OTP ka jawab.
+    const beforeId = Number((await parseScreenMessages(client, entity, 1).catch(() => []))[0]?.id) || 0;
+    // Bot ka AGLA message aane tak wait — koi chhota timeout nahi.
+    const verifyUntil = Date.now() + verifyBudget;
+    let mustResend = false;
     while (Date.now() < verifyUntil) {
-      const recent = await parseScreenMessages(client, entity, 4);
-      const kinds = recent.slice(0, 2).map((m) => worldBotPromptKind(m.text));
-      if (kinds.includes('otpFail')) {
-        console.warn('[WorldBot] bot ne OTP reject kiya — dobara try');
+      if (typeof cfg?.shouldAbort === 'function' && cfg.shouldAbort()) {
+        return { ok: true, reason: 'typed' };
+      }
+      const recent = await parseScreenMessages(client, entity, 4, { fresh: true }).catch(() => []);
+      const latestKind = worldBotPromptKind(recent[0]?.text);
+      // Bot ne OTP reject kiya → ek hi baar dobara.
+      if (latestKind === 'otpFail') {
+        console.warn('[WorldBot] bot ne OTP reject kiya — ek baar dobara bhejunga');
+        mustResend = true;
         break;
       }
-      if (worldBotPromptKind(recent[0]?.text) !== 'otpSent') return { ok: true, reason: 'typed' };
-      await sleep(pollMs);
+      // Naam ka step / JSON / koi bhi naya bot message = OTP accept ho gaya.
+      // ("OTP Sent" purana message abhi bhi latest ho sakta hai — us par
+      // rukna nahi hai, bas aur wait.)
+      if (latestKind && latestKind !== 'otpSent') return { ok: true, reason: 'typed', seen: latestKind };
+      if (!latestKind) {
+        // Text nahi mila (World Bot ke screens aksar `(no text)`) — agar aakhri
+        // message naya hai to OTP accept ho gaya.
+        const newest = recent[0];
+        if (newest && !newest.out && newest.id && newest.id !== beforeId) {
+          return { ok: true, reason: 'typed', seen: 'new-message' };
+        }
+      }
+      await sleep(Math.max(600, pollMs));
     }
-    if (attempt === 2) break;
+    if (!mustResend) {
+      // Timeout — OTP dobara NAHI (duplicate OTP = "Invalid OTP"), bas aage
+      // badho; login-result wait khud naam/JSON pakad lega.
+      console.warn(`[WorldBot] ⏳ OTP ke baad bot ka jawab ${Math.round(verifyBudget / 1000)}s me nahi aaya — OTP dobara nahi bhejunga, aage dekhta hoon`);
+      return { ok: true, reason: 'typed-slow' };
+    }
   }
   return { ok: false, reason: 'otp-not-accepted' };
 }
@@ -2050,6 +2637,10 @@ function nameStepPredicate(freshList) {
     const yes = pickWorldBotConfirmButton(message.buttons || []);
     if (yes) return { kind: 'confirm', entry: { button: yes?.button || yes, text: String(yes?.text || yes?.button?.text || 'Yes') }, message };
     if (kind === 'nameFail') return { kind: 'nameFail', message };
+    // ✅ "✅ Name set: Sudhani Kumar" = naam ACCEPT ho gaya. Ise pehle
+    // `askAgain` samajh kar agla candidate naam bhej diya jata tha (4 naam jal
+    // kar `name_rejected`, jabki account ban chuka hota tha).
+    if (kind === 'nameOk') return { kind: 'nameOk', message };
     if (kind === 'askName') return { kind: 'askAgain', message };
     if (pickWorldBotButton(message.buttons, 'copyCode')) return { kind: 'copy', message };
   }
@@ -2106,7 +2697,6 @@ async function submitWorldBotName({ client, entity, cfg = {}, shouldAbort = null
   if (!names.length) {
     return { ok: false, kind: 'name_rejected', reason: 'Naam ban hi nahi paya (nameProvider khali/invalid)' };
   }
-  let baseline = screenSignature(await parseScreenMessages(client, entity).catch(() => []));
   // 🔎 Owner ke log me pata chale bot exactly kya maang raha hai.
   try {
     const firstScreen = await parseScreenMessages(client, entity, 2, { fresh: true });
@@ -2132,6 +2722,14 @@ async function submitWorldBotName({ client, entity, cfg = {}, shouldAbort = null
       baseline = screenSignature(await parseScreenMessages(client, entity).catch(() => []));
     }
   } catch {}
+  const firstScreen = await parseScreenMessages(client, entity).catch(() => []);
+  let baseline = screenSignature(firstScreen);
+  // 🔁 Kis prompt (message id) ka jawab diya ja raha hai — same prompt dobara
+  // dikhe to matlab bot ne jawab nahi liya, naya naam bhejna galat hoga.
+  let answeredPromptId = Number(worldBotNamePromptOnScreen(firstScreen)?.id) || 0;
+  let samePromptWaits = 0;
+  // 🔁 Prompt bilkul same rahe (message process hua hi nahi) to wahi naam ek
+  // baar dobara bhejne ke liye.
   const resent = new Set();
   for (let i = 0; i < names.length; i += 1) {
     const name = names[i];
@@ -2178,10 +2776,37 @@ async function submitWorldBotName({ client, entity, cfg = {}, shouldAbort = null
       return { ok: false, kind: 'no-json', name, reason: 'Naam confirm ke baad bhi JSON nahi aaya' };
     }
 
+    // ✅ Naam ACCEPT ho gaya ("✅ Name set: Sudhani Kumar") — ab JSON ka thoda
+    // intezaar, phir recovery. Agla naam BILKUL nahi (pehle yahan 4 naam jal
+    // kar `name_rejected` aa jata tha, jabki account ban chuka hota tha).
+    if (res?.kind === 'nameOk') {
+      console.log(`[WorldBot] ✅ naam set ho gaya ("${name}") — JSON ka intezaar`);
+      setPhase('name-json-wait');
+      const after = await waitForReply({
+        client, entity, baseline, timeoutMs: Math.min(20_000, Number(cfg.stepTimeoutMs) || 20_000),
+        shouldAbort, what: 'JSON (naam set ke baad)', graceMs: 0,
+        predicate: nameStepPredicate, pollMs: cfg.pollMs,
+      }).catch(() => null);
+      if (['json', 'document', 'copy'].includes(after?.kind)) return { ok: true, name, final: after };
+      const recoveredOk = await recoverWorldBotJson({ client, entity, cfg, shouldAbort }).catch(() => null);
+      if (recoveredOk?.jsonText) return { ok: true, name, final: { kind: 'json', json: { text: recoveredOk.jsonText } } };
+      return { ok: false, kind: 'no-json', name, reason: 'Naam accept ho gaya par JSON nahi aaya (naya naam mat bhejo)' };
+    }
+
     if (res?.kind === 'askAgain' || res?.kind === 'nameFail') {
-      // 🔁 Sirf PROMPT dobara aaya (koi "Invalid name" nahi) = hamara naam
-      // shayad process hi nahi hua (race/flood). Pehle WAHI naam ek baar
-      // dobara bhejo — turant agla naam bhejna bot ko galat naam de deta tha.
+      // 🔁 Bot wahi PURANA naam-prompt dobara dikha raha ho (same message id),
+      // to iska matlab "answer nahi mila" — naya naam bhejna galat hai.
+      const promptId = Number(res?.message?.id) || 0;
+      if (res.kind === 'askAgain' && promptId && promptId === answeredPromptId && samePromptWaits < 1) {
+        samePromptWaits += 1;
+        console.warn(`[WorldBot] 🔁 wahi naam-prompt dobara mila (id ${promptId}) — naya naam nahi bhejunga, ek aur wait`);
+        baseline = screenSignature(await parseScreenMessages(client, entity).catch(() => []));
+        await sleep(1_200);
+        i -= 1;
+        continue;
+      }
+      // 🔁 Phir bhi prompt dobara (koi "Invalid name" nahi) = hamara naam
+      // process nahi hua — pehle WAHI naam ek baar dobara bhejo, agla nahi.
       if (res.kind === 'askAgain' && !resent.has(name)) {
         resent.add(name);
         console.warn(`[WorldBot] 🔁 naam ka prompt dobara aaya (koi reject nahi) — wahi "${name}" phir bhej raha hoon`);
@@ -2189,6 +2814,7 @@ async function submitWorldBotName({ client, entity, cfg = {}, shouldAbort = null
         i -= 1;   // isi naam par ek aur try
         continue;
       }
+      if (promptId) answeredPromptId = promptId;
       console.warn(`[WorldBot] ❌ bot ne naam accept nahi kiya ("${name}", ${res.kind}) — agla naam try (naya number ya /start nahi)`);
       baseline = screenSignature(await parseScreenMessages(client, entity).catch(() => []));
       continue;
@@ -2215,6 +2841,8 @@ async function submitWorldBotName({ client, entity, cfg = {}, shouldAbort = null
 }
 
 export const _submitWorldBotNameForTests = (opts) => submitWorldBotName(opts);
+export const _safeCancelForTests = (client, entity, cfg) => safeCancel(client, entity, cfg);
+export const _closeLoginFlowForTests = () => closeLoginFlow();
 
 // ---------------------------------------------------------------------------
 // BUTTON TRIGGER — pehle click; screen na badle to USI button ka POORA TEXT
@@ -2247,10 +2875,18 @@ async function clickOrType({
   if (cfg?.trigger !== 'type') {
     try {
       clickCallback = (await clickWorldButton(entry)) || '';
+      // ⚡ Click ka jawab kabhi 1-2s me screen par nahi aata, par pehle yahan
+      // har click ke baad 45s ka late scan baithta tha (owner: "command send
+      // karne me bahut time"). Click ke baad sirf thoda intezaar: screen na
+      // badle to neeche wala text-trigger khud dobara check karke kaam kar
+      // deta hai — isliye yahan lamba scan bilkul fizool hai.
+      // Click ka jawab der se aata hai — pehle 8s tha, ab 30s (owner: koi
+      // time limit nahi). Isse double-command (click + text) nahi jata.
+      const clickLateScanMs = graceMs === undefined ? 30_000 : Math.max(0, Number(graceMs) || 0);
       const hit = await waitForReply({
         client, entity, baseline: before, timeoutMs: grace, shouldAbort,
         what: `${what} (click)`, predicate, pollMs: cfg?.pollMs,
-        graceMs: graceMs === undefined ? undefined : Number(graceMs) || 0,
+        graceMs: clickLateScanMs,
       });
       state.lastTrigger = 'click';
       return hit;
@@ -2365,9 +3001,26 @@ async function clickOrType({
 }
 
 async function safeCancel(client, entity, cfg = {}) {
+  // ⛔ OTP type karne ke baad Cancel = poora login jala dena (World Bot
+  // "❌ Login Cancelled" bhej deta hai). Us waqt Cancel nahi karte — bot ko
+  // apna jawab (naam/JSON) dene do. Ye guard sirf OTP-typed window ka hai,
+  // number prompt atakne par Cancel pehle jaisa chalta hai.
+  const otpGuardMs = Math.max(20_000, Math.min(300_000, Number(cfg?.otpVerifyWaitMs) || 90_000));
+  const otpTypedAgo = Date.now() - (Number(state.otpTypedAt) || 0);
+  if (state.otpTypedAt && otpTypedAgo < otpGuardMs) {
+    console.warn(`[WorldBot] ⛔ OTP ${Math.round(otpTypedAgo / 1000)}s pehle type kiya tha — Cancel nahi bhejunga (Login Cancelled se bachaav)`);
+    return false;
+  }
   const waitMs = Math.min(1_800, Math.max(600, Number(cfg?.pollMs) || 1_500));
   const screens = await parseScreenMessages(client, entity);
   const cancelFromId = Number(screens[0]?.id) || 0;
+  // 👤 Bot "🆕 New Account Detected! Tell us the name…" par khada hai = account
+  // aadha ban chuka hai; Cancel bhejna usko mar deta hai (aur naam kabhi type
+  // nahi hota). Aise me Cancel bilkul nahi.
+  if (worldBotNamePromptOnScreen(screens, { strict: true })) {
+    console.warn('[WorldBot] ⛔ bot naam maang raha hai — Cancel nahi bhejunga (account bachao)');
+    return false;
+  }
   const awaiting = worldBotAwaitingKind(screens);
   const hit = findRoleOnScreens(screens, 'cancel');
   let did = false;
@@ -2407,6 +3060,14 @@ async function safeCancel(client, entity, cfg = {}) {
 async function worldResetToMenu(client, entity, cfg = {}) {
   const screen = await settledScreen(client, entity, cfg).catch(() => parseScreenMessages(client, entity));
   const pending = worldBotAwaitingKind(screen);
+  // 👤 Bot naam maang raha hai = account ban raha hai, bas naam chahiye.
+  // Yahan /cancel bhejna poora naya-account flow jala deta tha (owner ka
+  // 2026-11-09 case: screen "New Account Detected" par khadi thi aur hum
+  // /start + Login + OTP dobara kar rahe the). Naam caller handle karta hai.
+  if (pending === 'name' || worldBotNamePromptOnScreen(screen, { strict: true })) {
+    console.warn('[WorldBot] 👤 bot naam maang raha hai — Cancel/restart nahi karunga (account aadha bana hua hai)');
+    return false;
+  }
   if (pending) {
     setPhase('reset-menu');
     console.log(`[WorldBot] 🧹 adhoora flow (${pending}) mila — pehle Cancel, phir Main Menu`);
@@ -2444,6 +3105,13 @@ async function worldResetToMenu(client, entity, cfg = {}) {
     .some((b) => String(b?.role || '') === 'cancel'));
   if (String(cfg?.resetMode || '') === 'menu-only' || pendingNow || hasFlowButton) {
     console.warn(`[WorldBot] ⛔ /start nahi bhej raha (${pendingNow ? `bot ${pendingNow} maang raha hai` : hasFlowButton ? 'screen par Cancel button hai (flow chalu)' : 'resetMode=menu-only'}) — Cancel/button se kaam karenge`);
+    return false;
+  }
+  // ⛔ LOGIN GUARD: pichhla login abhi khatam nahi hua (number/OTP gaya tha,
+  // bot ka naam/JSON jawab nahi aaya) — /start usko CANCEL kar deta hai.
+  // Owner ka exact case: "Cancel kiu ho ja raha, 20s to diye hain".
+  if (worldLoginFlowOpenMs(cfg) > 0) {
+    console.warn(`[WorldBot] ⛔ /start nahi bhej raha — pichhla login abhi khula hai (${Math.round(worldLoginFlowOpenMs(cfg) / 1000)}s baaki) · Login Cancelled se bachaav`);
     return false;
   }
   await sendWorldText(client, entity, '/start').catch(() => {});
@@ -2821,6 +3489,25 @@ async function logoutAccountUnlocked(client, entity, cfg, cleanPhone, { shouldAb
 
   setPhase('logout-start');
 
+  // 📇 Agar bot pehle se account DETAIL screen par khada hai (My Swiggy
+  // Accounts → account → Export Login JSON | Login | Permanent Logout), to
+  // wahin se seedha logout — menu se dobara ghoomne ki zaroorat nahi.
+  const recentForLogout = (await parseScreenMessages(client, entity).catch(() => []))
+    .filter((m) => !m.out).slice(0, 5);
+  const onDetail = findRoleOnScreens(recentForLogout.filter((m) => {
+    // Stale screen (purana/dusre number ka) par logout mat dabao.
+    const digits = String(m.text || '').replace(/\D/g, '');
+    if (!cleanPhone) return true;
+    const mentioned = (String(m.text || '').match(/\b([6-9]\d{9})\b/) || [])[1] || '';
+    return !mentioned || mentioned === cleanPhone || digits.includes(cleanPhone);
+  }), 'permanentLogout');
+  if (onDetail) {
+    const detailClickId = Number((await latest(1))[0]?.id) || 0;
+    console.log('[WorldBot] 📇 account detail screen se seedha Permanent Logout');
+    await clickBtn(onDetail.button, (fresh) => (fresh && fresh.length ? true : null), 'Permanently Logout (detail)');
+    return finishLogoutConfirm({ latest, waitFor, clickBtn, step, cleanPhone, logoutClickId: detailClickId });
+  }
+
   // 🏠 Owner: "then click switch account …" — Switch Accounts sirf Main Menu
   // par hota hai. Login ke turant baad bot JSON screen par khada hota hai,
   // isliye pehle menu par aao (button se; /start sirf khali screen par).
@@ -2889,8 +3576,16 @@ async function logoutAccountUnlocked(client, entity, cfg, cleanPhone, { shouldAb
 
   const logoutClickId = Number((await latest(1))[0]?.id) || 0;
   await clickBtn(logoutHit.button, (fresh) => (fresh && fresh.length ? true : null), 'Permanently Logged Out');
+  return finishLogoutConfirm({ latest, waitFor, clickBtn, step, cleanPhone, logoutClickId });
+}
 
-  // ✅ Owner: logout par bot DO confirmation maangta hai —
+// ---------------------------------------------------------------------------
+// 🚪 LOGOUT CONFIRMATION — bot do confirmation maangta hai:
+//  ① "konsa account" (account button)  ② "Yes / Cancel" → YES
+// Cancel kabhi nahi dabta (owner: "Cancel kiu ho ja raha bc").
+// ---------------------------------------------------------------------------
+async function finishLogoutConfirm({ latest, waitFor, clickBtn, step, cleanPhone, logoutClickId }) {
+// ✅ Owner: logout par bot DO confirmation maangta hai —
   //   1) "konsa account" (account button)
   //   2) "Yes / Cancel"  →  YES dabana hai (Cancel kabhi nahi).
   const loggedOutRe = /(logged\s*out|log\s*out\s*(success|ho)|successfully\s*log)/i;
@@ -2962,6 +3657,317 @@ export async function worldBotPermanentLogout({
       reason: String(error?.message || error).slice(0, 200),
       errorCategory: category,
     };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 📇 SWIGGY ACCOUNTS — list → account detail → 📤 Export Login JSON
+//
+// Owner ka workflow (Part 4–7, screenshots ke saath):
+//   "Swiggy Accounts" → My Swiggy Accounts (Expired / Logged in / Saved +
+//   "Delete All Accounts") → account → detail screen (Name · Mobile · Status +
+//   "Export Login JSON" | "Login" | "Permanent Logout") → Export Login JSON →
+//   bot ek ASLI `.json` document bhejta hai ("swiggy-login-3.json", 1.2 KB) →
+//   wahi document (text nahi!) destination bot ko → Permanent Logout.
+//
+// Yahan koi bhi step apne-aap nahi maana jata: har button ka jawab ASLI
+// message/document se verify hota hai, warna `ok:false` + asli screen ke saath
+// lautte hain (owner rule: "Never assume a response arrived just because a
+// message was sent").
+// ---------------------------------------------------------------------------
+const worldAccountStepMs = (cfg = {}) => Math.max(500, Number(cfg?.pollMs) || 1_200);
+
+// Bot ka jawab aane tak poll — screen + jo predicate return kare, dono deta hai.
+async function worldScreenWait(client, entity, finder, {
+  shouldAbort = null, timeoutMs = 20_000, stepMs = 1_200, limit = 6,
+} = {}) {
+  const budget = Math.max(1_000, Number(timeoutMs) || 20_000);
+  const deadline = Date.now() + budget;
+  let lastScreens = [];
+  for (;;) {
+    if (typeof shouldAbort === 'function' && shouldAbort()) return null;
+    lastScreens = await parseScreenMessages(client, entity, limit, { fresh: true }).catch(() => []);
+    const found = finder(lastScreens);
+    if (found) return { found, screens: lastScreens };
+    if (Date.now() >= deadline) return { found: null, screens: lastScreens };
+    await sleep(Math.max(400, Number(stepMs) || 1_200));
+  }
+}
+
+// Main Menu → "Swiggy Accounts" → My Swiggy Accounts list.
+async function openAccountsList(client, entity, cfg, { shouldAbort = null } = {}) {
+  setPhase('accounts-open');
+  let screens = await parseScreenMessages(client, entity).catch(() => []);
+  // Account detail par khade ho → pehle Main Menu (wahan se hi list milti hai).
+  if (findRoleOnScreens(screens.slice(0, 2), 'exportJson')
+    || findRoleOnScreens(screens.slice(0, 1), 'permanentLogout')) {
+    await clickRole(client, entity, 'mainMenu', { cfg, shouldAbort, what: 'Main Menu (accounts)' }).catch(() => {});
+    screens = await parseScreenMessages(client, entity).catch(() => []);
+  }
+  let accounts = worldBotAccountsFromScreens(screens);
+  const alreadyListed = accounts.length > 0 || worldBotHasPromptKind(screens.slice(0, 3), 'accountsList');
+  if (!alreadyListed) {
+    // Pehle Menu par aao — buttons se; /start sirf wahan jahan worldResetToMenu
+    // khud safe samajhe (naam/OTP ka step ya khula login ho to /start nahi).
+    await worldResetToMenu(client, entity, cfg).catch(() => {});
+    await clickRole(client, entity, 'swiggyAccounts', { cfg, shouldAbort, what: 'Swiggy Accounts' });
+    const waited = await worldScreenWait(client, entity, (list) => {
+      const found = worldBotAccountsFromScreens(list);
+      if (found.length) return { accounts: found };
+      if (worldBotHasPromptKind(list.slice(0, 3), 'accountsList')) return { accounts: [] };
+      return null;
+    }, {
+      shouldAbort,
+      timeoutMs: Number(cfg?.stepTimeoutMs) || 20_000,
+      stepMs: worldAccountStepMs(cfg),
+    });
+    if (!waited || !waited.found) {
+      throw new WorldBotError('accounts-timeout', '"My Swiggy Accounts" list ka jawab nahi aaya');
+    }
+    screens = waited.screens;
+    accounts = worldBotAccountsFromScreens(screens);
+  }
+  return { screens, accounts };
+}
+
+// List → account detail. Phone diya ho to wahi account, warna pehla.
+async function openAccountDetail(client, entity, cfg, phone, { shouldAbort = null } = {}) {
+  const cleanPhone = normalizeWorldPhone(phone) || String(phone || '').replace(/\D/g, '').slice(-10);
+  setPhase('accounts-detail');
+  let screens = await parseScreenMessages(client, entity).catch(() => []);
+  const already = worldBotAccountDetailFromScreens(screens, cleanPhone);
+  if (already && (!cleanPhone || already.phone === cleanPhone)) return { screens, detail: already };
+  const { screens: listScreens, accounts } = await openAccountsList(client, entity, cfg, { shouldAbort });
+  const target = (cleanPhone && accounts.find((a) => a.phone === cleanPhone)) || accounts[0] || null;
+  if (!target) {
+    throw new WorldBotError(
+      'account-not-listed',
+      cleanPhone
+        ? `My Swiggy Accounts me ${cleanPhone} nahi mila (saved: ${accounts.map((a) => a.phone).join(', ') || 'none'})`
+        : 'My Swiggy Accounts khali hai — koi saved account nahi',
+    );
+  }
+  console.log(`[WorldBot] 📇 account detail khol raha hoon: ${target.phone}${target.status ? ` (${target.status})` : ''}`);
+  const hit = await clickOrType({
+    client, entity,
+    entry: target.entry,
+    cfg,
+    shouldAbort,
+    what: `account detail (${target.phone})`,
+    baseline: screenSignature(listScreens),
+    timeoutMs: Math.min(30_000, Number(cfg?.stepTimeoutMs) || 20_000),
+    predicate: (fresh, all) => worldBotAccountDetailFromScreens(all && all.length ? all : fresh, target.phone),
+  }).catch((error) => {
+    if (error?.code === 'aborted') throw error;
+    console.warn(`[WorldBot] account detail (${target.phone}): ${String(error?.message || error).slice(0, 120)}`);
+    return null;
+  });
+  screens = await parseScreenMessages(client, entity).catch(() => []);
+  const detail = (hit && (hit.buttons || hit.phone) ? hit : null) || worldBotAccountDetailFromScreens(screens, target.phone);
+  if (!detail) throw new WorldBotError('account-detail-missing', `Account detail screen nahi khuli (${target.phone})`);
+  return { screens, detail, accounts, target };
+}
+
+function accountsFailure(error, { phone = '', username = '' } = {}) {
+  const category = classifyWorldBotError(error);
+  const kind = category === 'aborted'
+    ? 'aborted'
+    : category === 'bot_unreachable'
+      ? 'bot_unreachable'
+      : category === 'worldbot_offline'
+        ? 'worldbot_offline'
+        : category === 'worldbot_setup'
+          ? 'worldbot_setup'
+          : 'accounts_failed';
+  return {
+    ok: false,
+    kind,
+    phone: phone || '',
+    username,
+    reason: String(error?.message || error).slice(0, 220),
+    code: error?.code || category,
+    errorCategory: category,
+  };
+}
+
+// 📇 "Swiggy Accounts" — saved accounts (phone + status).
+export async function worldBotAccounts({ shouldAbort = null, config = worldBotConfig() } = {}) {
+  const cfg = { ...worldBotConfig(), ...(config || {}) };
+  resetWorldBotRunState();
+  setPhase('accounts');
+  try {
+    return await withWorldBotClient(async ({ client }) => {
+      const entity = await getWorldEntity(client, cfg.username);
+      const { screens, accounts } = await openAccountsList(client, entity, cfg, { shouldAbort });
+      const list = accounts.map((a) => ({ phone: a.phone, label: a.label, status: a.status }));
+      const deleteAllVisible = Boolean(findRoleOnScreens(screens.slice(0, 3), 'deleteAllAccounts'));
+      console.log(`[WorldBot] 📇 My Swiggy Accounts: ${list.length} account(s)${list.length
+        ? ` — ${list.map((a) => `${a.phone}${a.status ? ` (${a.status})` : ''}`).join(', ')}`
+        : ''}${deleteAllVisible ? ' · Delete All Accounts bhi hai' : ''}`);
+      return {
+        ok: true,
+        kind: 'accounts',
+        username: cfg.username,
+        accounts: list,
+        count: list.length,
+        deleteAllVisible,
+        screenText: String(screens[0]?.text || '').replace(/\s+/g, ' ').slice(0, 300),
+      };
+    });
+  } catch (error) {
+    setError(error);
+    return accountsFailure(error, { username: cfg.username });
+  }
+}
+
+// 📇 Ek account ka detail screen (Name · Mobile · Status + buttons).
+export async function worldBotAccountDetail({ phone = '', shouldAbort = null, config = worldBotConfig() } = {}) {
+  const cfg = { ...worldBotConfig(), ...(config || {}) };
+  const cleanPhone = normalizeWorldPhone(phone) || String(phone || '').replace(/\D/g, '').slice(-10);
+  resetWorldBotRunState();
+  setPhase('accounts-detail');
+  try {
+    return await withWorldBotClient(async ({ client }) => {
+      const entity = await getWorldEntity(client, cfg.username);
+      const { detail } = await openAccountDetail(client, entity, cfg, cleanPhone, { shouldAbort });
+      console.log(`[WorldBot] 📇 detail: ${detail.phone || cleanPhone}${detail.name ? ` · ${detail.name}` : ''}${detail.status ? ` · ${detail.status}` : ''} · [${(detail.buttons || []).join(' | ') || 'no buttons'}]`);
+      return { ok: true, kind: 'account_detail', username: cfg.username, ...detail };
+    });
+  } catch (error) {
+    setError(error);
+    return accountsFailure(error, { phone: cleanPhone, username: cfg.username });
+  }
+}
+
+// 📤 "Export Login JSON" → bot ka ASLI .json document (text message nahi).
+// Return: { ok, kind:'exported', fileName, bytes, text/jsonText, viaDocument }
+export async function worldBotExportLoginJson({
+  phone = '',
+  shouldAbort = null,
+  config = worldBotConfig(),
+  timeoutMs = 0,
+} = {}) {
+  const cfg = { ...worldBotConfig(), ...(config || {}) };
+  const cleanPhone = normalizeWorldPhone(phone) || String(phone || '').replace(/\D/g, '').slice(-10);
+  resetWorldBotRunState();
+  setPhase('export-json');
+  try {
+    return await withWorldBotClient(async ({ client }) => {
+      const entity = await getWorldEntity(client, cfg.username);
+      const { screens, detail } = await openAccountDetail(client, entity, cfg, cleanPhone, { shouldAbort });
+      setPhase('export-json');
+      const hit = findRoleOnScreens(screens.slice(0, 2), 'exportJson');
+      if (!hit) {
+        return {
+          ok: false,
+          kind: 'export_button_missing',
+          phone: detail?.phone || cleanPhone,
+          reason: `"Export Login JSON" button nahi mila — screen: ${state.lastScreenButtons.join(' | ') || 'none'}`,
+        };
+      }
+      const budget = Math.max(20_000, Number(timeoutMs) || Number(cfg?.exportTimeoutMs) || 90_000);
+      console.log('[WorldBot] 📤 "Export Login JSON" dabaya — bot ka .json document/document-text chahiye');
+      const found = await clickOrType({
+        client, entity,
+        entry: hit.button,
+        cfg,
+        shouldAbort,
+        what: 'Export Login JSON',
+        baseline: screenSignature(screens),
+        timeoutMs: Math.min(budget, 30_000),
+        graceMs: budget,
+        predicate: (fresh, all) => {
+          const pool = [...(fresh || []), ...(all || [])];
+          for (const message of pool) {
+            if (!message || message.out) continue;
+            if (message.hasDocument) return { kind: 'document', message };
+            const json = extractWorldBotJson(message?.text);
+            if (json) return { kind: 'json', message, json };
+          }
+          return null;
+        },
+      }).catch((error) => {
+        if (error?.code === 'aborted') throw error;
+        console.warn(`[WorldBot] Export Login JSON: ${String(error?.message || error).slice(0, 140)}`);
+        return null;
+      });
+      if (!found) {
+        return {
+          ok: false,
+          kind: 'export_missing',
+          phone: detail?.phone || cleanPhone,
+          reason: `Export Login JSON ka jawab ${Math.round(budget / 1000)}s me nahi aaya — na .json document, na JSON text (screen: ${state.lastScreenButtons.join(' | ') || 'none'})`,
+        };
+      }
+      let text = '';
+      let viaDocument = false;
+      let fileName = '';
+      let bytes = 0;
+      // 📎 Document ke ASLI bytes — destination bot ko bilkul wahi file jaati
+      // hai (owner Part 43: file hi bhejo, uska text nahi).
+      let docBuffer = null;
+      if (found.kind === 'document') {
+        viaDocument = true;
+        // parsed entry me asli Telegram message `raw` me hota hai (document
+        // attributes wahin hain) — warna bot ka filename miss ho jata tha.
+        const rawMessage = found.message.raw || found.message;
+        fileName = messageDocumentName(rawMessage) || messageDocumentName(found.message);
+        bytes = messageDocumentSize(rawMessage) || messageDocumentSize(found.message);
+        const buffer = await client.downloadMedia(found.message.raw || found.message, {}).catch((error) => {
+          console.warn(`[WorldBot] 📥 export document download fail: ${String(error?.message || error).slice(0, 120)}`);
+          return null;
+        });
+        const body = buffer ? (Buffer.isBuffer(buffer) ? buffer.toString('utf8') : String(buffer)) : '';
+        if (buffer && (Buffer.isBuffer(buffer) ? buffer.length : body.length)) docBuffer = Buffer.from(body, 'utf8');
+        if (body) bytes = bytes || Buffer.byteLength(body, 'utf8');
+        const parsed = extractWorldBotJson(body);
+        if (parsed?.text) text = parsed.text;
+        else {
+          try {
+            const obj = JSON.parse(body);
+            if (looksLikeSessionJson(obj)) text = JSON.stringify(obj);
+          } catch {}
+        }
+        console.log(`[WorldBot] 📥 export document: ${fileName || '(naam nahi mila)'} · ${bytes || 0} bytes · JSON ${text ? `${text.length} chars` : 'NAHI mila'}`);
+      } else {
+        text = found.json?.text || '';
+        bytes = Buffer.byteLength(text, 'utf8');
+      }
+      if (!text || !isValidWorldSessionJson(text)) {
+        return {
+          ok: false,
+          kind: 'export_bad_json',
+          phone: detail?.phone || cleanPhone,
+          viaDocument,
+          fileName,
+          bytes,
+          reason: text
+            ? `Export me JSON aaya par adhoora/parse fail (${text.length} chars) — token/tid/cookies kuch nahi mila`
+            : `Export me .json document aaya par usme JSON nahi tha (${fileName || 'naam nahi mila'}, ${bytes} bytes)`,
+        };
+      }
+      const name = fileName || worldBotExportFileName(detail?.phone || cleanPhone);
+      state.lastOkAt = Date.now();
+      setPhase('export-done');
+      console.log(`[WorldBot] ✅ Export ready: ${name} · ${bytes || Buffer.byteLength(text, 'utf8')} bytes · ${text.length} chars JSON`);
+      return {
+        ok: true,
+        kind: 'exported',
+        phone: detail?.phone || cleanPhone,
+        name: detail?.name || '',
+        status: detail?.status || '',
+        fileName: name,
+        bytes: bytes || Buffer.byteLength(text, 'utf8'),
+        text,
+        jsonText: text,
+        viaDocument,
+        buffer: docBuffer,
+        username: cfg.username,
+      };
+    });
+  } catch (error) {
+    setError(error);
+    return accountsFailure(error, { phone: cleanPhone, username: cfg.username });
   }
 }
 

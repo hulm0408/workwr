@@ -4177,6 +4177,68 @@ Thanks`)),
     }
   }
 
+  // ⚡ SPEED (owner: "bot bahut time le raha hai command send karne me"):
+  // flood na hua ho to late scan 45–90s ka nahi baithta.
+  wb._resetWorldBotReadCacheForTests();
+  {
+    const startedAt = Date.now();
+    const capped = await wb._waitForReplyForTests({
+      client: { async getMessages() { return [fakeMsg(7, 'kuch nahi')]; } },
+      entity: { id: 'x' },
+      baseline: null,
+      timeoutMs: 300,
+      graceMs: 60_000,
+      graceCapMs: 400,
+      pollMs: 100,
+      what: 'speed: grace cap',
+      predicate: () => null,
+    }).catch((e) => ({ error: String(e?.message || e) }));
+    const tookMs = Date.now() - startedAt;
+    ok(capped?.error && tookMs < 3_000,
+      `speed: flood 0 → 60s grace ki jagah chhoti scan (${tookMs}ms me fail)`);
+  }
+
+  // 🚪 Asli bug (2026-11-09 ka log): blank reply + screen login menu par thi.
+  // Pehle ise "OTP Sent" maan liya jata tha → OTP type hota tha (bot use
+  // bekaar samajhta tha) → 45s+90s wait → naam ka step kabhi aaya hi nahi.
+  // Ab: OTP Sent confirm NAHI hota, wahi number dobara issue hota hai.
+  wb._resetWorldBotReadCacheForTests();
+  {
+    const otpLoginBtn = { text: '2️⃣ OTP Login' };
+    const cancelBtn = { text: 'Cancel' };
+    const box = [
+      { id: 3, out: false, text: '', buttons: [] },                    // bot ka blank reply
+      { id: 2, out: false, text: '🔐 Swiggy Login\n\nSelect a login method:', buttons: [[otpLoginBtn, cancelBtn]] },
+      { id: 1, out: true, text: '9876543210', buttons: [] },           // apna bheja number
+    ];
+    const res = await wb._waitForOtpSentForTests({
+      client: { async getMessages() { return [...box]; } },
+      entity: { id: 'x' },
+      baseline: null,
+      cfg: { otpSendTimeoutMs: 20_000, queueWaitMs: 2_000, pollMs: 100 },
+    }).catch((e) => ({ error: String(e?.message || e) }));
+    ok(res?.ok === false && res?.code === 'WORLDBOT_NO_NUMBER_PROMPT',
+      `speed: blank reply + login menu = OTP Sent NAHI (${res?.code || res?.error || res?.kind})`);
+  }
+
+  // 🛑 Aur agar phir bhi OTP type karne ka mauka aaye par screen login menu
+  // par ho, to code bhejte hi nahi (bot use number samajh leta tha).
+  {
+    let sends = 0;
+    const screen = [{
+      id: 5, out: false, text: '🔐 Swiggy Login\n\nSelect a login method:',
+      buttons: [[{ text: '2️⃣ OTP Login' }, { text: 'Cancel' }]],
+    }];
+    const typed = await wb._sendWorldCodeForTests(
+      { async getMessages() { return screen; }, async sendMessage() { sends += 1; return true; } },
+      { id: 'x' },
+      '445566',
+      { pollMs: 80 },
+    );
+    ok(typed?.ok === false && typed?.reason === 'bot-number-prompt-missing' && sends === 0,
+      `speed: login menu par OTP type nahi hota (reason: ${typed?.reason || typed?.ok})`);
+  }
+
   ok(wb.shouldReissueWorldOtp('login_cancelled') === true
     && wb.shouldReissueWorldOtp('worldbot_offline') === false
     && wb.shouldReissueWorldOtp('number_blocked') === false,

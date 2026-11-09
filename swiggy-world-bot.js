@@ -835,6 +835,8 @@ export const _readWorldMessagesForTests = (client, entity, limit) => readWorldMe
 export const _parseScreenMessagesForTests = (client, entity, limit, readOpts) => parseScreenMessages(client, entity, limit, readOpts);
 export const _messageTextOfForTests = (message) => messageTextOf(message);
 export const _waitForReplyForTests = (opts) => waitForReply(opts);
+export const _waitForOtpSentForTests = (opts) => waitForOtpSent(opts);
+export const _sendWorldCodeForTests = (client, entity, code, cfg) => sendWorldCode(client, entity, code, cfg);
 
 export function worldBotReadInfo() {
   return {
@@ -1041,7 +1043,11 @@ async function scanForLateReply({
       console.log(`[WorldBot] 🕰 late reply mil gaya — "${what}" PASS`);
       return hit;
     }
-    await sleep(3_000);
+    // Fixed 3s sleep chhote grace (speed fix) ko bhi 3s tak kheench deta tha —
+    // ab bachi hui window se zyada nahi sote.
+    const left = deadline - Date.now();
+    if (left <= 0) break;
+    await sleep(Math.min(3_000, Math.max(200, left)));
   }
   return null;
 }
@@ -1050,6 +1056,9 @@ async function scanForLateReply({
 // return ho jata hai; timeout par WorldBotError('worldbot-timeout').
 async function waitForReply({
   client, entity, predicate, baseline, timeoutMs, shouldAbort, what = 'reply', pollMs, graceMs,
+  // graceCapMs: flood na hua ho to late scan ki limit (default 20s). Tests
+  // ise chhota de kar fast check karte hain.
+  graceCapMs,
 }) {
   const budget = Math.max(1_000, Number(timeoutMs) || WORLD_BOT_DEFAULTS.stepTimeoutMs);
   // ⏱ Flood wait se kha Liya gaya waqt deadline me wapas jata hai (max 3x).
@@ -1079,7 +1088,20 @@ async function waitForReply({
   }
   // Deadline khatam — par flood ke baad jawab late aata hai, isliye ek
   // aakhri dheemi scan (default 45s).
-  const grace = graceMs === undefined ? 45_000 : Number(graceMs) || 0;
+  //
+  // ⚡ Owner ki shikayat (2026-11-09): "bot bahut time le raha hai". Wajah:
+  // har step ke timeout ke BAAD poora 45–90s ka late scan baithta tha, chahe
+  // Telegram ne ek second bhi flood wait nahi diya ho. Agar poore wait me
+  // koi read block nahi hua (flood = 0), to bot ka jawab aana hi tha aur nahi
+  // aaya — usme 90s aur baithna sirf waqt barbaad hai. Tab chhota scan.
+  // Flood ne waqt khaya ho tab poora grace (wahan late reply ka asli risk hai).
+  const graceWanted = graceMs === undefined ? 45_000 : Number(graceMs) || 0;
+  const floodStole = extraMs >= 1_500 || (Number(worldReadCache.lastFloodMs) || 0) > 1_500;
+  const graceCap = Number(graceCapMs) >= 0 && graceCapMs !== undefined ? Number(graceCapMs) : 20_000;
+  const grace = graceWanted ? (floodStole ? graceWanted : Math.min(graceWanted, graceCap)) : 0;
+  if (grace && grace < graceWanted) {
+    console.log(`[WorldBot] ⚡ flood 0 tha — "${what}" ka late scan ${Math.round(grace / 1000)}s hi (${Math.round(graceWanted / 1000)}s ki jagah)`);
+  }
   const late = await scanForLateReply({
     client, entity, predicate, baseline, graceMs: grace, shouldAbort, what,
   }).catch(() => null);
@@ -1561,11 +1583,34 @@ export async function worldBotLogin({
       }
 
       // 6) Outcome: naam ka sawaal = naya account; seedha JSON = purana.
+      //
+      // 🚪 "Bot ne OTP liya hi nahi" ko turant pakdo: agar OTP type karne ke
+      // baad screen wapas LOGIN METHOD menu (JSON/TID Login | OTP Login |
+      // Cancel) par aa jaye aur 6s tak wahin rahe, to bot ne code reject kar
+      // diya hai — aise me 45s + 90s wait karna bilkul fizool tha (owner ke
+      // log me yahi hua: 2 min baith kar number jala aur naam ka step kabhi
+      // aaya hi nahi).
+      let menuBackAt = 0;
       const outcome = await waitForReply({
         client, entity, baseline: before, timeoutMs: cfg.stepTimeoutMs, shouldAbort,
         what: 'login result',
         graceMs: Number(cfg.lateReplyGraceMs) || 90_000,
-        predicate: (freshList) => {
+        predicate: (freshList, all) => {
+          // Login-method menu wapas = OTP accept nahi hua (sirf LATEST bot
+          // message dekho — neeche pada purana menu galti se na pakda jaye).
+          const latestInbound = (Array.isArray(all) ? all : []).find((m) => !m.out) || null;
+          const menuBack = Boolean(latestInbound
+            && pickWorldBotButton(latestInbound.buttons, 'otpLogin')
+            && pickWorldBotButton(latestInbound.buttons, 'cancel'));
+          if (!menuBack) {
+            menuBackAt = 0;
+          } else {
+            if (!menuBackAt) menuBackAt = Date.now();
+            else if (Date.now() - menuBackAt >= 6_000) {
+              console.warn('[WorldBot] 🚪 screen wapas login menu par hai — bot ne OTP nahi liya (wait chhota)');
+              return { kind: 'otpNotAccepted', message: latestInbound };
+            }
+          }
           for (const message of freshList) {
             if (message.hasDocument) return { kind: 'document', message };
             const json = extractWorldBotJson(message.text);
@@ -1590,6 +1635,19 @@ export async function worldBotLogin({
 
       let askedName = false;
       let final = outcome;
+
+      // 🚪 Bot ne OTP liya hi nahi (login menu wapas). Naam ka step kabhi
+      // aayega hi nahi — yahin saaf-saaf bata do (45s+90s wait nahi).
+      if (outcome.kind === 'otpNotAccepted') {
+        await safeCancel(client, entity, cfg).catch(() => {});
+        return {
+          ok: false,
+          kind: 'failed_otp_verify',
+          phone: cleanPhone,
+          code: 'WORLDBOT_OTP_NOT_TAKEN',
+          reason: 'bot ne OTP accept nahi kiya — screen wapas Login menu par aa gayi (naam ka step aaya hi nahi)',
+        };
+      }
 
       if (outcome.kind === 'askName') {
         askedName = true;
@@ -1752,6 +1810,8 @@ async function waitForOtpSent({ client, entity, baseline, cfg, shouldAbort }) {
   // tha aur OTP kabhi type hi nahi hota tha. Ab aisa reply = OTP Sent.
   let blankReplyAt = 0;
   let blankReplyMedia = false;
+  // 🚪 blank reply + login menu = number accept nahi hua (neeche dekho).
+  let menuStuckAt = 0;
   // 🐢 Flood wait se kha Liya gaya waqt 20s ke budget me se nahi jayega —
   // warna bot ka "OTP Sent" aane se pehle hi hum Cancel + dobara number
   // bhej dete the (Swiggy: login attempts exceeded).
@@ -1821,6 +1881,34 @@ async function waitForOtpSent({ client, entity, baseline, cfg, shouldAbort }) {
       if (worldBotHasPromptKind(recent, 'cancelled')) {
         return { ok: false, kind: 'login_cancelled', code: 'WORLDBOT_LOGIN_CANCELLED', reason: 'Bot ne login cancel kar diya (screen: Login Cancelled)' };
       }
+      // 🚪 Owner ke log (2026-11-09) ki asli galti: blank reply ko "OTP Sent"
+      // maan liya gaya, par screen abhi bhi LOGIN METHOD menu
+      // (JSON/TID Login | OTP Login | Cancel) par thi — matlab number hi bot
+      // tak nahi pahuncha. Uske baad OTP type hua (bot ne use bekaar
+      // samjha), 45s+90s wait, aur naam ka step kabhi aaya hi nahi.
+      // Ab: OTP prompt na mile aur screen login menu par ho to OTP Sent
+      // maan kar OTP type nahi karte — wahi number dobara issue hota hai.
+      const awaitingNow = worldBotAwaitingKind(recent);
+      const loginMenuStuck = awaitingNow !== 'otp'
+        && Boolean(roleOnLatest(recent, 'otpLogin') || roleOnLatest(recent, 'jsonLogin') || roleOnLatest(recent, 'login'));
+      if (loginMenuStuck) {
+        if (!menuStuckAt) {
+          menuStuckAt = Date.now();
+          console.warn('[WorldBot] ⏳ blank reply par screen Login menu par hai — OTP prompt ka thoda intezaar');
+        } else if (Date.now() - menuStuckAt >= 5_000) {
+          console.warn('[WorldBot] ❌ bot ne number accept nahi kiya (screen Login menu par hi) — OTP Sent nahi maan raha, wahi number dobara');
+          return {
+            ok: false,
+            kind: 'failed_otp_send',
+            code: 'WORLDBOT_NO_NUMBER_PROMPT',
+            reason: 'bot ne number accept nahi kiya — screen Login menu par hi rahi (OTP prompt aaya hi nahi)',
+          };
+        }
+        if (menuStuckAt) {
+          await sleep(700); // reads ko flood na karo
+          continue;         // dekhna jaari rakho, OTP Sent mat maano
+        }
+      }
       console.log('[WorldBot] ✅ OTP Sent confirm (blank/media reply, screen khali) — ab OTP bot se code');
       return { ok: true, kind: 'otpSent', confirmedBy: blankReplyMedia ? 'media-reply' : 'blank-reply' };
     }
@@ -1881,6 +1969,19 @@ async function sendWorldCode(client, entity, code, cfg = {}) {
     return { ok: false, reason: `bot-${awaiting}-maang-raha-hai` };
   }
   if (awaiting !== 'otp') {
+    // 🚪 Screen seedha LOGIN MENU (JSON/TID Login | OTP Login | Cancel) par
+    // ho to number hi bot tak nahi pahuncha — OTP type karna bekaar hai:
+    // bot use number/command samajh leta hai, aur naam ka step kabhi nahi
+    // aata (owner ka 2026-11-09 wala log bilkul yahi tha).
+    const firstFew = (Array.isArray(lookScreen) ? lookScreen : []).slice(0, 3);
+    const onLoginMenu = Boolean(
+      roleOnLatest(lookScreen, 'otpLogin') || roleOnLatest(lookScreen, 'jsonLogin')
+      || worldBotHasPromptKind(firstFew, 'loginScreen') || worldBotHasPromptKind(firstFew, 'menu')
+    );
+    if (onLoginMenu) {
+      console.warn('[WorldBot] OTP type nahi kiya — screen Login menu par hai (number prompt aaya hi nahi)');
+      return { ok: false, reason: 'bot-number-prompt-missing' };
+    }
     // Screen saaf/mixed hai — phir bhi OTP bhejte hain (ye hi asli kaam hai).
     console.warn('[WorldBot] OTP screen saaf nahi mili — phir bhi OTP bhej raha hoon');
   }
@@ -2174,10 +2275,16 @@ async function clickOrType({
   if (cfg?.trigger !== 'type') {
     try {
       clickCallback = (await clickWorldButton(entry)) || '';
+      // ⚡ Click ka jawab kabhi 1-2s me screen par nahi aata, par pehle yahan
+      // har click ke baad 45s ka late scan baithta tha (owner: "command send
+      // karne me bahut time"). Click ke baad sirf thoda intezaar: screen na
+      // badle to neeche wala text-trigger khud dobara check karke kaam kar
+      // deta hai — isliye yahan lamba scan bilkul fizool hai.
+      const clickLateScanMs = graceMs === undefined ? 8_000 : Math.max(0, Number(graceMs) || 0);
       const hit = await waitForReply({
         client, entity, baseline: before, timeoutMs: grace, shouldAbort,
         what: `${what} (click)`, predicate, pollMs: cfg?.pollMs,
-        graceMs: graceMs === undefined ? undefined : Number(graceMs) || 0,
+        graceMs: clickLateScanMs,
       });
       state.lastTrigger = 'click';
       return hit;

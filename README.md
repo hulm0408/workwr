@@ -38,6 +38,13 @@ hai.
 > Bot **sirf tab** badalta hai jab wo `OTP Sent` 20s me confirm na kar paye ya
 > "queue/wait" me 20s se zyada atka rahe. **OTP 20s me nahi aaya = number skip,
 > bot wahi.** OTP galat / delete fail / flow atka par bhi bot nahi badalta.
+>
+> ⚡ **Speed (2026-11-09):** har click ke baad 45s ka late scan nahi baithta
+> (sirf 8s, phir seedha button ka text trigger). Step ka budget khatam hone par
+> bhi poora 90s ka scan sirf tab chalta hai jab Telegram ne flood wait diya ho.
+> Blank reply + screen par Login menu = number bot tak pahuncha hi nahi → OTP
+> **type nahi** hota, wahi number dobara issue hota hai (pehle yahan OTP
+> bekaar chala jata tha aur naam ka step kabhi aata hi nahi tha).
 
 ### 🐘 Hathi + 🔐 HardXotp — OTP bots
 
@@ -634,6 +641,7 @@ Helpers `rich-text.js` me hain: `fancy()`, `bracketHeader()`, `headerRule()`, `s
 | `SWIGGY_WORLD_QUEUE_WAIT_MS` | 45000 | Bot "queue/wait" bole to itna wait (asli run me OTP Sent ~40-60s baad aata hai); isse zyada → **bot badlo** |
 | `SWIGGY_WORLD_TRIGGER` | `auto` | Button **click** → screen na badle to **button ka text likh kar bhej** (`type` = click bilkul nahi) |
 | `SWIGGY_WORLD_CLICK_GRACE_MS` | 4000 | Click ke baad screen badalne ka intezaar, phir text trigger |
+| `SWIGGY_WORLD_LATE_REPLY_GRACE_MS` | 90000 | Step ka budget khatam hone par aakhri dheemi scan — **flood wait hua ho tab hi poora** (warna max 20s), `0` = band. Isse "bekaar me minute bhar baithna" band hua |
 | `SWIGGY_WORLD_NUMBER_RETRIES` | 1 | OTP send confirm na ho (aur bot ne Cancel bhi na bheja ho) to number **skip nahi** — wahi number itni baar `Login → 2 → number` se dobara issue (max 2, `0` = off) |
 | `SWIGGY_WORLD_LOGOUT_AFTER_DELETE` | 1 | JSON file worker bot par jaane ke baad `Switch Accounts → Permanently Logged Out` try kare |
 | `SHOP_BOT_STOCK_ENABLED` | 1 | Har fresh JSON ko `@its_shop_bot` ke stock me bheje (`0` = band) |

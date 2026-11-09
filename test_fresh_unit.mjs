@@ -4202,10 +4202,9 @@ Thanks`)),
       `speed: flood 0 → 60s grace ki jagah chhoti scan (${tookMs}ms me fail)`);
   }
 
-  // 🚪 Asli bug (2026-11-09 ka log): blank reply + screen login menu par thi.
-  // Pehle ise "OTP Sent" maan liya jata tha → OTP type hota tha (bot use
-  // bekaar samajhta tha) → 45s+90s wait → naam ka step kabhi aaya hi nahi.
-  // Ab: OTP Sent confirm NAHI hota, wahi number dobara issue hota hai.
+  // ✅ Owner ka rule (2026-11-09): "OTP aa jaye to TYPE karo". World Bot ke
+  // screens aksar `(no text)` hote hain, isliye blank reply par bhi OTP Sent
+  // maana jata hai — pehle yahan fail kar dete the aur OTP enter hi nahi hota tha.
   wb._resetWorldBotReadCacheForTests();
   {
     const otpLoginBtn = { text: '2️⃣ OTP Login' };
@@ -4221,12 +4220,12 @@ Thanks`)),
       baseline: null,
       cfg: { otpSendTimeoutMs: 20_000, queueWaitMs: 2_000, pollMs: 100 },
     }).catch((e) => ({ error: String(e?.message || e) }));
-    ok(res?.ok === false && res?.code === 'WORLDBOT_NO_NUMBER_PROMPT',
-      `speed: blank reply + login menu = OTP Sent NAHI (${res?.code || res?.error || res?.kind})`);
+    ok(res?.ok === true && res?.kind === 'otpSent',
+      `speed: blank reply = OTP Sent confirm (OTP type hoga) — ${res?.code || res?.kind || res?.error}`);
   }
 
-  // 🛑 Aur agar phir bhi OTP type karne ka mauka aaye par screen login menu
-  // par ho, to code bhejte hi nahi (bot use number samajh leta tha).
+  // ✅ Screen kuch bhi dikhaye — code mila hai to OTP TYPE hota hai (koi
+  // "screen samajh" wala rok nahi; isi rok se OTP enter nahi ho raha tha).
   {
     let sends = 0;
     const screen = [{
@@ -4239,8 +4238,8 @@ Thanks`)),
       '445566',
       { pollMs: 80 },
     );
-    ok(typed?.ok === false && typed?.reason === 'bot-number-prompt-missing' && sends === 0,
-      `speed: login menu par OTP type nahi hota (reason: ${typed?.reason || typed?.ok})`);
+    ok(typed?.ok === true && sends === 1,
+      `speed: OTP hamesha type hota hai (${typed?.reason || typed?.ok} · sends=${sends})`);
   }
 
   // 👤 Owner ka 2026-11-09 case: bot "🆕 New Account Detected! Tell us the name
@@ -4343,10 +4342,15 @@ Thanks`)),
       const sentAfter = fake.chat.filter((m) => m.out).map((m) => String(m.text));
       ok(!sentAfter.includes('/start'),
         `guard: retry par bhi /start nahi (Login Cancelled nahi hoga) — ${sentAfter.join(' · ') || 'kuch nahi'}`);
-      ok(wb.worldBotConfig({}).otpVerifyWaitMs === 90_000
+      // "Fixed input ka koi time limit nahi" — OTP ke baad ka budget bada
+      // (5 min), queue/OTP ka apna 20s rule neeche test hota hai.
+      ok(wb.worldBotConfig({}).otpVerifyWaitMs === 300_000
         && wb.worldBotConfig({ SWIGGY_WORLD_OTP_VERIFY_WAIT_MS: '45000' }).otpVerifyWaitMs === 45_000
-        && wb.worldBotConfig({ SWIGGY_WORLD_OTP_VERIFY_WAIT_MS: '999999' }).otpVerifyWaitMs === 240_000,
-      'guard: OTP ke baad ka budget alag (default 90s, 30s–240s clamp)');
+        && wb.worldBotConfig({ SWIGGY_WORLD_OTP_VERIFY_WAIT_MS: '999999' }).otpVerifyWaitMs === 900_000,
+      'guard: OTP ke baad ka budget bada (default 5 min, 30s–900s clamp)');
+      ok(wb.worldBotConfig({}).stepTimeoutMs === 300_000
+        && wb.worldBotConfig({}).startTimeoutMs === 120_000,
+      'speed: world bot ke fixed steps ka koi chhota time limit nahi (5 min / 2 min)');
     } finally {
       wb._setWorldBotClientOverrideForTests(null);
     }
@@ -4511,9 +4515,9 @@ Thanks`)),
     'worldbot: OTP wait 20 second (owner rule)');
   ok(wb.worldBotConfig({}).otpSendTimeoutMs === 20_000,
     'worldbot: OTP-send ka budget 20s (owner rule)');
-  ok(wb.worldBotConfig({}).queueWaitMs === 45_000,
-    'worldbot: queue ke baad 45s wait (asli run me OTP ~40-60s baad aata hai)');
-  ok(wb.worldBotConfig({ SWIGGY_WORLD_QUEUE_WAIT_MS: '20000' }).queueWaitMs === 20_000,
+  ok(wb.worldBotConfig({}).queueWaitMs === 20_000,
+    'worldbot: queue ka budget 20s (owner ka naya rule — OTP/queue sirf 20s)');
+  ok(wb.worldBotConfig({ SWIGGY_WORLD_QUEUE_WAIT_MS: '45000' }).queueWaitMs === 45_000,
     'worldbot: queue wait env se override ho sakta hai');
   ok(wb.worldBotQueueKind('Account creation is in queue, please wait') === true,
     'worldbot: "queue/wait" message pehchanta hai');

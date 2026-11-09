@@ -3552,11 +3552,15 @@ Thanks`)),
 
   // Pipeline ka order: file → worker bot → logout → stock.
   const pipelineT = pipelineCharges;
-  ok(pipelineT.includes("from './session-file.js'") && pipelineT.includes('writeSessionFile({ phone, accountKey: imported.key'),
-    'pipeline: login ke baad JSON ki file banti hai');
+  ok(pipelineT.includes("from './session-file.js'")
+    && pipelineT.includes('writeSessionFile({')
+    && pipelineT.includes('accountKey: imported.key')
+    && pipelineT.includes("name: exported?.fileName ? `${imported.key}-${exported.fileName}` : ''"),
+  'pipeline: login ke baad JSON ki file banti hai (bot ke export document se, naam bhi bot ka)');
   ok(pipelineT.includes('jsonText: fileText')
-    && pipelineT.includes('fileName: file.ok ? file.name'),
-  'pipeline: wahi file worker bot ko jaati hai (jsonText + fileName)');
+    && pipelineT.includes("fileName: exported?.fileName || (file.ok ? file.name : '')")
+    && pipelineT.includes('buffer: exported?.buffer'),
+  'pipeline: wahi file worker bot ko jaati hai (jsonText + bot ka fileName + asli bytes)');
   const sendAt = pipelineT.indexOf('const out = await sendSession({');
   const logoutAt = pipelineT.indexOf('const out = await worldBotPermanentLogout({ phone, shouldAbort, config: botCfg || worldCfg })');
   const stockAt = pipelineT.indexOf('const stock = await pushSessionToShopStock({');
@@ -4009,7 +4013,7 @@ Thanks`)),
   // OTP → naam → JSON, phir Switch Account → account → Permanent Logout → Yes.
   // ---------------------------------------------------------------------
   const JSON_SAMPLE = '{"tid":"abc123","token":"tok","cookies":[{"name":"a","value":"b"}]}';
-  const makeFakeWorldBot = ({ startWithAccount = false, silentAfterNumber = false, bareDetection = false, namePromptDelayMs = 0 } = {}) => {
+  const makeFakeWorldBot = ({ startWithAccount = false, silentAfterNumber = false, bareDetection = false, namePromptDelayMs = 0, withExport = false } = {}) => {
     const chat = [];
     let id = 0;
     const accounts = new Map(startWithAccount ? [['9876543210', { name: 'ihgfe' }]] : []);
@@ -4017,8 +4021,9 @@ Thanks`)),
     let pendingPhone = '';
     let loggedIn = startWithAccount ? '9876543210' : '';
     let startSendsDuringFlow = 0;
-    const push = (text, buttons = [], out = false) => {
-      const m = { id: ++id, out, text, buttons, date: new Date() };
+    let exportSends = 0;
+    const push = (text, buttons = [], out = false, extra = {}) => {
+      const m = { id: ++id, out, text, buttons, date: new Date(), ...(extra || {}) };
       chat.unshift(m);
       return m;
     };
@@ -4044,15 +4049,48 @@ Thanks`)),
         btn('1️⃣ JSON/TID Login', async () => push('JSON login')),
         btn('2️⃣ OTP Login', async () => { awaiting = 'number'; push('📱 OTP Login\n\nSend your 10-digit Swiggy number.'); }),
       ], [btn('Cancel')]]))],
-      [btn('Swiggy Accounts', async () => accountList())],
+      [btn('Swiggy Accounts', async () => (withExport ? myAccounts() : accountList()))],
       [btn('Order Hub', async () => accountList())],
       [btn('Switch Accounts', async () => accountList())],
+    ]);
+    // 📇 Owner ka Part 4–5: My Swiggy Accounts → account → detail (Name ·
+    // Mobile · Status + Export Login JSON | Login | Permanent Logout) → export
+    // par bot ek ASLI .json document (swiggy-login-3.json) bhejta hai.
+    const accountDetail = (ph) => push(
+      `👤 ${accounts.get(ph)?.name || '—'}\n📱 ${ph}\n📌 Status: ${ph === loggedIn ? 'Logged in' : 'Saved'}`,
+      [
+        [btn('📤 Export Login JSON', async () => {
+          const payload = JSON_SAMPLE;
+          push('📤 Login JSON Export', [], false);
+          push('swiggy-login-3.json', [], false, {
+            document: {
+              attributes: [{ className: 'DocumentAttributeFilename', fileName: 'swiggy-login-3.json' }],
+              size: Buffer.byteLength(payload, 'utf8'),
+              json: payload,
+            },
+          });
+          exportSends += 1;
+        })],
+        [btn('🔐 Login')],
+        [btn('🗑 Permanent Logout', async () => logoutConfirm())],
+      ],
+    );
+    const myAccounts = () => push('📇 My Swiggy Accounts', [
+      ...[...accounts.entries()].map(([ph]) => [
+        btn(`📱 ${ph} · ${ph === loggedIn ? 'Logged in' : 'Saved'}`, async () => accountDetail(ph)),
+      ]),
+      [btn('🗑 Delete All Accounts')],
+      [btn('🏠 Main Menu', async () => pushMenu())],
     ]);
     pushMenu();
     const client = {
       async getMessages(_e, { limit = 10 } = {}) { return chat.slice(0, Math.max(1, limit)); },
       async getEntity() { return { id: 'bot' }; },
-      async downloadMedia() { return Buffer.from('{}'); },
+      async downloadMedia(msg) {
+        const doc = msg?.document || msg?.media?.document || null;
+        if (doc?.json) return Buffer.from(String(doc.json), 'utf8');
+        return Buffer.from('{}');
+      },
       async sendMessage(_e, { message }) {
         push(message, [], true);
         const text = String(message || '').trim();
@@ -4119,7 +4157,7 @@ Thanks`)),
     };
     return {
       client, chat,
-      state: () => ({ awaiting, pendingPhone, loggedIn, accounts: [...accounts.keys()], startSendsDuringFlow }),
+      state: () => ({ awaiting, pendingPhone, loggedIn, accounts: [...accounts.keys()], startSendsDuringFlow, exportSends }),
     };
   };
   const flowCfg = {
@@ -4429,6 +4467,97 @@ Thanks`)),
     const did2 = await wb._safeCancelForTests(client2, { id: 'bot' }, { pollMs: 600 });
     ok(did2 === true && chat2.some((m) => m.out && m.text === '/cancel'),
       `cancel: number ke prompt par Cancel chalta hai (guard sirf naam ke liye) — ${chat2.filter((m) => m.out).map((m) => m.text).join(' · ')}`);
+  }
+
+  // ============ 📇 MY SWIGGY ACCOUNTS + 📤 EXPORT LOGIN JSON ============
+  // Owner ka Part 4–7: Swiggy Accounts → account → detail → Export Login JSON
+  // (ASLI .json document) → destination bot ko wahi file → Permanent Logout.
+  ok(wb.worldBotButtonRole('📤 Export Login JSON') === 'exportJson'
+    && wb.worldBotButtonRole('Export Login JSON') !== 'jsonLogin'
+    && wb.worldBotButtonRole('2️⃣ JSON/TID Login') === 'jsonLogin'
+    && wb.worldBotButtonRole('🗑 Delete All Accounts') === 'deleteAllAccounts'
+    && wb.worldBotButtonRole('🗑 Delete Account') === 'deleteAccount',
+  'accounts: "Export Login JSON" aur "Delete All Accounts" ka role alag (galat flow nahi khulta)');
+
+  // Part 8 — chaar jawab chaar alag states, ek me do nahi.
+  ok(wb.worldBotOutcome('❌ Login Cancelled\nNo account was logged in.') === 'login_cancelled'
+    && wb.worldBotOutcome('Session Expired\nYour Swiggy JSON/session has expired.') === 'session_expired'
+    && wb.worldBotOutcome('🗑 Permanent Logout Successful') === 'permanent_logout'
+    && wb.worldBotOutcome('✅ Account Deleted Successfully\n🧾 Swiggy: User successfully archived\n📌 StatusCode: 33') === 'account_deleted',
+  'states: login cancelled / session expired / permanent logout / account deleted — chaar alag');
+  ok(wb.worldBotPromptKind('You have been logged out automatically. Please Login again (OTP or fresh JSON).') === 'sessionExpired'
+    && wb.worldBotOutcome('You have been logged out automatically.') === 'session_expired',
+  'states: "logged out automatically" = session expiry (Permanent Logout NAHI)');
+  ok(wb.worldBotOutcome('❌ This Account Cannot Be Deleted\nSwiggy refused the request: Session expired. Please login again.') === 'session_expired'
+    && wb.worldBotDeleteBlockedInfo('❌ This Account Cannot Be Deleted (user charges present)').code === 'charges',
+  'states: delete failure ka karan alag — session expired vs charges/dues');
+
+  wb._resetWorldBotReadCacheForTests();
+  {
+    const fake = makeFakeWorldBot({ startWithAccount: true, withExport: true });
+    wb._setWorldBotClientOverrideForTests(fake.client);
+    try {
+      const accs = await wb.worldBotAccounts({ config: flowCfg });
+      ok(accs.ok && accs.count === 1 && accs.accounts[0].phone === '9876543210'
+        && accs.accounts[0].status === 'logged_in' && accs.deleteAllVisible,
+      `accounts: My Swiggy Accounts list (phone + status + Delete All) — ${JSON.stringify(accs.accounts)}`);
+
+      const detail = await wb.worldBotAccountDetail({ phone: '9876543210', config: flowCfg });
+      ok(detail.ok && detail.phone === '9876543210' && detail.name === 'ihgfe'
+        && detail.buttons.includes('📤 Export Login JSON')
+        && detail.buttons.includes('🗑 Permanent Logout'),
+      `accounts: detail screen (Name/Mobile/Status + 3 buttons) — ${detail.name} · ${detail.buttons.join(' | ')}`);
+
+      const exp = await wb.worldBotExportLoginJson({ phone: '9876543210', config: flowCfg });
+      ok(exp.ok && exp.kind === 'exported' && exp.viaDocument === true
+        && exp.fileName === 'swiggy-login-3.json'
+        && String(exp.text).includes('"tid"') && exp.bytes > 0,
+      `export: bot ka ASLI .json document mila (${exp.fileName}, ${exp.bytes} bytes, ${exp.kind})`);
+      ok(Buffer.isBuffer(exp.buffer) && exp.buffer.length === exp.bytes,
+        'export: document ke asli bytes saath (destination ko wahi file jayegi, re-encoded text nahi)');
+      ok(fake.state().exportSends === 1,
+        `export: "Export Login JSON" sirf ek baar dabaya (${fake.state().exportSends})`);
+
+      const out = await wb.worldBotPermanentLogout({ phone: '9876543210', config: flowCfg });
+      ok(out.ok && out.kind === 'logged_out' && !fake.state().accounts.includes('9876543210'),
+        `export ke baad: detail screen se seedha Permanent Logout (${out.kind})`);
+    } finally {
+      wb._setWorldBotClientOverrideForTests(null);
+    }
+  }
+
+  // 📤 Destination bot ko file (document) — text nahi. Mock JSON se poori
+  // chain: export document → file → destination, aur record (name/size/result).
+  wb._resetWorldBotReadCacheForTests();
+  {
+    const fake = makeFakeWorldBot({ startWithAccount: true, withExport: true });
+    wb._setWorldBotClientOverrideForTests(fake.client);
+    try {
+      const exp = await wb.worldBotExportLoginJson({ phone: '9876543210', config: flowCfg });
+      const delivered = [];
+      const sendToDestination = async (payload) => {
+        // Owner Part 43/44: document jaata hai aur confirmation ka intezaar hota hai.
+        const doc = payload.buffer || Buffer.from(String(payload.jsonText || ''), 'utf8');
+        const parsed = JSON.parse(doc.toString('utf8'));
+        delivered.push({
+          fileName: payload.fileName || 'swiggy-login-3.json',
+          bytes: doc.length,
+          destination: '@its_shop_bot',
+          result: parsed?.tid ? 'delivered' : 'rejected',
+        });
+        return true;
+      };
+      const okSend = await sendToDestination({
+        fileName: exp.fileName, bytes: exp.bytes, buffer: exp.buffer, jsonText: exp.text,
+      });
+      ok(okSend && delivered.length === 1
+        && delivered[0].fileName === 'swiggy-login-3.json'
+        && delivered[0].bytes === exp.bytes
+        && delivered[0].result === 'delivered',
+      `export→destination: file hi gayi (${delivered[0]?.fileName}, ${delivered[0]?.bytes} bytes, ${delivered[0]?.result})`);
+    } finally {
+      wb._setWorldBotClientOverrideForTests(null);
+    }
   }
 
   // ⛔ "Cancel kiu ho ja raha" — login khula hone par /start bilkul nahi.

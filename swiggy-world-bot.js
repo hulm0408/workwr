@@ -60,7 +60,9 @@ export function listWorldBotUsernames(env = process.env) {
 // default naam — "Sudhani Kumar". Jaise hi bot "New Account Detected" bole,
 // yahi naam chala jata hai (digit-mapping sirf fallback hai, agar bot is naam
 // ko reject kar de).
-export const WORLD_BOT_DEFAULT_NAME = 'Sudhani Kumar';
+// Owner ka default naam. Spec me "Sudha Kumari" likha aa sakta hai — naam
+// badalna ho to env se (SWIGGY_WORLD_NAME), code chhedne ki zaroorat nahi.
+export const WORLD_BOT_DEFAULT_NAME = String(process.env.SWIGGY_WORLD_NAME || '').trim() || 'Sudhani Kumar';
 
 export const WORLD_BOT_DEFAULTS = {
   // ⏳ Owner ka rule (2026-11-09): "fixed input ka koi time limit nahi — bot
@@ -321,6 +323,14 @@ export function worldBotButtonRole(text = '') {
   if (!n) return '';
   // "Copy Code" / "Copy JSON" — sabse pehle, kyunki isme "JSON" bhi hota hai.
   if (/\bcopy\b/.test(n)) return 'copyCode';
+  // 📤 "Export Login JSON" — isme "JSON" bhi hai, isliye `jsonLogin` se PEHLE.
+  // Owner ka flow: My Swiggy Accounts → account → "Export Login JSON" → bot ek
+  // ASLI .json document bhejta hai ("swiggy-login-3.json"). Pehle is button ka
+  // koi role hi nahi tha, isliye export step kabhi chalta hi nahi tha.
+  if (/\bexport\b/.test(n) && /\b(json|login|session)\b/.test(n)) return 'exportJson';
+  // "Delete All Accounts" (My Swiggy Accounts screen) — `deleteAccount` se
+  // alag, warna ek button se saare accounts ud jate the.
+  if (/\bdelete\b/.test(n) && /\ball\b/.test(n) && /\baccounts?\b/.test(n)) return 'deleteAllAccounts';
   if (/\b(json|tid)\b/.test(n)) return 'jsonLogin';
   if (/\botp\b/.test(n) && /\blogin\b/.test(n)) return 'otpLogin';
   if (/\b(order\s*hub|orders?)\b/.test(n) && !/\bmy\s*orders\b/.test(n)) return 'orderHub';
@@ -433,9 +443,18 @@ export function worldBotDeleteBlockedInfo(text = '') {
     || /\bdelet\w*\b.{0,40}\b(not\s+possible|not\s+allowed|failed)\b/.test(n);
   const chargeWords = /\b(user\s+charges?|charges?|dues?|pending\s+(amount|payment|order|bill|dues)|wallet\s*balance|outstanding|balance\s+amount)\b/.test(n);
   if (!cannotDelete && !(chargeWords && /\bdelet/.test(n))) return null;
+  // ⚠️ Owner ke Part 8 me delete failure ke do alag karan hain:
+  //   • charges/dues  → is number par fresh account ban hi nahi sakta (skip)
+  //   • session expired → pehle LOGIN karo, phir delete (number jalao mat)
+  // Dono ko ek hi "deleteBlocked" me mila dena galat tha.
+  const sessionExpired = /\bsession (?:has )?expired\b|\bjson\s*\/?\s*session has expired\b|\blogin again\b/.test(n);
   return {
     kind: 'deleteBlocked',
-    reason: `Account delete nahi ho sakta${chargeWords ? ' (charges/dues pending)' : ''}: ${raw.replace(/\s+/g, ' ').slice(0, 160)}`,
+    code: sessionExpired ? 'session_expired' : 'charges',
+    sessionExpired,
+    reason: sessionExpired
+      ? `Account delete nahi hua — Swiggy session expire ho gaya (pehle login, phir delete): ${raw.replace(/\s+/g, ' ').slice(0, 160)}`
+      : `Account delete nahi ho sakta${chargeWords ? ' (charges/dues pending)' : ''}: ${raw.replace(/\s+/g, ' ').slice(0, 160)}`,
     text: raw.replace(/\s+/g, ' ').slice(0, 200),
   };
 }
@@ -488,6 +507,18 @@ export function worldBotPromptKind(text = '') {
   if (/\b(deleted successfully|account deleted|successfully archived|deleted)\b/.test(n)) return 'deleted';
   if (/\b(otp was not accepted|invalid otp|otp galat|wrong otp|otp expired)\b/.test(n)) return 'otpFail';
   if (/\b(invalid mobile|invalid number|number galat)\b/.test(n)) return 'invalidNumber';
+  // 🔌 SESSION EXPIRED — owner ka Part 8: "Session Expired / Your Swiggy
+  // JSON/session has expired / You have been logged out automatically /
+  // Please Login again (OTP or fresh JSON)." Ye Permanent Logout NAHI hai aur
+  // Delete failure se bhi alag state hai — isliye sabse pehle yahan.
+  // ("logged out automatically" me "logged out" hai, par ye logout-success
+  // nahi — warna account "logged out" maan liya jata aur naya number aa jata.)
+  if (/\bsession (?:has )?expired\b/.test(n)
+    || /\bjson\s*\/?\s*session (?:has )?expired\b/.test(n)
+    || /\blogged out automatically\b/.test(n)
+    || /\bplease login again\b.{0,40}\b(otp|fresh json)\b/.test(n)) return 'sessionExpired';
+  // 📤 Bot ne JSON file export kar di — "swiggy-login-3.json · 1.2 KB".
+  if (/\bswiggy-login-\d+\.json\b/.test(n)) return 'exportSent';
   // 🗑 Permanent logout ka apna jawab (transcript: "🗑 Permanent Logout Successful").
   if (/\b(permanent logout successful|logged out successfully|logout successful)\b/.test(n)) return 'logoutOk';
   // ❌ Login cancel — transcript: "❌ Login Cancelled / No account was logged in."
@@ -500,6 +531,12 @@ export function worldBotPromptKind(text = '') {
   if (/\b(login json|tap copy)\b/.test(n) || /(tid|access[_\s-]?token|cookies?)/i.test(n) && /\{/.test(String(text || ''))) return 'loginJson';
   // ⏳ Swiggy rate limit / account creation queue — flow rukta nahi, wait.
   if (/\b(rate limit|rate-limit)\b/.test(n) && /\b(queue|que me|queued|create|creation|ban)\b/.test(n)) return 'queued';
+  // 📇 "My Swiggy Accounts" — saved accounts ki list (Expired / Logged in /
+  // Saved + "Delete All Accounts"). ⚠️ Logout/delete ke result me bhi "My
+  // Swiggy Accounts" likha hota hai ("The account has been removed from My
+  // Swiggy Accounts") — wahan ye list NAHI hai, isliye result words exclude.
+  if (/\bmy swiggy accounts\b/.test(n)
+    && !/\b(logout|logged out|removed|deleted|success)\b/.test(n)) return 'accountsList';
   // 🏠 Main Menu — "Main Menu / Pick a feature".
   if (/\b(main menu|pick a feature)\b/.test(n)) return 'menu';
   // ❌ Bot ne khud OTP bhejne se mana kar diya — "Could not send OTP.
@@ -686,6 +723,129 @@ export function worldBotNamePromptOnScreen(messages = [], { strict = false } = {
     }
   }
   return null;
+}
+
+// ---------------------------------------------------------------------------
+// 📇 MY SWIGGY ACCOUNTS — saved accounts ki list, account detail aur bot ke
+// 4 alag-alag jawab (owner ke Part 8: login cancelled / session expired /
+// delete failure / permanent logout — inhe kabhi mila dena galat hai).
+// ---------------------------------------------------------------------------
+const WORLD_ACCOUNT_STATUS_RULES = [
+  [/\blogged\s*in\b|\blogin\s*active\b|\bactive\b/i, 'logged_in'],
+  [/\bsaved\b/i, 'saved'],
+  [/\bexpired?\b/i, 'expired'],
+  [/\blogged\s*out\b|\bnot\s*logged\s*in\b/i, 'logged_out'],
+];
+
+// "Expired" / "Logged in" / "Saved" — account button ya screen text se.
+export function worldBotAccountStatus(text = '') {
+  const raw = String(text || '');
+  for (const [re, status] of WORLD_ACCOUNT_STATUS_RULES) if (re.test(raw)) return status;
+  return '';
+}
+
+// "My Swiggy Accounts" screen ke buttons → saved account list.
+// Button ka text hi asli number deta hai ("📱 9876543210 · Logged in"), isliye
+// sirf 10-digit wale buttons account maane jate hain (Main Menu/Delete All
+// Accounts/Cancel chhoot jate hain).
+export function worldBotAccountsFromScreens(messages = []) {
+  const seen = new Set();
+  const out = [];
+  for (const message of (Array.isArray(messages) ? messages : [])) {
+    if (!message || message.out) continue;
+    for (const entry of (message.buttons || [])) {
+      const text = String(entry?.text || '');
+      const phone = (text.match(/(?:^|\D)([6-9]\d{9})(?:\D|$)/) || [])[1] || '';
+      if (!phone || seen.has(phone)) continue;
+      seen.add(phone);
+      out.push({
+        phone,
+        label: text,
+        status: worldBotAccountStatus(text) || worldBotAccountStatus(message.text),
+        entry,
+        messageId: message.id,
+      });
+    }
+  }
+  return out;
+}
+
+// Account DETAIL screen (Name · Mobile · Status + Export Login JSON / Login /
+// Permanent Logout). Sirf wahi screen detail maani jati hai jisme in teen me se
+// koi button ho — warna koi bhi list ke upar khada message detail ban jata.
+export function worldBotAccountDetailFromScreens(messages = [], phone = '') {
+  const list = (Array.isArray(messages) ? messages : []).filter((m) => m && !m.out);
+  const wanted = String(phone || '').replace(/\D/g, '').slice(-10);
+  for (const message of list.slice(0, 3)) {
+    const roles = new Set((message.buttons || []).map((b) => b.role || worldBotButtonRole(b.text)));
+    const isDetail = roles.has('exportJson') || roles.has('permanentLogout')
+      || (roles.has('login') && roles.has('exportJson'));
+    if (!isDetail) continue;
+    const text = String(message.text || '');
+    const mobile = (text.match(/(?:mobile|number|phone|📱)\s*[:\-]?\s*(\+?\d[\d\s-]{8,})/i) || [])[1] || '';
+    const digits = String(mobile || '').replace(/\D/g, '').slice(-10) || (text.match(/\b([6-9]\d{9})\b/) || [])[1] || '';
+    if (wanted && digits && digits !== wanted) continue;
+    const name = ((text.match(/(?:name|naam)\s*[:\-]\s*([^\n·|]+)/i) || [])[1]
+      || (text.match(/👤\s*([^\n·|]+)/) || [])[1] || '').replace(/\s+/g, ' ').trim();
+    return {
+      phone: digits || wanted,
+      name: name.slice(0, 60),
+      status: worldBotAccountStatus(text),
+      text: text.replace(/\s+/g, ' ').slice(0, 300),
+      buttons: (message.buttons || []).map((b) => b.text),
+      roles: [...roles],
+      messageId: message.id,
+      at: message.dateMs || 0,
+    };
+  }
+  return null;
+}
+
+// Bot ke jawab ka "outcome" — 4 states alag rehte hain, ek me do nahi.
+export function worldBotOutcome(text = '') {
+  const kind = worldBotPromptKind(text);
+  if (kind === 'cancelled') return 'login_cancelled';
+  if (kind === 'sessionExpired') return 'session_expired';
+  if (kind === 'deleteBlocked') {
+    return worldBotDeleteBlockedInfo(text)?.code === 'session_expired' ? 'session_expired' : 'delete_refused';
+  }
+  if (kind === 'logoutOk') return 'permanent_logout';
+  if (kind === 'deleted') return 'account_deleted';
+  if (kind === 'loginOk' || kind === 'loginJson' || kind === 'exportSent') return 'login_ok';
+  return '';
+}
+
+// Export file ka naam bot se: "DocumentAttributeFilename.fileName".
+function messageDocumentName(message) {
+  try {
+    const doc = message?.document || message?.media?.document || null;
+    const attrs = (doc && doc.attributes) || (message?.media?.document && message.media.document.attributes) || [];
+    for (const attribute of (Array.isArray(attrs) ? attrs : [])) {
+      const name = attribute?.fileName || attribute?.file_name || attribute?.attributes?.fileName;
+      if (name) return String(name).trim();
+    }
+    const direct = message?.fileName || doc?.name || message?.media?.document?.name || '';
+    if (direct) return String(direct).trim();
+  } catch {}
+  return '';
+}
+
+function messageDocumentSize(message) {
+  try {
+    const doc = message?.document || message?.media?.document || null;
+    const size = Number(doc?.size ?? message?.media?.document?.size ?? 0);
+    return Number.isFinite(size) && size > 0 ? size : 0;
+  } catch {
+    return 0;
+  }
+}
+
+// Export ka default naam jab bot apna filename na de (owner ke screenshot me
+// "swiggy-login-3.json" tha — koi bhi JSON naam chalega, par .json hi).
+export function worldBotExportFileName(phone = '', fallbackIndex = 3) {
+  const digits = String(phone || '').replace(/\D/g, '');
+  const suffix = digits ? digits.slice(-4) : String(Number(fallbackIndex) || 3);
+  return `swiggy-login-${suffix}.json`;
 }
 
 // OTP send confirm na hua ho (aur bot ne Cancel bhi na bheja) to number skip
@@ -3257,6 +3417,25 @@ async function logoutAccountUnlocked(client, entity, cfg, cleanPhone, { shouldAb
 
   setPhase('logout-start');
 
+  // 📇 Agar bot pehle se account DETAIL screen par khada hai (My Swiggy
+  // Accounts → account → Export Login JSON | Login | Permanent Logout), to
+  // wahin se seedha logout — menu se dobara ghoomne ki zaroorat nahi.
+  const recentForLogout = (await parseScreenMessages(client, entity).catch(() => []))
+    .filter((m) => !m.out).slice(0, 5);
+  const onDetail = findRoleOnScreens(recentForLogout.filter((m) => {
+    // Stale screen (purana/dusre number ka) par logout mat dabao.
+    const digits = String(m.text || '').replace(/\D/g, '');
+    if (!cleanPhone) return true;
+    const mentioned = (String(m.text || '').match(/\b([6-9]\d{9})\b/) || [])[1] || '';
+    return !mentioned || mentioned === cleanPhone || digits.includes(cleanPhone);
+  }), 'permanentLogout');
+  if (onDetail) {
+    const detailClickId = Number((await latest(1))[0]?.id) || 0;
+    console.log('[WorldBot] 📇 account detail screen se seedha Permanent Logout');
+    await clickBtn(onDetail.button, (fresh) => (fresh && fresh.length ? true : null), 'Permanently Logout (detail)');
+    return finishLogoutConfirm({ latest, waitFor, clickBtn, step, cleanPhone, logoutClickId: detailClickId });
+  }
+
   // 🏠 Owner: "then click switch account …" — Switch Accounts sirf Main Menu
   // par hota hai. Login ke turant baad bot JSON screen par khada hota hai,
   // isliye pehle menu par aao (button se; /start sirf khali screen par).
@@ -3325,8 +3504,16 @@ async function logoutAccountUnlocked(client, entity, cfg, cleanPhone, { shouldAb
 
   const logoutClickId = Number((await latest(1))[0]?.id) || 0;
   await clickBtn(logoutHit.button, (fresh) => (fresh && fresh.length ? true : null), 'Permanently Logged Out');
+  return finishLogoutConfirm({ latest, waitFor, clickBtn, step, cleanPhone, logoutClickId });
+}
 
-  // ✅ Owner: logout par bot DO confirmation maangta hai —
+// ---------------------------------------------------------------------------
+// 🚪 LOGOUT CONFIRMATION — bot do confirmation maangta hai:
+//  ① "konsa account" (account button)  ② "Yes / Cancel" → YES
+// Cancel kabhi nahi dabta (owner: "Cancel kiu ho ja raha bc").
+// ---------------------------------------------------------------------------
+async function finishLogoutConfirm({ latest, waitFor, clickBtn, step, cleanPhone, logoutClickId }) {
+// ✅ Owner: logout par bot DO confirmation maangta hai —
   //   1) "konsa account" (account button)
   //   2) "Yes / Cancel"  →  YES dabana hai (Cancel kabhi nahi).
   const loggedOutRe = /(logged\s*out|log\s*out\s*(success|ho)|successfully\s*log)/i;
@@ -3398,6 +3585,317 @@ export async function worldBotPermanentLogout({
       reason: String(error?.message || error).slice(0, 200),
       errorCategory: category,
     };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 📇 SWIGGY ACCOUNTS — list → account detail → 📤 Export Login JSON
+//
+// Owner ka workflow (Part 4–7, screenshots ke saath):
+//   "Swiggy Accounts" → My Swiggy Accounts (Expired / Logged in / Saved +
+//   "Delete All Accounts") → account → detail screen (Name · Mobile · Status +
+//   "Export Login JSON" | "Login" | "Permanent Logout") → Export Login JSON →
+//   bot ek ASLI `.json` document bhejta hai ("swiggy-login-3.json", 1.2 KB) →
+//   wahi document (text nahi!) destination bot ko → Permanent Logout.
+//
+// Yahan koi bhi step apne-aap nahi maana jata: har button ka jawab ASLI
+// message/document se verify hota hai, warna `ok:false` + asli screen ke saath
+// lautte hain (owner rule: "Never assume a response arrived just because a
+// message was sent").
+// ---------------------------------------------------------------------------
+const worldAccountStepMs = (cfg = {}) => Math.max(500, Number(cfg?.pollMs) || 1_200);
+
+// Bot ka jawab aane tak poll — screen + jo predicate return kare, dono deta hai.
+async function worldScreenWait(client, entity, finder, {
+  shouldAbort = null, timeoutMs = 20_000, stepMs = 1_200, limit = 6,
+} = {}) {
+  const budget = Math.max(1_000, Number(timeoutMs) || 20_000);
+  const deadline = Date.now() + budget;
+  let lastScreens = [];
+  for (;;) {
+    if (typeof shouldAbort === 'function' && shouldAbort()) return null;
+    lastScreens = await parseScreenMessages(client, entity, limit, { fresh: true }).catch(() => []);
+    const found = finder(lastScreens);
+    if (found) return { found, screens: lastScreens };
+    if (Date.now() >= deadline) return { found: null, screens: lastScreens };
+    await sleep(Math.max(400, Number(stepMs) || 1_200));
+  }
+}
+
+// Main Menu → "Swiggy Accounts" → My Swiggy Accounts list.
+async function openAccountsList(client, entity, cfg, { shouldAbort = null } = {}) {
+  setPhase('accounts-open');
+  let screens = await parseScreenMessages(client, entity).catch(() => []);
+  // Account detail par khade ho → pehle Main Menu (wahan se hi list milti hai).
+  if (findRoleOnScreens(screens.slice(0, 2), 'exportJson')
+    || findRoleOnScreens(screens.slice(0, 1), 'permanentLogout')) {
+    await clickRole(client, entity, 'mainMenu', { cfg, shouldAbort, what: 'Main Menu (accounts)' }).catch(() => {});
+    screens = await parseScreenMessages(client, entity).catch(() => []);
+  }
+  let accounts = worldBotAccountsFromScreens(screens);
+  const alreadyListed = accounts.length > 0 || worldBotHasPromptKind(screens.slice(0, 3), 'accountsList');
+  if (!alreadyListed) {
+    // Pehle Menu par aao — buttons se; /start sirf wahan jahan worldResetToMenu
+    // khud safe samajhe (naam/OTP ka step ya khula login ho to /start nahi).
+    await worldResetToMenu(client, entity, cfg).catch(() => {});
+    await clickRole(client, entity, 'swiggyAccounts', { cfg, shouldAbort, what: 'Swiggy Accounts' });
+    const waited = await worldScreenWait(client, entity, (list) => {
+      const found = worldBotAccountsFromScreens(list);
+      if (found.length) return { accounts: found };
+      if (worldBotHasPromptKind(list.slice(0, 3), 'accountsList')) return { accounts: [] };
+      return null;
+    }, {
+      shouldAbort,
+      timeoutMs: Number(cfg?.stepTimeoutMs) || 20_000,
+      stepMs: worldAccountStepMs(cfg),
+    });
+    if (!waited || !waited.found) {
+      throw new WorldBotError('accounts-timeout', '"My Swiggy Accounts" list ka jawab nahi aaya');
+    }
+    screens = waited.screens;
+    accounts = worldBotAccountsFromScreens(screens);
+  }
+  return { screens, accounts };
+}
+
+// List → account detail. Phone diya ho to wahi account, warna pehla.
+async function openAccountDetail(client, entity, cfg, phone, { shouldAbort = null } = {}) {
+  const cleanPhone = normalizeWorldPhone(phone) || String(phone || '').replace(/\D/g, '').slice(-10);
+  setPhase('accounts-detail');
+  let screens = await parseScreenMessages(client, entity).catch(() => []);
+  const already = worldBotAccountDetailFromScreens(screens, cleanPhone);
+  if (already && (!cleanPhone || already.phone === cleanPhone)) return { screens, detail: already };
+  const { screens: listScreens, accounts } = await openAccountsList(client, entity, cfg, { shouldAbort });
+  const target = (cleanPhone && accounts.find((a) => a.phone === cleanPhone)) || accounts[0] || null;
+  if (!target) {
+    throw new WorldBotError(
+      'account-not-listed',
+      cleanPhone
+        ? `My Swiggy Accounts me ${cleanPhone} nahi mila (saved: ${accounts.map((a) => a.phone).join(', ') || 'none'})`
+        : 'My Swiggy Accounts khali hai — koi saved account nahi',
+    );
+  }
+  console.log(`[WorldBot] 📇 account detail khol raha hoon: ${target.phone}${target.status ? ` (${target.status})` : ''}`);
+  const hit = await clickOrType({
+    client, entity,
+    entry: target.entry,
+    cfg,
+    shouldAbort,
+    what: `account detail (${target.phone})`,
+    baseline: screenSignature(listScreens),
+    timeoutMs: Math.min(30_000, Number(cfg?.stepTimeoutMs) || 20_000),
+    predicate: (fresh, all) => worldBotAccountDetailFromScreens(all && all.length ? all : fresh, target.phone),
+  }).catch((error) => {
+    if (error?.code === 'aborted') throw error;
+    console.warn(`[WorldBot] account detail (${target.phone}): ${String(error?.message || error).slice(0, 120)}`);
+    return null;
+  });
+  screens = await parseScreenMessages(client, entity).catch(() => []);
+  const detail = (hit && (hit.buttons || hit.phone) ? hit : null) || worldBotAccountDetailFromScreens(screens, target.phone);
+  if (!detail) throw new WorldBotError('account-detail-missing', `Account detail screen nahi khuli (${target.phone})`);
+  return { screens, detail, accounts, target };
+}
+
+function accountsFailure(error, { phone = '', username = '' } = {}) {
+  const category = classifyWorldBotError(error);
+  const kind = category === 'aborted'
+    ? 'aborted'
+    : category === 'bot_unreachable'
+      ? 'bot_unreachable'
+      : category === 'worldbot_offline'
+        ? 'worldbot_offline'
+        : category === 'worldbot_setup'
+          ? 'worldbot_setup'
+          : 'accounts_failed';
+  return {
+    ok: false,
+    kind,
+    phone: phone || '',
+    username,
+    reason: String(error?.message || error).slice(0, 220),
+    code: error?.code || category,
+    errorCategory: category,
+  };
+}
+
+// 📇 "Swiggy Accounts" — saved accounts (phone + status).
+export async function worldBotAccounts({ shouldAbort = null, config = worldBotConfig() } = {}) {
+  const cfg = { ...worldBotConfig(), ...(config || {}) };
+  resetWorldBotRunState();
+  setPhase('accounts');
+  try {
+    return await withWorldBotClient(async ({ client }) => {
+      const entity = await getWorldEntity(client, cfg.username);
+      const { screens, accounts } = await openAccountsList(client, entity, cfg, { shouldAbort });
+      const list = accounts.map((a) => ({ phone: a.phone, label: a.label, status: a.status }));
+      const deleteAllVisible = Boolean(findRoleOnScreens(screens.slice(0, 3), 'deleteAllAccounts'));
+      console.log(`[WorldBot] 📇 My Swiggy Accounts: ${list.length} account(s)${list.length
+        ? ` — ${list.map((a) => `${a.phone}${a.status ? ` (${a.status})` : ''}`).join(', ')}`
+        : ''}${deleteAllVisible ? ' · Delete All Accounts bhi hai' : ''}`);
+      return {
+        ok: true,
+        kind: 'accounts',
+        username: cfg.username,
+        accounts: list,
+        count: list.length,
+        deleteAllVisible,
+        screenText: String(screens[0]?.text || '').replace(/\s+/g, ' ').slice(0, 300),
+      };
+    });
+  } catch (error) {
+    setError(error);
+    return accountsFailure(error, { username: cfg.username });
+  }
+}
+
+// 📇 Ek account ka detail screen (Name · Mobile · Status + buttons).
+export async function worldBotAccountDetail({ phone = '', shouldAbort = null, config = worldBotConfig() } = {}) {
+  const cfg = { ...worldBotConfig(), ...(config || {}) };
+  const cleanPhone = normalizeWorldPhone(phone) || String(phone || '').replace(/\D/g, '').slice(-10);
+  resetWorldBotRunState();
+  setPhase('accounts-detail');
+  try {
+    return await withWorldBotClient(async ({ client }) => {
+      const entity = await getWorldEntity(client, cfg.username);
+      const { detail } = await openAccountDetail(client, entity, cfg, cleanPhone, { shouldAbort });
+      console.log(`[WorldBot] 📇 detail: ${detail.phone || cleanPhone}${detail.name ? ` · ${detail.name}` : ''}${detail.status ? ` · ${detail.status}` : ''} · [${(detail.buttons || []).join(' | ') || 'no buttons'}]`);
+      return { ok: true, kind: 'account_detail', username: cfg.username, ...detail };
+    });
+  } catch (error) {
+    setError(error);
+    return accountsFailure(error, { phone: cleanPhone, username: cfg.username });
+  }
+}
+
+// 📤 "Export Login JSON" → bot ka ASLI .json document (text message nahi).
+// Return: { ok, kind:'exported', fileName, bytes, text/jsonText, viaDocument }
+export async function worldBotExportLoginJson({
+  phone = '',
+  shouldAbort = null,
+  config = worldBotConfig(),
+  timeoutMs = 0,
+} = {}) {
+  const cfg = { ...worldBotConfig(), ...(config || {}) };
+  const cleanPhone = normalizeWorldPhone(phone) || String(phone || '').replace(/\D/g, '').slice(-10);
+  resetWorldBotRunState();
+  setPhase('export-json');
+  try {
+    return await withWorldBotClient(async ({ client }) => {
+      const entity = await getWorldEntity(client, cfg.username);
+      const { screens, detail } = await openAccountDetail(client, entity, cfg, cleanPhone, { shouldAbort });
+      setPhase('export-json');
+      const hit = findRoleOnScreens(screens.slice(0, 2), 'exportJson');
+      if (!hit) {
+        return {
+          ok: false,
+          kind: 'export_button_missing',
+          phone: detail?.phone || cleanPhone,
+          reason: `"Export Login JSON" button nahi mila — screen: ${state.lastScreenButtons.join(' | ') || 'none'}`,
+        };
+      }
+      const budget = Math.max(20_000, Number(timeoutMs) || Number(cfg?.exportTimeoutMs) || 90_000);
+      console.log('[WorldBot] 📤 "Export Login JSON" dabaya — bot ka .json document/document-text chahiye');
+      const found = await clickOrType({
+        client, entity,
+        entry: hit.button,
+        cfg,
+        shouldAbort,
+        what: 'Export Login JSON',
+        baseline: screenSignature(screens),
+        timeoutMs: Math.min(budget, 30_000),
+        graceMs: budget,
+        predicate: (fresh, all) => {
+          const pool = [...(fresh || []), ...(all || [])];
+          for (const message of pool) {
+            if (!message || message.out) continue;
+            if (message.hasDocument) return { kind: 'document', message };
+            const json = extractWorldBotJson(message?.text);
+            if (json) return { kind: 'json', message, json };
+          }
+          return null;
+        },
+      }).catch((error) => {
+        if (error?.code === 'aborted') throw error;
+        console.warn(`[WorldBot] Export Login JSON: ${String(error?.message || error).slice(0, 140)}`);
+        return null;
+      });
+      if (!found) {
+        return {
+          ok: false,
+          kind: 'export_missing',
+          phone: detail?.phone || cleanPhone,
+          reason: `Export Login JSON ka jawab ${Math.round(budget / 1000)}s me nahi aaya — na .json document, na JSON text (screen: ${state.lastScreenButtons.join(' | ') || 'none'})`,
+        };
+      }
+      let text = '';
+      let viaDocument = false;
+      let fileName = '';
+      let bytes = 0;
+      // 📎 Document ke ASLI bytes — destination bot ko bilkul wahi file jaati
+      // hai (owner Part 43: file hi bhejo, uska text nahi).
+      let docBuffer = null;
+      if (found.kind === 'document') {
+        viaDocument = true;
+        // parsed entry me asli Telegram message `raw` me hota hai (document
+        // attributes wahin hain) — warna bot ka filename miss ho jata tha.
+        const rawMessage = found.message.raw || found.message;
+        fileName = messageDocumentName(rawMessage) || messageDocumentName(found.message);
+        bytes = messageDocumentSize(rawMessage) || messageDocumentSize(found.message);
+        const buffer = await client.downloadMedia(found.message.raw || found.message, {}).catch((error) => {
+          console.warn(`[WorldBot] 📥 export document download fail: ${String(error?.message || error).slice(0, 120)}`);
+          return null;
+        });
+        const body = buffer ? (Buffer.isBuffer(buffer) ? buffer.toString('utf8') : String(buffer)) : '';
+        if (buffer && (Buffer.isBuffer(buffer) ? buffer.length : body.length)) docBuffer = Buffer.from(body, 'utf8');
+        if (body) bytes = bytes || Buffer.byteLength(body, 'utf8');
+        const parsed = extractWorldBotJson(body);
+        if (parsed?.text) text = parsed.text;
+        else {
+          try {
+            const obj = JSON.parse(body);
+            if (looksLikeSessionJson(obj)) text = JSON.stringify(obj);
+          } catch {}
+        }
+        console.log(`[WorldBot] 📥 export document: ${fileName || '(naam nahi mila)'} · ${bytes || 0} bytes · JSON ${text ? `${text.length} chars` : 'NAHI mila'}`);
+      } else {
+        text = found.json?.text || '';
+        bytes = Buffer.byteLength(text, 'utf8');
+      }
+      if (!text || !isValidWorldSessionJson(text)) {
+        return {
+          ok: false,
+          kind: 'export_bad_json',
+          phone: detail?.phone || cleanPhone,
+          viaDocument,
+          fileName,
+          bytes,
+          reason: text
+            ? `Export me JSON aaya par adhoora/parse fail (${text.length} chars) — token/tid/cookies kuch nahi mila`
+            : `Export me .json document aaya par usme JSON nahi tha (${fileName || 'naam nahi mila'}, ${bytes} bytes)`,
+        };
+      }
+      const name = fileName || worldBotExportFileName(detail?.phone || cleanPhone);
+      state.lastOkAt = Date.now();
+      setPhase('export-done');
+      console.log(`[WorldBot] ✅ Export ready: ${name} · ${bytes || Buffer.byteLength(text, 'utf8')} bytes · ${text.length} chars JSON`);
+      return {
+        ok: true,
+        kind: 'exported',
+        phone: detail?.phone || cleanPhone,
+        name: detail?.name || '',
+        status: detail?.status || '',
+        fileName: name,
+        bytes: bytes || Buffer.byteLength(text, 'utf8'),
+        text,
+        jsonText: text,
+        viaDocument,
+        buffer: docBuffer,
+        username: cfg.username,
+      };
+    });
+  } catch (error) {
+    setError(error);
+    return accountsFailure(error, { phone: cleanPhone, username: cfg.username });
   }
 }
 

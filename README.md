@@ -97,6 +97,46 @@ hai.
 > pehle Cancel karke saaf menu. `/cancel` bhi naam ke step par kabhi nahi
 > jata (warna poora naya-account flow jal jata tha).
 
+### 📇 Poore account ka cycle — login → delete → wapas login → accounts → export → logout
+
+Owner ka workflow (screenshots ke saath) aur code me uska hissa — har step ka
+jawab **asli message/document** se verify hota hai, koi step "bhej diya to ho
+gaya" nahi maana jata:
+
+| Step | Bot | Code |
+|---|---|---|
+| **Login #1** | `/start` → Login → OTP Login → number → OTP → `✅ Login Successful` + Login JSON | `worldBotLogin()` |
+| **Delete** | Order Hub → account → Delete Account → Delete OTP → `✅ Account Deleted Successfully` (`StatusCode: 33`) | `worldBotDeleteAccount()` |
+| **Login #2 (wahi number)** | number → OTP → `🆕 New Account Detected!` → naam (`Sudhani Kumar`) → `✅ Login Successful` + JSON | `worldBotLogin()` (naam step) |
+| **My Swiggy Accounts** | `📇 My Swiggy Accounts` — accounts + `Expired / Logged in / Saved` + `Delete All Accounts` | `worldBotAccounts()` |
+| **Account detail** | Name · Mobile · Status + `Export Login JSON` · `Login` · `Permanent Logout` | `worldBotAccountDetail()` |
+| **📤 Export Login JSON** | bot **.json document** bhejta hai (`swiggy-login-3.json`, 1.2 KB) | `worldBotExportLoginJson()` |
+| **📎 Destination** | wahi file Telegram **document** ke roop me (text nahi), delivery confirm hone par hi "bhej diya" | pipeline `sendSession` / fresh-bot `sendSessionFile` |
+| **Permanent Logout** | detail screen → Permanent Logout → `Yes` → `🗑 Permanent Logout Successful` | `worldBotPermanentLogout()` |
+
+Kuch cheezein jo spec me galat likhi hoti hain, code me sahi hain:
+
+* **Number kahan se aata hai** — user se poochha nahi jata. Number (aur OTP)
+  owner ke **OTP bot** (Hermes / Hathi / HardXotp / Firebase) se aata hai; Shop
+  Bot sirf World Bot par number/OTP/naam type karta hai.
+* **File kahan jaati hai** — pehle se tay hai: wahi worker/Shop Bot chat
+  (`sendSession`). Koi naya destination configure nahi karna.
+* **Naam** — default `Sudhani Kumar`; badalna ho to `SWIGGY_WORLD_NAME`
+  (code chhedne ki zaroorat nahi).
+* **Export = document, text nahi** — export se aaye document ke **asli bytes**
+  aage jaate hain (`buffer`), naam bhi bot ka (`swiggy-login-3.json`); file
+  na milne par hi login ke JSON text se file banti hai.
+* **Chaar jawab = chaar states** (`worldBotOutcome`): `login_cancelled` /
+  `session_expired` / `delete_refused` / `permanent_logout` — `"You have been
+  logged out automatically"` ko Permanent Logout nahi samajhte, aur delete
+  failure ka karan (`charges` vs `session expired`) alag rehta hai.
+
+Export step ka behaviour: pipeline login ke baad `Export Login JSON` bhi try
+karta hai — mil gaya to **wahi document** file ban kar destination jaati hai,
+na mile/chale to login ke JSON se file banti hai (number nahi jalta).
+`SWIGGY_WORLD_EXPORT_JSON=0` se export step band, `SWIGGY_WORLD_EXPORT_TIMEOUT_MS`
+se uska budget (default 90s) — dono optional.
+
 ### 🐘 Hathi + 🔐 HardXotp — OTP bots
 
 Teeno OTP bots ek hi spare Telegram account (usi MTProto session) se chalte hain,

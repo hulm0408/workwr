@@ -57,6 +57,7 @@ import {
   worldBotDeleteAccount,
   worldBotPermanentLogout,
   worldBotConfig,
+  WORLD_BOT_DEFAULT_NAME,
   normalizeWorldPhone,
   listWorldBotUsernames,
   currentWorldBotUsername,
@@ -1163,7 +1164,7 @@ export async function processSingleNumberViaWorldBot({
 
     await say(section('🌍 World Bot — Login Shuru', [
       `📱 <b>Number:</b> <code>${esc(phone)}</code>`,
-      `🤖 Bot: <code>@${esc(botUsername)}</code> · koi proxy/WAF nahi`,
+      `🤖 Bot: <code>@${esc(botUsername)}</code>`,
       telegramMode
         ? '→ Number + OTP OTP-bot chat se · account Swiggy World Bot se banega'
         : '→ /start → Login → OTP Login → number → OTP (Firebase inbox se)',
@@ -1176,8 +1177,10 @@ export async function processSingleNumberViaWorldBot({
       phone,
       otpProvider: makeOtpProvider(),
       otpWatermark: makeOtpWatermark(),
-      // 🅰️ Owner ka naam rule: mobile ke pehle 5 digit → alphabetic (1→a … 9→i, 0→x).
-      nameProvider: async () => swiggyNameFromPhone(phone) || existingName || getNextAutoUserName(),
+      // 👤 Owner ka naam rule (2026-11-09): har account ka default naam
+      // "Sudhani Kumar" — bot "New Account Detected" bole to yahi jaata hai.
+      // (Fallback candidates world bot khud rakhta hai: digit-mapping etc.)
+      nameProvider: async () => WORLD_BOT_DEFAULT_NAME || swiggyNameFromPhone(phone) || existingName || getNextAutoUserName(),
       report: say,
       shouldAbort,
       config: cfg,

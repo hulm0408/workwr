@@ -56,6 +56,12 @@ export function listWorldBotUsernames(env = process.env) {
 
 // Har step ka default budget. Bot slow ho to Settings/env se badhaya ja sakta
 // hai (SWIGGY_WORLD_STEP_TIMEOUT_MS) — batch isi ke andar recover karta hai.
+// 👤 Owner ka final naam rule (2026-11-09): har naye account ke liye ek hi
+// default naam — "Sudhani Kumar". Jaise hi bot "New Account Detected" bole,
+// yahi naam chala jata hai (digit-mapping sirf fallback hai, agar bot is naam
+// ko reject kar de).
+export const WORLD_BOT_DEFAULT_NAME = 'Sudhani Kumar';
+
 export const WORLD_BOT_DEFAULTS = {
   stepTimeoutMs: 45_000,
   pollMs: 1_500,
@@ -1963,13 +1969,21 @@ async function clickCopyCode({ client, entity, cfg, shouldAbort }) {
 //   • naam confirm maange (Yes/Cancel) to Yes dabta hai.
 // ---------------------------------------------------------------------------
 export function worldBotNameCandidates(primary = '', phone = '') {
-  const clean = (v) => String(v || '').replace(/[^A-Za-z]/g, '').slice(0, 20);
+  // "Sudhani Kumar" jaisa naam SPACE ke saath hi jata hai (letters + single
+  // space allowed) — pehle space hata kar "SudhaniKumar" ban jata tha.
+  const clean = (v) => String(v || '')
+    .replace(/[^A-Za-z\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 24);
   const out = [];
   const push = (v) => {
     const c = clean(v);
-    if (c.length >= 3 && c.length <= 20 && !out.includes(c)) out.push(c);
+    const letters = c.replace(/\s/g, '');
+    if (letters.length >= 3 && letters.length <= 20 && !out.includes(c)) out.push(c);
   };
-  // 1) jo bhi pipeline ne diya (phone ke pehle 5 digit → a-i, 0 → x)
+  // 1) owner ka default naam, phir jo bhi pipeline ne diya
+  push(WORLD_BOT_DEFAULT_NAME);
   push(primary);
   const digits = String(phone || '').replace(/\D/g, '').slice(-10);
   const map = { 0: 'x', 1: 'a', 2: 'b', 3: 'c', 4: 'd', 5: 'e', 6: 'f', 7: 'g', 8: 'h', 9: 'i' };
@@ -2051,6 +2065,8 @@ async function submitWorldBotName({ client, entity, cfg = {}, shouldAbort = null
   } catch (e) {
     console.warn(`[WorldBot] ⚠️ nameProvider fail: ${String(e?.message || e).slice(0, 90)}`);
   }
+  // 👤 Default naam hamesha list me pehla hota hai — nameProvider kuch bhi
+  // (ya kuch nahi) de, "Sudhani Kumar" hi jaata hai.
   const names = worldBotNameCandidates(primary, phone || state.phone);
   if (!names.length) {
     return { ok: false, kind: 'name_rejected', reason: 'Naam ban hi nahi paya (nameProvider khali/invalid)' };

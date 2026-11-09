@@ -450,9 +450,11 @@ World bots ka default pool: `@SwiggyByworldBot`, `@SwiggyByworld1Bot` …
   nahi. Flow: **Main Menu → Switch Accounts → woh ID → Permanently Logged
   Out → naya number**. Number skip hota hai (ledger me skipped), bot nahi
   badalta. Card: `⛔ Delete Blocked (Charges) — Naya Number`.
-- **Naam phone se:** bot jab naam maange to `swiggyNameFromPhone(phone)` —
-  10 digit ke pehle 5 digit → alphabetic (1→a … 9→i, **0→x**). `92046…` →
-  `ibxdf`, `98765…` → `ihgfe`.
+- **Naam = `Sudhani Kumar`:** bot jab `New Account Detected` bole to naam
+  seedha **`Sudhani Kumar`** jaata hai (space allowed, isliye `SudhaniKumar`
+  nahi banta). Sirf reject hone par fallback: pipeline ka naam, phir
+  `swiggyNameFromPhone(phone)` (pehle 5 digit → alphabetic, 1→a … 9→i,
+  **0→x**: `98765…` → `ihgfe`).
 - **Delete success = turant Main Menu:** delete confirmation ka poll 500ms aur
   Main Menu click bina settle-wait (`settle:false`) — screen aate hi button dab
   jata hai. Uske baad wahi number: Login → OTP Login → number → OTP → naam.

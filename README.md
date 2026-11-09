@@ -46,6 +46,18 @@ hai.
 > **type nahi** hota, wahi number dobara issue hota hai (pehle yahan OTP
 > bekaar chala jata tha aur naam ka step kabhi aata hi nahi tha).
 >
+> ⏳ **“Fixed input ka koi time limit nahi” (2026-11-09):** World Bot ko jo fixed
+> input dena hai (button, number, naam, JSON), us step par chhota timeout nahi —
+> bot apna output dega, tabhi agla input jayega (`SWIGGY_WORLD_STEP_TIMEOUT_MS`
+> default 5 min, start 2 min, OTP ke baad 5 min). **Sirf OTP aur queue ka 20s
+> rule** hai: OTP Sent 20s, queue 20s — OTP **source** (Hermes/Firebase) me code
+> aane ka wait isse alag hai, wahan OTP bot app refresh hota rehta hai.
+>
+> ✍️ **OTP hamesha TYPE hota hai:** World Bot ke screens aksar `(no text)` aate
+> hain. Pehle hum screen padh kar "number prompt aaya hi nahi" maan lete the aur
+> OTP bhejte hi nahi the (owner: "ab OTP hi enter nahi hota"). Ab code mila =
+> code jaata hai; sirf jab bot saaf-saaf number/naam maang raha ho tab nahi.
+>
 > ⛔ **“Cancel kiu ho ja raha?” (2026-11-09):** OTP type karne ke baad bot account
 > bana raha hota hai (queue me 1–2 minute). Us waqt `/start` ya `Cancel` bhejna
 > poora login jala deta hai — bot `❌ Login Cancelled / No account was logged in`
@@ -649,17 +661,17 @@ Helpers `rich-text.js` me hain: `fancy()`, `bracketHeader()`, `headerRule()`, `s
 | `PREMIUM_ACCOUNT_ENGINE` | `direct` | `direct` = apna Swiggy bridge (proxy/WAF) · `worldbot` = @SwiggyByWorldBot ke buttons click (proxy nahi) |
 | `SWIGGY_WORLD_BOT_USERNAME` | `SwiggyByWorldBot` | World Bot ka handle (badalna ho to) — pool me na ho to sabse aage lagta hai |
 | `SWIGGY_WORLD_BOT_USERNAMES` | *(khali)* | Comma wali list se poora bot pool override — default pool: `SwiggyByworldBot, SwiggyByworld1Bot … SwiggyByworld5Bot` (saare same) |
-| `SWIGGY_WORLD_STEP_TIMEOUT_MS` | 45000 | World Bot ke ek step (button/JSON) ka budget |
+| `SWIGGY_WORLD_STEP_TIMEOUT_MS` | 300000 | World Bot ke ek step (button/JSON) ka budget — **koi chhota time limit nahi**, bot apna output dega tabhi agla input |
 | `SWIGGY_WORLD_OTP_TIMEOUT_MS` | 20000 | OTP ka intezaar **sirf 20s** — nahi aaya to number skip (bot wahi) |
 | `SWIGGY_WORLD_OTP_SEND_TIMEOUT_MS` | 20000 | Bot "OTP Sent" 20s me confirm na kare → **bot badlo** |
 | `SWIGGY_WORLD_OTP_INBOX_TIMEOUT_MS` | 90000 | OTP **source** (Hermes/Firebase) me code aane ka intezaar — ye number ki life nahi, 20s se alag budget |
 | `SWIGGY_OTP_REFRESH_MS` | 1000 | OTP bot (Hermes/Hathi) me REFRESH kitni der me — OTP Sent ke baad **har second** refresh, OTP aaye to copy karke world bot me |
 | `SWIGGY_OTP_SCAN_LIMIT` | 30 | OTP bot chat ke kitne aakhri messages padhein (12–60). Thoda bada rakhna accha: refresh se purana card bahar chala jata hai, par id se phir bhi padha jata hai |
-| `SWIGGY_WORLD_QUEUE_WAIT_MS` | 45000 | Bot "queue/wait" bole to itna wait (asli run me OTP Sent ~40-60s baad aata hai); isse zyada → **bot badlo** |
+| `SWIGGY_WORLD_QUEUE_WAIT_MS` | 20000 | Bot "queue/wait" bole to bas **20s** (owner rule: OTP/queue = 20s), isse zyada → **bot badlo** |
 | `SWIGGY_WORLD_TRIGGER` | `auto` | Button **click** → screen na badle to **button ka text likh kar bhej** (`type` = click bilkul nahi) |
-| `SWIGGY_WORLD_CLICK_GRACE_MS` | 4000 | Click ke baad screen badalne ka intezaar, phir text trigger |
-| `SWIGGY_WORLD_OTP_VERIFY_WAIT_MS` | 90000 | OTP type karne ke **baad** bot ke jawab (naam/JSON) ka budget — account creation me waqt lagta hai (30s–240s). 20s sirf OTP **source** ka rule hai |
-| `SWIGGY_WORLD_LOGIN_GUARD_MS` | 300000 | Itne waqt tak `/start` aur `Cancel` **band** jab login khula ho (number/OTP gaya, jawab nahi aaya) — warna World Bot "❌ Login Cancelled" de deta hai |
+| `SWIGGY_WORLD_CLICK_GRACE_MS` | 6000 | Click ke baad screen badalne ka intezaar, phir text trigger (click ka late reply 30s tak dekha jata hai) |
+| `SWIGGY_WORLD_OTP_VERIFY_WAIT_MS` | 300000 | OTP type karne ke **baad** bot ke jawab (naam/JSON) ka budget — account creation me waqt lagta hai (30s–900s). 20s sirf OTP **source** ka rule hai |
+| `SWIGGY_WORLD_LOGIN_GUARD_MS` | 600000 | Itne waqt tak `/start` aur `Cancel` **band** jab login khula ho (number/OTP gaya, jawab nahi aaya) — warna World Bot "❌ Login Cancelled" de deta hai |
 | `SWIGGY_WORLD_LATE_REPLY_GRACE_MS` | 90000 | Step ka budget khatam hone par aakhri dheemi scan — **flood wait hua ho tab hi poora** (warna max 20s), `0` = band. Isse "bekaar me minute bhar baithna" band hua |
 | `SWIGGY_WORLD_NUMBER_RETRIES` | 1 | OTP send confirm na ho (aur bot ne Cancel bhi na bheja ho) to number **skip nahi** — wahi number itni baar `Login → 2 → number` se dobara issue (max 2, `0` = off) |
 | `SWIGGY_WORLD_LOGOUT_AFTER_DELETE` | 1 | JSON file worker bot par jaane ke baad `Switch Accounts → Permanently Logged Out` try kare |

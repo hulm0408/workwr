@@ -63,19 +63,21 @@ export function listWorldBotUsernames(env = process.env) {
 export const WORLD_BOT_DEFAULT_NAME = 'Sudhani Kumar';
 
 export const WORLD_BOT_DEFAULTS = {
-  stepTimeoutMs: 45_000,
+  // ⏳ Owner ka rule (2026-11-09): "fixed input ka koi time limit nahi — bot
+  // output dega, usko samajh kar next input dena hai". Isliye step ka budget
+  // badha diya (45s → 5 min). Sirf OTP/queue ke 20s rule hain, wo neeche.
+  stepTimeoutMs: 300_000,
   pollMs: 1_500,
-  startTimeoutMs: 25_000,
+  startTimeoutMs: 120_000,
   readLimit: 15,
   // Owner rule: OTP bhejne ke baad SIRF 20 second. Nahi aaya = number skip.
   otpTimeoutMs: 20_000,
   // "OTP Sent" confirmation (bot ki taraf se OTP send) ka budget.
   otpSendTimeoutMs: 20_000,
-  // Bot "account creation queue me hai" bole to itna wait — isse zyada =
-  // bot badlo. 👀 Owner ke asli run me queue message ke ~40-60s baad OTP Sent
-  // aata hai, isliye 20s bahut kam pad raha tha (bot bekaar rotate hota tha
-  // aur pending OTP chhoot jata tha) → default 45s.
-  queueWaitMs: 45_000,
+  // ⏱ Owner ka naya rule (2026-11-09): "jab baat OTP aur queue ki ho tab bas
+  // 20 second" — OTP/queue ka apna chhota budget, baaki sab steps ka koi
+  // limit nahi. (20s = OTP bot app refresh karke code bhejne ka window.)
+  queueWaitMs: 20_000,
   // OTP send confirm na ho (aur bot ne Cancel bhi na bheja ho) to number SKIP
   // nahi hota — wahi number itni baar dobara issue hota hai (Login → 2 → number).
   numberRetries: 1,
@@ -83,7 +85,7 @@ export const WORLD_BOT_DEFAULTS = {
   // creation Swiggy par queue me hoti hai — 45s bahut kam padta tha aur hum
   // beech me /start bhej kar poora login cancel kar dete the (owner:
   // "Cancel kiu ho ja raha"). 20s sirf OTP SOURCE ka rule hai, ye alag.
-  otpVerifyWaitMs: 90_000,
+  otpVerifyWaitMs: 300_000,
   // ⏱ Telegram flood wait ke baad bot ka jawab late padha jata hai. Step ka
   // budget khatam hone par turant "fail" na karo — itni der dheemi scan
   // chalti hai (delete/login result ke liye). Warna delete ho chuka account
@@ -259,25 +261,27 @@ export function worldBotConfig(env = process.env) {
     username: currentWorldBotUsername(env),
     usernames: listWorldBotUsernames(env),
     stepTimeoutMs: num('SWIGGY_WORLD_STEP_TIMEOUT_MS', WORLD_BOT_DEFAULTS.stepTimeoutMs),
+    // Main menu / start ka apna budget (step se alag).
+    startTimeoutMs: num('SWIGGY_WORLD_START_TIMEOUT_MS', WORLD_BOT_DEFAULTS.startTimeoutMs, 5_000),
     pollMs: num('SWIGGY_WORLD_POLL_MS', WORLD_BOT_DEFAULTS.pollMs, 300),
     otpTimeoutMs: num('SWIGGY_WORLD_OTP_TIMEOUT_MS', WORLD_BOT_DEFAULTS.otpTimeoutMs, 5_000),
     otpSendTimeoutMs: num('SWIGGY_WORLD_OTP_SEND_TIMEOUT_MS', WORLD_BOT_DEFAULTS.otpSendTimeoutMs, 5_000),
     // OTP type karne ke baad bot ke jawab (naam/JSON) ka budget — account
     // creation me waqt lagta hai. Default 90s (30s–240s clamp).
-    otpVerifyWaitMs: Math.max(30_000, Math.min(240_000,
+    otpVerifyWaitMs: Math.max(30_000, Math.min(900_000,
       num('SWIGGY_WORLD_OTP_VERIFY_WAIT_MS', WORLD_BOT_DEFAULTS.otpVerifyWaitMs, 30_000))),
     // Itne waqt tak /start aur Cancel band rehte hain jab login flow khula ho
     // (number/OTP bheja gaya ho par jawab na aaya ho) — warna World Bot
     // "❌ Login Cancelled" de deta hai.
-    loginGuardMs: Math.max(60_000, Math.min(900_000,
-      num('SWIGGY_WORLD_LOGIN_GUARD_MS', 300_000, 60_000))),
+    loginGuardMs: Math.max(60_000, Math.min(1_800_000,
+      num('SWIGGY_WORLD_LOGIN_GUARD_MS', 600_000, 60_000))),
     queueWaitMs: num('SWIGGY_WORLD_QUEUE_WAIT_MS', WORLD_BOT_DEFAULTS.queueWaitMs, 5_000),
     // Button trigger: 'auto' = pehle click; screen na badle to button ka TEXT
     // type karke action trigger. 'type' = click bilkul nahi, seedha text.
     trigger: ['click', 'type', 'auto'].includes(String(env?.SWIGGY_WORLD_TRIGGER || '').trim().toLowerCase())
       ? String(env.SWIGGY_WORLD_TRIGGER).trim().toLowerCase()
       : 'auto',
-    clickGraceMs: num('SWIGGY_WORLD_CLICK_GRACE_MS', 4_000, 1_000),
+    clickGraceMs: num('SWIGGY_WORLD_CLICK_GRACE_MS', 6_000, 1_000),
     // OTP inbox (Hermes/Firebase) me code aane ka intezaar — 20s se alag.
     otpInboxTimeoutMs: Math.max(30_000, Math.min(180_000,
       num('SWIGGY_WORLD_OTP_INBOX_TIMEOUT_MS', 90_000, 30_000))),
@@ -1883,13 +1887,10 @@ export async function worldBotLogin({
 
       // 6) Outcome: naam ka sawaal = naya account; seedha JSON = purana.
       //
-      // 🚪 "Bot ne OTP liya hi nahi" ko turant pakdo: agar OTP type karne ke
-      // baad screen wapas LOGIN METHOD menu (JSON/TID Login | OTP Login |
-      // Cancel) par aa jaye aur 6s tak wahin rahe, to bot ne code reject kar
-      // diya hai — aise me 45s + 90s wait karna bilkul fizool tha (owner ke
-      // log me yahi hua: 2 min baith kar number jala aur naam ka step kabhi
-      // aaya hi nahi).
-      let menuBackAt = 0;
+      // ⏳ Owner ka rule (2026-11-09): "fixed input ka koi time limit nahi —
+      // bot output dega, usko samajh kar next input dena hai". Isliye jaldi
+      // fail karne wale short-cut (jaise menu ka 6s guess) hata diye hain —
+      // sirf lamba budget aur seedha wait.
       // ⏱ Account creation me waqt lagta hai — 45s ke step budget ki jagah
       // alag (bada) budget. Owner: "20s to diye hain" — haan, 20s sirf OTP
       // SOURCE ka rule hai; OTP type karne ke baad Swiggy ka jawab isse alag
@@ -1900,21 +1901,6 @@ export async function worldBotLogin({
         what: 'login result',
         graceMs: Number(cfg.lateReplyGraceMs) || 90_000,
         predicate: (freshList, all) => {
-          // Login-method menu wapas = OTP accept nahi hua (sirf LATEST bot
-          // message dekho — neeche pada purana menu galti se na pakda jaye).
-          const latestInbound = (Array.isArray(all) ? all : []).find((m) => !m.out) || null;
-          const menuBack = Boolean(latestInbound
-            && pickWorldBotButton(latestInbound.buttons, 'otpLogin')
-            && pickWorldBotButton(latestInbound.buttons, 'cancel'));
-          if (!menuBack) {
-            menuBackAt = 0;
-          } else {
-            if (!menuBackAt) menuBackAt = Date.now();
-            else if (Date.now() - menuBackAt >= 6_000) {
-              console.warn('[WorldBot] 🚪 screen wapas login menu par hai — bot ne OTP nahi liya (wait chhota)');
-              return { kind: 'otpNotAccepted', message: latestInbound };
-            }
-          }
           for (const message of freshList) {
             if (message.hasDocument) return { kind: 'document', message };
             const json = extractWorldBotJson(message.text);
@@ -1947,19 +1933,6 @@ export async function worldBotLogin({
 
       let askedName = false;
       let final = outcome;
-
-      // 🚪 Bot ne OTP liya hi nahi (login menu wapas). Naam ka step kabhi
-      // aayega hi nahi — yahin saaf-saaf bata do (45s+90s wait nahi).
-      if (outcome.kind === 'otpNotAccepted') {
-        await safeCancel(client, entity, cfg).catch(() => {});
-        return {
-          ok: false,
-          kind: 'failed_otp_verify',
-          phone: cleanPhone,
-          code: 'WORLDBOT_OTP_NOT_TAKEN',
-          reason: 'bot ne OTP accept nahi kiya — screen wapas Login menu par aa gayi (naam ka step aaya hi nahi)',
-        };
-      }
 
       if (outcome.kind === 'askName') {
         askedName = true;
@@ -2152,34 +2125,10 @@ async function waitForOtpSent({ client, entity, baseline, cfg, shouldAbort }) {
       if (worldBotHasPromptKind(recent, 'cancelled')) {
         return { ok: false, kind: 'login_cancelled', code: 'WORLDBOT_LOGIN_CANCELLED', reason: 'Bot ne login cancel kar diya (screen: Login Cancelled)' };
       }
-      // 🚪 Owner ke log (2026-11-09) ki asli galti: blank reply ko "OTP Sent"
-      // maan liya gaya, par screen abhi bhi LOGIN METHOD menu
-      // (JSON/TID Login | OTP Login | Cancel) par thi — matlab number hi bot
-      // tak nahi pahuncha. Uske baad OTP type hua (bot ne use bekaar
-      // samjha), 45s+90s wait, aur naam ka step kabhi aaya hi nahi.
-      // Ab: OTP prompt na mile aur screen login menu par ho to OTP Sent
-      // maan kar OTP type nahi karte — wahi number dobara issue hota hai.
-      const awaitingNow = worldBotAwaitingKind(recent);
-      const loginMenuStuck = awaitingNow !== 'otp'
-        && Boolean(roleOnLatest(recent, 'otpLogin') || roleOnLatest(recent, 'jsonLogin') || roleOnLatest(recent, 'login'));
-      if (loginMenuStuck) {
-        if (!menuStuckAt) {
-          menuStuckAt = Date.now();
-          console.warn('[WorldBot] ⏳ blank reply par screen Login menu par hai — OTP prompt ka thoda intezaar');
-        } else if (Date.now() - menuStuckAt >= 5_000) {
-          console.warn('[WorldBot] ❌ bot ne number accept nahi kiya (screen Login menu par hi) — OTP Sent nahi maan raha, wahi number dobara');
-          return {
-            ok: false,
-            kind: 'failed_otp_send',
-            code: 'WORLDBOT_NO_NUMBER_PROMPT',
-            reason: 'bot ne number accept nahi kiya — screen Login menu par hi rahi (OTP prompt aaya hi nahi)',
-          };
-        }
-        if (menuStuckAt) {
-          await sleep(700); // reads ko flood na karo
-          continue;         // dekhna jaari rakho, OTP Sent mat maano
-        }
-      }
+      // ⚠️ World Bot ke screens aksar `(no text)` hote hain — blank/media reply
+      // par yahan OTP Sent maan lete hain (warna OTP kabhi type hi nahi hota;
+      // owner: "ab otp hi enter nahi hota"). Naam/JSON ka jawab baad me
+      // alag se handle hota hai, isliye isse kuch nahi bigadta.
       console.log('[WorldBot] ✅ OTP Sent confirm (blank/media reply, screen khali) — ab OTP bot se code');
       return { ok: true, kind: 'otpSent', confirmedBy: blankReplyMedia ? 'media-reply' : 'blank-reply' };
     }
@@ -2240,20 +2189,10 @@ async function sendWorldCode(client, entity, code, cfg = {}) {
     return { ok: false, reason: `bot-${awaiting}-maang-raha-hai` };
   }
   if (awaiting !== 'otp') {
-    // 🚪 Screen seedha LOGIN MENU (JSON/TID Login | OTP Login | Cancel) par
-    // ho to number hi bot tak nahi pahuncha — OTP type karna bekaar hai:
-    // bot use number/command samajh leta hai, aur naam ka step kabhi nahi
-    // aata (owner ka 2026-11-09 wala log bilkul yahi tha).
-    const firstFew = (Array.isArray(lookScreen) ? lookScreen : []).slice(0, 3);
-    const onLoginMenu = Boolean(
-      roleOnLatest(lookScreen, 'otpLogin') || roleOnLatest(lookScreen, 'jsonLogin')
-      || worldBotHasPromptKind(firstFew, 'loginScreen') || worldBotHasPromptKind(firstFew, 'menu')
-    );
-    if (onLoginMenu) {
-      console.warn('[WorldBot] OTP type nahi kiya — screen Login menu par hai (number prompt aaya hi nahi)');
-      return { ok: false, reason: 'bot-number-prompt-missing' };
-    }
-    // Screen saaf/mixed hai — phir bhi OTP bhejte hain (ye hi asli kaam hai).
+    // ⚠️ Owner ka rule (2026-11-09): "OTP aa jaye to TYPE karo". World Bot ke
+    // screens aksar `(no text)` aate hain — sirf buttons padh kar ye maan lena
+    // ki "number prompt aaya hi nahi" GALAT tha: isi wajah se OTP enter hi
+    // nahi hota tha. Screen kuch bhi dikhaye, code mila hai to bhejte hain.
     console.warn('[WorldBot] OTP screen saaf nahi mili — phir bhi OTP bhej raha hoon');
   }
 
@@ -2551,7 +2490,9 @@ async function clickOrType({
       // karne me bahut time"). Click ke baad sirf thoda intezaar: screen na
       // badle to neeche wala text-trigger khud dobara check karke kaam kar
       // deta hai — isliye yahan lamba scan bilkul fizool hai.
-      const clickLateScanMs = graceMs === undefined ? 8_000 : Math.max(0, Number(graceMs) || 0);
+      // Click ka jawab der se aata hai — pehle 8s tha, ab 30s (owner: koi
+      // time limit nahi). Isse double-command (click + text) nahi jata.
+      const clickLateScanMs = graceMs === undefined ? 30_000 : Math.max(0, Number(graceMs) || 0);
       const hit = await waitForReply({
         client, entity, baseline: before, timeoutMs: grace, shouldAbort,
         what: `${what} (click)`, predicate, pollMs: cfg?.pollMs,

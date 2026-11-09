@@ -3994,6 +3994,180 @@ Thanks`)),
       'naam step: bot confirm maange to "✅ Yes" dabta hai, phir JSON');
   }
 
+  // ---------------------------------------------------------------------
+  // 🎬 POORA FLOW — asli World Bot jaisa fake Telegram client (owner ka
+  // favourable outcome): number → OTP → naam → JSON, phir purana account:
+  // Order Hub → account → Delete → delete OTP → Main Menu → wahi number →
+  // OTP → naam → JSON, phir Switch Account → account → Permanent Logout → Yes.
+  // ---------------------------------------------------------------------
+  const JSON_SAMPLE = '{"tid":"abc123","token":"tok","cookies":[{"name":"a","value":"b"}]}';
+  const makeFakeWorldBot = ({ startWithAccount = false } = {}) => {
+    const chat = [];
+    let id = 0;
+    const accounts = new Map(startWithAccount ? [['9876543210', { name: 'ihgfe' }]] : []);
+    let awaiting = '';
+    let pendingPhone = '';
+    let loggedIn = startWithAccount ? '9876543210' : '';
+    let startSendsDuringFlow = 0;
+    const push = (text, buttons = [], out = false) => {
+      const m = { id: ++id, out, text, buttons, date: new Date() };
+      chat.unshift(m);
+      return m;
+    };
+    const btn = (text, onClick) => ({ text, click: async () => { await onClick?.(); return { message: 'ok' }; } });
+    const loginJson = () => {
+      push(`✅ Login Successful\n\n👤 ${accounts.get(loggedIn)?.name || 'ihgfe'}\n📱 ${loggedIn}\n🆔 Customer ID: 44821`);
+      push(`Login JSON\n\nTap Copy on the code block below (1-tap).\n\`\`\`json\n${JSON_SAMPLE}\n\`\`\``);
+    };
+    const logoutConfirm = () => push('Kya sach me logout karna hai?', [[
+      btn('✅ Yes', async () => { accounts.delete(loggedIn); loggedIn = ''; awaiting = ''; push('🗑 Permanent Logout Successful'); }),
+    ], [btn('❌ Cancel')]]);
+    const accountMenu = () => push(`👤 ${accounts.get(loggedIn)?.name || 'Kya be'} - ${loggedIn}`, [
+      [btn('Delete Account', async () => {
+        awaiting = 'delete-otp';
+        push('✅ Delete OTP Sent\n\nSend the 6-digit OTP sent to your Swiggy number.\nThe account will be permanently deleted.\n\nSend /cancel to cancel.');
+      })],
+      [btn('🗑 Permanent Logout', async () => logoutConfirm())],
+      [btn('Switch Accounts')],
+    ]);
+    const accountList = () => push('Account chuno:', [[btn(`Kya be - ${loggedIn || pendingPhone}`, async () => accountMenu())]]);
+    const pushMenu = () => push('🏠 Main Menu\n\nPick a feature:', [
+      [btn('🔐 Login', async () => push('🔐 Swiggy Login\n\nSelect a login method:', [[
+        btn('1️⃣ JSON/TID Login', async () => push('JSON login')),
+        btn('2️⃣ OTP Login', async () => { awaiting = 'number'; push('📱 OTP Login\n\nSend your 10-digit Swiggy number.'); }),
+      ], [btn('Cancel')]]))],
+      [btn('Swiggy Accounts', async () => accountList())],
+      [btn('Order Hub', async () => accountList())],
+      [btn('Switch Accounts', async () => accountList())],
+    ]);
+    pushMenu();
+    const client = {
+      async getMessages(_e, { limit = 10 } = {}) { return chat.slice(0, Math.max(1, limit)); },
+      async getEntity() { return { id: 'bot' }; },
+      async downloadMedia() { return Buffer.from('{}'); },
+      async sendMessage(_e, { message }) {
+        push(message, [], true);
+        const text = String(message || '').trim();
+        if (text === '/start') {
+          // 🛑 Owner rule test: /start kabhi bhi is waqt na jaye jab bot number/
+          // OTP/naam maang raha ho (warna flow reset ho jata hai).
+          if (awaiting) startSendsDuringFlow += 1;
+          awaiting = '';
+          pushMenu();
+          return { id: ++id };
+        }
+        if (awaiting === 'number' && /^[6-9]\d{9}$/.test(text)) {
+          pendingPhone = text;
+          awaiting = 'otp';
+          push('✅ OTP Sent\n\nSend the 6-digit OTP you received from Swiggy.');
+          return { id: ++id };
+        }
+        if (awaiting === 'otp' && /^\d{6}$/.test(text)) {
+          if (accounts.has(pendingPhone)) { loggedIn = pendingPhone; awaiting = ''; loginJson(); }
+          else { awaiting = 'name'; push('🆕 New Account Detected!\n\nTell us the name to set on your Swiggy account.'); }
+          return { id: ++id };
+        }
+        if (awaiting === 'delete-otp' && /^\d{6}$/.test(text)) {
+          awaiting = '';
+          accounts.delete(loggedIn);
+          loggedIn = '';
+          push('✅ Account Deleted Successfully\n\n🧾 Swiggy: User successfully archived\n📌 StatusCode: 33', [[btn('🏠 Main Menu', async () => pushMenu())]]);
+          return { id: ++id };
+        }
+        if (awaiting === 'name' && /^[A-Za-z]{3,20}$/.test(text)) {
+          accounts.set(pendingPhone, { name: text });
+          loggedIn = pendingPhone;
+          awaiting = '';
+          loginJson();
+          return { id: ++id };
+        }
+        return { id: ++id };
+      },
+    };
+    return {
+      client, chat,
+      state: () => ({ awaiting, pendingPhone, loggedIn, accounts: [...accounts.keys()], startSendsDuringFlow }),
+    };
+  };
+  const flowCfg = {
+    stepTimeoutMs: 6_000, pollMs: 80, clickGraceMs: 700, lateReplyGraceMs: 1_000,
+    otpSendTimeoutMs: 4_000, queueWaitMs: 2_000, otpInboxTimeoutMs: 5_000,
+  };
+
+  // 1️⃣ Naya number: number → OTP → naam → JSON
+  wb._resetWorldBotReadCacheForTests();
+  {
+    const fake = makeFakeWorldBot();
+    wb._setWorldBotClientOverrideForTests(fake.client);
+    try {
+      const login = await wb.worldBotLogin({
+        phone: '9876543210',
+        otpProvider: async () => ({ code: '445566' }),
+        otpWatermark: async () => ({}),
+        nameProvider: async () => 'ihgfe',
+        config: flowCfg,
+      });
+      const sent = fake.chat.filter((m) => m.out).map((m) => String(m.text));
+      ok(login.ok && login.askedName && String(login.jsonText || '').includes('"tid"'),
+        `flow: naya number — OTP → naam → JSON (${login.kind || login.reason})`);
+      ok(sent.includes('ihgfe') && sent.includes('445566') && sent.includes('9876543210'),
+        `flow: bot ko number, OTP aur naam teeno gaye (${sent.join(' · ')})`);
+      ok(fake.state().accounts.includes('9876543210'),
+        'flow: naya account ban gaya (naam accept hua)');
+    } finally {
+      wb._setWorldBotClientOverrideForTests(null);
+    }
+  }
+
+  // 2️⃣ Purana account: login → Order Hub → account → Delete → delete OTP →
+  //    Main Menu → wahi number → OTP → naam → JSON → logout (Switch Account).
+  wb._resetWorldBotReadCacheForTests();
+  {
+    const fake = makeFakeWorldBot({ startWithAccount: true });
+    wb._setWorldBotClientOverrideForTests(fake.client);
+    try {
+      const first = await wb.worldBotLogin({
+        phone: '9876543210',
+        otpProvider: async () => ({ code: '111111' }),
+        otpWatermark: async () => ({}),
+        nameProvider: async () => 'ihgfe',
+        config: flowCfg,
+      });
+      ok(first.ok && first.askedName === false,
+        'flow: purana account — naam nahi poochha (delete karna hai)');
+
+      const del = await wb.worldBotDeleteAccount({
+        phone: '9876543210',
+        otpProvider: async () => ({ code: '222222' }),
+        otpWatermark: async () => ({}),
+        config: flowCfg,
+      });
+      ok(del.ok && del.kind === 'deleted' && del.atMenu,
+        `flow: delete — Order Hub → account → Delete → OTP → Deleted → Main Menu (${del.kind || del.reason})`);
+
+      const again = await wb.worldBotLogin({
+        phone: '9876543210',
+        otpProvider: async () => ({ code: '333333' }),
+        otpWatermark: async () => ({}),
+        nameProvider: async () => 'ihgfe',
+        config: flowCfg,
+        fresh: true,
+      });
+      ok(again.ok && again.askedName && String(again.jsonText || '').includes('"tid"'),
+        `flow: delete ke baad WAHI number se naya account + JSON (${again.kind || again.reason})`);
+
+      const out = await wb.worldBotPermanentLogout({ phone: '9876543210', config: flowCfg });
+      ok(out.ok && out.kind === 'logged_out',
+        `flow: logout — Switch Account → account → Permanent Logout → Yes (${out.kind || out.reason})`);
+      ok(!fake.state().accounts.includes('9876543210'),
+        'flow: logout ke baad account My Swiggy Accounts se hat gaya');
+      ok(fake.state().startSendsDuringFlow === 0,
+        `flow: bot number/OTP/naam maang raha ho to /start kabhi nahi (${fake.state().startSendsDuringFlow} baar gaya)`);
+    } finally {
+      wb._setWorldBotClientOverrideForTests(null);
+    }
+  }
+
   ok(wb.shouldReissueWorldOtp('login_cancelled') === true
     && wb.shouldReissueWorldOtp('worldbot_offline') === false
     && wb.shouldReissueWorldOtp('number_blocked') === false,

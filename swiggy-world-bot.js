@@ -274,6 +274,11 @@ export function worldBotButtonRole(text = '') {
   // 🏠 "Main Menu" / "Back to Menu" — delete ke baad owner ka step: pehle
   // Main Menu dabao, phir Login (na /start, na seedha Login).
   if (/\b(main\s*menu|back\s*to\s*menu|home|start\s*over)\b/.test(n)) return 'mainMenu';
+  // ✍️ Naam ka button ("Send Name" / "Enter Name" / "Naam bhejo") — kuch
+  // screens par pehle ye dabana padta hai, tab hi free text chalta hai.
+  if (/\b(send|enter|type|set|add|change|update)\b.{0,12}\bname\b/.test(n)
+    || /\bname\b.{0,12}\b(send|enter|type|set|bhejo|likho|daalo|batao)\b/.test(n)
+    || /\bnaam\b/.test(n)) return 'nameEntry';
   if (/\b(cancel|back)\b/.test(n)) return 'cancel';
   if (/\blogin\b/.test(n)) return 'login';
   return '';
@@ -386,10 +391,19 @@ export function worldBotLooksLikeNamePrompt(text = '', buttons = []) {
   const raw = String(text || '');
   const n = norm(raw);
   if (!n) return false;
+  // 🆕 "New Account Detected" jaisa marker sabse strong signal hai — isme
+  // "OTP verified" / "number" / Cancel button bhi hote hain, phir bhi ye naam
+  // ka hi step hai (yehi wajah thi ki naam ka prompt miss ho raha tha).
+  if (/\bnew account detected\b/.test(n)
+    || (/\b(name|naam)\b/.test(n) && /\b(new|naya)\s+(swiggy\s+)?account\b/.test(n))) return true;
   if (Array.isArray(buttons) && buttons.length) return false;   // button wali screen = menu/confirm
   if (/\b(invalid|error|fail|failed|could not|cannot|suspended|expired|cancel|blocked|charge|due)\b/.test(n)) return false;
   if (/\b(otp|code|json|tid|token|cookie|session|order|menu|wallet|logout|login)\b/.test(n)) return false;
   if (/\d{4,}/.test(n)) return false;                           // number/OTP/ID wala text nahi
+  // "✅ Name set: Sudhani Kumar" / "Welcome …" = naam ACCEPT ho gaya, dobara
+  // poochha nahi ja raha — ise prompt samajh kar naam dobara bhejna galat tha.
+  if (/\b(name|naam)\s*(?:is|has been|was)?\s*(?:successfully\s+)?(?:set|saved|updated|changed|accepted)\b/.test(n)
+    || /\bwelcome\b/.test(n)) return false;
   if (/\b(name|naam)\b/.test(n) || /\?/.test(raw) || /\b(your good name|call you|apna naam)\b/.test(n)) return true;
   // "🆕 New Account Detected!" jaisa chhota plain message bhi naam ka step hai.
   const words = n.split(' ').filter(Boolean).length;
@@ -446,9 +460,23 @@ export function worldBotPromptKind(text = '') {
   // ⚠️ "OTP bhejne ke liye 10 digit number bhejo" me bhi "OTP" + "bhej" hai —
   // ise OTP Sent maan lena galat tha (number maang raha hota hai). Pehle wahi
   // pakdo. Asli confirmation me "sent"/"bhej diya" hota hai, "bhejo" nahi.
+  // 🔤 Naam ke signals PEHLE compute karo. Warna naam ka prompt jisme
+  // "Send" + "number" dono hain (asli bot: "🆕 New Account Detected! This
+  // number is not registered with Swiggy. Send your name …") `askNumber` ban
+  // jata tha aur flow number DOBARA bhej deta tha → "Invalid Mobile Number".
+  const nameAskSignals = /\b(name|naam)\b/.test(n)
+    || /\b(what should (we|i) call you|call you|your good name|apna naam|naam likh|naam bhej|naam daal|naam batao|your name please)\b/.test(n);
+  const newAccountMarker = /\bnew account detected\b/.test(n)
+    || /\b(new|naya)\s+(swiggy\s+)?account\b/.test(n)
+    // "This number is not registered … send your NAME" — par akela
+    // "Account not found" naam ka step nahi hai, isliye 'name' lafz zaroori.
+    || (/(?:not|nahi)\s+(?:registered|found|exists?|linked)/.test(n)
+      && /\b(name|naam)\b/.test(n))
+    || /\bcreate\s+(?:a\s+|your\s+|new\s+|naya\s+)*account\b/.test(n);
+  const nameScreen = newAccountMarker || nameAskSignals;
   const asksForNumber = /\b(send|enter|type|provide|bhejo|bhej do|batao|daalo|daal do)\b/.test(n)
     && /\b(10\s?-?digit|mobile|number|namber)\b/.test(n);
-  if (asksForNumber && !/\b(otp sent|otp has been sent|code sent|sent to|otp bhej diya|bhej diya)\b/.test(n)) {
+  if (asksForNumber && !nameScreen && !/\b(otp sent|otp has been sent|code sent|sent to|otp bhej diya|bhej diya)\b/.test(n)) {
     return 'askNumber';
   }
   if (/\b(otp sent|otp bhej|send the 6 digit otp)\b/.test(n)) return 'otpSent';
@@ -461,18 +489,25 @@ export function worldBotPromptKind(text = '') {
     || /\b(name|naam)\b.{0,25}\b(invalid|galat|wrong|not valid|letters? only|alphabets? only|3\s*(?:-|to|se)\s*20|reject\w*)\b/.test(n)
     || /\b(try (a )?(different|another)|dobara|phir se)\b.{0,20}\b(name|naam)\b/.test(n)
     || /\bname\b.{0,20}\b(already (taken|exists)|must be|should be|should contain)\b/.test(n)) return 'nameFail';
-  // Naam ka sawaal — "What is your name?", "Send your name", "apna naam batao".
-  // Asli bot lamba likhta hai: "🆕 New Account Detected! Tell us the name to
-  // set on your Swiggy account." — pehle 12-word limit ki wajah se ye miss ho
-  // jata tha aur bot naam ka intezaar karta reh jata tha.
-  // Bot har baar "name" shabd nahi likhta — kuch screens par sirf poochhta hai
-  // "What should we call you?" / "Apna naam likho". Ye bhi naam ka step hai.
-  const asksName = /\b(name|naam)\b/.test(n)
-    || /\b(what should (we|i) call you|call you|your good name|apna naam|naam likh|naam bhej|naam daal|naam batao|your name please)\b/.test(n);
-  if (asksName
-    && !/\b(otp|code|10\s?-?digit|mobile\s*number|send your 10|main menu|login successful)\b/.test(n)
-    && !/\b(rate limit|queue|suspended|attempts exceeded)\b/.test(n)
-    && n.split(' ').filter(Boolean).length <= 30) return 'askName';
+  // ✅ Naam ACCEPT ho gaya — bot apna hi echo bhejta hai
+  // ("✅ Name set: Sudhani Kumar" / "Account created"). Ise dobara naam ka
+  // prompt samajhna galat tha: flow naam phir type karta, bot "Invalid name"
+  // deta aur step ghoomta reh jata tha.
+  // "name to set" (prompt) ko acceptance na samjho — sirf "name set/saved"
+  // (aur koi maangne wala verb na ho) acceptance hai.
+  const nameAccepted = !/\b(send|enter|type|tell us|provide|bhejo|batao|likho|daalo)\b/.test(n)
+    && (/\b(name|naam)\s*(?:is|has been|was)?\s*(?:successfully\s+)?(?:set|saved|updated|changed|accepted)\b/.test(n)
+      || /\b(name|naam)\s+(?:set|saved|updated|changed)\s*[:\-]/.test(n)
+      || /\b(welcome|account (created|ban gaya|successfully created))\b/.test(n));
+  if (nameAccepted) return 'nameOk';
+  // Naam ka sawaal ("Send your name" / "What should we call you?") ya
+  // "🆕 New Account Detected" marker — dono naam ka hi step hain. Marker me
+  // "OTP Verified" / "number" / Cancel button hote hain, phir bhi ye naam ka
+  // prompt hai; pehle inhi wajah se ye askName nahi banta tha aur flow 45s+90s
+  // dead wait ke baad dobara login karta tha (naya OTP = number jal jata tha).
+  const blocked = /\b(rate limit|queue|suspended|attempts exceeded|main menu|login successful)\b/.test(n);
+  if (nameScreen && !blocked
+    && n.split(' ').filter(Boolean).length <= 40) return 'askName';
   if (/\b(send|enter|type|provide|bhejo|batao)\b/.test(n) && /\b(10 digit|10-digit|mobile|number)\b/.test(n)) return 'askNumber';
   return '';
 }
@@ -2072,6 +2107,32 @@ async function submitWorldBotName({ client, entity, cfg = {}, shouldAbort = null
     return { ok: false, kind: 'name_rejected', reason: 'Naam ban hi nahi paya (nameProvider khali/invalid)' };
   }
   let baseline = screenSignature(await parseScreenMessages(client, entity).catch(() => []));
+  // 🔎 Owner ke log me pata chale bot exactly kya maang raha hai.
+  try {
+    const firstScreen = await parseScreenMessages(client, entity, 2, { fresh: true });
+    const prompt = firstScreen.find((m) => !m.out && worldBotPromptKind(m.text) === 'askName')
+      || firstScreen.find((m) => !m.out);
+    if (prompt) {
+      console.log(`[WorldBot] 🔤 naam prompt: ${String(prompt.text || '').replace(/\s+/g, ' ').slice(0, 120)}`
+        + ` · [${(prompt.buttons || []).map((b) => b.text).join(' | ') || 'no buttons'}]`);
+    }
+  } catch {}
+  console.log(`[WorldBot] 🔤 naam candidates: ${names.join(' | ')}`);
+  // ✍️ Screen par naam ka apna button ho to pehle wahi dabao (kuch screens par
+  // free text tabhi accept hota hai). Cancel/menu/back kabhi nahi dabta.
+  try {
+    const screen = await parseScreenMessages(client, entity, 3, { fresh: true });
+    const nameBtn = screen
+      .map((m) => pickWorldBotButton(m.buttons, 'nameEntry'))
+      .find(Boolean);
+    if (nameBtn) {
+      console.log(`[WorldBot] 🖱 naam ka button: ${String(nameBtn.text || '').slice(0, 40)}`);
+      await clickWorldButton(nameBtn).catch((e) => console.warn(`[WorldBot] naam button click: ${String(e?.message || e).slice(0, 70)}`));
+      await sleep(600);
+      baseline = screenSignature(await parseScreenMessages(client, entity).catch(() => []));
+    }
+  } catch {}
+  const resent = new Set();
   for (let i = 0; i < names.length; i += 1) {
     const name = names[i];
     setPhase('send-name');
@@ -2118,6 +2179,16 @@ async function submitWorldBotName({ client, entity, cfg = {}, shouldAbort = null
     }
 
     if (res?.kind === 'askAgain' || res?.kind === 'nameFail') {
+      // 🔁 Sirf PROMPT dobara aaya (koi "Invalid name" nahi) = hamara naam
+      // shayad process hi nahi hua (race/flood). Pehle WAHI naam ek baar
+      // dobara bhejo — turant agla naam bhejna bot ko galat naam de deta tha.
+      if (res.kind === 'askAgain' && !resent.has(name)) {
+        resent.add(name);
+        console.warn(`[WorldBot] 🔁 naam ka prompt dobara aaya (koi reject nahi) — wahi "${name}" phir bhej raha hoon`);
+        baseline = screenSignature(await parseScreenMessages(client, entity).catch(() => []));
+        i -= 1;   // isi naam par ek aur try
+        continue;
+      }
       console.warn(`[WorldBot] ❌ bot ne naam accept nahi kiya ("${name}", ${res.kind}) — agla naam try (naya number ya /start nahi)`);
       baseline = screenSignature(await parseScreenMessages(client, entity).catch(() => []));
       continue;
@@ -2129,7 +2200,9 @@ async function submitWorldBotName({ client, entity, cfg = {}, shouldAbort = null
     const nowScreen = await parseScreenMessages(client, entity, 4, { fresh: true }).catch(() => []);
     const asksAgain = worldBotHasPromptKind(nowScreen, 'askName') || worldBotHasPromptKind(nowScreen, 'nameFail');
     const latestInbound = nowScreen.find((m) => !m.out) || null;
-    const guessName = latestInbound
+    // "✅ Name set" (nameOk) par guess NAHI — wo accept hai, prompt nahi.
+    const latestKind = latestInbound ? worldBotPromptKind(latestInbound.text) : '';
+    const guessName = latestInbound && !latestKind
       && worldBotLooksLikeNamePrompt(latestInbound.text, latestInbound.buttons);
     if (asksAgain || guessName) {
       if (!asksAgain) console.warn('[WorldBot] 🔤 naam dobara maanga lag raha hai (guess) — agla naam bhej raha hoon');

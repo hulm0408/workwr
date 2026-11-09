@@ -3924,6 +3924,40 @@ Thanks`)),
     && wb.worldBotPromptKind('This name is already taken, try another name') === 'nameFail'
     && wb.worldBotPromptKind('🆕 New Account Detected!\n\nTell us the name to set on your Swiggy account.') === 'askName',
   'naam: reject hone wale jawab (nameFail) askName se alag — warna 90s wait + /start');
+  // 🆕 Asli bot ke wording variants — inhi par flow atak raha tha:
+  //   • "✅ OTP Verified! 🆕 New Account Detected! Send the name…"  (OTP lafz)
+  //   • "🆕 New Account Detected! This number is not registered… Send your name" (number lafz)
+  //   • akela "🆕 New Account Detected!" (koi detail nahi)
+  ok(wb.worldBotPromptKind('✅ OTP Verified!\n\n🆕 New Account Detected!\n\nSend the name you want on your new Swiggy account.') === 'askName'
+    && wb.worldBotPromptKind('🆕 New Account Detected!\n\nThis number is not registered with Swiggy. Send your name (3-20 letters) to create an account. Reply /cancel to cancel.') === 'askName'
+    && wb.worldBotPromptKind('🆕 New Account Detected!') === 'askName'
+    && wb.worldBotPromptKind('Naya account detected hai! Apna naam bhejo.') === 'askName',
+  'naam: "New Account Detected" wala marker askName hai — OTP/number lafz se bhi na ruke');
+  ok(wb.worldBotLooksLikeNamePrompt('✅ OTP Verified!\n\n🆕 New Account Detected!\n\nSend your name.', [{ text: '❌ Cancel' }]) === true
+    && wb.worldBotLooksLikeNamePrompt('🆕 New Account Detected! This number is not registered. Send your name.', []) === true,
+  'naam: marker + Cancel button ho to bhi naam ka prompt maana jaye');
+  ok(wb.worldBotPromptKind('✅ Name set: Sudhani Kumar') === 'nameOk'
+    && wb.worldBotPromptKind('✅ Your name is successfully set to Sudhani Kumar') === 'nameOk'
+    && wb.worldBotLooksLikeNamePrompt('✅ Name set: Sudhani Kumar', []) === false,
+  'naam: accept ka echo (nameOk) dobara prompt nahi — warna naam phir type hota');
+  // ✍️ Kuch screens par naam ka apna BUTTON hota hai ("Send Name") — pehle
+  // wahi dabana padta hai, tab free text chalta hai.
+  ok(wb.worldBotButtonRole('✍️ Send Name') === 'nameEntry'
+    && wb.worldBotButtonRole('Enter Name') === 'nameEntry'
+    && wb.worldBotButtonRole('Naam bhejo') === 'nameEntry'
+    && wb.worldBotButtonRole('❌ Cancel') === 'cancel'
+    && wb.worldBotButtonRole('🏠 Main Menu') === 'mainMenu'
+    && Boolean(wb.pickWorldBotButton([{ text: '❌ Cancel' }, { text: '✍️ Enter Name' }], 'nameEntry')),
+  'naam: naam ka button (Send/Enter Name) alag role hai — Cancel/Menu kabhi nahi');
+  ok(wb.worldBotPromptKind('❌ Account not found. Try another.') === ''
+    && wb.worldBotPromptKind('👤 Sudhani Kumar - 9876543210') === ''
+    && wb.worldBotPromptKind('Account chuno:') === '',
+  'naam: "Account not found" / account list naam ka prompt nahi (galat jagah naam nahi jata)');
+  ok(wb.worldBotPromptKind('📱 OTP Login\n\nSend your 10-digit Swiggy number.') === 'askNumber'
+    && wb.worldBotPromptKind('📱 OTP Sent\n\nSend the 6-digit OTP you received from Swiggy.') === 'otpSent'
+    && wb.worldBotPromptKind('🏠 Main Menu\n\nPick a feature:') === 'menu'
+    && wb.worldBotPromptKind('🚦 Rate limit — account creation queued, wait') === 'queued',
+  'naam: baaki screens (number/OTP/menu/queue) apne hi kind par rehte hain');
   ok(wbFlowSrc.includes('async function submitWorldBotName') && wbFlowSrc.includes('worldBotNameCandidates')
     && wbFlowSrc.includes('const nameRes = await submitWorldBotName'),
   'naam: login flow naam step helper se karta hai (khali naam/invalid naam handle)');
@@ -3968,6 +4002,81 @@ Thanks`)),
       `naam step: default naam reject → agla candidate bheja (${sent.join(' → ') || 'kuch nahi'})`);
     ok(res.ok && res.final?.kind === 'json' && String(res.final?.json?.text || '').includes('"tid"'),
       'naam step: doosre naam par JSON mil gaya (timeout/`/start` nahi)');
+  }
+
+  // ✍️ Button wala naam step: text tabhi chalta hai jab pehle "Send Name" dabta hai.
+  wb._resetWorldBotReadCacheForTests();
+  {
+    const entity = { id: 'wb-name-btn' };
+    const sent = [];
+    let nextId = 70;
+    let unlocked = false;
+    let clicks = 0;
+    const box = [];
+    const pushMsg = (text, buttons = [], out = false) => box.unshift({ id: ++nextId, text, buttons, out });
+    const nameButton = {
+      text: '✍️ Send Name',
+      async click() {
+        clicks += 1;
+        unlocked = true;
+        pushMsg('🆕 New Account Detected!\n\nSend the name you want on your Swiggy account.');
+        return { message: 'ok' };
+      },
+    };
+    pushMsg('🆕 New Account Detected!\n\nTap the button below to set your name.', [[nameButton]]);
+    const client = {
+      async getMessages() { return [...box]; },
+      async sendMessage(_e, { message }) {
+        sent.push(message);
+        pushMsg(message, [], true);
+        if (unlocked) {
+          pushMsg(`✅ Name set: ${message}`);
+          pushMsg('Login JSON\nTap Copy on the code block below\n{\"tid\":\"btn1\",\"token\":\"tok\",\"cookies\":[]}');
+        }
+        return true;
+      },
+    };
+    const res = await wb._submitWorldBotNameForTests({
+      client, entity, phone: '9876543210',
+      nameProvider: async () => 'ihgfe',
+      cfg: { stepTimeoutMs: 4_000, pollMs: 150, lateReplyGraceMs: 800 },
+    });
+    ok(clicks === 1 && res.ok && sent[0] === 'Sudhani Kumar',
+      `naam: pehle "Send Name" button dabta hai, phir default naam jata hai (clicks ${clicks}, sent ${sent.join('→') || 'kuch nahi'})`);
+  }
+
+  // 🔁 Prompt dobara aaya (koi "Invalid name" nahi) = hamara naam process nahi hua.
+  // Yahan WAHI naam dobara jata hai (naya/agla naam nahi), phir JSON.
+  wb._resetWorldBotReadCacheForTests();
+  {
+    const entity = { id: 'wb-name-repeat' };
+    const sent = [];
+    let nextId = 50;
+    const promptText = '✅ OTP Verified!\n\n🆕 New Account Detected!\n\nThis number is not registered with Swiggy. Send your name (3-20 letters) to create an account.';
+    const box = [{ id: 1, out: false, text: promptText, buttons: [] }];
+    const client = {
+      async getMessages() { return [...box]; },
+      async sendMessage(_e, { message }) {
+        sent.push(message);
+        box.unshift({ id: ++nextId, out: true, text: message, buttons: [] });
+        if (sent.length === 1) {
+          // Pehla naam "gum" ho gaya — bot wahi prompt dobara bhejta hai.
+          box.unshift({ id: ++nextId, out: false, text: promptText, buttons: [] });
+        } else {
+          box.unshift({ id: ++nextId, out: false, text: '✅ Name set: Sudhani Kumar', buttons: [] });
+          box.unshift({ id: ++nextId, out: false, text: 'Login JSON\nTap Copy on the code block below\n{"tid":"rep1","token":"tok","cookies":[]}', buttons: [] });
+        }
+        return true;
+      },
+    };
+    const res = await wb._submitWorldBotNameForTests({
+      client, entity, phone: '9876543210',
+      nameProvider: async () => 'ihgfe',
+      cfg: { stepTimeoutMs: 4_000, pollMs: 150, lateReplyGraceMs: 800 },
+    });
+    ok(res.ok && sent.length === 2 && sent[0] === 'Sudhani Kumar' && sent[1] === 'Sudhani Kumar'
+      && res.name === 'Sudhani Kumar',
+    `naam: prompt dobara aaya to WAHI naam phir bheja (${sent.join(' → ') || 'kuch nahi'})`);
   }
 
   // 🧪 Confirm wala case: bot "Yes/Cancel" poochhe to Yes dabta hai (Cancel kabhi nahi).
@@ -4072,7 +4181,13 @@ Thanks`)),
         }
         if (awaiting === 'otp' && /^\d{6}$/.test(text)) {
           if (accounts.has(pendingPhone)) { loggedIn = pendingPhone; awaiting = ''; loginJson(); }
-          else { awaiting = 'name'; push('🆕 New Account Detected!\n\nTell us the name to set on your Swiggy account.'); }
+          // Asli bot ka wording: isi message me "OTP Verified" aur "number" dono
+          // hote hain — isi wajah se pehle naam ka prompt miss/askNumber ban
+          // jata tha aur flow number dobara bhej deta tha.
+          else {
+            awaiting = 'name';
+            push('✅ OTP Verified!\n\n🆕 New Account Detected!\n\nThis number is not registered with Swiggy. Send your name (3-20 letters) to create an account.\n\nSend /cancel to cancel.');
+          }
           return { id: ++id };
         }
         if (awaiting === 'delete-otp' && /^\d{6}$/.test(text)) {
@@ -4121,6 +4236,8 @@ Thanks`)),
         `flow: naya number — OTP → naam → JSON (${login.kind || login.reason})`);
       ok(sent.includes('Sudhani Kumar') && sent.includes('445566') && sent.includes('9876543210'),
         `flow: bot ko number, OTP aur default naam (Sudhani Kumar) teeno gaye (${sent.join(' · ')})`);
+      ok(sent.filter((t) => t === '9876543210').length === 1,
+        `flow: naam ke waqt number DOBARA nahi gaya (warna "Invalid Mobile Number") — ${sent.filter((t) => t === '9876543210').length}x`);
       ok(fake.state().accounts.includes('9876543210'),
         'flow: naya account ban gaya (naam accept hua)');
     } finally {

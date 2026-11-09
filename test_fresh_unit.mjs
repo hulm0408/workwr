@@ -4952,14 +4952,26 @@ Thanks`)),
   ok(pipelineSrc.includes("telegramMode\n        ? '→ Number + OTP OTP-bot chat se"),
     'worldbot failover: login card source ke hisaab se');
 
-  // --- START ke 3 source buttons ---
+  // --- START ke source buttons: OTP bot + Chromium / OTP bot + Swiggy World ---
   const presets = await import('./start-source-presets.js');
-  ok(presets.START_SOURCE_PRESET_IDS.join('|') === 'hermes_world|hathi|world',
-    'START: teen hi source presets');
-  ok(presets.getStartSourcePreset('hermes_world')?.accountEngine === 'worldbot',
-    'START: HERMESHU + SWIGGYBYWORLD = world bot engine');
-  ok(presets.getStartSourcePreset('hermes_world')?.otpBotProfile === 'hermes',
-    'START: HERMESHU + SWIGGYBYWORLD me Hermes numbers/OTP');
+  ok(presets.START_SOURCE_PRESET_IDS.join('|') === 'otp_chromium|otp_world|hathi|world',
+    'START: pehle do options — OTP bot + Chromium aur OTP bot + Swiggy World');
+  ok(presets.getStartSourcePreset('otp_chromium')?.label === '🧩 OTP BOT + CHROMIUM'
+    && presets.getStartSourcePreset('otp_world')?.label === '🌍 OTP BOT + SWIGGY WORLD',
+  'START: owner wale naam — OTP BOT + CHROMIUM / OTP BOT + SWIGGY WORLD');
+  {
+    const chromium = presets.startSourcePresetSettings(presets.getStartSourcePreset('otp_chromium'));
+    const world = presets.startSourcePresetSettings(presets.getStartSourcePreset('otp_world'));
+    ok(chromium.telegramOtpMode === true && chromium.accountEngine === 'direct'
+      && !('otpBotProfile' in chromium),
+    'START: OTP bot + Chromium — number/OTP OTP bot se, account Chromium (direct) se, OTP bot wahi');
+    ok(world.telegramOtpMode === true && world.accountEngine === 'worldbot'
+      && !('otpBotProfile' in world),
+    'START: OTP bot + Swiggy World — number/OTP OTP bot se, account World Bot se');
+  }
+  ok(presets.getStartSourcePreset('otp_chromium')?.sourceMode === 'telegram'
+    && presets.getStartSourcePreset('otp_world')?.sourceMode === 'telegram',
+  'START: dono options me number source OTP bot (telegram) hi hai');
   ok(presets.getStartSourcePreset('hathi')?.accountEngine === 'worldbot'
     && presets.getStartSourcePreset('hathi')?.otpBotProfile === 'hathi',
   'START: HATHI WALA BOT = hathi OTP + world bot (Swiggy by World)');
@@ -4968,15 +4980,23 @@ Thanks`)),
   'START: SWIGGY BY WORLD = Firebase numbers + world bot');
   ok(presets.startSourcePresetSettings(presets.getStartSourcePreset('world')).telegramOtpMode === false,
     'START: SWIGGY BY WORLD par Firebase mode on');
-  ok(presets.startSourcePresetSettings(presets.getStartSourcePreset('hermes_world')).telegramOtpMode === true,
-    'START: combined preset par telegram mode on');
-  ok(autoResumeSrc.includes('presetRow(\'hermes_world\')')
-    && autoResumeSrc.includes('presetRow(\'hathi\')')
-    && autoResumeSrc.includes('presetRow(\'world\')'),
-  'START: teen buttons picker par maujood');
-  ok(autoResumeSrc.includes('HERMESHU + SWIGGYBYWORLD')
-    || (await fsp.readFile(new URL('./start-source-presets.js', import.meta.url), 'utf8')).includes('HERMESHU + SWIGGYBYWORLD'),
-  'START: combined button ka naam owner wala');
+  ok(presets.isStartSourcePresetId('hermes_world')
+    && presets.canonicalStartSourcePresetId('hermes_world') === 'otp_world'
+    && presets.getStartSourcePreset('hermes_world')?.accountEngine === 'worldbot',
+  'START: purana HERMESHU + SWIGGYBYWORLD button bhi kaam karta hai (alias)');
+  ok(autoResumeSrc.includes("presetRow('otp_chromium')")
+    && autoResumeSrc.includes("presetRow('otp_world')")
+    && autoResumeSrc.includes("presetRow('hathi')")
+    && autoResumeSrc.includes("presetRow('world')"),
+  'START: dono naye options picker par maujood (purane bhi)');
+  ok(autoResumeSrc.includes("callback_data: 'ap_engine_chromium'")
+    && autoResumeSrc.includes("callback_data: 'ap_engine_worldbot'")
+    && autoResumeSrc.includes('applyAccountEngineChoice(ctx, \'direct\')')
+    && autoResumeSrc.includes('applyAccountEngineChoice(ctx, \'worldbot\')'),
+  'Settings: OTP bot + Chromium / OTP bot + Swiggy World — do buttons, dono set karte hain');
+  ok(autoResumeSrc.includes("telegramOtpMode: true,\n    accountEngine: 'direct'") === false
+    || (await fsp.readFile(new URL('./start-source-presets.js', import.meta.url), 'utf8')).includes("accountEngine: 'direct'"),
+  'START: Chromium option ka engine direct hai');
   ok(autoResumeSrc.includes('startSourcePresetSettings(preset)'),
     'START: preset dabate hi settings lock (engine + OTP bot)');
   ok(autoResumeSrc.includes("accountEngine: bs.getSetting('accountEngine') === 'worldbot' ? 'worldbot' : 'direct'"),
@@ -5286,6 +5306,18 @@ Thanks`)),
     otpBotLabel: 'Hermes', stopReason: 'waf_stuck', proxyMode: 'direct',
   }, { stageText: 'Security Challenge — Proxy Rotate', final: true })),
   'card: World Bot ke final card par WAF/route ka naam nahi (stop reason bhi saaf)');
+  // 👤 World Bot ke kharab run par card seedha doosra rasta dikhata hai.
+  const wbFailCard = wbEngine.formatCompactAutopilotCard({
+    accountEngine: 'worldbot', sourceMode: 'telegram', running: false, final: true,
+    target: 10, fresh: 0, failed: 2, stopReason: 'circuit_breaker', otpBotLabel: 'Hermes',
+  }, { stageText: '', final: true });
+  ok(/OTP bot \+ Chromium/.test(wbFailCard) && !/waf|route/i.test(wbFailCard),
+    'card: World Bot fail hone par "Settings → OTP bot + Chromium" ka rasta dikhta hai');
+  ok(!/OTP bot \+ Chromium/.test(wbEngine.formatCompactAutopilotCard({
+    accountEngine: 'direct', sourceMode: 'firebase', running: false, final: true,
+    target: 10, fresh: 2, failed: 0, stopReason: 'target',
+  }, { stageText: '', final: true })),
+  'card: Chromium (direct) mode ke card par ye hint nahi aata');
   const wbBotSrc = await fsp.readFile(new URL('./fresh-bot.js', import.meta.url), 'utf8');
   ok(wbBotSrc.includes("const diagWorld = bs.getSetting('accountEngine') === 'worldbot'")
     && wbBotSrc.includes('if (!diagWorld) {'),

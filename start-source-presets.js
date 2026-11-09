@@ -1,39 +1,74 @@
-// ===== 🚀 START SOURCE PRESETS — owner ke 3 buttons =====
+// ===== 🚀 START SOURCE PRESETS — owner ke buttons =====
 //
-// Owner ka exact rule (11 screenshots ke baad):
-//   START dabane par teen source buttons dikhein:
-//     1) HERMESHU + SWIGGYBYWORLD  (combined)
-//     2) HATHI WALA BOT
-//     3) SWIGGY BY WORLD
+// Owner ka naya rule (2026-11-09):
+//   "otp bot + chromium" aur "otp bot + swiggy world" — do saaf options.
+//   Wajah: agar Swiggy World Bot kaam na kare to kam se kam Chromium wala
+//   rasta to chale (number + OTP dono tab bhi OTP bot se hi aate hain).
 //
-// Matlab: number + OTP kahan se aayega, aur Swiggy account kaun banayega.
-//   • hermes_world → number+OTP @HermeshuOTPROBOT se, Swiggy ka kaam
-//                    @SwiggyByworldBot ke buttons se (world bot engine).
-//   • hathi        → number+OTP @Hathi_otp_bot se, Swiggy ka kaam bhi
-//                    @SwiggyByworldBot ke buttons se (same world bot engine).
-//   • world        → number+OTP Firebase pool se, Swiggy ka kaam
-//                    @SwiggyByworldBot se.
+// Matlab: number + OTP kahan se, aur Swiggy account kaun banayega.
+//   • otp_chromium → number+OTP OTP bot (Hermes/Hathi) se, Swiggy ka kaam is
+//                    bot ke apne bridge se (Chromium + proxy/WAF solver).
+//   • otp_world    → number+OTP OTP bot se, Swiggy ka kaam
+//                    @SwiggyByworldBot ke buttons se.
+//   • hathi        → Hathi OTP bot chun kar + Swiggy World (same as otp_world
+//                    par uska profile fix).
+//   • world        → number+OTP Firebase pool se, Swiggy ka kaam World Bot se.
+//   • hermes_world → purana id (legacy alias of otp_world) — purane buttons ka
+//                    callback_data kaam karta rahe.
 //
 // YE FILE PURE HAI (koi network/session nahi) — isliye test karna aasan hai.
 
 import { OTP_BOT_PROFILE_IDS } from './otp-bot-profiles.js';
 
-export const START_SOURCE_PRESET_IDS = ['hermes_world', 'hathi', 'world'];
+// Pickers par ye buttons dikhte hain (order yahi rehta hai).
+export const START_SOURCE_PRESET_IDS = ['otp_chromium', 'otp_world', 'hathi', 'world'];
+// Purane id bhi valid rehte hain (chat me pada purana button dab jaye to).
+export const LEGACY_START_SOURCE_PRESET_IDS = ['hermes_world'];
 
 export const START_SOURCE_PRESETS = {
-  // 1) Hermes number/OTP + World Bot account
+  // 1) 🧩 OTP bot + CHROMIUM — number/OTP OTP bot se, account is bot ke apne
+  //    Swiggy bridge (Chromium) se. Yehi fallback hai: World Bot na chale to
+  //    batch isi se chalta rahega.
+  otp_chromium: {
+    id: 'otp_chromium',
+    label: '🧩 OTP BOT + CHROMIUM',
+    shortLabel: 'OTP bot + Chromium',
+    sourceMode: 'telegram',
+    otpBotProfile: null,          // jo OTP bot abhi chuna hai wahi rehta hai
+    telegramOtpMode: true,
+    accountEngine: 'direct',
+    lines: [
+      '📨 Number + OTP: <b>aapka OTP bot</b> (Hermes / Hathi)',
+      '🧩 Swiggy login/create: <b>Chromium</b> — is bot ka apna bridge',
+    ],
+  },
+  // 2) 🌍 OTP bot + SWIGGY WORLD — number/OTP OTP bot se, account
+  //    @SwiggyByworldBot ke buttons se.
+  otp_world: {
+    id: 'otp_world',
+    label: '🌍 OTP BOT + SWIGGY WORLD',
+    shortLabel: 'OTP bot + World',
+    sourceMode: 'telegram',
+    otpBotProfile: null,          // jo OTP bot abhi chuna hai wahi rehta hai
+    telegramOtpMode: true,
+    accountEngine: 'worldbot',
+    lines: [
+      '📨 Number + OTP: <b>aapka OTP bot</b> (Hermes / Hathi)',
+      '🌍 Swiggy login/delete: <b>@SwiggyByworldBot</b> (buttons click)',
+    ],
+  },
+  // 3) Legacy alias — purane "HERMESHU + SWIGGYBYWORLD" button ka id.
   hermes_world: {
     id: 'hermes_world',
     label: '🤝 HERMESHU + SWIGGYBYWORLD',
     shortLabel: 'Hermes + World',
-    // Ye source engine ko jata hai: 'telegram' (OTP bot se claim)
     sourceMode: 'telegram',
     otpBotProfile: 'hermes',
     telegramOtpMode: true,
     accountEngine: 'worldbot',
     lines: [
       '📨 Number + OTP: <b>@HermeshuOTPROBOT</b>',
-      '🌍 Swiggy login/delete: <b>@SwiggyByworldBot</b> (buttons click, no proxy)',
+      '🌍 Swiggy login/delete: <b>@SwiggyByworldBot</b> (buttons click)',
     ],
   },
   // 2) Hathi number/OTP + World Bot account (owner: "HATHI WALA BOT BHI
@@ -68,7 +103,15 @@ export const START_SOURCE_PRESETS = {
 };
 
 export function isStartSourcePresetId(value = '') {
-  return START_SOURCE_PRESET_IDS.includes(String(value || '').trim().toLowerCase());
+  const id = String(value || '').trim().toLowerCase();
+  return START_SOURCE_PRESET_IDS.includes(id) || LEGACY_START_SOURCE_PRESET_IDS.includes(id);
+}
+
+// Purana id → naya id (purane button dabne par bhi sahi option chale).
+export function canonicalStartSourcePresetId(value = '') {
+  const id = String(value || '').trim().toLowerCase();
+  if (id === 'hermes_world') return 'otp_world';
+  return id;
 }
 
 export function listStartSourcePresets() {

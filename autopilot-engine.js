@@ -1045,6 +1045,7 @@ export function formatCompactAutopilotCard(snap = state, { stageText = '', final
     waf_stuck: 'WAF rukawat',
     circuit_breaker: 'Lagatar failures par safety stop',
     'worldbot-setup': 'Swiggy World Bot / Telegram session setup pending',
+    'worldbot-offline': 'Telegram client disconnect — number bacha, batch ruka',
   }[s.stopReason] || (s.stopReason ? `Stop: ${s.stopReason}` : 'Batch complete');
   const skipRequested = !final && Boolean(s.skipRequestedPhone && s.skipRequestedPhone === currentPhone);
   const now = final ? reason : (skipRequested ? 'Current number SKIP ho raha hai' : info.now);
@@ -1478,6 +1479,13 @@ export async function startAutopilot(opts = {}) {
     if (res.kind === 'worldbot_setup') {
       state.lastError = String(res.reason || 'World Bot setup pending').slice(0, 200);
       return 'worldbot_setup';
+    }
+
+    // 🔌 Telegram socket disconnect — number bhi nahi jala, session bhi nahi
+    // mara. Batch ruk kar saaf batata hai (reconnect ke baad START).
+    if (res.kind === 'worldbot_offline') {
+      state.lastError = String(res.reason || 'Telegram client disconnect').slice(0, 200);
+      return 'worldbot_offline';
     }
 
     state.processed++;
@@ -3268,6 +3276,13 @@ export async function startAutopilot(opts = {}) {
         break;
       }
 
+      // 🔌 Telegram socket disconnect — number jalana bekaar, session theek
+      // hai. Batch ruk kar owner ko batata hai (reconnect khud ho jata hai).
+      if (outcome === 'worldbot_offline') {
+        requestRunEnd('worldbot-offline');
+        break;
+      }
+
       // Owner SKIP: sirf ye number khatam, batch bina gap agle number par.
       if (outcome === 'manual_skip') {
         clearAutopilotSkipRequest(res.phone || entry.phone);
@@ -3763,7 +3778,7 @@ export async function startAutopilot(opts = {}) {
     // restart (Render deploy, Actions runner badalna) hote hi batch khud
     // wapas shuru ho jata hai.
     try {
-      const resumeOffReasons = ['target', 'manual', 'telegram-setup', 'worldbot-setup', 'firebase-cleared'];
+      const resumeOffReasons = ['target', 'manual', 'telegram-setup', 'worldbot-setup', 'worldbot-offline', 'firebase-cleared'];
       if (resumeOffReasons.includes(endReason)) clearAutopilotResume();
       else setAutopilotResume({ wanted: true, lastEndReason: endReason, lastEndedAt: Date.now() });
     } catch (e) { console.warn('[Autopilot] resume flag:', e?.message || e); }

@@ -3416,9 +3416,13 @@ Thanks`)),
   ok(wbFlowSrc.includes('hasMedia: messageHasMedia(message)')
     && wbFlowSrc.includes("${m.hasMedia ? 'media' : ''}"),
   'worldbot: screen signature me media bhi (naya reply detect hota hai)');
-  ok(wbFlowSrc.includes('blankReplyAt') && wbFlowSrc.includes('bot ne reply diya')
+  // 🔁 Task V: blank reply ko seedha "OTP Sent" maan lena galat tha — uske
+  // peeche "❌ Could not send OTP … login attempts exceeded" pada hota tha.
+  // Ab pehle poora screen padha jata hai, blocked text jeetta hai.
+  ok(wbFlowSrc.includes('blankReplyAt') && wbFlowSrc.includes('screen dobara padhta hoon')
+    && wbFlowSrc.includes('blank reply ke peeche')
     && wbFlowSrc.includes('confirmedBy: blankReplyMedia ?'),
-  'worldbot: blank/media reply = OTP Sent (Cancel + dobara number nahi)');
+  'worldbot: blank/media reply par pehle screen verify (Could not send OTP jeetta hai)');
   ok(wbFlowSrc.includes("new WorldBotError('empty-screen'") && wbFlowSrc.includes('attempt <= 2'),
     'worldbot: Telegram flood wait / khali read par koshish (screen: none se fail nahi)');
   ok(wbFlowSrc.includes('let clickCallback') && wbFlowSrc.includes('click ka callback aaya'),
@@ -3778,8 +3782,8 @@ Thanks`)),
   'otp scan: watermark ke baad ka code hi naya (afterMs rule)');
   ok(wb.worldBotPromptKind('🆕 New Account Detected!\n\nTell us the name to set on your Swiggy account.') === 'askName',
     'worldbot: asli lamba "New Account Detected… name" prompt detect hota hai');
-  ok(wb.worldBotPromptKind('Login JSON\nTap Copy on the code block below\n{"name":"x","mobile":"9"}') === '',
-    'worldbot: JSON message ko galti se naam ka prompt nahi samajhta');
+  ok(wb.worldBotPromptKind('Login JSON\nTap Copy on the code block below\n{"name":"x","mobile":"9"}') === 'loginJson',
+    'worldbot: Login JSON screen apna role rakhti hai (naam/number ka prompt nahi)');
   ok(wb.worldBotPromptKind('Send your name') === 'askName',
     'worldbot: naam ka sawaal = NAYA account');
   ok(wb.worldBotPromptKind('Invalid Mobile Number') === 'invalidNumber',
@@ -3790,6 +3794,137 @@ Thanks`)),
     'worldbot: delete OTP sent detect');
   ok(wb.worldBotPromptKind('Account Deleted Successfully') === 'deleted',
     'worldbot: delete success detect');
+
+  // ---------------------------------------------------------------------
+  // 🎯 TASK V — owner ka asli transcript (24.10.2026 17:21–17:58) hi process hai.
+  //    Jahan hum galat step samajh rahe the, wahan exact strings se test.
+  // ---------------------------------------------------------------------
+  const TR_DELETE_OTP = '✅ Delete OTP Sent\n\nSend the 6-digit OTP sent to your Swiggy number.\nThe account will be permanently deleted.\n\nSend /cancel to cancel.';
+  ok(wb.worldBotPromptKind(TR_DELETE_OTP) === 'deleteSent',
+    'transcript: "Delete OTP Sent … account will be permanently deleted" = DELETE OTP (deleted nahi)');
+  ok(wb.worldBotPromptKind('✅ Account Deleted Successfully\n\n🧾 Swiggy: User successfully archived\n📌 StatusCode: 33\n🗂 Bot se remove: Haan ✅') === 'deleted',
+    'transcript: "Account Deleted Successfully / StatusCode 33" = deleted');
+  ok(wb.worldBotPromptKind('🔐 Swiggy Login\n\nSelect a login method:\n1️⃣ JSON/TID Login\n2️⃣ OTP Login') === 'loginScreen',
+    'transcript: "Swiggy Login / Select a login method" = loginScreen');
+  ok(wb.worldBotPromptKind('🏠 Main Menu\n\nPick a feature:') === 'menu',
+    'transcript: "Main Menu / Pick a feature" = menu');
+  ok(wb.worldBotPromptKind('✅ Login Successful\n\n👤 Kya be\n📱 7899901714\n🆔 Customer ID: 12345') === 'loginOk',
+    'transcript: "Login Successful + Customer ID" = loginOk');
+  ok(wb.worldBotPromptKind('❌ Login Cancelled\n\nNo account was logged in.') === 'cancelled',
+    'transcript: "Login Cancelled / No account was logged in" = cancelled');
+  ok(wb.worldBotPromptKind('🗑 Permanent Logout Successful') === 'logoutOk',
+    'transcript: "Permanent Logout Successful" = logoutOk (logout step bhi detect hota hai)');
+  ok(wb.worldBotPromptKind('⏳ Swiggy rate limit ke wajah se tumhara account creation queue me chala gaya hai') === 'queued',
+    'transcript: rate-limit + queue = queued (flow rukta nahi)');
+  // ❌ Bot switch sirf OTP-send fail / queue / bot unreachable par — Swiggy ke
+  // number-level jawab par NAHI (owner: "login attempts exceeded par switch galat").
+  ok(wb.shouldSwitchWorldBot({ ok: false, kind: 'number_blocked' }) === false
+    && wb.shouldSwitchWorldBot({ ok: false, kind: 'login_result_timeout' }) === false
+    && wb.shouldSwitchWorldBot({ ok: false, kind: 'login_cancelled' }) === false
+    && wb.shouldSwitchWorldBot({ ok: false, kind: 'worldbot_offline' }) === false,
+  'transcript: number_blocked / late reply / cancel / disconnect par bot switch NAHI');
+  ok(wb.shouldSwitchWorldBot({ ok: false, kind: 'failed_otp_send' }) === true
+    && wb.shouldSwitchWorldBot({ ok: false, kind: 'queued_timeout' }) === true,
+  'transcript: bot switch sirf OTP send fail / queue timeout / bot unreachable par');
+  // ❌ Log me aisa hota tha: bot ne mana kiya, par timeout ka message aisa tha
+  //    "… last: 230713" (humara hi OTP) — blocked text chhup gaya, number ka
+  //    faisla bot switch ban gaya. Ab timeout reason me bot ka screen aata hai.
+  const timeoutReason = 'OTP type ka jawab 45s (+0s flood) me nahi aaya — ❌ Could not send OTP. Swiggy response: login attempts exceeded · apna bheja: 230713 · buttons: none';
+  ok(wb.worldBotOtpBlockInfo(timeoutReason)?.code === 'SWIGGY_ATTEMPTS'
+    && wb.shouldSwitchWorldBot({ ok: false, kind: wb.worldBotOtpBlockInfo(timeoutReason).kind }) === false,
+  'transcript: timeout ke message me chhupa "login attempts exceeded" ab number-block ban kar padha jata hai');
+  ok(wbFlowSrc.includes('apna bheja:') && wbFlowSrc.includes("inboundTail || '(bot ka text nahi aaya)'"),
+    'transcript: timeout ka reason bot ka screen dikhata hai (apna OTP nahi)');
+  // Delete se PEHLE bhi Main Menu (transcript: Main Menu → Order Hub → account).
+  // Seedha Order Hub dabane par JSON screen par wo button hi nahi hota tha.
+  ok(wbFlowSrc.indexOf("setPhase('delete-main-menu')") > 0
+    && wbFlowSrc.indexOf("setPhase('delete-main-menu')") < wbFlowSrc.indexOf("setPhase('delete-order-hub')"),
+  'transcript: delete se pehle Main Menu → phir Order Hub → account → Delete Account');
+  // Logout pehle transcript wale raste se (Swiggy Accounts), phir Order Hub.
+  ok(wbFlowSrc.indexOf("'logout: Swiggy Accounts'") > 0
+    && wbFlowSrc.indexOf("'logout: Swiggy Accounts'") < wbFlowSrc.indexOf("'Order Hub (logout)'"),
+  'transcript: logout pehle Swiggy Accounts → number → Permanent Logout, phir Order Hub');
+
+  ok(wb.classifyWorldBotError(new Error('Cannot send requests while disconnected')) === 'worldbot_offline',
+    'transcript: "Cannot send requests while disconnected" = worldbot_offline (number nahi jalta)');
+  // 🎬 TRANSCRIPT WALK — owner ke golden transcript (24.10.2026) ka har screen
+  // aur humara agla step. Ye seedha "process follow ho raha hai?" ka jawab hai.
+  const scr = (id, text, labels = [], out = false) => ({
+    id, text, out,
+    buttons: labels.map((l) => [{ text: l }]),
+  });
+  const WALK = [
+    { step: 'Main Menu', screen: scr(101, '🏠 Main Menu\n\nPick a feature:', ['Login', 'Swiggy Accounts', 'Order Hub', 'Swiggy Breakfast', 'Help', 'Bulk Login']), role: 'login' },
+    { step: 'Swiggy Login (method picker)', screen: scr(102, '🔐 Swiggy Login\n\nSelect a login method:', ['1️⃣ JSON/TID Login', '2️⃣ OTP Login', 'Cancel']), role: 'otpLogin' },
+    { step: 'OTP Login (number prompt)', screen: scr(103, '📱 OTP Login\n\nSend your 10-digit Swiggy number.'), awaiting: 'number', kind: 'askNumber' },
+    { step: 'OTP Sent', screen: scr(104, '✅ OTP Sent\n\nSend the 6-digit OTP you received from Swiggy.'), awaiting: 'otp', kind: 'otpSent' },
+    { step: 'New Account Detected (naam)', screen: scr(105, '🆕 New Account Detected!\n\nTell us the name to set on your Swiggy account.'), awaiting: 'name', kind: 'askName' },
+    { step: 'Login Successful + JSON', screen: scr(106, '✅ Login Successful\n\n👤 abcde\n📱 9876543210\n🆔 Customer ID: 44821', ['📋 Copy Code', '🏠 Main Menu']), role: 'copyCode', kind: 'loginOk' },
+    { step: 'Delete OTP Sent', screen: scr(107, TR_DELETE_OTP), awaiting: 'otp', kind: 'deleteSent' },
+    { step: 'Account Deleted Successfully', screen: scr(108, '✅ Account Deleted Successfully\n\n🧾 Swiggy: User successfully archived\n📌 StatusCode: 33', ['🗂 Bot se remove: Haan ✅ (289291349)', '🏠 Main Menu']), kind: 'deleted', role: 'mainMenu' },
+    { step: 'Main Menu (delete ke baad)', screen: scr(109, '🏠 Main Menu\n\nPick a feature:', ['Login', 'Swiggy Accounts', 'Order Hub']), role: 'login' },
+    { step: 'Main Menu (logout ke liye)', screen: scr(110, '🏠 Main Menu\n\nPick a feature:', ['Login', 'Swiggy Accounts', 'Order Hub']), role: 'swiggyAccounts' },
+    { step: 'Swiggy Accounts list', screen: scr(1101, '📇 Swiggy Accounts\n\nApna account chuno:', ['Kya be - 7899901714', 'Back']) },
+    { step: 'Account menu (logout)', screen: scr(111, '👤 Kya be - 7899901714', ['Delete Account', '🗑 Permanent Logout', 'Switch Accounts', 'Back']), role: 'permanentLogout' },
+    { step: 'Permanent Logout Successful', screen: scr(112, '🗑 Permanent Logout Successful\n\nAccount My Swiggy Accounts se hata diya.'), kind: 'logoutOk' },
+    { step: 'Rate limit + queue (flow nahi rukta)', screen: scr(113, '⏳ Swiggy rate limit ke wajah se tumhara account creation queue me chala gaya hai'), kind: 'queued' },
+  ];
+  const walkProblems = [];
+  for (const row of WALK) {
+    const screen = [row.screen];
+    if (row.kind) {
+      const got = wb.worldBotPromptKind(row.screen.text);
+      if (got !== row.kind) walkProblems.push(`${row.step}: kind ${got || '(none)'} != ${row.kind}`);
+    }
+    if (row.awaiting !== undefined) {
+      const got = wb.worldBotAwaitingKind(screen);
+      if (got !== row.awaiting) walkProblems.push(`${row.step}: awaiting ${got || '(none)'} != ${row.awaiting}`);
+    }
+    if (row.role) {
+      const btn = wb.pickWorldBotButton(row.screen.buttons.flat(), row.role);
+      if (!btn) walkProblems.push(`${row.step}: button role ${row.role} nahi mila`);
+    }
+  }
+  ok(walkProblems.length === 0,
+    `transcript walk: poore golden flow ke ${WALK.length} screens par humara agla step sahi${walkProblems.length ? ` — ${walkProblems.join(' · ')}` : ''}`);
+  // Account button (logout/delete dono) number se milta hai — transcript chips
+  // "Kya be - 7899901714" me bhi number hai.
+  ok(Boolean(wb.findWorldBotAccountButton([{ text: 'Kya be - 7899901714' }], '7899901714')),
+    'transcript walk: "Kya be - 7899901714" se account button milta hai');
+  // Delete success par "Haan ✅ (bot se remove)" confirm — Main Menu nahi.
+  ok(Boolean(wb.pickWorldBotConfirmButton([{ text: '🏠 Main Menu' }, { text: '🗂 Bot se remove: Haan ✅ (289291349)' }])),
+    'transcript walk: delete ke baad "Haan ✅ (bot se remove)" confirm milta hai');
+  // Logout par Yes, Cancel kabhi nahi.
+  ok(wb.pickWorldBotConfirmButton([{ text: '❌ Cancel' }]) === null
+    && Boolean(wb.pickWorldBotConfirmButton([{ text: '✅ Yes' }])),
+  'transcript walk: logout confirmation — Yes dabta hai, Cancel kabhi nahi');
+
+  ok(wb.shouldReissueWorldOtp('login_cancelled') === true
+    && wb.shouldReissueWorldOtp('worldbot_offline') === false
+    && wb.shouldReissueWorldOtp('number_blocked') === false,
+  'transcript: cancel par WAHI number dobara, block/disconnect par nahi');
+
+  // 📭 read ki robustness: teleproto ka `text` getter ek message par throw kar
+  //    de to bhi asli text (`message.message`) milna chahiye — warna screen
+  //    `(no text)` ban jati hai aur step "45s me jawab nahi aaya" par marta hai.
+  const throwingMsg = { id: 7, out: false, message: '✅ OTP Sent\n\nSend the 6-digit OTP you received from Swiggy.' };
+  Object.defineProperty(throwingMsg, 'text', { get() { throw new Error('entity unparse fail'); } });
+  ok(wb._messageTextOfForTests(throwingMsg).includes('OTP Sent'),
+    'read: `text` getter throw kare to bhi message.message se text milta hai');
+  // Service/khali message sabse upar ho to screen blank na ho — bot ka asli
+  // screen (button ke saath) hi "latest" maana jaye.
+  wb._resetWorldBotReadCacheForTests();
+  const blankServiceMsg = { id: 12, out: false, text: '', buttons: [] };
+  const realScreenMsg = {
+    id: 11, out: false, text: '🔐 Swiggy Login\n\nSelect a login method:',
+    buttons: [[{ text: '1️⃣ JSON/TID Login' }], [{ text: '2️⃣ OTP Login' }], [{ text: 'Cancel' }]],
+  };
+  const screenClient = { async getMessages() { return [blankServiceMsg, realScreenMsg]; } };
+  const parsedScreen = await wb._parseScreenMessagesForTests(screenClient, { id: 'x' }, 5);
+  ok(parsedScreen[0].id === 12 && !parsedScreen[0].text,
+    'read: khali service message read hota hai par screen nahi banta');
+  ok(wb.worldBotAwaitingKind(parsedScreen) === '' && parsedScreen[1].buttons.length === 3,
+    'read: text/button wala asli screen hi latest (blank message usse chhupata nahi)');
 
   // ⚠️ Number maangne wala message OTP-Sent nahi hai (owner ka bug: "OTP
   // bhejne ke liye number bhejo" ko OTP Sent samajh liya jata tha).

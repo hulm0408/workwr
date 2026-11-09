@@ -464,6 +464,10 @@ World bots ka default pool: `@SwiggyByworldBot`, `@SwiggyByworld1Bot` …
 - **Naam step:** naam khali kabhi nahi jata (phone digits se letters); bot reject
   kare to agla naam, confirm maange to Yes, JSON miss ho to recovery. Sab fail
   ho to `name_rejected`/`no-json` = wahi number dobara (bot wahi).
+- **Per-message kind:** screens jod kar classify nahi hote (warna number prompt
+  45s late scan par jata tha); stale account button dobara nahi dabta.
+- **Logout:** pehle Main Menu → Switch Account → account → Permanent Logout →
+  Yes, phir Swiggy Accounts, phir Order Hub.
 - **`/start` flow ke beech nahi:** bot naam/OTP/number maang raha ho ya screen par
   Cancel/Copy button ho to `/start` nahi bhejta (reset = Invalid OTP ka kaaran).
 - **Delete OTP ≠ delete success:** `✅ Delete OTP Sent … account will be

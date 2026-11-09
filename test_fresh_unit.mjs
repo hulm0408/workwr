@@ -4009,7 +4009,7 @@ Thanks`)),
   // OTP → naam → JSON, phir Switch Account → account → Permanent Logout → Yes.
   // ---------------------------------------------------------------------
   const JSON_SAMPLE = '{"tid":"abc123","token":"tok","cookies":[{"name":"a","value":"b"}]}';
-  const makeFakeWorldBot = ({ startWithAccount = false, silentAfterNumber = false, bareDetection = false } = {}) => {
+  const makeFakeWorldBot = ({ startWithAccount = false, silentAfterNumber = false, bareDetection = false, namePromptDelayMs = 0 } = {}) => {
     const chat = [];
     let id = 0;
     const accounts = new Map(startWithAccount ? [['9876543210', { name: 'ihgfe' }]] : []);
@@ -4081,10 +4081,12 @@ Thanks`)),
             // "name" shabd nahi) aur ek inline button — yahi woh screen hai
             // jahan naam kabhi type nahi hota tha.
             awaiting = 'name';
-            push('🆕 New Account Detected!', [[btn('📋 Copy Code')]]);
+            const say = () => push('🆕 New Account Detected!', [[btn('📋 Copy Code')]]);
+            if (namePromptDelayMs > 0) setTimeout(say, namePromptDelayMs); else say();
           } else {
             awaiting = 'name';
-            push('🆕 New Account Detected!\n\nTell us the name to set on your Swiggy account.');
+            const say = () => push('🆕 New Account Detected!\n\nTell us the name to set on your Swiggy account.');
+            if (namePromptDelayMs > 0) setTimeout(say, namePromptDelayMs); else say();
           }
           return { id: ++id };
         }
@@ -4362,6 +4364,73 @@ Thanks`)),
     }
   }
 
+  // ⏳ OTP ke baad bot ka jawab DER se aata hai (8s). Pehle yahan sirf 6s thi →
+  // OTP DOBARA jata tha → "otp-not-accepted" → /cancel → "❌ Login Cancelled"
+  // → naam ka screen kabhi nahi aata tha. Ab: ek hi OTP, naam type hota hai,
+  // Cancel nahi, JSON milta hai.
+  wb._resetWorldBotReadCacheForTests();
+  {
+    const fake = makeFakeWorldBot({ bareDetection: true, namePromptDelayMs: 8_000 });
+    wb._setWorldBotClientOverrideForTests(fake.client);
+    try {
+      const login = await wb.worldBotLogin({
+        phone: '9123456791',
+        otpProvider: async () => ({ code: '889900' }),
+        otpWatermark: async () => ({}),
+        nameProvider: async () => 'ihgfe',
+        config: { ...flowCfg, otpVerifyWaitMs: 20_000, stepTimeoutMs: 25_000 },
+      });
+      const sent = fake.chat.filter((m) => m.out).map((m) => String(m.text));
+      ok(login.ok && login.askedName && String(login.jsonText || '').includes('"tid"'),
+        `late: OTP ke 8s baad aaya naam ka screen — phir bhi naam → JSON (${login.kind || login.reason})`);
+      ok(sent.filter((t) => t === '889900').length === 1,
+        `late: OTP sirf EK baar gaya (duplicate OTP = Invalid OTP) — ${sent.join(' · ')}`);
+      ok(sent.filter((t) => t === 'Sudhani Kumar').length === 1,
+        `late: naam type hua (OTP nahi) — ${sent.join(' · ')}`);
+      ok(!sent.includes('/cancel') && !sent.includes('/start') && !sent.includes('Cancel'),
+        `late: koi /cancel ya /start nahi gaya — ${sent.join(' · ')}`);
+    } finally {
+      wb._setWorldBotClientOverrideForTests(null);
+    }
+  }
+
+  // ⛔ Naam ke screen par Cancel bilkul nahi (account aadha ban chuka hai).
+  wb._resetWorldBotReadCacheForTests();
+  {
+    const chat = [
+      { id: 42, out: false, text: '🆕 New Account Detected!', buttons: [[
+        { text: '📋 Copy Code', click: async () => ({ message: 'ok' }) },
+        { text: 'Cancel', click: async () => ({ message: 'cancelled' }) },
+      ]], date: new Date() },
+      { id: 41, out: true, text: '889900', buttons: [], date: new Date() },
+    ];
+    const client = {
+      async getMessages() { return chat.slice(); },
+      async getEntity() { return { id: 'bot' }; },
+      async sendMessage(_e, { message }) { chat.unshift({ id: 99, out: true, text: message, buttons: [], date: new Date() }); return { id: 99 }; },
+    };
+    wb._closeLoginFlowForTests();
+    const did = await wb._safeCancelForTests(client, { id: 'bot' }, { pollMs: 600 });
+    const outText = chat.filter((m) => m.out).map((m) => String(m.text));
+    ok(did === false && !outText.some((t) => /cancel/i.test(t)),
+      `cancel: naam ka screen par Cancel nahi jata (${outText.join(' · ') || 'kuch nahi'})`);
+
+    // Control: number maang raha ho to Cancel pehle jaisa chalta hai.
+    const chat2 = [
+      { id: 7, out: false, text: '📱 OTP Login\n\nSend your 10-digit Swiggy number.', buttons: [], date: new Date() },
+    ];
+    const client2 = {
+      async getMessages() { return chat2.slice(); },
+      async getEntity() { return { id: 'bot' }; },
+      async sendMessage(_e, { message }) { chat2.unshift({ id: 8, out: true, text: message, buttons: [], date: new Date() }); return { id: 8 }; },
+    };
+    wb._resetWorldBotReadCacheForTests();
+    wb._closeLoginFlowForTests();
+    const did2 = await wb._safeCancelForTests(client2, { id: 'bot' }, { pollMs: 600 });
+    ok(did2 === true && chat2.some((m) => m.out && m.text === '/cancel'),
+      `cancel: number ke prompt par Cancel chalta hai (guard sirf naam ke liye) — ${chat2.filter((m) => m.out).map((m) => m.text).join(' · ')}`);
+  }
+
   // ⛔ "Cancel kiu ho ja raha" — login khula hone par /start bilkul nahi.
   // Owner ka log (2026-11-09): number → OTP type → bot account bana raha tha →
   // humne /start bhej diya → "❌ Login Cancelled / No account was logged in".
@@ -4618,8 +4687,9 @@ Thanks`)),
   ok(wbSrc.includes("bot-${pending}-maang-raha-hai") && wbSrc.includes("const pending = awaiting || 'name'")
     && wbSrc.includes('OTP screen saaf nahi mili'),
   'worldbot: OTP sirf tab skip jab bot number/naam (New Account Detected) maang raha ho');
-  ok(wbSrc.includes('SIRF latest screen dekho'),
-    'worldbot: OTP ek hi baar jata hai (latest screen se verify)');
+  ok(wbSrc.includes('verifyBudget') && wbSrc.includes('OTP dobara nahi bhejunga')
+    && wbSrc.includes('latestKind === \'otpFail\''),
+  'worldbot: OTP ke baad jawab aane tak wait (6s nahi) aur duplicate OTP nahi');
   ok(wbSrc.includes('OTP source (Hermes/Firebase) me is number ka code hi nahi aaya')
     && wbSrc.includes("code: 'OTP_SOURCE_EMPTY'"),
   'worldbot: OTP source khali ho to saaf reason (bot ne type nahi kiya kyunki code hi nahi tha)');

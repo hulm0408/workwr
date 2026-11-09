@@ -1553,6 +1553,30 @@ export async function worldBotLogin({
         };
       }
 
+      // 🛡️ NAAM RESCUE — jab bhi screen par "🆕 New Account Detected!" dikhe,
+      // matlab account aadha ban chuka hai: naam bhejo aur JSON lo. Isse fail
+      // hone se pehle bhi call karte hain, taaki naam kabhi chhoot na jaye.
+      const rescueNameStep = async () => {
+        const screen = await parseScreenMessages(client, entity, 8, { fresh: true }).catch(() => []);
+        if (!worldBotNamePromptOnScreen(screen, { strict: true })) return null;
+        setPhase('send-name');
+        console.log('[WorldBot] 👤 naam ka step dikha — naam bhej raha hoon (JSON ke saath)');
+        const nameRes = await submitWorldBotName({
+          client, entity, cfg, shouldAbort, nameProvider, phone: cleanPhone,
+        }).catch(() => null);
+        if (!nameRes?.ok) return null;
+        const jsonText = await resolveWorldJsonText({ client, entity, cfg, shouldAbort, final: nameRes.final });
+        state.lastOkAt = Date.now();
+        closeLoginFlow();
+        setPhase('done');
+        console.log(`[WorldBot] ✅ Login ready (naam rescue): ${cleanPhone} · NEW · JSON ${jsonText.length} chars`);
+        return {
+          ok: true, kind: 'fresh_new', phone: cleanPhone, askedName: true, jsonText,
+          viaWorldBot: true, username: cfg.username,
+          screenButtons: [...(state.lastScreenButtons || [])],
+        };
+      };
+
       // ⏳ Pichhla login abhi KHULA hai (is WAHI number par number/OTP gaya
       // tha) aur screen par kuch nahi — bot account bana raha hoga. /start
       // ya Cancel bhejna usko cancel kar deta hai (owner: "Cancel kiu ho ja
@@ -1845,6 +1869,10 @@ export async function worldBotLogin({
       ]);
       console.log(`[WorldBot] 🔎 OTP fetch khatam (${Date.now() - fetchStartedAt}ms) — ${otp?.code ? 'code mila' : 'code nahi mila'}`);
       if (!otp?.code) {
+        // 🛡️ OTP nahi mila, par bot naam maang raha ho to account ban chuka
+        // hai (pichhle attempt ka OTP accept hua tha) — naam + JSON le lo.
+        const rescueMiss = await rescueNameStep().catch(() => null);
+        if (rescueMiss?.ok) return rescueMiss;
         await safeCancel(client, entity, cfg).catch(() => {});
         if (otp?.aborted) return { ok: false, kind: 'aborted', phone: cleanPhone, reason: 'OTP wait abort' };
         // 👀 Owner ko saaf pata chale ki OTP SOURCE me code hi nahi aaya
@@ -1914,6 +1942,10 @@ export async function worldBotLogin({
       const typed = await sendWorldCode(client, entity, otpCode, cfg);
       if (typed.ok) markLoginFlowOpen({ otpTypedAt: Date.now() });
       if (!typed.ok) {
+        // 🛡️ Fail karne se pehle ek aakhri chance: bot agar naam maang raha hai to
+        // account ban chuka hai — naam bhejo aur JSON lo (Cancel nahi).
+        const rescue = await rescueNameStep().catch(() => null);
+        if (rescue?.ok) return rescue;
         await safeCancel(client, entity, cfg).catch(() => {});
         if (typed.reason === 'bot-login-cancelled' || String(typed.reason || '').startsWith('bot-SWIGGY_')) {
           return {
@@ -2251,31 +2283,62 @@ async function sendWorldCode(client, entity, code, cfg = {}) {
     console.warn('[WorldBot] OTP screen saaf nahi mili — phir bhi OTP bhej raha hoon');
   }
 
+  // ⏳ OTP type karne ke baad bot ka jawab kabhi 6s me nahi aata (Swiggy account
+  // creation 10-60s leti hai). Pehle yahan sirf 6s thi: timeout par OTP DOBARA
+  // bhej dete the, phir `otp-not-accepted` → `safeCancel` → World Bot
+  // "❌ Login Cancelled" — aur bot jo naam maang raha hota tha wo kabhi type
+  // hi nahi hota. Ab: jawab aane tak wait (owner: koi time limit nahi), OTP
+  // dobara sirf tab jab bot khud kahe "Invalid OTP".
+  const verifyBudget = Math.max(20_000, Number(cfg?.otpVerifyWaitMs) || 300_000);
   for (let attempt = 1; attempt <= 2; attempt += 1) {
     try {
       setPhase('otp-type');
       await sendWorldText(client, entity, text);
+      // ⛔ OTP type ho gaya = login flow khula hai (Cancel//start band).
+      markLoginFlowOpen({ otpTypedAt: Date.now() });
       console.log(`[WorldBot] ⌨️ OTP type kiya (try ${attempt})`);
     } catch (e) {
       console.warn(`[WorldBot] OTP send fail (try ${attempt}): ${e?.message || e}`);
       await sleep(1_200);
       continue;
     }
-    // Bot ne OTP accept kiya? SIRF latest screen dekho — purana "OTP Sent"
-    // message neeche pada rehta hai, usse "abhi bhi OTP maang raha hai" galat
-    // samajh kar OTP do baar chala jata tha.
-    const verifyUntil = Date.now() + 6_000;
+    // Is waqt ka latest message id — iske baad koi bhi naya message = OTP ka jawab.
+    const beforeId = Number((await parseScreenMessages(client, entity, 1).catch(() => []))[0]?.id) || 0;
+    // Bot ka AGLA message aane tak wait — koi chhota timeout nahi.
+    const verifyUntil = Date.now() + verifyBudget;
+    let mustResend = false;
     while (Date.now() < verifyUntil) {
-      const recent = await parseScreenMessages(client, entity, 4);
-      const kinds = recent.slice(0, 2).map((m) => worldBotPromptKind(m.text));
-      if (kinds.includes('otpFail')) {
-        console.warn('[WorldBot] bot ne OTP reject kiya — dobara try');
+      if (typeof cfg?.shouldAbort === 'function' && cfg.shouldAbort()) {
+        return { ok: true, reason: 'typed' };
+      }
+      const recent = await parseScreenMessages(client, entity, 4, { fresh: true }).catch(() => []);
+      const latestKind = worldBotPromptKind(recent[0]?.text);
+      // Bot ne OTP reject kiya → ek hi baar dobara.
+      if (latestKind === 'otpFail') {
+        console.warn('[WorldBot] bot ne OTP reject kiya — ek baar dobara bhejunga');
+        mustResend = true;
         break;
       }
-      if (worldBotPromptKind(recent[0]?.text) !== 'otpSent') return { ok: true, reason: 'typed' };
-      await sleep(pollMs);
+      // Naam ka step / JSON / koi bhi naya bot message = OTP accept ho gaya.
+      // ("OTP Sent" purana message abhi bhi latest ho sakta hai — us par
+      // rukna nahi hai, bas aur wait.)
+      if (latestKind && latestKind !== 'otpSent') return { ok: true, reason: 'typed', seen: latestKind };
+      if (!latestKind) {
+        // Text nahi mila (World Bot ke screens aksar `(no text)`) — agar aakhri
+        // message naya hai to OTP accept ho gaya.
+        const newest = recent[0];
+        if (newest && !newest.out && newest.id && newest.id !== beforeId) {
+          return { ok: true, reason: 'typed', seen: 'new-message' };
+        }
+      }
+      await sleep(Math.max(600, pollMs));
     }
-    if (attempt === 2) break;
+    if (!mustResend) {
+      // Timeout — OTP dobara NAHI (duplicate OTP = "Invalid OTP"), bas aage
+      // badho; login-result wait khud naam/JSON pakad lega.
+      console.warn(`[WorldBot] ⏳ OTP ke baad bot ka jawab ${Math.round(verifyBudget / 1000)}s me nahi aaya — OTP dobara nahi bhejunga, aage dekhta hoon`);
+      return { ok: true, reason: 'typed-slow' };
+    }
   }
   return { ok: false, reason: 'otp-not-accepted' };
 }
@@ -2546,6 +2609,8 @@ async function submitWorldBotName({ client, entity, cfg = {}, shouldAbort = null
 }
 
 export const _submitWorldBotNameForTests = (opts) => submitWorldBotName(opts);
+export const _safeCancelForTests = (client, entity, cfg) => safeCancel(client, entity, cfg);
+export const _closeLoginFlowForTests = () => closeLoginFlow();
 
 // ---------------------------------------------------------------------------
 // BUTTON TRIGGER — pehle click; screen na badle to USI button ka POORA TEXT
@@ -2717,6 +2782,13 @@ async function safeCancel(client, entity, cfg = {}) {
   const waitMs = Math.min(1_800, Math.max(600, Number(cfg?.pollMs) || 1_500));
   const screens = await parseScreenMessages(client, entity);
   const cancelFromId = Number(screens[0]?.id) || 0;
+  // 👤 Bot "🆕 New Account Detected! Tell us the name…" par khada hai = account
+  // aadha ban chuka hai; Cancel bhejna usko mar deta hai (aur naam kabhi type
+  // nahi hota). Aise me Cancel bilkul nahi.
+  if (worldBotNamePromptOnScreen(screens, { strict: true })) {
+    console.warn('[WorldBot] ⛔ bot naam maang raha hai — Cancel nahi bhejunga (account bachao)');
+    return false;
+  }
   const awaiting = worldBotAwaitingKind(screens);
   const hit = findRoleOnScreens(screens, 'cancel');
   let did = false;

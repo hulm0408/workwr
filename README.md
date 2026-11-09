@@ -76,7 +76,20 @@ hai.
 > baad agla naam nahi, seedha JSON; aur wahi purana prompt dobara dikhe to naya
 > naam nahi bhejte.
 >
-> 👤 **“New Account Detected” ka naam step:** ye screen jahan bhi dikhe — login
+> 
+> ⏳ **OTP ke baad koi 6-second wala timeout nahi (2026-11-09, round 3):** asli
+> blocker OTP ke *baad* tha — Swiggy account banane me 10–60s lagte hain, par
+> code sirf 6s wait karke OTP **dobara** bhej deta tha → bot `Invalid OTP` →
+> `otp-not-accepted` → `safeCancel` → **“❌ Login Cancelled”** → naam ka screen
+> kabhi aata hi nahi tha. Ab: OTP type karne ke baad bot ke **agle message** ka
+> wait (`SWIGGY_WORLD_OTP_VERIFY_WAIT_MS`, default 300s) — koi naya message (ya
+> seedha naam ka screen) = OTP accept; OTP dobara sirf tab jab bot khud
+> `Invalid OTP` kahe; wait khatam hone par bhi duplicate OTP **nahi**. Aur jab
+> bot naam maang raha ho to `safeCancel` Cancel bhejne se **mana** karta hai
+> (`⛔ bot naam maang raha hai — Cancel nahi bhejunga`); us jagah `rescueNameStep`
+> seedha naam bhej kar JSON le aata hai.
+
+👤 **“New Account Detected” ka naam step:** ye screen jahan bhi dikhe — login
 > ke shuru me, OTP type karne se pehle, ya login ke result ka intezaar me —
 > wahan **turant naam (`Sudhani Kumar`) chala jata hai** aur JSON liya jata hai
 > (naya OTP/naya number/`/start` bilkul nahi). Screen par koi dusra number

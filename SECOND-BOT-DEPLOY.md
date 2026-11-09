@@ -337,15 +337,19 @@ aur har number par pehla attempt maximum 1 minute ke andar start hota hai. Lock 
 
 ### 🌍 Swiggy World Bot mode (@SwiggyByWorldBot)
 
-Do account engines hain (Settings → 🌍 Account engine, ya
-`PREMIUM_ACCOUNT_ENGINE=worldbot`):
+Do options hain (START par buttons, ya Settings → 🌍 Account engine):
 
-| | DIRECT API (default) | WORLD BOT |
+| | 🧩 OTP BOT + CHROMIUM (default) | 🌍 OTP BOT + SWIGGY WORLD |
 |---|---|---|
-| Swiggy call | is bot ka bridge | `@SwiggyByWorldBot` |
+| Number + OTP source | OTP bot (Hermes / Hathi) / Firebase | OTP bot (Hermes / Hathi) / Firebase |
+| Swiggy call | is bot ka bridge (**Chromium**) | `@SwiggyByWorldBot` |
 | Proxy / WAF solver | zaroori | **bilkul nahi** |
-| Number + OTP source | Firebase pool / Hermes / Hathi | Firebase pool **ya** Hermes/Hathi |
 | Session delivery | `.json` file chat me | `.json` file chat me |
+
+**Swiggy World na chale to 🧩 OTP BOT + CHROMIUM chuno** — number + OTP wahi
+OTP bot se aata rahega, sirf account banane ka rasta Chromium (is bot ka
+bridge) ho jayega. Dono ek tap ke door hain (Settings me dono buttons, START
+par dono options).
 
 World Bot flow (jaise owner ke screenshots me hai):
 

@@ -12,7 +12,7 @@
 
 **Ek START dabao — phone chhod ke aa jao.** Bot khud:
 
-0. **START dabao → teen source buttons**: 🤝 **HERMESHU + SWIGGYBYWORLD** (number+OTP Hermes se, Swiggy kaam `@SwiggyByworldBot` se), 🐘 **HATHI WALA BOT** (number+OTP `@Hathi_otp_bot` se, Swiggy kaam bhi `@SwiggyByworldBot` se), 🌍 **SWIGGY BY WORLD** (number+OTP Firebase pool se, Swiggy kaam `@SwiggyByworldBot` se). `⚙️ Advanced` me purane option (Firebase only, HardXotp) aur 🗑 **Delete All Firebase** bhi hai.
+0. **START dabao → do saaf options**: 🧩 **OTP BOT + CHROMIUM** (number + OTP aapke OTP bot — Hermes/Hathi — se, Swiggy ka kaam is bot ke apne bridge/Chromium se) aur 🌍 **OTP BOT + SWIGGY WORLD** (number + OTP OTP bot se, Swiggy ka kaam `@SwiggyByworldBot` ke buttons se). **Swiggy World na chale to 🧩 OTP BOT + CHROMIUM chuno — number/OTP wahi rehta hai, kaam Chromium se ho jata hai.** Neeche purane buttons bhi hain: 🐘 **HATHI WALA BOT**, 🌍 **SWIGGY BY WORLD** (Firebase numbers), `⚙️ Advanced` (Firebase only / HardXotp) aur 🗑 **Delete All Firebase**.
 1. Selected source se number uthata hai — Hermes/Hathi me **NEW NUMBER (warna FIND NUMBER)**, HardXotp me **NEW NUMBER (warna GET NUMBERS)**, Firebase me pool (`clients/`, online devices pehle)
 2. Swiggy par OTP bhejta hai → bot ke card par **REFRESH** (Hermes/Hathi) / **VIEW MESSAGES** (HardXotp) ya Firebase **OTP inbox** (`messages/`) se code padh kar paste karta hai. OTP **20s** (configurable) me na aaye to wahi number chhod kar agla number.
 3. Har number ko FRESH banata hai:
@@ -603,7 +603,7 @@ chalta rehta hai; temporary error par number failed nahi gina jata.
 | File | Kaam |
 |---|---|
 | `fresh-bot.js` | Bot UI — START/STOP/STATUS/**SETTINGS** (entry point) |
-| `start-source-presets.js` | START ke 3 source buttons (Hermes+World / Hathi / Swiggy by World) |
+| `start-source-presets.js` | START ke source buttons — OTP bot + Chromium / OTP bot + Swiggy World (+ Hathi / Firebase, legacy alias) |
 | `shop-bot-stock.js` | Fresh JSON → `@its_shop_bot` stock queue (10-10 files, zip nahi) |
 | `autopilot-engine.js` | **Parallel batch lanes** — distinct IPs/devices, target/time, lane-local rotate/defer, live-card |
 | `number-pipeline.js` | EK number ka poora lifecycle (saare scenarios) |

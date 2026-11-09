@@ -385,8 +385,8 @@ function settingsCard() {
     field('📴 Offline devices', bs.getSetting('allowOffline') ? 'ON (try bhi karenge)' : 'OFF (sirf online)'),
     ``,
     field('🌍 Account engine', bs.getSetting('accountEngine') === 'worldbot'
-      ? `WORLD BOT — @${esc(worldBot.worldBotUsername())} ke buttons click honge (login + OTP wahi se)`
-      : 'DIRECT API — is bot ka apna Swiggy bridge (proxy + WAF solver)'),
+      ? `OTP BOT + SWIGGY WORLD — number/OTP OTP bot se, account @${esc(worldBot.worldBotUsername())} ke buttons se`
+      : 'OTP BOT + CHROMIUM — number/OTP OTP bot se, account is bot ke apne Swiggy bridge se'),
     field('📨 Telegram mode', bs.fmtSetting('telegramOtpMode')),
     field('🤖 OTP bot', `${esc(bs.fmtSetting('otpBotProfile'))} — <code>@${esc(String(telegramProviderStatus().botUsername || ''))}</code>`),
     numberSourceLine(),
@@ -422,7 +422,20 @@ const settingsRows = () => [
   [{ text: `🚦 Gap: ${bs.fmtSetting('gapMs')}`, callback_data: 'ap_pick_gap' }],
   [{ text: `📴 Offline: ${bs.getSetting('allowOffline') ? 'ON' : 'OFF'}`, callback_data: 'ap_toggle_offline' }],
   [{ text: `🔁 Never-stop: ${bs.getSetting('autoContinue') ? 'ON' : 'OFF'}`, callback_data: 'ap_toggle_neverstop', style: 'success' }],
-  [{ text: `🌍 Account engine: ${bs.fmtSetting('accountEngine')}`, callback_data: 'ap_toggle_engine', style: 'primary' }],
+  // 👤 Owner: "otp bot + chromium" aur "otp bot + swiggy world" — dono options
+  // ek hi screen par, jo chalu hai us par ✓.
+  [
+    {
+      text: `${bs.getSetting('accountEngine') === 'worldbot' ? '' : '✓ '}🧩 OTP bot + Chromium`,
+      callback_data: 'ap_engine_chromium',
+      style: bs.getSetting('accountEngine') === 'worldbot' ? 'primary' : 'success',
+    },
+    {
+      text: `${bs.getSetting('accountEngine') === 'worldbot' ? '✓ ' : ''}🌍 OTP bot + Swiggy World`,
+      callback_data: 'ap_engine_worldbot',
+      style: 'primary',
+    },
+  ],
   [{ text: '🔎 World Bot screen check', callback_data: 'ap_world_probe' }],
   [{ text: '📦 Shop Bot Stock (@its_shop_bot)', callback_data: 'ap_shop_stock', style: 'success' }],
   [{ text: '🩺 Diagnose (kya toota hai?)', callback_data: 'ap_diag' }],
@@ -840,12 +853,9 @@ async function sendSessionFile(chatId, { jsonText = '', filename = 'session.json
 function activeStartPresetId() {
   const engine = bs.getSetting('accountEngine') === 'worldbot' ? 'worldbot' : 'direct';
   const tgMode = telegramSettingEnabled();
-  const profile = otpBotProfiles.normalizeOtpBotProfileId(bs.getSetting('otpBotProfile'));
-  if (engine === 'worldbot') {
-    if (!tgMode) return 'world';
-    return profile === 'hathi' ? 'hathi' : 'hermes_world';
-  }
-  return '';
+  // 👤 Owner ke do options: OTP bot + Chromium  ya  OTP bot + Swiggy World.
+  if (tgMode) return engine === 'worldbot' ? 'otp_world' : 'otp_chromium';
+  return engine === 'worldbot' ? 'world' : '';
 }
 
 function otpBotChoiceRows() {
@@ -863,7 +873,9 @@ function otpBotChoiceRows() {
     }];
   };
   return [
-    presetRow('hermes_world'),
+    // 👤 Owner: "otp bot + chromium" aur "otp bot + swiggy world" — do saaf option.
+    presetRow('otp_chromium'),
+    presetRow('otp_world'),
     presetRow('hathi'),
     presetRow('world'),
     [{ text: '⚙️ Advanced (Firebase only / HardXotp)', callback_data: 'ap_start_adv' }],
@@ -906,6 +918,7 @@ function startSourceCard() {
     '',
     `⏱ OTP wait ${bs.fmtSetting('telegramOtpTimeoutMs')} · OTP na aaye to number skip`,
     sub('Jo yahan chunoge wahi is batch ka source lock hoga. World Bot ke saare bots same hain — error aaye tab hi next bot.'),
+    sub('Swiggy World kaam na kare to 🧩 OTP BOT + CHROMIUM chuno — number + OTP wahi OTP bot se aayega, account Chromium se banega.'),
   ].join('\n'));
 }
 
@@ -2282,30 +2295,53 @@ bot.action('ap_toggle_neverstop', async (ctx) => {
 // 🌍 ACCOUNT ENGINE — direct API (proxy + WAF solver) ya Swiggy World Bot
 // (@SwiggyByWorldBot ke buttons click; koi proxy nahi). Batch chalte waqt
 // badalna allowed nahi — warna aadha batch ek engine par, aadha doosre par.
-bot.action('ap_toggle_engine', async (ctx) => {
+// 👤 Owner ke do saaf options (Settings me do buttons):
+//   🧩 OTP BOT + CHROMIUM      → number/OTP OTP bot se, account Chromium bridge se
+//   🌍 OTP BOT + SWIGGY WORLD  → number/OTP OTP bot se, account World Bot se
+// Engine badalne par number-source ko chhedte nahi — OTP bot hi rehta hai
+// (pipeline dono engine ke saath telegram numbers/OTP chalati hai).
+async function applyAccountEngineChoice(ctx, next) {
   if (!(await gate(ctx))) return;
   if (isAutopilotRunning()) {
     await ctx.answerCbQuery('⏳ Batch chal raha hai — pehle STOP karo, phir engine badlo.', { show_alert: true }).catch(() => {});
     return;
   }
-  const cur = bs.getSetting('accountEngine') === 'worldbot' ? 'worldbot' : 'direct';
-  const next = cur === 'worldbot' ? 'direct' : 'worldbot';
-  const r = bs.setSetting('accountEngine', next);
+  const want = next === 'worldbot' ? 'worldbot' : 'direct';
+  const already = bs.getSetting('accountEngine') === want;
+  const r = bs.setSetting('accountEngine', want);
   if (!r.ok) {
     await ctx.answerCbQuery(`❌ ${r.error}`, { show_alert: true }).catch(() => {});
     return;
   }
-  let note = next === 'worldbot'
-    ? '🌍 World Bot ON — account @' + worldBot.worldBotUsername() + ' ke buttons click karke banega.'
-    : '🌍 Direct API ON — is bot ka apna Swiggy bridge (proxy + WAF solver).';
-  if (next === 'worldbot') {
+  let note = want === 'worldbot'
+    ? '🌍 OTP BOT + SWIGGY WORLD ON — number/OTP OTP bot se, account @' + worldBot.worldBotUsername() + ' ke buttons se.'
+    : '🧩 OTP BOT + CHROMIUM ON — number/OTP OTP bot se, account is bot ke apne Swiggy bridge (Chromium) se.';
+  if (already) note = `${note} (pehle se yahi chalu hai)`;
+  if (want === 'worldbot') {
     let st = {};
     try { st = await telegramOtp.telegramUserClientStatus(); } catch {}
-    if (!st.configured) note = '⚠️ World Bot ON, par spare Telegram account configured nahi — Settings → Add Telegram Account karo.';
-    else if (telegramSettingEnabled()) note += ' ℹ️ Telegram Hermes number-source World Bot mode me OFF hai (numbers Firebase se).';
+    if (!st.configured) {
+      note = '⚠️ Swiggy World ke liye spare Telegram account chahiye — Settings → Add Telegram Account karo. (Abhi ke liye 🧩 OTP BOT + CHROMIUM chalega.)';
+    }
   }
   await ctx.answerCbQuery(note, { show_alert: true }).catch(() => {});
   await editOrSend(ctx, settingsCard(), settingsRows());
+}
+
+bot.action('ap_engine_chromium', async (ctx) => {
+  await ctx.answerCbQuery('🧩 OTP bot + Chromium').catch(() => {});
+  await applyAccountEngineChoice(ctx, 'direct');
+});
+
+bot.action('ap_engine_worldbot', async (ctx) => {
+  await ctx.answerCbQuery('🌍 OTP bot + Swiggy World').catch(() => {});
+  await applyAccountEngineChoice(ctx, 'worldbot');
+});
+
+// Purana button (kisi purane message me pada ho to bhi kaam kare): flip.
+bot.action('ap_toggle_engine', async (ctx) => {
+  const cur = (() => { try { return bs.getSetting('accountEngine') === 'worldbot' ? 'worldbot' : 'direct'; } catch { return 'direct'; } })();
+  await applyAccountEngineChoice(ctx, cur === 'worldbot' ? 'direct' : 'worldbot');
 });
 
 // 🔎 World Bot screen check — bot ke latest buttons/text dikhata hai, taaki

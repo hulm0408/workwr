@@ -27,7 +27,9 @@ const SPECS = {
   //   worldbot = @SwiggyByWorldBot ke buttons click karke (koi proxy nahi;
   //              wahi flow jo owner screenshot me dikhaya: Login → OTP Login
   //              → number → OTP → JSON; purana account = delete → re-login)
-  accountEngine:     { dflt: 'direct', label: '🌍 Account engine (direct API ya Swiggy World Bot)',
+  // 👤 Owner ke do saaf options: 'OTP bot + Chromium' (direct) ya
+  // 'OTP bot + Swiggy World' (worldbot). Number/OTP dono me OTP bot se hi.
+  accountEngine:     { dflt: 'direct', label: '🌍 Account engine (OTP bot + Chromium ya OTP bot + Swiggy World)',
                        enum: ['direct', 'worldbot'] },
   telegramOtpMode:   { bool: true, dflt: false, label: '📨 Telegram Hermes mode (number + OTP Telegram bot se)' },
   telegramOtpTimeoutMs: { min: 5000, max: 180000, dflt: 20000, label: 'Hermes OTP Refresh budget (ms)' },
@@ -131,7 +133,9 @@ export function fmtSetting(key) {
   const v = getSetting(key);
   if (key === 'allowOffline' || key === 'telegramOtpMode' || key === 'autoContinue') return v ? 'ON' : 'OFF';
   if (key === 'otpBotProfile') return { hermes: 'Hermes', hathi: 'Hathi', chauhan: 'HardXotp' }[v] || 'Hermes';
-  if (key === 'accountEngine') return v === 'worldbot' ? 'World Bot' : 'Direct API';
+  if (key === 'accountEngine') {
+    return v === 'worldbot' ? 'OTP bot + Swiggy World' : 'OTP bot + Chromium';
+  }
   if (key === 'gapMs' || key === 'backoffMs' || key === 'otpWaitMs' || key === 'otpTimeoutMs' || key === 'telegramOtpTimeoutMs' || key === 'telegramOtpRefreshMs') {
     return v >= 60000 ? `${Math.round(v / 60000)} min` : `${Math.round(v / 1000)}s`;
   }

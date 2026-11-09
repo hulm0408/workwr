@@ -1096,6 +1096,13 @@ export function formatCompactAutopilotCard(snap = state, { stageText = '', final
       : `<b>Next:</b> ${esc(next)}`,
     (final || info.errorish) && s.lastError ? `⚠ ${mono(truncateUiText(s.lastError, 76))}` : '',
   ];
+  // 👤 Owner: "Swiggy World na kare to kam se kam Chromium wala chale." World
+  // Bot ke kharab run par card par seedha rasta dikhao.
+  const wbTrouble = final && wb && (Number(s.failed) > 0
+    || ['worldbot-setup', 'worldbot-offline', 'circuit_breaker', 'waf_stuck'].includes(String(s.stopReason)));
+  if (wbTrouble) {
+    lines.push(sub('World Bot na chale to Settings → 🧩 OTP bot + Chromium chuno — number + OTP wahi OTP bot se aayega.'));
+  }
   if (final && Array.isArray(s.freshAccounts) && s.freshAccounts.length) {
     const latest = s.freshAccounts.slice(-5);
     lines.push(`<b>Latest:</b> ${latest.map((a) => mono(a.phone)).join(' · ')}${s.freshAccounts.length > latest.length ? ` <i>+${s.freshAccounts.length - latest.length} aur</i>` : ''}`);

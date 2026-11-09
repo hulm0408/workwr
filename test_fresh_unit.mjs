@@ -3395,6 +3395,7 @@ Thanks`)),
   ok(tgRefreshSrc.includes('|| 1_000)') && tgRefreshSrc.includes('refreshAttempts += 1'),
   'otp bot refresh: default har 1 second + attempt counter');
   const pipelineRefreshSrc = await fsp.readFile(new URL('./number-pipeline.js', import.meta.url), 'utf8');
+  const pipelineName = pipelineRefreshSrc;
   ok(pipelineRefreshSrc.includes('SWIGGY_OTP_REFRESH_MS') && pipelineRefreshSrc.includes('|| 1_000'),
   'worldbot: OTP refresh world-bot flow me 1s (env se override)');
   ok(pipelineRefreshSrc.includes('captureTelegramOtpWatermark')
@@ -3898,6 +3899,100 @@ Thanks`)),
   ok(wb.pickWorldBotConfirmButton([{ text: '❌ Cancel' }]) === null
     && Boolean(wb.pickWorldBotConfirmButton([{ text: '✅ Yes' }])),
   'transcript walk: logout confirmation — Yes dabta hai, Cancel kabhi nahi');
+
+  // ---------------------------------------------------------------------
+  // 🔤 NAAM STEP — owner: "new account detected ke baad naam enter nahi hota
+  // aur uske baad /start chala jata hai". Tests: naam ka candidate list,
+  // reject hone par agla naam, confirm par Yes, aur /start ka pehra.
+  // ---------------------------------------------------------------------
+  const nameCand = wb.worldBotNameCandidates('ihgfe', '9876543210');
+  ok(nameCand[0] === 'ihgfe' && nameCand.length >= 2
+    && nameCand.every((n) => /^[A-Za-z]{3,20}$/.test(n)),
+  `naam: candidates letters-only (${nameCand.join(', ')})`);
+  ok(wb.worldBotNameCandidates('', '9876543210').length >= 2,
+    'naam: nameProvider khali ho to phone digits se naam bante hain (khali string nahi jata)');
+  ok(wb.worldBotNameCandidates('12345', '9001234567')[0] === 'ixxab',
+    'naam: digits/emoji wala invalid primary hata kar phone se saaf naam (0 → x)');
+  ok(wb.worldBotPromptKind('❌ Invalid name. Please send letters only.') === 'nameFail'
+    && wb.worldBotPromptKind('Name must be between 3 and 20 characters') === 'nameFail'
+    && wb.worldBotPromptKind('This name is already taken, try another name') === 'nameFail'
+    && wb.worldBotPromptKind('🆕 New Account Detected!\n\nTell us the name to set on your Swiggy account.') === 'askName',
+  'naam: reject hone wale jawab (nameFail) askName se alag — warna 90s wait + /start');
+  ok(wbFlowSrc.includes('async function submitWorldBotName') && wbFlowSrc.includes('worldBotNameCandidates')
+    && wbFlowSrc.includes('const nameRes = await submitWorldBotName'),
+  'naam: login flow naam step helper se karta hai (khali naam/invalid naam handle)');
+  ok(wbFlowSrc.includes('⛔ /start nahi bhej raha') && wbFlowSrc.includes("resetMode || '') === 'menu-only'")
+    && wbFlowSrc.includes('hasFlowButton'),
+  '/start ka pehra: bot naam/OTP maang raha ho ya flow ka button (Cancel/Copy) ho to /start nahi jata');
+  ok(wbFlowSrc.includes('async function recoverWorldBotJson') && wbFlowSrc.includes('JSON recovery mil gaya'),
+    'JSON recovery: Copy button → aakhri 15 messages → 12s wait (na mile to hi no-json)');
+  ok(pipelineName.includes("['login_result_timeout', 'name_rejected', 'no-json'].includes(String(first.kind))")
+    && pipelineName.includes("first = await loginOnce(true);"),
+  'naam/JSON fail par wahi number dobara (naya number nahi, /start nahi)');
+
+  // 🧪 ASLI behaviour — fake client: pehla naam reject, doosre par JSON.
+  wb._resetWorldBotReadCacheForTests();
+  {
+    const entity = { id: 'wb-name-1' };
+    const sent = [];
+    let nextId = 10;
+    const box = [{ id: 1, out: false, text: '🆕 New Account Detected!\n\nTell us the name to set on your Swiggy account.', buttons: [] }];
+    const client = {
+      async getMessages() { return [...box]; },
+      async sendMessage(_e, { message }) {
+        sent.push(message);
+        box.unshift({ id: ++nextId, out: true, text: message, buttons: [] });
+        if (sent.length === 1) {
+          box.unshift({ id: ++nextId, out: false, text: '❌ Invalid name. Please send letters only.', buttons: [] });
+        } else {
+          box.unshift({ id: ++nextId, out: false, text: '✅ Login Successful\n\n🆔 Customer ID: 991', buttons: [] });
+          box.unshift({ id: ++nextId, out: false, text: 'Login JSON\nTap Copy on the code block below\n{"tid":"abc123","token":"tok","cookies":[{"name":"a"}]}', buttons: [] });
+        }
+        return true;
+      },
+    };
+    const res = await wb._submitWorldBotNameForTests({
+      client, entity, phone: '9876543210',
+      nameProvider: async () => 'ihgfe',
+      cfg: { stepTimeoutMs: 4_000, pollMs: 150, lateReplyGraceMs: 1_200 },
+    });
+    ok(res.ok && sent[0] === 'ihgfe' && sent[1] === 'dcbax' && res.name === 'dcbax',
+      `naam step: pehla naam reject → agla naam bheja (${sent.join(' → ') || 'kuch nahi'})`);
+    ok(res.ok && res.final?.kind === 'json' && String(res.final?.json?.text || '').includes('"tid"'),
+      'naam step: doosre naam par JSON mil gaya (timeout/`/start` nahi)');
+  }
+
+  // 🧪 Confirm wala case: bot "Yes/Cancel" poochhe to Yes dabta hai (Cancel kabhi nahi).
+  wb._resetWorldBotReadCacheForTests();
+  {
+    const entity = { id: 'wb-name-2' };
+    let nextId = 30;
+    let yesClicked = 0;
+    const box = [{ id: 1, out: false, text: '🆕 New Account Detected!\n\nTell us the name to set on your Swiggy account.', buttons: [] }];
+    const yesButton = {
+      text: '✅ Yes',
+      async click() {
+        yesClicked += 1;
+        box.unshift({ id: ++nextId, out: false, text: 'Login JSON\n\n{"tid":"zzz","token":"t","cookies":[]}', buttons: [] });
+        return { message: 'ok' };
+      },
+    };
+    const client = {
+      async getMessages() { return [...box]; },
+      async sendMessage(_e, { message }) {
+        box.unshift({ id: ++nextId, out: true, text: message, buttons: [] });
+        box.unshift({ id: ++nextId, out: false, text: 'Naam confirm karo?', buttons: [[yesButton]] });
+        return true;
+      },
+    };
+    const res = await wb._submitWorldBotNameForTests({
+      client, entity, phone: '9876543210',
+      nameProvider: async () => 'ihgfe',
+      cfg: { stepTimeoutMs: 4_000, pollMs: 150, lateReplyGraceMs: 1_200 },
+    });
+    ok(res.ok && yesClicked === 1 && res.final?.kind === 'json',
+      'naam step: bot confirm maange to "✅ Yes" dabta hai, phir JSON');
+  }
 
   ok(wb.shouldReissueWorldOtp('login_cancelled') === true
     && wb.shouldReissueWorldOtp('worldbot_offline') === false

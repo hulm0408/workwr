@@ -1109,6 +1109,20 @@ export async function processSingleNumberViaWorldBot({
         viaWorldBot: true, switchBot: false,
       };
     }
+    // 🔤 Naam accept nahi hua / JSON miss — account ban chuka hai, number
+    // turant retire nahi hota (engine ise agle run me wahi number de sakta hai).
+    if (kind === 'name_rejected' || kind === 'no-json') {
+      return {
+        ok: false,
+        kind: 'deferred_swiggy_transient',
+        phone,
+        code: kind === 'name_rejected' ? 'WORLDBOT_NAME_REJECTED' : 'WORLDBOT_JSON_MISSING',
+        stage: 'worldbot_name',
+        reason: `${botTag}: ${res?.reason || (kind === 'name_rejected' ? 'naam accept nahi hua' : 'JSON nahi mila')} — /start nahi bheja, bot wahi`,
+        viaWorldBot: true,
+        switchBot: false,
+      };
+    }
     // ❌ Bot ne login khud cancel kar diya (OTP send hi nahi hua) — number
     // skip, bot wahi.
     if (kind === 'login_cancelled') {
@@ -1173,10 +1187,18 @@ export async function processSingleNumberViaWorldBot({
     // ⏱ OTP accept ho gaya par bot ka JSON/naam ka jawab Telegram flood wait me
     // late aaya — ye number ka fail NAHI hai. Wahi number par ek aur try
     // (Main Menu → Login → OTP Login → wahi number), naya number/card nahi.
-    if (!first.ok && first.kind === 'login_result_timeout') {
-      await say(section('⏳ Login Ka Jawab Late — Wahi Number Dobara', [
+    //
+    // 🔤 Naam ka step bhi yahin aata hai: naam reject ho ya JSON miss ho jaye
+    // to bhi WAHI number — `/start` bhej kar World Bot reset karna galat hai
+    // (owner: "naam enter nahi hota aur /start chala jata hai").
+    if (!first.ok && ['login_result_timeout', 'name_rejected', 'no-json'].includes(String(first.kind))) {
+      await say(section(first.kind === 'name_rejected'
+        ? '🔤 Naam Accept Nahi Hua — Wahi Number Dobara'
+        : '⏳ Login Ka Jawab Late — Wahi Number Dobara', [
         `📱 <code>${esc(phone)}</code> · @${esc(botUsername)}`,
-        '→ Bot ka jawab Telegram flood wait me late aaya (OTP accept ho gaya tha) — number skip nahi kar raha.',
+        first.kind === 'name_rejected'
+          ? '→ Bot ne naam accept nahi kiya — naya number nahi, /start nahi.'
+          : '→ Bot ka jawab Telegram flood wait me late aaya (OTP accept ho gaya tha) — number skip nahi kar raha.',
         '→ Ab wahi number dobara: Main Menu → Login → OTP Login → number → OTP.',
       ].join('\n')));
       first = await loginOnce(true);
@@ -1331,7 +1353,7 @@ export async function processSingleNumberViaWorldBot({
     // ⏱ Yahi rule fresh login par bhi: jawab late aaya to wahi number dobara
     // (delete to ho chuka hai, sirf bot ka JSON late hai).
     let again = await loginOnce(true);
-    if (!again.ok && again.kind === 'login_result_timeout') {
+    if (!again.ok && ['login_result_timeout', 'name_rejected', 'no-json'].includes(String(again.kind))) {
       await say(section('⏳ Fresh Login Ka Jawab Late — Wahi Number Dobara', [
         `📱 <code>${esc(phone)}</code> · @${esc(botUsername)}`,
         '→ Account delete ho chuka hai; bot ka JSON late aaya — wahi number dobara.',

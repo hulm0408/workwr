@@ -419,6 +419,14 @@ export function worldBotPromptKind(text = '') {
   }
   if (/\b(otp sent|otp bhej|send the 6 digit otp)\b/.test(n)) return 'otpSent';
   if (/\b(otp|code)\b/.test(n) && /\b(sent|delivered|bhej\w*|gaya|chala gaya)\b/.test(n)) return 'otpSent';
+  // ❌ Naam reject ho gaya — bot ka jawab: "❌ Invalid name", "Name must be
+  // 3-20 letters", "Naam galat hai, dobara bhejo". Isse pehle hum ise miss kar
+  // dete the aur 90s tak JSON ka intezaar karke /start bhej dete the (owner:
+  // "naam enter nahi ho raha aur baad me /start chala jata hai").
+  if (/\b(invalid|galat|wrong|not accepted|reject\w*)\b.{0,20}\b(name|naam)\b/.test(n)
+    || /\b(name|naam)\b.{0,25}\b(invalid|galat|wrong|not valid|letters? only|alphabets? only|3\s*(?:-|to|se)\s*20|reject\w*)\b/.test(n)
+    || /\b(try (a )?(different|another)|dobara|phir se)\b.{0,20}\b(name|naam)\b/.test(n)
+    || /\bname\b.{0,20}\b(already (taken|exists)|must be|should be|should contain)\b/.test(n)) return 'nameFail';
   // Naam ka sawaal — "What is your name?", "Send your name", "apna naam batao".
   // Asli bot lamba likhta hai: "🆕 New Account Detected! Tell us the name to
   // set on your Swiggy account." — pehle 12-word limit ki wajah se ye miss ho
@@ -1136,12 +1144,16 @@ async function sendWorldText(client, entity, text) {
 }
 
 async function clickWorldButton(entry) {
-  if (!entry?.button) throw new WorldBotError('no-button', 'Button nahi mila');
-  state.lastAction = `click:${entry.text}`;
-  setPhase(`click-${entry.role || 'button'}`);
-  const answer = await entry.button.click({});
+  // entry kabhi wrapper `{ button, text, role }` hota hai, kabhi seedha button
+  // object — dono chalein (naam confirm wale raste me raw button bhi aata hai).
+  const button = entry?.button || (typeof entry?.click === 'function' ? entry : null);
+  if (!button) throw new WorldBotError('no-button', 'Button nahi mila');
+  state.lastAction = `click:${entry?.text || button?.text || ''}`;
+  setPhase(`click-${entry?.role || 'button'}`);
+  const answer = await button.click({});
   const callback = String(answer?.message || '').trim().slice(0, 180);
-  console.log(`[WorldBot] click: ${entry.text}${callback ? ` — callback: ${callback}` : ''}`);
+  const label = String(entry?.text || button?.text || 'button');
+  console.log(`[WorldBot] click: ${label}${callback ? ` — callback: ${callback}` : ''}`);
   state.lastChatAt = Date.now();
   return callback;
 }
@@ -1522,28 +1534,30 @@ export async function worldBotLogin({
 
       if (outcome.kind === 'askName') {
         askedName = true;
-        setPhase('send-name');
-        const displayName = typeof nameProvider === 'function'
-          ? String((await nameProvider()) || '').slice(0, 40)
-          : 'Rahul Kumar';
-        before = screenSignature(await parseScreenMessages(client, entity));
-        await sendWorldText(client, entity, displayName);
-        final = await waitForReply({
-          client, entity, baseline: before, timeoutMs: cfg.stepTimeoutMs, shouldAbort,
-          what: 'JSON (name ke baad)',
-          predicate: (freshList) => {
-            for (const message of freshList) {
-              if (message.hasDocument) return { kind: 'document', message };
-              const json = extractWorldBotJson(message.text);
-              if (json) return { kind: 'json', message, json };
-              const kind = worldBotPromptKind(message.text);
-              if (kind === 'otpFail') return { kind: 'otpFail', message };
-              if (pickWorldBotButton(message.buttons, 'copyCode')) return { kind: 'copy', message };
-            }
-            return null;
-          },
-          pollMs: cfg.pollMs,
+        // 🔤 Naam step apne helper me: khali/invalid naam reject hone par agla
+        // naam, confirm maange to Yes, aur JSON miss ho to recovery — /start
+        // ya naya number kabhi nahi (owner ka rule).
+        const nameRes = await submitWorldBotName({
+          client, entity, cfg, shouldAbort, nameProvider, phone: cleanPhone,
         });
+        if (!nameRes.ok) {
+          if (nameRes.kind === 'otpFail') {
+            await safeCancel(client, entity, cfg).catch(() => {});
+            return { ok: false, kind: 'failed_otp_verify', phone: cleanPhone, reason: 'World Bot ne OTP accept nahi kiya' };
+          }
+          setPhase('name-failed');
+          console.warn(`[WorldBot] ❌ naam step fail (${nameRes.kind}): ${nameRes.reason}`);
+          return {
+            ok: false,
+            kind: nameRes.kind === 'name_rejected' ? 'name_rejected' : 'no-json',
+            phone: cleanPhone,
+            askedName: true,
+            code: nameRes.kind === 'name_rejected' ? 'WORLDBOT_NAME_REJECTED' : 'WORLDBOT_JSON_MISSING',
+            reason: `${nameRes.reason || 'naam step fail'} — account ban gaya hai, naya number ya /start nahi (wahi number se JSON le sakte hain)`,
+          };
+        }
+        console.log(`[WorldBot] ✅ naam accept hua: ${nameRes.name}`);
+        final = nameRes.final;
       }
 
       if (final.kind === 'otpFail') {
@@ -1574,19 +1588,14 @@ export async function worldBotLogin({
         }
       }
       if (!jsonText) {
-        // Kabhi JSON agle message me aata hai (file ke baad caption), thoda wait.
-        const late = await waitForReply({
-          client, entity, baseline: screenSignature(await parseScreenMessages(client, entity)), timeoutMs: 12_000, shouldAbort,
-          predicate: (freshList) => {
-            for (const message of freshList) {
-              const json = extractWorldBotJson(message.text);
-              if (json) return json;
-            }
-            return null;
-          },
-          pollMs: cfg.pollMs,
-        }).catch(() => null);
-        if (late) jsonText = late.text;
+        // 🔎 JSON recovery: Copy button → aakhri 15 messages → 12s ka wait.
+        // (Kabhi JSON agle message me ya edit hokar aata hai; pehle seedha
+        // `no-json` ho kar flow /start par chala jata tha.)
+        const recovered = await recoverWorldBotJson({ client, entity, cfg, shouldAbort }).catch(() => null);
+        if (recovered?.jsonText) {
+          jsonText = recovered.jsonText;
+          console.log(`[WorldBot] 🔎 JSON recovery mil gaya (${recovered.via})`);
+        }
       }
       if (!jsonText) throw new WorldBotError('no-json', 'Login ho gaya par JSON na mila (na file, na code block)');
       // 🛡️ JSON mila par adhoora (token/tid/cookies kuch nahi) → aage bhejne ka
@@ -1890,6 +1899,176 @@ async function clickCopyCode({ client, entity, cfg, shouldAbort }) {
 }
 
 // ---------------------------------------------------------------------------
+// 🔤 NAAM STEP (owner: "new account detected ke baad naam enter nahi hota aur
+// uske baad /start chala jata hai")
+//   • naam khali/invalid nikle to bot use accept hi nahi karta — pehle hum
+//     seedha bhej dete the (kabhi khali string) aur 90s baad /start.
+//   • bot naam reject kare ("Invalid name" / "Name must be 3-20 letters" /
+//     "already taken") to agla naam try hota hai, /start nahi.
+//   • naam confirm maange (Yes/Cancel) to Yes dabta hai.
+// ---------------------------------------------------------------------------
+export function worldBotNameCandidates(primary = '', phone = '') {
+  const clean = (v) => String(v || '').replace(/[^A-Za-z]/g, '').slice(0, 20);
+  const out = [];
+  const push = (v) => {
+    const c = clean(v);
+    if (c.length >= 3 && c.length <= 20 && !out.includes(c)) out.push(c);
+  };
+  // 1) jo bhi pipeline ne diya (phone ke pehle 5 digit → a-i, 0 → x)
+  push(primary);
+  const digits = String(phone || '').replace(/\D/g, '').slice(-10);
+  const map = { 0: 'x', 1: 'a', 2: 'b', 3: 'c', 4: 'd', 5: 'e', 6: 'f', 7: 'g', 8: 'h', 9: 'i' };
+  const letters = (from, to) => [...digits.slice(from, to)].map((d) => map[d] || '').join('');
+  if (digits.length >= 10) {
+    push(letters(0, 5));
+    push(letters(5, 10));
+    push(letters(2, 7));
+  }
+  push(`${clean(primary)}a`);
+  push('abcde');
+  return out.slice(0, 4);
+}
+
+export const _worldBotNameCandidatesForTests = (primary, phone) => worldBotNameCandidates(primary, phone);
+
+// Naam ke baad bot ka jawab: JSON / document / Copy button / naam reject /
+// naam confirm (Yes) — sab yahan handle hote hain.
+function nameStepPredicate(freshList) {
+  for (const message of freshList) {
+    if (message.hasDocument) return { kind: 'document', message };
+    const json = extractWorldBotJson(message.text);
+    if (json) return { kind: 'json', message, json };
+    const kind = worldBotPromptKind(message.text);
+    if (kind === 'otpFail') return { kind: 'otpFail', message };
+    // ⚠️ Confirm button pehle: bot "Naam confirm karo? ✅ Yes / ❌ Cancel"
+    // poochhta hai — is text me "naam" hai, isliye pehle askAgain maan liya jata
+    // tha aur Yes kabhi nahi dabta tha.
+    const yes = pickWorldBotConfirmButton(message.buttons || []);
+    if (yes) return { kind: 'confirm', entry: { button: yes?.button || yes, text: String(yes?.text || yes?.button?.text || 'Yes') }, message };
+    if (kind === 'nameFail') return { kind: 'nameFail', message };
+    if (kind === 'askName') return { kind: 'askAgain', message };
+    if (pickWorldBotButton(message.buttons, 'copyCode')) return { kind: 'copy', message };
+  }
+  return null;
+}
+
+// 🔎 JSON recovery — naam/login ke baad JSON ka message miss ho jaye (flood /
+// blank read) to yahan se nikalta hai: Copy button, phir aakhri 15 messages,
+// phir 12s ka intezaar. Pehle seedha `no-json`/timeout ho kar /start chala jata tha.
+async function recoverWorldBotJson({ client, entity, cfg = {}, shouldAbort = null }) {
+  const copied = await clickCopyCode({ client, entity, cfg, shouldAbort }).catch(() => null);
+  const fromCopy = copied?.json?.text
+    || (copied?.message ? await downloadJsonFromMessage(client, copied.message).catch(() => '') : '');
+  if (fromCopy && isValidWorldSessionJson(fromCopy)) return { jsonText: fromCopy, via: 'copy-code' };
+
+  const screen = await parseScreenMessages(client, entity, 15, { fresh: true }).catch(() => []);
+  for (const message of screen) {
+    const json = extractWorldBotJson(message.text);
+    if (json && isValidWorldSessionJson(json.text)) return { jsonText: json.text, via: 'screen' };
+    if (message.hasDocument) {
+      const body = await downloadJsonFromMessage(client, message).catch(() => '');
+      if (body && isValidWorldSessionJson(body)) return { jsonText: body, via: 'document' };
+    }
+  }
+
+  const baseline = screenSignature(screen);
+  const late = await waitForReply({
+    client, entity, baseline, timeoutMs: 12_000, shouldAbort, what: 'JSON (recovery)', graceMs: 0,
+    predicate: (freshList) => {
+      for (const message of freshList) {
+        const json = extractWorldBotJson(message.text);
+        if (json) return json;
+      }
+      return null;
+    },
+    pollMs: cfg?.pollMs,
+  }).catch(() => null);
+  if (late?.text && isValidWorldSessionJson(late.text)) return { jsonText: late.text, via: 'late' };
+  return { jsonText: '', via: '' };
+}
+
+// Naam bhejo + bot ka jawab sambhalo. Return: { ok, name, final } ya
+// { ok:false, kind, reason }.
+async function submitWorldBotName({ client, entity, cfg = {}, shouldAbort = null, nameProvider = null, phone = '' }) {
+  let primary = '';
+  try {
+    primary = String((await nameProvider?.()) || '');
+  } catch (e) {
+    console.warn(`[WorldBot] ⚠️ nameProvider fail: ${String(e?.message || e).slice(0, 90)}`);
+  }
+  const names = worldBotNameCandidates(primary, phone || state.phone);
+  if (!names.length) {
+    return { ok: false, kind: 'name_rejected', reason: 'Naam ban hi nahi paya (nameProvider khali/invalid)' };
+  }
+  let baseline = screenSignature(await parseScreenMessages(client, entity).catch(() => []));
+  for (let i = 0; i < names.length; i += 1) {
+    const name = names[i];
+    setPhase('send-name');
+    try {
+      await sendWorldText(client, entity, name);
+    } catch (e) {
+      console.warn(`[WorldBot] naam send fail (${name}): ${String(e?.message || e).slice(0, 90)}`);
+      await sleep(1_200);
+      continue;
+    }
+    state.lastTypedText = name;
+    state.lastTypedAt = Date.now();
+    console.log(`[WorldBot] ⌨️ naam type kiya (try ${i + 1}/${names.length}): ${name}`);
+    const res = await waitForReply({
+      client, entity, baseline, timeoutMs: cfg.stepTimeoutMs, shouldAbort,
+      what: `JSON (naam ${name} ke baad)`,
+      graceMs: Number(cfg.lateReplyGraceMs) || 60_000,
+      predicate: nameStepPredicate,
+      pollMs: cfg.pollMs,
+    }).catch((e) => {
+      if (e?.code === 'aborted') throw e;
+      console.warn(`[WorldBot] naam ke baad jawab nahi (${name}): ${String(e?.message || e).slice(0, 140)}`);
+      return { kind: 'timeout' };
+    });
+
+    if (res?.kind === 'json' || res?.kind === 'document' || res?.kind === 'copy') return { ok: true, name, final: res };
+    if (res?.kind === 'otpFail') return { ok: false, kind: 'otpFail', name, final: res };
+
+    if (res?.kind === 'confirm') {
+      setPhase('name-confirm');
+      console.log(`[WorldBot] 🖱 naam confirm: "${res.entry.text}"`);
+      baseline = screenSignature(await parseScreenMessages(client, entity).catch(() => []));
+      await clickWorldButton(res.entry).catch((e) => console.warn(`[WorldBot] naam confirm click: ${String(e?.message || e).slice(0, 80)}`));
+      const after = await waitForReply({
+        client, entity, baseline, timeoutMs: cfg.stepTimeoutMs, shouldAbort,
+        what: 'JSON (naam confirm ke baad)', graceMs: Number(cfg.lateReplyGraceMs) || 60_000,
+        predicate: nameStepPredicate, pollMs: cfg.pollMs,
+      }).catch(() => ({ kind: 'timeout' }));
+      if (['json', 'document', 'copy'].includes(after?.kind)) return { ok: true, name, final: after };
+      if (after?.kind === 'otpFail') return { ok: false, kind: 'otpFail', name, final: after };
+      const recovered = await recoverWorldBotJson({ client, entity, cfg, shouldAbort }).catch(() => null);
+      if (recovered?.jsonText) return { ok: true, name, final: { kind: 'json', json: { text: recovered.jsonText } } };
+      return { ok: false, kind: 'no-json', name, reason: 'Naam confirm ke baad bhi JSON nahi aaya' };
+    }
+
+    if (res?.kind === 'askAgain' || res?.kind === 'nameFail') {
+      console.warn(`[WorldBot] ❌ bot ne naam accept nahi kiya ("${name}", ${res.kind}) — agla naam try (naya number ya /start nahi)`);
+      baseline = screenSignature(await parseScreenMessages(client, entity).catch(() => []));
+      continue;
+    }
+
+    // timeout — naam shayad chala gaya par JSON late/miss hua: recovery try.
+    const recovered = await recoverWorldBotJson({ client, entity, cfg, shouldAbort }).catch(() => null);
+    if (recovered?.jsonText) return { ok: true, name, final: { kind: 'json', json: { text: recovered.jsonText } } };
+    const nowScreen = await parseScreenMessages(client, entity, 4, { fresh: true }).catch(() => []);
+    const nowKind = worldBotPromptKind(nowScreen.map((m) => m.text).join('\n'));
+    if (nowKind === 'askName' || nowKind === 'nameFail') {
+      baseline = screenSignature(nowScreen);
+      continue;
+    }
+    return { ok: false, kind: 'no-json', name, reason: 'Naam type kar diya par bot ka JSON nahi aaya' };
+  }
+  return { ok: false, kind: 'name_rejected', reason: `Naam accept nahi hua (tries: ${names.join(', ')})` };
+}
+
+export const _submitWorldBotNameForTests = (opts) => submitWorldBotName(opts);
+
+// ---------------------------------------------------------------------------
 // BUTTON TRIGGER — pehle click; screen na badle to USI button ka POORA TEXT
 // likh kar bhej do (owner ka rule). Do-guna trigger se bachne ke liye typing se
 // pehle screen dobara padhi jati hai.
@@ -2099,6 +2278,20 @@ async function worldResetToMenu(client, entity, cfg = {}) {
   if (!worldBotAwaitingKind(settled) && roleOnLatest(settled, 'login')) {
     console.log('[WorldBot] ✅ menu pehle se saaf hai — /start skip');
     return true;
+  }
+  // ⛔ OWNER RULE: login/OTP/naam ke beech me /start BILKUL nahi — wo World Bot
+  // ko reset karke `Invalid OTP` / `Invalid Mobile Number` deta hai. Owner ki
+  // shikayat bhi yahi thi: "naam enter nahi hota aur baad me /start chala jata
+  // hai". Ab /start sirf tab jab screen par koi button hi na ho aur bot kuch
+  // maang bhi na raha ho (asli blank screen), ya `resetMode: 'menu-only'`.
+  const pendingNow = worldBotAwaitingKind(settled);
+  // Flow "chalu" hai agar bot kuch maang raha hai (naam/OTP/number) ya screen
+  // par Cancel/Yes jaisa step-button hai. Aise me /start = reset = galat.
+  const hasFlowButton = settled.some((m) => (m.buttons || [])
+    .some((b) => ['cancel', 'permanentLogout', 'copyCode'].includes(String(b?.role || ''))));
+  if (String(cfg?.resetMode || '') === 'menu-only' || pendingNow || hasFlowButton) {
+    console.warn(`[WorldBot] ⛔ /start nahi bhej raha (${pendingNow ? `bot ${pendingNow} maang raha hai` : hasFlowButton ? 'screen par flow ka button (Cancel/Copy) hai' : 'resetMode=menu-only'}) — Cancel/button se kaam karenge`);
+    return false;
   }
   await sendWorldText(client, entity, '/start').catch(() => {});
   const after = await settledScreen(client, entity, cfg).catch(() => parseScreenMessages(client, entity));

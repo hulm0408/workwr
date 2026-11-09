@@ -45,6 +45,14 @@ hai.
 > Blank reply + screen par Login menu = number bot tak pahuncha hi nahi → OTP
 > **type nahi** hota, wahi number dobara issue hota hai (pehle yahan OTP
 > bekaar chala jata tha aur naam ka step kabhi aata hi nahi tha).
+>
+> 👤 **“New Account Detected” ka naam step:** ye screen jahan bhi dikhe — login
+> ke shuru me, OTP type karne se pehle, ya login ke result ka intezaar me —
+> wahan **turant naam (`Sudhani Kumar`) chala jata hai** aur JSON liya jata hai
+> (naya OTP/naya number/`/start` bilkul nahi). Screen par koi dusra number
+> likha ho (pichhle number ka aadha account) to usme naam nahi bharta —
+> pehle Cancel karke saaf menu. `/cancel` bhi naam ke step par kabhi nahi
+> jata (warna poora naya-account flow jal jata tha).
 
 ### 🐘 Hathi + 🔐 HardXotp — OTP bots
 

@@ -4239,6 +4239,66 @@ Thanks`)),
       `speed: login menu par OTP type nahi hota (reason: ${typed?.reason || typed?.ok})`);
   }
 
+  // 👤 Owner ka 2026-11-09 case: bot "🆕 New Account Detected! Tell us the name
+  // to set on your Swiggy account." par khada tha par naam type hi nahi hua.
+  // Naam sirf fresh messages me dhoondha jata tha — screen par pehle se khada
+  // prompt match hi nahi hota tha (baseline me tha).
+  ok(wb.worldBotNamePromptOnScreen([
+    { id: 2, out: false, text: '🆕 New Account Detected!\n\nTell us the name to set on your Swiggy account.', buttons: [] },
+    { id: 1, out: false, text: '🏠 Main Menu\n\nPick a feature:', buttons: [] },
+  ], { strict: true })?.id === 2,
+  'naam: screen par khada "New Account Detected" prompt pakda jata hai');
+  ok(wb.worldBotNamePromptOnScreen([
+    { id: 3, out: false, text: '🏠 Main Menu\n\nPick a feature:', buttons: [[{ text: '🔐 Login' }]] },
+  ], { strict: true }) === null
+    && wb.worldBotNamePromptOnScreen([
+      { id: 4, out: false, text: 'Login JSON\n\nTap Copy on the code block below', buttons: [[{ text: 'Copy Code' }]] },
+    ], { strict: true }) === null,
+  'naam: menu/JSON screen ko galti se naam ka prompt nahi samajhta');
+
+  // Bot pehle se naam par khada ho to login usi waqt naam bheje (naya OTP /
+  // number / /start nahi) — warna number bekaar jata tha.
+  wb._resetWorldBotReadCacheForTests();
+  {
+    let nextId = 100;
+    const box = [
+      { id: 2, out: false, text: '🆕 New Account Detected!\n\nTell us the name to set on your Swiggy account.', buttons: [] },
+      { id: 1, out: false, text: '🏠 Main Menu', buttons: [[{ text: '🔐 Login' }]] },
+    ];
+    let otpCalls = 0;
+    const client = {
+      async getMessages(_e, { limit = 10 } = {}) { return box.slice(0, Math.max(1, limit)); },
+      async getEntity() { return { id: 'bot' }; },
+      async downloadMedia() { return Buffer.from('{}'); },
+      async sendMessage(_e, { message }) {
+        const text = String(message || '').trim();
+        box.unshift({ id: ++nextId, out: true, text, buttons: [] });
+        if (/^[A-Za-z][A-Za-z ]{2,24}$/.test(text)) {
+          box.unshift({ id: ++nextId, out: false, text: `Login JSON\n\n\`\`\`json\n${JSON_SAMPLE}\n\`\`\``, buttons: [] });
+        }
+        return { id: ++nextId };
+      },
+    };
+    wb._setWorldBotClientOverrideForTests(client);
+    try {
+      const login = await wb.worldBotLogin({
+        phone: '9876543210',
+        otpProvider: async () => { otpCalls += 1; return { code: '999999' }; },
+        otpWatermark: async () => ({}),
+        nameProvider: async () => 'ihgfe',
+        config: flowCfg,
+      });
+      const sent = box.filter((m) => m.out).map((m) => String(m.text));
+      ok(login.ok && login.askedName && String(login.jsonText || '').includes('"tid"'),
+        `naam: bot naam par khada tha → seedha naam → JSON (${login.kind || login.reason})`);
+      ok(sent.includes('Sudhani Kumar') && !sent.includes('/start') && otpCalls === 0
+        && !sent.some((t) => /^\d{6}$/.test(t)),
+        `naam: naya OTP/number//start nahi gaya (${sent.join(' · ') || 'kuch nahi'})`);
+    } finally {
+      wb._setWorldBotClientOverrideForTests(null);
+    }
+  }
+
   ok(wb.shouldReissueWorldOtp('login_cancelled') === true
     && wb.shouldReissueWorldOtp('worldbot_offline') === false
     && wb.shouldReissueWorldOtp('number_blocked') === false,

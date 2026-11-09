@@ -461,6 +461,11 @@ World bots ka default pool: `@SwiggyByworldBot`, `@SwiggyByworld1Bot` …
   result `logout_not_confirmed` (jhoothi success nahi). Transcript wala rasta
   pehle try hota hai: `Main Menu → 📇 Swiggy Accounts → woh number → 🗑 Permanent
   Logout`, uske baad Switch Accounts / Order Hub.
+- **Naam step:** naam khali kabhi nahi jata (phone digits se letters); bot reject
+  kare to agla naam, confirm maange to Yes, JSON miss ho to recovery. Sab fail
+  ho to `name_rejected`/`no-json` = wahi number dobara (bot wahi).
+- **`/start` flow ke beech nahi:** bot naam/OTP/number maang raha ho ya screen par
+  Cancel/Copy button ho to `/start` nahi bhejta (reset = Invalid OTP ka kaaran).
 - **Delete OTP ≠ delete success:** `✅ Delete OTP Sent … account will be
   permanently deleted` ab `deleteSent` hai (pehle "deleted" shabd ki wajah se
   delete-success maan liya jata tha).

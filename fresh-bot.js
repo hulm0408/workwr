@@ -318,7 +318,7 @@ function startCard() {
       ? '[POOL] › WORLD BOT LOGIN › OTP › JSON'
       : (telegram ? '[NEW] › OTP › REFRESH › VERIFY › ADDR › FRESH' : '[POOL] › OTP › INBOX › VERIFY › ADDR › FRESH')),
     engineWorld
-      ? `🌍 ${mono(`WORLD BOT @${worldBot.worldBotUsername()}`)} <i>· koi proxy/WAF nahi</i>`
+      ? `🌍 ${mono(`WORLD BOT @${worldBot.worldBotUsername()}`)} <i>· login + OTP bot ke andar</i>`
       : '',
     '<b>Abhi:</b> START ka wait hai',
     telegram
@@ -327,7 +327,9 @@ function startCard() {
     `🎯 ${mono(`${target} fresh`)} · ⏱ ${mono(`${maxMin} min`)} · 🔁 ${mono(`NEVER-STOP ${bs.getSetting('autoContinue') ? 'ON' : 'OFF'}`)}`,
     '⏭ Running card par <b>SKIP NUMBER</b> bhi rahega — sirf current number chhodega, batch nahi rukega.',
     bs.getSetting('autoContinue')
-      ? '🔁 Batch <b>rukega nahi</b> — time cap/fail/WAF-403/pool rukawat par khud recovery karega; sirf TARGET ya ⏹ STOP par band.'
+      ? (engineWorld
+        ? '🔁 Batch <b>rukega nahi</b> — fail/rate-limit/pool rukawat par khud aage badhega; sirf TARGET ya ⏹ STOP par band.'
+        : '🔁 Batch <b>rukega nahi</b> — time cap/fail/WAF-403/pool rukawat par khud recovery karega; sirf TARGET ya ⏹ STOP par band.')
       : '⚠️ Never-stop OFF hai — safety stops batch band kar sakte hain (Settings → 🔁 Never-stop).',
     telegram
       ? '<b>Next:</b> START dabao — bot chuno, phir new number aayega'
@@ -374,14 +376,16 @@ function settingsCard() {
     field('⚡ Parallel lanes', `${bs.getSetting('concurrency')} numbers/IPs ek saath`),
     field('⏱ Max time', `${bs.getSetting('maxMinutes')} min`),
     field('🔁 Never-stop', bs.getSetting('autoContinue')
-      ? 'ON — time cap/fail/WAF/pool rukawat par batch khud aage badhta hai'
+      ? (bs.getSetting('accountEngine') === 'worldbot'
+        ? 'ON — fail/rate-limit/pool rukawat par batch khud aage badhta hai'
+        : 'ON — time cap/fail/WAF/pool rukawat par batch khud aage badhta hai')
       : 'OFF — purana safety-stop behaviour'),
     field('🚦 Gap', bs.fmtSetting('gapMs')),
     field('⏳ OTP wait', bs.fmtSetting('otpWaitMs')),
     field('📴 Offline devices', bs.getSetting('allowOffline') ? 'ON (try bhi karenge)' : 'OFF (sirf online)'),
     ``,
     field('🌍 Account engine', bs.getSetting('accountEngine') === 'worldbot'
-      ? `WORLD BOT — @${esc(worldBot.worldBotUsername())} ke buttons click honge (koi proxy/WAF nahi)`
+      ? `WORLD BOT — @${esc(worldBot.worldBotUsername())} ke buttons click honge (login + OTP wahi se)`
       : 'DIRECT API — is bot ka apna Swiggy bridge (proxy + WAF solver)'),
     field('📨 Telegram mode', bs.fmtSetting('telegramOtpMode')),
     field('🤖 OTP bot', `${esc(bs.fmtSetting('otpBotProfile'))} — <code>@${esc(String(telegramProviderStatus().botUsername || ''))}</code>`),
@@ -406,11 +410,12 @@ const settingsRows = () => [
     { text: `⏳ OTP wait: ${bs.fmtSetting('telegramOtpTimeoutMs')}`, callback_data: 'ap_pick_telegram_wait' },
     { text: `🔄 Refresh: ${bs.fmtSetting('telegramOtpRefreshMs')}`, callback_data: 'ap_pick_telegram_refresh' },
   ]] : []),
-  [{
+  // 🌍 World Bot mode me proxy ka koi button/wording nahi.
+  ...(bs.getSetting('accountEngine') === 'worldbot' ? [] : [[{
     text: proxyPool.proxySummary().direct ? '🔀 Proxies: DIRECT' : `🔀 Proxies: ${proxyPool.proxySummary().enabledCount}`,
     callback_data: 'ap_proxies',
     style: 'primary',
-  }],
+  }]]),
   [{ text: `🎯 Target: ${bs.getSetting('target')}`, callback_data: 'ap_pick_target' }],
   [{ text: `⚡ Parallel: ${bs.getSetting('concurrency')} lanes`, callback_data: 'ap_pick_parallel' }],
   [{ text: `⏱ Max: ${bs.getSetting('maxMinutes')}m`, callback_data: 'ap_pick_time' }],
@@ -1083,6 +1088,9 @@ bot.help((ctx) => ctx.reply('/start — menu · /status — current batch · /di
 // ---------------------------------------------------------------------------
 async function diagCard() {
   const lines = [];
+  // 🌍 World Bot engine: proxy/Chrome/WAF-token lafz hi nahi dikhne chahiye
+  // (owner ka rule) — is mode me ye cheezein exist hi nahi karti.
+  const diagWorld = bs.getSetting('accountEngine') === 'worldbot';
   lines.push(field('Node', process.version));
   {
     const shard = instanceShard.shardSummary();
@@ -1106,17 +1114,18 @@ async function diagCard() {
   lines.push(field('📡 FresBot Bot API', runtimeHealth.telegramReady
     ? `✅ ready${runtimeHealth.telegramUsername ? ` (@${esc(runtimeHealth.telegramUsername)})` : ''}`
     : `❌ ready nahi${runtimeHealth.lastTelegramError ? ` — ${esc(String(runtimeHealth.lastTelegramError).slice(0, 100))}` : ''}`));
-  // Chrome (WAF solver ke liye zaroori)
-  try {
-    const c = getChromeStatus();
-    lines.push(field('🌐 Chrome', c.found ? `✅ mila — <code>${esc(c.path)}</code>${c.headless ? ' (headless)' : ''}` : '❌ NAHI mila — Chrome install karo ya .env me PUPPETEER_EXECUTABLE_PATH do'));
-  } catch { lines.push(field('🌐 Chrome', '—')); }
-  // WAF token
-  try {
-    wafPool.loadFromDb?.(); // db.json me saved token bhi dikhe (warna hamesha "nahi hai" lagega)
-    const w = wafPool.getSummary();
-    lines.push(field('🛡 WAF token', w.hasToken ? `✅ hai (age ${w.tokenAgeMin}m, ${esc(w.source)})` : (w.stale ? '⚠️ purana/expired — batch start par naya banega (Chrome chahiye)' : '— abhi nahi (batch start par banega)')));
-  } catch { lines.push(field('🛡 WAF token', '—')); }
+  // Chrome + WAF token — sirf direct-API engine ke liye (World Bot me nahi).
+  if (!diagWorld) {
+    try {
+      const c = getChromeStatus();
+      lines.push(field('🌐 Chrome', c.found ? `✅ mila — <code>${esc(c.path)}</code>${c.headless ? ' (headless)' : ''}` : '❌ NAHI mila — Chrome install karo ya .env me PUPPETEER_EXECUTABLE_PATH do'));
+    } catch { lines.push(field('🌐 Chrome', '—')); }
+    try {
+      wafPool.loadFromDb?.(); // db.json me saved token bhi dikhe (warna hamesha "nahi hai" lagega)
+      const w = wafPool.getSummary();
+      lines.push(field('🛡 WAF token', w.hasToken ? `✅ hai (age ${w.tokenAgeMin}m, ${esc(w.source)})` : (w.stale ? '⚠️ purana/expired — batch start par naya banega (Chrome chahiye)' : '— abhi nahi (batch start par banega)')));
+    } catch { lines.push(field('🛡 WAF token', '—')); }
+  }
   const diagTelegramMode = isTelegramNumberSource();
   if (diagTelegramMode) {
     // Telegram-only mode me Firebase ko "toota hua" mat dikhao — number aur
@@ -1216,16 +1225,18 @@ async function diagCard() {
       lines.push(field('📟 Device gate', `sirf wahi devices jinki last activity ≤${Math.round(wMs / 1000)}s purani ho (env PREMIUM_DEVICE_ACTIVE_WINDOW_MS se badal sakta hai)`));
     }
   }
-  // Proxies
-  try {
-    const ps = proxyPool.proxySummary();
-    if (ps.direct) {
-      lines.push(field('🔀 Proxies', `🔀 ${mono('DIRECT MODE')} — koi proxy nahi, ek IP, 1 lane`));
-      lines.push(sub('Slow par predictable: proxy fetch/WAF-solve ka time bachta hai, par Swiggy ki per-IP rate-limit seedha lagti hai.'));
-    } else {
-      lines.push(field('🔀 Proxies', ps.enabled ? `✅ ${ps.enabledCount}/${ps.total} ON` : '⚠️ OFF (ek hi IP — rukna pad sakta hai)'));
-    }
-  } catch { lines.push(field('🔀 Proxies', '—')); }
+  // Proxies — sirf direct-API engine me (World Bot me proxy hoti hi nahi).
+  if (!diagWorld) {
+    try {
+      const ps = proxyPool.proxySummary();
+      if (ps.direct) {
+        lines.push(field('🔀 Proxies', `🔀 ${mono('DIRECT MODE')} — koi proxy nahi, ek IP, 1 lane`));
+        lines.push(sub('Slow par predictable: proxy fetch/WAF-solve ka time bachta hai, par Swiggy ki per-IP rate-limit seedha lagti hai.'));
+      } else {
+        lines.push(field('🔀 Proxies', ps.enabled ? `✅ ${ps.enabledCount}/${ps.total} ON` : '⚠️ OFF (ek hi IP — rukna pad sakta hai)'));
+      }
+    } catch { lines.push(field('🔀 Proxies', '—')); }
+  }
   // Ek number = ek hi baar (owner rule): number park/queue nahi hota.
   try {
     const win = Math.round(numberDecisionWindowMs() / 1000);
@@ -1241,7 +1252,7 @@ async function diagCard() {
       ? ` · last phase: ${wbStatus.phase}${wbStatus.lastAction ? ` (${wbStatus.lastAction})` : ''}`
       : '';
     lines.push(field('🌍 Account engine', engine === 'worldbot'
-      ? `✅ ${mono('WORLD BOT')} @${esc(worldBot.worldBotUsername())} — koi proxy/WAF nahi · spare TG ${tg.configured ? '✅' : '❌'}${esc(wbLine)}`
+      ? `✅ ${mono('WORLD BOT')} @${esc(worldBot.worldBotUsername())} · spare TG ${tg.configured ? '✅' : '❌'}${esc(wbLine)}`
       : `✅ ${mono('DIRECT API')} — bridge + proxy/WAF solver (Settings → 🌍 Account engine se World Bot chuno)`));
   } catch { lines.push(field('🌍 Account engine', '—')); }
   // 🔁 Never-stop + auto-resume — batch rukne na rukne ka sach.
@@ -1252,7 +1263,9 @@ async function diagCard() {
       ? `auto-resume armed (${String(resume.lastEndReason || 'restart')} ke baad wapas chalega)`
       : 'auto-resume idle';
     lines.push(field('🔁 Never-stop', bs.getSetting('autoContinue')
-      ? `✅ ${mono(ns)} — time cap/fail-streak/rate-limit/WAF-403/pool khali par batch khud aage badhta hai; sirf TARGET/STOP end. ${esc(resumeLine)}`
+      ? (diagWorld
+        ? `✅ ${mono(ns)} — fail-streak/rate-limit/pool khali par batch khud aage badhta hai; sirf TARGET/STOP end. ${esc(resumeLine)}`
+        : `✅ ${mono(ns)} — time cap/fail-streak/rate-limit/WAF-403/pool khali par batch khud aage badhta hai; sirf TARGET/STOP end. ${esc(resumeLine)}`)
       : `⚠️ ${mono(ns)} — safety stops batch band kar sakte hain. ${esc(resumeLine)}`));
   } catch { lines.push(field('🔁 Never-stop', '—')); }
   const snap = getAutopilotSnapshot();
@@ -2032,6 +2045,15 @@ bot.action('ap_src_add', async (ctx) => {
 bot.action('ap_proxies', async (ctx) => {
   if (!(await gate(ctx))) return;
   await ctx.answerCbQuery().catch(() => {});
+  // 🌍 World Bot mode: proxy pool ka concept nahi — sirf saaf jawab.
+  if (bs.getSetting('accountEngine') === 'worldbot') {
+    await editOrSend(ctx, section('🌍 World Bot ON', [
+      '› Login, OTP aur account banane ka kaam Swiggy World Bot ke andar hota hai.',
+      '',
+      sub('Engine badalna ho to Settings → 🌍 Account engine.'),
+    ].join('\n')), [[{ text: '↩️ Settings', callback_data: 'ap_settings', style: 'primary' }]]);
+    return;
+  }
   const { text, rows } = proxiesCard();
   await editOrSend(ctx, text, rows);
 });
@@ -2266,7 +2288,7 @@ bot.action('ap_toggle_engine', async (ctx) => {
     return;
   }
   let note = next === 'worldbot'
-    ? '🌍 World Bot ON — account @' + worldBot.worldBotUsername() + ' ke buttons click karke banega (proxy/WAF OFF).'
+    ? '🌍 World Bot ON — account @' + worldBot.worldBotUsername() + ' ke buttons click karke banega.'
     : '🌍 Direct API ON — is bot ka apna Swiggy bridge (proxy + WAF solver).';
   if (next === 'worldbot') {
     let st = {};

@@ -3487,7 +3487,7 @@ Thanks`)),
   'name: 0 ke liye x (92046 → ibxdf · 90012 → ixxab)');
   ok(phoneUtils.swiggyNameFromPhone('') === '' && phoneUtils.swiggyNameFromPhone('+91 98765 43210') === 'ihgfe',
     'name: khali/invalid par khali, +91 ke baad bhi wahi 10 digit');
-  ok(pipelineCharges.includes("swiggyNameFromPhone(phone) || existingName || getNextAutoUserName()")
+  ok(pipelineCharges.includes("WORLD_BOT_DEFAULT_NAME || swiggyNameFromPhone(phone) || existingName || getNextAutoUserName()")
     && pipelineCharges.includes('const loginOnce = (fresh = false) => worldBotLogin({')
     && pipelineCharges.includes('let first = await loginOnce();')
     && pipelineCharges.includes('let again = await loginOnce(true);'),
@@ -3905,14 +3905,20 @@ Thanks`)),
   // aur uske baad /start chala jata hai". Tests: naam ka candidate list,
   // reject hone par agla naam, confirm par Yes, aur /start ka pehra.
   // ---------------------------------------------------------------------
+  // 👤 Owner rule (2026-11-09): har naye account ka naam "Sudhani Kumar".
+  ok(wb.WORLD_BOT_DEFAULT_NAME === 'Sudhani Kumar',
+    'naam: default naam Sudhani Kumar hai');
   const nameCand = wb.worldBotNameCandidates('ihgfe', '9876543210');
-  ok(nameCand[0] === 'ihgfe' && nameCand.length >= 2
-    && nameCand.every((n) => /^[A-Za-z]{3,20}$/.test(n)),
-  `naam: candidates letters-only (${nameCand.join(', ')})`);
-  ok(wb.worldBotNameCandidates('', '9876543210').length >= 2,
-    'naam: nameProvider khali ho to phone digits se naam bante hain (khali string nahi jata)');
-  ok(wb.worldBotNameCandidates('12345', '9001234567')[0] === 'ixxab',
-    'naam: digits/emoji wala invalid primary hata kar phone se saaf naam (0 → x)');
+  ok(nameCand[0] === 'Sudhani Kumar' && nameCand[1] === 'ihgfe'
+    && nameCand.length >= 2
+    && nameCand.every((n) => /^[A-Za-z]+(?: [A-Za-z]+)*$/.test(n) && !/  /.test(n)),
+  `naam: default pehle, phir pipeline ka naam — space bacha hua (${nameCand.join(' | ')})`);
+  ok(wb.worldBotNameCandidates('', '9876543210')[0] === 'Sudhani Kumar'
+    && wb.worldBotNameCandidates('', '9876543210').length >= 2,
+  'naam: nameProvider khali ho to bhi default naam jata hai (khali string nahi)');
+  ok(wb.worldBotNameCandidates('12345', '9001234567')[0] === 'Sudhani Kumar'
+    && wb.worldBotNameCandidates('12345', '9001234567')[1] === 'ixxab',
+  'naam: default ke baad digits/emoji wala invalid primary hata kar phone se saaf naam (0 → x)');
   ok(wb.worldBotPromptKind('❌ Invalid name. Please send letters only.') === 'nameFail'
     && wb.worldBotPromptKind('Name must be between 3 and 20 characters') === 'nameFail'
     && wb.worldBotPromptKind('This name is already taken, try another name') === 'nameFail'
@@ -3956,8 +3962,10 @@ Thanks`)),
       nameProvider: async () => 'ihgfe',
       cfg: { stepTimeoutMs: 4_000, pollMs: 150, lateReplyGraceMs: 1_200 },
     });
-    ok(res.ok && sent[0] === 'ihgfe' && sent[1] === 'dcbax' && res.name === 'dcbax',
-      `naam step: pehla naam reject → agla naam bheja (${sent.join(' → ') || 'kuch nahi'})`);
+    // Default naam reject ho jaye to hi fallback jaata hai (owner: naam ka
+    // masla hamesha ke liye khatam — pehla try hamesha "Sudhani Kumar").
+    ok(res.ok && sent[0] === 'Sudhani Kumar' && sent[1] === 'ihgfe' && res.name === 'ihgfe',
+      `naam step: default naam reject → agla candidate bheja (${sent.join(' → ') || 'kuch nahi'})`);
     ok(res.ok && res.final?.kind === 'json' && String(res.final?.json?.text || '').includes('"tid"'),
       'naam step: doosre naam par JSON mil gaya (timeout/`/start` nahi)');
   }
@@ -4074,7 +4082,8 @@ Thanks`)),
           push('✅ Account Deleted Successfully\n\n🧾 Swiggy: User successfully archived\n📌 StatusCode: 33', [[btn('🏠 Main Menu', async () => pushMenu())]]);
           return { id: ++id };
         }
-        if (awaiting === 'name' && /^[A-Za-z]{3,20}$/.test(text)) {
+        // Asli bot letters + single space leta hai — "Sudhani Kumar" pass hona chahiye.
+        if (awaiting === 'name' && /^[A-Za-z][A-Za-z ]{2,24}$/.test(text) && !/  /.test(text)) {
           accounts.set(pendingPhone, { name: text });
           loggedIn = pendingPhone;
           awaiting = '';
@@ -4110,8 +4119,8 @@ Thanks`)),
       const sent = fake.chat.filter((m) => m.out).map((m) => String(m.text));
       ok(login.ok && login.askedName && String(login.jsonText || '').includes('"tid"'),
         `flow: naya number — OTP → naam → JSON (${login.kind || login.reason})`);
-      ok(sent.includes('ihgfe') && sent.includes('445566') && sent.includes('9876543210'),
-        `flow: bot ko number, OTP aur naam teeno gaye (${sent.join(' · ')})`);
+      ok(sent.includes('Sudhani Kumar') && sent.includes('445566') && sent.includes('9876543210'),
+        `flow: bot ko number, OTP aur default naam (Sudhani Kumar) teeno gaye (${sent.join(' · ')})`);
       ok(fake.state().accounts.includes('9876543210'),
         'flow: naya account ban gaya (naam accept hua)');
     } finally {
@@ -4699,6 +4708,40 @@ Thanks`)),
   ok(botSrc.includes('1 NUMBER = 1 BAAR'), 'diag: number rule line');
   ok(botSrc.includes('attempt start, warna chhod do'), 'diag: precise 60s rule');
   ok(botSrc.includes('🔒 Consumed'), 'diag: consumed count line');
+
+  // ---------------------------------------------------------------------
+  // 👤 NAAM DEFAULT + 🚫 WAF/ROUTE/PROXY ka pehra (owner rules, 2026-11-09)
+  //    "har naye account ka naam Sudhani Kumar" aur "ek line bhi WAF/route
+  //    ki nahi dikhni chahiye — direct number uthao".
+  // ---------------------------------------------------------------------
+  ok(readme.includes('Sudhani Kumar') && docs.includes('Sudhani Kumar'),
+    'docs: default naam Sudhani Kumar README + deploy doc me hai');
+  const wbEngine = await import('./autopilot-engine.js');
+  const wbPipelineSrc = await fsp.readFile(new URL('./number-pipeline.js', import.meta.url), 'utf8');
+  ok(wbPipelineSrc.includes('WORLD_BOT_DEFAULT_NAME || swiggyNameFromPhone(phone)'),
+    'pipeline: World Bot ko pehle default naam Sudhani Kumar milta hai');
+  const wbCard = wbEngine.formatCompactAutopilotCard({
+    accountEngine: 'worldbot', sourceMode: 'telegram', running: true, target: 10,
+    fresh: 1, processed: 1, proxyMode: 'direct', concurrency: 1, otpBotLabel: 'Hermes',
+  }, { stageText: 'WAF token solve ho raha hai — route ready' });
+  ok(!/waf|route|proxy|direct ip/i.test(wbCard),
+    'card: World Bot mode me WAF/route/proxy ka ek lafz bhi nahi');
+  ok(wbCard.includes('NAME') && wbCard.includes('JSON') && wbCard.includes('FILE') && wbCard.includes('LOGOUT'),
+    'card: World Bot flow number → OTP → naam → JSON → file → logout dikhata hai');
+  ok(!/waf|route|proxy|direct ip/i.test(wbEngine.formatCompactAutopilotCard({
+    accountEngine: 'worldbot', sourceMode: 'telegram', running: true, target: 5, fresh: 0,
+    otpBotLabel: 'Hermes', stopReason: 'waf_stuck', proxyMode: 'direct',
+  }, { stageText: 'Security Challenge — Proxy Rotate', final: true })),
+  'card: World Bot ke final card par WAF/route ka naam nahi (stop reason bhi saaf)');
+  const wbBotSrc = await fsp.readFile(new URL('./fresh-bot.js', import.meta.url), 'utf8');
+  ok(wbBotSrc.includes("const diagWorld = bs.getSetting('accountEngine') === 'worldbot'")
+    && wbBotSrc.includes('if (!diagWorld) {'),
+  'diag: World Bot mode me Chrome/WAF token/proxy fields chhupe rehte hain');
+  ok(wbBotSrc.includes("...(bs.getSetting('accountEngine') === 'worldbot' ? [] : [[{")
+    && wbBotSrc.includes('🌍 World Bot ON'),
+  'settings: World Bot mode me Proxies button nahi, purana button neutral card deta hai');
+  ok(!/koi proxy\/WAF nahi/.test(wbBotSrc) && !/koi proxy\/WAF nahi/.test(wbPipelineSrc),
+    'text: "koi proxy/WAF nahi" jaisi koi line user ko nahi dikhti');
 }
 
 console.log(`\n✅ ALL PASSED — ${passed} checks`);

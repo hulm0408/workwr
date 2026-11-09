@@ -840,6 +840,7 @@ function compactStepInfo(snap = {}, stageText = '') {
   const { title, detail } = stageParts(stageText);
   const text = `${title} ${detail}`.toLowerCase();
   const telegram = snap.sourceMode === 'telegram';
+  const worldBotMode = snap.accountEngine === 'worldbot' || snap.worldBotMode;
   let step = telegram ? 'NEW' : 'POOL';
   let now = telegram ? 'New number le raha hoon' : 'Number select ho raha hai';
 
@@ -857,11 +858,11 @@ function compactStepInfo(snap = {}, stageText = '') {
     if (/rate limit/.test(text)) {
       // Direct mode me nayi IP nahi; rate-limited number retire hota hai.
       const retrySec = Math.max(1, Math.round((Number(snap.rateLimitRetryMs) || 5000) / 1000));
-      now = snap.proxyMode === 'direct'
+      now = (worldBotMode || snap.proxyMode === 'direct')
         ? `Rate-limit — ye number khatam, ${retrySec}s me naya`
         : `Rate-limit — ye number khatam, ${retrySec}s me nayi IP + naya number`;
     } else {
-      now = 'Route/WAF ready ho raha hai';
+      now = worldBotMode ? 'Swiggy World Bot ka jawab aa raha hai' : 'Route/WAF ready ho raha hai';
     }
   } else if (/otp wait|refresh|otp.*intezaar|otp.*wait/.test(text)) {
     step = telegram ? 'REFRESH' : 'INBOX';
@@ -936,12 +937,29 @@ function compactStepInfo(snap = {}, stageText = '') {
     }
   }
 
-  const flow = telegram
+  // 🌍 World Bot mode ka apna flow — ismein REFRESH/ADDR/route/WAF jaisa kuch
+  // nahi: number → OTP → naam → JSON → file → logout.
+  const WB_FLOW = ['NUMBER', 'OTP', 'NAME', 'JSON', 'FILE', 'LOGOUT'];
+  const WB_STEP = { NEW: 'NUMBER', POOL: 'NUMBER', OTP: 'OTP', REFRESH: 'OTP', VERIFY: 'NAME', ADDR: 'JSON', FRESH: 'JSON' };
+  let flow = telegram
     ? ['NEW', 'OTP', 'REFRESH', 'VERIFY', 'ADDR', 'FRESH']
     : ['POOL', 'OTP', 'INBOX', 'VERIFY', 'ADDR', 'FRESH'];
+  if (worldBotMode) {
+    step = WB_STEP[step] || 'NUMBER';
+    flow = WB_FLOW;
+  }
   if (!flow.includes(step)) step = flow[0];
   const flowText = flow.map((x) => (x === step ? `[${x}]` : x)).join(' › ');
-  const nextByStep = telegram
+  const nextByStep = worldBotMode
+    ? {
+        NUMBER: 'Number aate hi Swiggy OTP jayega',
+        OTP: 'OTP aate hi bot me type hoga',
+        NAME: 'Naam: Sudhani Kumar (default)',
+        JSON: 'JSON aate hi file ban kar worker bot par jayegi',
+        FILE: 'File jaane ke baad logout hoga',
+        LOGOUT: 'Switch Account → Permanent Logout → Yes',
+      }
+    : telegram
     ? {
         NEW: 'Number aate hi Swiggy OTP jayega',
         OTP: 'OTP ke baad REFRESH chalega',
@@ -968,11 +986,11 @@ function compactStepInfo(snap = {}, stageText = '') {
     now,
     flowText,
     next: manualSkip
-      ? 'Batch chalega — NEW NUMBER aayega'
+      ? (worldBotMode ? 'Batch chalega — naya number aayega' : 'Batch chalega — NEW NUMBER aayega')
       : oneShotOtp
-        ? 'Ye number khatam — route ready karke NEW NUMBER aayega'
+        ? (worldBotMode ? 'Ye number khatam — naya number aayega' : 'Ye number khatam — route ready karke NEW NUMBER aayega')
         : errorish
-          ? 'Route recovery hoga — STOP nahi hoga'
+          ? (worldBotMode ? 'Bot wahi rahega — number ka faisla hoga' : 'Route recovery hoga — STOP nahi hoga')
           : nextByStep[step],
     errorish,
   };
@@ -1030,6 +1048,7 @@ export function formatCompactAutopilotCard(snap = state, { stageText = '', final
     + (Number(s.telegramInfraRetries) || 0);
   const fresh = Number(s.fresh) || 0;
   const target = Number(s.target) || 0;
+  const wb = s.accountEngine === 'worldbot' || Boolean(s.worldBotMode);
   const reason = {
     target: 'Target complete',
     time: 'Max time complete',
@@ -1041,8 +1060,10 @@ export function formatCompactAutopilotCard(snap = state, { stageText = '', final
     telegram: 'Hermes connection error',
     firebase: s.sourceMode === 'telegram' ? 'Hermes connection error' : 'Firebase error',
     rate_limited: 'Swiggy rate-limit',
-    security_challenge: 'Swiggy ne 3 baar OTP security challenge diya — batch safety stop',
-    waf_stuck: 'WAF rukawat',
+    security_challenge: wb
+      ? 'Swiggy ne 3 baar OTP nahi diya — batch safety stop'
+      : 'Swiggy ne 3 baar OTP security challenge diya — batch safety stop',
+    waf_stuck: wb ? 'Bot se jawab nahi aaya' : 'WAF rukawat',
     circuit_breaker: 'Lagatar failures par safety stop',
     'worldbot-setup': 'Swiggy World Bot / Telegram session setup pending',
     'worldbot-offline': 'Telegram client disconnect — number bacha, batch ruka',
@@ -1054,12 +1075,17 @@ export function formatCompactAutopilotCard(snap = state, { stageText = '', final
   const lines = [
     mono(info.flowText),
     `<b>Abhi:</b> ${esc(now)}`,
-    !final && info.detail && info.detail !== now ? `<i>${esc(info.detail)}</i>` : '',
+    // 🌍 World Bot mode: kisi bhi stage-text se WAF/route/proxy lafz kabhi
+    // card par na nikle (owner: "ek line bhi nahi").
+    !final && info.detail && info.detail !== now
+      && !(wb && /waf|route|proxy|solver/i.test(info.detail))
+      ? `<i>${esc(info.detail)}</i>` : '',
     progressBar(fresh, target),
     `📱 ${mono(phoneText)} · ⏱ ${mono(fmtDuration(compactElapsedMs(s)))}${rateText(s) ? ` · ${rateText(s)}` : ''}${s.sourceMode !== 'telegram' && (s.concurrency || 1) > 1 ? ` · ⚡ ${mono(`${Number(s.activeWorkers) || active.length}/${Number(s.concurrency) || 1}`)}` : ''}`,
     compactSourceLine(s),
     s.shardEnabled ? `🧩 ${mono(`SHARE ${s.shardShare || ''}`)} <i>· pool ka apna hissa, koi ladai nahi</i>` : '',
-    s.proxyMode === 'direct' ? `🔀 ${mono('DIRECT')} <i>· bina proxy, ek IP — slow par predictable</i>` : '',
+    // 🌍 World Bot mode me route/proxy ki koi line nahi (owner ka rule).
+    !wb && s.proxyMode === 'direct' ? `🔀 ${mono('DIRECT')} <i>· bina proxy, ek IP — slow par predictable</i>` : '',
     !final && s.neverStop
       ? `🔁 ${mono('NEVER-STOP')} <i>· batch sirf TARGET/STOP par rukega${Number(s.timeExtensions) ? ` · ⏱ +${Number(s.timeExtensions)} extend` : ''}${Number(s.poolWaits) ? ` · 🕳 pool-wait #${Number(s.poolWaits)}` : ''}${Date.now() < Number(s.infraPauseUntil || 0) ? ` · ⏸ ${Math.max(1, Math.round((Number(s.infraPauseUntil) - Date.now()) / 1000))}s cool-off` : ''}</i>`
       : '',
@@ -1607,9 +1633,13 @@ export async function startAutopilot(opts = {}) {
     // `let` isliye: free-proxy auto-fetch ke baad summary badal jati hai
     // (pool OFF → ON) aur poora loop isi snapshot par faisle karta hai.
     let ps = proxyPool.proxySummary();
-    await push(progressCard(section('🔥 Warm-up', telegramMode
-      ? 'Hermes + route/WAF ready ho rahe hain'
-      : 'Pool + route/WAF ready ho rahe hain')), stopRows());
+    await push(progressCard(section('🔥 Warm-up', worldBotMode
+      // 🌍 World Bot mode: Swiggy ka kaam bot karta hai — proxy/WAF/route ka
+      // koi zikr nahi (owner: "ek line bhi nahi dikhni chahiye").
+      ? 'OTP bot + Swiggy World Bot ready ho rahe hain'
+      : telegramMode
+        ? 'Hermes + route/WAF ready ho rahe hain'
+        : 'Pool + route/WAF ready ho rahe hain')), stopRows());
 
     // Proxy assign — pehli enabled proxy (round-robin se). WAF token bhi
     // usi IP ke liye arrange hoga.
@@ -1916,7 +1946,8 @@ export async function startAutopilot(opts = {}) {
       // Chrome hi nahi mila aur saved token bhi nahi → har OTP par 403 pakki
       // hai. Pehle ye sirf console me chup chaap reh jata tha aur user ko
       // lagta tha "bot work nahi kar raha" — ab Telegram card par saaf btao.
-      if (!tok) {
+      // 🌍 World Bot mode me token/proxy ka concept hi nahi — kuch na dikhao.
+      if (!tok && !worldBotMode) {
         let chrome = null;
         try { chrome = getChromeStatus(); } catch {}
         if (chrome && !chrome.found) {

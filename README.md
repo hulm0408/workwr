@@ -67,6 +67,15 @@ hai.
 > (Hermes/Firebase) ka hai — OTP type karne ke baad alag budget
 > (`SWIGGY_WORLD_OTP_VERIFY_WAIT_MS`, default 90s) chalta hai.
 >
+> 🆕 **“New Account Detected” ko pehchanne wala fix (2026-11-09, round 2):** bot
+> ka asli screen sirf `🆕 New Account Detected!` hota hai — isme “name” shabd hi
+> nahi hota, isliye pehle kind `''` aata tha aur naam ka step **kabhi pehchana hi
+> nahi jata tha** (OTP naam ki jagah chala jata tha / 4 naam jal kar
+> `name_rejected`). Ab: detection line = `askName` (strict mode me bhi), button
+> ya digit ho to bhi; `✅ Name set: Sudhani Kumar` = **accept** (`nameOk`) — uske
+> baad agla naam nahi, seedha JSON; aur wahi purana prompt dobara dikhe to naya
+> naam nahi bhejte.
+>
 > 👤 **“New Account Detected” ka naam step:** ye screen jahan bhi dikhe — login
 > ke shuru me, OTP type karne se pehle, ya login ke result ka intezaar me —
 > wahan **turant naam (`Sudhani Kumar`) chala jata hai** aur JSON liya jata hai

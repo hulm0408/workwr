@@ -449,6 +449,10 @@ export function worldBotLooksLikeNamePrompt(text = '', buttons = []) {
   const raw = String(text || '');
   const n = norm(raw);
   if (!n) return false;
+  // 🆕 "New Account Detected!" = pakka naam ka step — is par button ho ya
+  // digit ho, dono se pehle ise accept karo (asli bot ise inline button ke
+  // saath bhi bhejta hai, aur pehle guess wahin mar jata tha).
+  if (/\bnew account detected\b|\baccount detected\b/.test(n)) return true;
   if (Array.isArray(buttons) && buttons.length) return false;   // button wali screen = menu/confirm
   if (/\b(invalid|error|fail|failed|could not|cannot|suspended|expired|cancel|blocked|charge|due)\b/.test(n)) return false;
   if (/\b(otp|code|json|tid|token|cookie|session|order|menu|wallet|logout|login)\b/.test(n)) return false;
@@ -516,6 +520,19 @@ export function worldBotPromptKind(text = '') {
   }
   if (/\b(otp sent|otp bhej|send the 6 digit otp)\b/.test(n)) return 'otpSent';
   if (/\b(otp|code)\b/.test(n) && /\b(sent|delivered|bhej\w*|gaya|chala gaya)\b/.test(n)) return 'otpSent';
+  // 🆕 ACCOUNT-CREATION screen — "🆕 New Account Detected!". Isme "name"
+  // shabd hi nahi hota, isliye pehle koi bhi branch ise match nahi karti thi:
+  // kind = '' → naam ka step pehchanai hi nahi jati thi → naam kabhi type nahi
+  // hota tha aur OTP naam ki jagah chala jata tha. Ab ye seedha naam ka step hai.
+  if (/\bnew account detected\b|\baccount detected\b/.test(n)) return 'askName';
+  // ✅ Naam ACCEPT ho gaya — "✅ Name set: Sudhani Kumar" / "Naam set ho gaya" /
+  // "Name updated". Pehle ye bhi `askName` banta tha, isliye naam accept hone
+  // ke baad bhi agla candidate naam chala jata tha (4 naam jal kar
+  // `name_rejected`) — JSON ek message door hota tha.
+  // ⚠️ "Tell us the name to set…" yahan nahi aana chahiye → wo request verbs
+  // (tell us / send / enter / batao) wale case exclude hain.
+  if (/\b(name|naam)\b\s*(?::|—|-|is|=)?\s*(set|saved|updated|accepted|confirmed|successfully|ho gaya|lag gaya)\b/.test(n)
+    && !/\b(tell us|send|enter|type|what is|batao|likho|daalo)\b/.test(n)) return 'nameOk';
   // ❌ Naam reject ho gaya — bot ka jawab: "❌ Invalid name", "Name must be
   // 3-20 letters", "Naam galat hai, dobara bhejo". Isse pehle hum ise miss kar
   // dete the aur 90s tak JSON ka intezaar karke /start bhej dete the (owner:
@@ -651,6 +668,9 @@ export function worldBotNamePromptOnScreen(messages = [], { strict = false } = {
   const latest = list[0];
   const kind = worldBotPromptKind(latest.text);
   if (kind === 'askName') return latest;
+  // 🆕 "New Account Detected" line — strict mode me bhi naam ka step hai
+  // (isme "name" shabd nahi hota, isliye pehle yahan miss ho jata tha).
+  if (/\bnew account detected\b/.test(norm(latest.text))) return latest;
   if (!strict && !kind && worldBotLooksLikeNamePrompt(latest.text, latest.buttons)) return latest;
   // Latest message blank/media ho (bot ne text ke bina kuch bheja) to ek
   // message peecha dekho — bot ka naam ka sawaal usi ke upar ho sakta hai.
@@ -1489,10 +1509,17 @@ export async function worldBotLogin({
       const preName = worldBotNamePromptOnScreen(preScreen, { strict: true });
       // Bot ke messages me koi DUSRA number likha ho to ye pichhle number ka
       // aadha-bana account hai — usme apna naam nahi daalna.
-      const otherNumber = [...worldBotNumbersOnScreen(preScreen)].find((n) => n !== cleanPhone);
+      // Sirf LATEST 2 bot messages dekho — chat me pichhle number ka card pada
+      // rehta hai, usse guard galat fire ho kar aadha bana account cancel ho
+      // jata tha.
+      const otherNumber = [...worldBotNumbersOnScreen(preScreen.filter((m) => !m.out).slice(0, 2))]
+        .find((n) => n !== cleanPhone);
       if (preName && otherNumber) {
-        console.warn(`[WorldBot] 👤 naam ka step hai par screen par dusra number (${otherNumber}) — is account me naam nahi bharunga (Cancel karke saaf menu)`);
-        await safeCancel(client, entity, cfg).catch(() => {});
+        console.warn(`[WorldBot] 👤 naam ka step hai par screen par dusra number (${otherNumber}) — is account me naam nahi bharunga`);
+        // /cancel se aadha bana account mar jata tha — pehle Main Menu button.
+        const menuBtn = findRoleOnScreens(preScreen, 'mainMenu');
+        if (menuBtn) await clickWorldButton(menuBtn.button).catch(() => {});
+        await sleep(400);
       } else if (preName) {
         setPhase('send-name');
         console.log(`[WorldBot] 👤 bot pehle se naam maang raha hai — seedha naam bhej raha hoon (naya OTP/number nahi)`);
@@ -1773,6 +1800,27 @@ export async function worldBotLogin({
           attempts: usedAttempts,
           reason: `${numberResult?.reason || 'OTP send confirm nahi hua'}${usedAttempts > 1 ? ` · ${usedAttempts} try ke baad bhi` : ''}`,
         };
+      }
+
+      // 👤 Bot ne seedha naam maang liya (OTP ke bina) — seedha naam + JSON.
+      if (numberResult?.kind === 'nameFirst') {
+        setPhase('send-name');
+        console.log('[WorldBot] 👤 number ke baad bot ne seedha naam maanga — OTP type skip, naam bhej raha hoon');
+        const nameFirstRes = await submitWorldBotName({
+          client, entity, cfg, shouldAbort, nameProvider, phone: cleanPhone,
+        }).catch((e) => ({ ok: false, kind: 'no-json', reason: String(e?.message || e) }));
+        if (nameFirstRes?.ok) {
+          const jsonText = await resolveWorldJsonText({ client, entity, cfg, shouldAbort, final: nameFirstRes.final });
+          state.lastOkAt = Date.now();
+          closeLoginFlow();
+          setPhase('done');
+          console.log(`[WorldBot] ✅ Login ready: ${cleanPhone} · NEW (naam) · JSON ${jsonText.length} chars`);
+          return {
+            ok: true, kind: 'fresh_new', phone: cleanPhone, askedName: true, jsonText,
+            viaWorldBot: true, username: cfg.username,
+            screenButtons: [...(state.lastScreenButtons || [])],
+          };
+        }
       }
 
       // 5) OTP lao (Firebase inbox se — pipeline deta hai) aur bhejo
@@ -2080,6 +2128,9 @@ async function waitForOtpSent({ client, entity, baseline, cfg, shouldAbort }) {
       if (blocked) return { ok: false, kind: blocked.kind, code: blocked.code, reason: blocked.reason, message };
       const kind = worldBotPromptKind(message.text);
       if (kind === 'otpSent') return { ok: true, kind: 'otpSent', message };
+      // 👤 Bot ne OTP maangne ke bajaye seedha NAAM maang liya (account pehle
+      // hi bana hua tha) — "OTP Sent nahi aaya" maan kar number jalana galat.
+      if (kind === 'askName') return { ok: true, kind: 'nameFirst', message };
       if (kind === 'invalidNumber') return { ok: false, kind: 'invalidNumber', message };
       // Bot ka jawab aaya par text nahi (photo/blank) — ise turant "OTP Sent"
       // mat maano. Owner ke log me yahi hua: blank reply ke 3s baad hum OTP
@@ -2184,9 +2235,13 @@ async function sendWorldCode(client, entity, code, cfg = {}) {
     console.warn('[WorldBot] OTP type nahi kiya — bot ne login cancel kar diya (Login Cancelled screen)');
     return { ok: false, reason: 'bot-login-cancelled' };
   }
-  if (awaiting === 'number' || awaiting === 'name') {
-    console.warn(`[WorldBot] OTP type nahi kiya — bot abhi ${awaiting} maang raha hai`);
-    return { ok: false, reason: `bot-${awaiting}-maang-raha-hai` };
+  // 🆕 Bot "New Account Detected" par khada ho to 6-digit OTP uske naam ki
+  // jagah chala jata tha (Swiggy: "Invalid name") — pehle naam bhejte hain.
+  const detectedName = /\bnew account detected\b/.test(lookText.toLowerCase());
+  if (awaiting === 'number' || awaiting === 'name' || detectedName) {
+    const pending = awaiting || 'name';
+    console.warn(`[WorldBot] OTP type nahi kiya — bot abhi ${pending} maang raha hai`);
+    return { ok: false, reason: `bot-${pending}-maang-raha-hai` };
   }
   if (awaiting !== 'otp') {
     // ⚠️ Owner ka rule (2026-11-09): "OTP aa jaye to TYPE karo". World Bot ke
@@ -2326,6 +2381,10 @@ function nameStepPredicate(freshList) {
     const yes = pickWorldBotConfirmButton(message.buttons || []);
     if (yes) return { kind: 'confirm', entry: { button: yes?.button || yes, text: String(yes?.text || yes?.button?.text || 'Yes') }, message };
     if (kind === 'nameFail') return { kind: 'nameFail', message };
+    // ✅ "✅ Name set: Sudhani Kumar" = naam ACCEPT ho gaya. Ise pehle
+    // `askAgain` samajh kar agla candidate naam bhej diya jata tha (4 naam jal
+    // kar `name_rejected`, jabki account ban chuka hota tha).
+    if (kind === 'nameOk') return { kind: 'nameOk', message };
     if (kind === 'askName') return { kind: 'askAgain', message };
     if (pickWorldBotButton(message.buttons, 'copyCode')) return { kind: 'copy', message };
   }
@@ -2382,7 +2441,12 @@ async function submitWorldBotName({ client, entity, cfg = {}, shouldAbort = null
   if (!names.length) {
     return { ok: false, kind: 'name_rejected', reason: 'Naam ban hi nahi paya (nameProvider khali/invalid)' };
   }
-  let baseline = screenSignature(await parseScreenMessages(client, entity).catch(() => []));
+  const firstScreen = await parseScreenMessages(client, entity).catch(() => []);
+  let baseline = screenSignature(firstScreen);
+  // 🔁 Kis prompt (message id) ka jawab diya ja raha hai — same prompt dobara
+  // dikhe to matlab bot ne jawab nahi liya, naya naam bhejna galat hoga.
+  let answeredPromptId = Number(worldBotNamePromptOnScreen(firstScreen)?.id) || 0;
+  let samePromptWaits = 0;
   for (let i = 0; i < names.length; i += 1) {
     const name = names[i];
     setPhase('send-name');
@@ -2428,7 +2492,36 @@ async function submitWorldBotName({ client, entity, cfg = {}, shouldAbort = null
       return { ok: false, kind: 'no-json', name, reason: 'Naam confirm ke baad bhi JSON nahi aaya' };
     }
 
+    // ✅ Naam ACCEPT ho gaya ("✅ Name set: Sudhani Kumar") — ab JSON ka thoda
+    // intezaar, phir recovery. Agla naam BILKUL nahi (pehle yahan 4 naam jal
+    // kar `name_rejected` aa jata tha, jabki account ban chuka hota tha).
+    if (res?.kind === 'nameOk') {
+      console.log(`[WorldBot] ✅ naam set ho gaya ("${name}") — JSON ka intezaar`);
+      setPhase('name-json-wait');
+      const after = await waitForReply({
+        client, entity, baseline, timeoutMs: Math.min(20_000, Number(cfg.stepTimeoutMs) || 20_000),
+        shouldAbort, what: 'JSON (naam set ke baad)', graceMs: 0,
+        predicate: nameStepPredicate, pollMs: cfg.pollMs,
+      }).catch(() => null);
+      if (['json', 'document', 'copy'].includes(after?.kind)) return { ok: true, name, final: after };
+      const recoveredOk = await recoverWorldBotJson({ client, entity, cfg, shouldAbort }).catch(() => null);
+      if (recoveredOk?.jsonText) return { ok: true, name, final: { kind: 'json', json: { text: recoveredOk.jsonText } } };
+      return { ok: false, kind: 'no-json', name, reason: 'Naam accept ho gaya par JSON nahi aaya (naya naam mat bhejo)' };
+    }
+
     if (res?.kind === 'askAgain' || res?.kind === 'nameFail') {
+      // 🔁 Bot wahi PURANA naam-prompt dobara dikha raha ho (same message id),
+      // to iska matlab "answer nahi mila" — naya naam bhejna galat hai.
+      const promptId = Number(res?.message?.id) || 0;
+      if (res.kind === 'askAgain' && promptId && promptId === answeredPromptId && samePromptWaits < 1) {
+        samePromptWaits += 1;
+        console.warn(`[WorldBot] 🔁 wahi naam-prompt dobara mila (id ${promptId}) — naya naam nahi bhejunga, ek aur wait`);
+        baseline = screenSignature(await parseScreenMessages(client, entity).catch(() => []));
+        await sleep(1_200);
+        i -= 1;
+        continue;
+      }
+      if (promptId) answeredPromptId = promptId;
       console.warn(`[WorldBot] ❌ bot ne naam accept nahi kiya ("${name}", ${res.kind}) — agla naam try (naya number ya /start nahi)`);
       baseline = screenSignature(await parseScreenMessages(client, entity).catch(() => []));
       continue;

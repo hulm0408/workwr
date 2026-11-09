@@ -4009,7 +4009,7 @@ Thanks`)),
   // OTP → naam → JSON, phir Switch Account → account → Permanent Logout → Yes.
   // ---------------------------------------------------------------------
   const JSON_SAMPLE = '{"tid":"abc123","token":"tok","cookies":[{"name":"a","value":"b"}]}';
-  const makeFakeWorldBot = ({ startWithAccount = false, silentAfterNumber = false } = {}) => {
+  const makeFakeWorldBot = ({ startWithAccount = false, silentAfterNumber = false, bareDetection = false } = {}) => {
     const chat = [];
     let id = 0;
     const accounts = new Map(startWithAccount ? [['9876543210', { name: 'ihgfe' }]] : []);
@@ -4076,7 +4076,16 @@ Thanks`)),
         }
         if (awaiting === 'otp' && /^\d{6}$/.test(text)) {
           if (accounts.has(pendingPhone)) { loggedIn = pendingPhone; awaiting = ''; loginJson(); }
-          else { awaiting = 'name'; push('🆕 New Account Detected!\n\nTell us the name to set on your Swiggy account.'); }
+          else if (bareDetection) {
+            // Asli bot ka chhota version: sirf "New Account Detected!" (isme
+            // "name" shabd nahi) aur ek inline button — yahi woh screen hai
+            // jahan naam kabhi type nahi hota tha.
+            awaiting = 'name';
+            push('🆕 New Account Detected!', [[btn('📋 Copy Code')]]);
+          } else {
+            awaiting = 'name';
+            push('🆕 New Account Detected!\n\nTell us the name to set on your Swiggy account.');
+          }
           return { id: ++id };
         }
         if (awaiting === 'delete-otp' && /^\d{6}$/.test(text)) {
@@ -4091,7 +4100,16 @@ Thanks`)),
           accounts.set(pendingPhone, { name: text });
           loggedIn = pendingPhone;
           awaiting = '';
-          loginJson();
+          if (bareDetection) {
+            // Pehle "✅ Name set" (jo pehle galti se askAgain banta tha), JSON
+            // ~800ms baad alag message me.
+            push(`✅ Name set: ${text}`);
+            setTimeout(() => {
+              push(`Login JSON\n\n\`\`\`json\n${JSON_SAMPLE}\n\`\`\``);
+            }, 800);
+          } else {
+            loginJson();
+          }
           return { id: ++id };
         }
         return { id: ++id };
@@ -4297,6 +4315,48 @@ Thanks`)),
       ok(sent.includes('Sudhani Kumar') && !sent.includes('/start') && otpCalls === 0
         && !sent.some((t) => /^\d{6}$/.test(t)),
         `naam: naya OTP/number//start nahi gaya (${sent.join(' · ') || 'kuch nahi'})`);
+    } finally {
+      wb._setWorldBotClientOverrideForTests(null);
+    }
+  }
+
+  // 🆕 "New Account Detected" par naam — asli bug (2026-11-09, dusra round):
+  // detection line me "name" shabd hi nahi hota, isliye kind '' aata tha aur
+  // teeno strict call sites ise miss kar jate the → naam kabhi type nahi hota
+  // tha (ya OTP naam ki jagah chala jata tha).
+  ok(wb.worldBotPromptKind('🆕 New Account Detected!') === 'askName'
+    && wb.worldBotNamePromptOnScreen([
+      { id: 9, out: false, text: '🆕 New Account Detected!', buttons: [[{ text: '📋 Copy Code' }]] },
+    ], { strict: true })?.id === 9,
+  'naam: "New Account Detected" (bina "name" shabd, button ke saath) bhi naam ka step hai');
+  ok(wb.worldBotAwaitingKind([{ out: false, text: '🆕 New Account Detected!', buttons: [] }]) === 'name',
+    'naam: awaiting-kind bhi use naam maanta hai (OTP uski jagah nahi jata)');
+  ok(wb.worldBotPromptKind('✅ Name set: Sudhani Kumar') === 'nameOk'
+    && wb.worldBotPromptKind('Naam set ho gaya') === 'nameOk'
+    && wb.worldBotPromptKind('Tell us the name to set on your Swiggy account.') === 'askName',
+  'naam: "Name set" = accept (nameOk), "name to set" = sawaal (askName)');
+
+  // Poora flow: bare "New Account Detected!" (button ke saath) → naam → "✅ Name
+  // set" → JSON. Pehle yahan OTP naam ki jagah jata tha / 4 naam jalte the.
+  wb._resetWorldBotReadCacheForTests();
+  {
+    const fake = makeFakeWorldBot({ bareDetection: true });
+    wb._setWorldBotClientOverrideForTests(fake.client);
+    try {
+      const login = await wb.worldBotLogin({
+        phone: '9123456780',
+        otpProvider: async () => ({ code: '778899' }),
+        otpWatermark: async () => ({}),
+        nameProvider: async () => 'ihgfe',
+        config: flowCfg,
+      });
+      const sent = fake.chat.filter((m) => m.out).map((m) => String(m.text));
+      ok(login.ok && login.askedName && String(login.jsonText || '').includes('"tid"'),
+        `naam: bare detection → naam → JSON (${login.kind || login.reason})`);
+      ok(sent.filter((t) => t === 'Sudhani Kumar').length === 1 && !sent.includes('ihgfe'),
+        `naam: sirf EK naam gaya (\"Name set\" ko askAgain nahi samjha) — ${sent.join(' · ')}`);
+      ok(sent.includes('778899') && !sent.includes('/start'),
+        'naam: OTP type hua (naam ki jagah nahi) aur /start nahi gaya');
     } finally {
       wb._setWorldBotClientOverrideForTests(null);
     }
@@ -4555,8 +4615,9 @@ Thanks`)),
   // EK baar (purana "OTP Sent" message dekh kar dobara nahi).
   ok(wbSrc.includes("setPhase('otp-type')") && wbSrc.includes("return { ok: true, reason: 'typed' }"),
     'worldbot: OTP mila to bot ko TYPE hota hai (guard se skip nahi)');
-  ok(wbSrc.includes("bot-${awaiting}-maang-raha-hai") && wbSrc.includes('OTP screen saaf nahi mili'),
-    'worldbot: OTP sirf tab skip jab bot number/naam maang raha ho');
+  ok(wbSrc.includes("bot-${pending}-maang-raha-hai") && wbSrc.includes("const pending = awaiting || 'name'")
+    && wbSrc.includes('OTP screen saaf nahi mili'),
+  'worldbot: OTP sirf tab skip jab bot number/naam (New Account Detected) maang raha ho');
   ok(wbSrc.includes('SIRF latest screen dekho'),
     'worldbot: OTP ek hi baar jata hai (latest screen se verify)');
   ok(wbSrc.includes('OTP source (Hermes/Firebase) me is number ka code hi nahi aaya')

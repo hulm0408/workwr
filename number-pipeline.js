@@ -1038,6 +1038,21 @@ export async function processSingleNumberViaWorldBot({
     // Setup problem (spare Telegram session missing/dead) = config issue, not
     // number issue. Engine ise alag handle karta hai (batch clear message ke
     // saath rukta hai, numbers jalte nahi).
+    // 🔌 Telegram socket disconnect ("Cannot send requests while
+    // disconnected") — na number ki galti, na bot ki. Batch ruk kar batata
+    // hai, number jalta nahi (pehle ye `deferred_swiggy_transient` ban kar
+    // number retire kar deta tha).
+    if (kind === 'worldbot_offline' || /cannot send requests while disconnected|telegram client disconnect|client (is )?not connected|connection closed/i.test(String(res?.reason || ''))) {
+      return {
+        ok: false,
+        kind: 'worldbot_offline',
+        phone,
+        stage: 'worldbot_offline',
+        reason: `Telegram client disconnect ho gaya tha (${String(res?.reason || 'socket down').slice(0, 160)}) — number bachaya, batch ruk raha hoon. Reconnect ke baad dobara START dabao.`,
+        viaWorldBot: true,
+        switchBot: false,
+      };
+    }
     if (kind === 'worldbot_setup' || /session authorized nahi|setup missing|api_id|api_hash|login chal raha|telegram account|AUTH_KEY_UNREGISTERED|SESSION_REVOKED|SESSION_EXPIRED/i.test(String(res?.reason || ''))) {
       return {
         ok: false,
@@ -1091,6 +1106,17 @@ export async function processSingleNumberViaWorldBot({
         otpFailure: true, otpAttemptConsumed: true, otpAttempts: 1,
         code: res?.code || 'WORLDBOT_BLOCKED',
         reason: res?.reason || `${botTag} ne OTP bhejne se mana kiya`,
+        viaWorldBot: true, switchBot: false,
+      };
+    }
+    // ❌ Bot ne login khud cancel kar diya (OTP send hi nahi hua) — number
+    // skip, bot wahi.
+    if (kind === 'login_cancelled') {
+      return {
+        ok: false, kind: 'failed_otp_send', phone, stage: 'worldbot_otp_send',
+        otpFailure: true, otpAttemptConsumed: true, otpAttempts: 1,
+        code: 'WORLDBOT_LOGIN_CANCELLED',
+        reason: res.reason || `${botTag} ne login cancel kar diya`,
         viaWorldBot: true, switchBot: false,
       };
     }

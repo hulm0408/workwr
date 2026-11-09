@@ -177,6 +177,10 @@ export function shouldSwitchWorldBot(result = {}) {
   if (kind === 'aborted' || kind === 'manual_skip') return false;
   if (kind === 'failed_invalid_number') return false; // number ki galti
   if (kind === 'worldbot_setup') return false;        // session/setup issue
+  if (kind === 'worldbot_offline') return false;      // Telegram disconnect
+  // ❌ Swiggy ka number-level block ("login attempts exceeded" / "suspended")
+  // aur late reply — ye number ka faisla hai, bot wahi rehta hai.
+  if (kind === 'number_blocked' || kind === 'login_result_timeout' || kind === 'login_cancelled') return false;
   if (result?.switchBot === true) return true;
   return ['failed_otp_send', 'queued_timeout', 'bot_unreachable'].includes(kind);
 }
@@ -253,6 +257,11 @@ export function worldBotButtonRole(text = '') {
   if (/\b(order\s*hub|orders?)\b/.test(n) && !/\bmy\s*orders\b/.test(n)) return 'orderHub';
   if (/\bdelete\b/.test(n) && /\baccount\b/.test(n)) return 'deleteAccount';
   if (/\bswitch\s*accounts?\b/.test(n)) return 'switchAccounts';
+  // 📇 Owner ke transcript ka apna step: Main Menu → "Swiggy Accounts" → woh
+  // number → "🗑 Permanent Logout". Pehle is button ka koi role hi nahi tha,
+  // isliye logout sirf Order Hub/Switch Account se try hota tha aur transcript
+  // wala rasta chhoot jata tha.
+  if (/\b(swiggy\s*accounts?|my\s*accounts?|saved\s*accounts?)\b/.test(n)) return 'swiggyAccounts';
   if (/\bpermanent\w*\b/.test(n) && /\blog|out\b/.test(n)) return 'permanentLogout';
   if (/\b(log\s*out|logout|sign\s*out)\b/.test(n)) return 'permanentLogout';
   if (/\b(permanent\w*\s*log\s*out|log\s*out\s*permanent\w*)\b/.test(n)) return 'permanentLogout';
@@ -368,12 +377,30 @@ export function worldBotPromptKind(text = '') {
   if (!n) return '';
   // ⛔ "can't be deleted … charges" me "deleted" bhi hai — isliye pehle ye.
   if (worldBotDeleteBlockedInfo(text)) return 'deleteBlocked';
-  if (/\b(deleted successfully|account deleted|successfully archived|deleted)\b/.test(n)) return 'deleted';
+  // ⚠️ Owner ke transcript (24.10.2026) ki asli line:
+  //   "✅ Delete OTP Sent … the account will be permanently deleted."
+  // Isme "deleted" shabd hai — pehle `deleted` check pehle chalta tha, isliye
+  // DELETE OTP ki request hi "Account Deleted Successfully" maan li jaati thi
+  // aur flow Main Menu → Login chala jata tha (account zinda rehta tha).
+  // Ab delete ka OTP pehle, delete-success baad me.
   if (/\b(delete otp|otp sent.{0,40}delete|delete.{0,30}otp)\b/.test(n)) return 'deleteSent';
+  if (/\b(deleted successfully|account deleted|successfully archived|deleted)\b/.test(n)) return 'deleted';
   if (/\b(otp was not accepted|invalid otp|otp galat|wrong otp|otp expired)\b/.test(n)) return 'otpFail';
   if (/\b(invalid mobile|invalid number|number galat)\b/.test(n)) return 'invalidNumber';
-  // "OTP sent" ke kai tarah ke shabd: "OTP has been sent", "we sent a code",
-  // "OTP bhej diya" — sab ek hi step hain.
+  // 🗑 Permanent logout ka apna jawab (transcript: "🗑 Permanent Logout Successful").
+  if (/\b(permanent logout successful|logged out successfully|logout successful)\b/.test(n)) return 'logoutOk';
+  // ❌ Login cancel — transcript: "❌ Login Cancelled / No account was logged in."
+  if (/\b(login cancelled|login canceled|no account was logged in)\b/.test(n)) return 'cancelled';
+  // 🔐 Login method screen — "Swiggy Login / Select a login method: JSON | OTP".
+  if (/\b(swiggy login|select a login method)\b/.test(n)) return 'loginScreen';
+  // ✅ Login ho gaya — "Login Successful … 🆔 Customer ID: …".
+  if (/\b(login successful)\b/.test(n)) return 'loginOk';
+  // 🧾 JSON wala screen — "Login JSON / Tap Copy on the code block below".
+  if (/\b(login json|tap copy)\b/.test(n) || /(tid|access[_\s-]?token|cookies?)/i.test(n) && /\{/.test(String(text || ''))) return 'loginJson';
+  // ⏳ Swiggy rate limit / account creation queue — flow rukta nahi, wait.
+  if (/\b(rate limit|rate-limit)\b/.test(n) && /\b(queue|que me|queued|create|creation|ban)\b/.test(n)) return 'queued';
+  // 🏠 Main Menu — "Main Menu / Pick a feature".
+  if (/\b(main menu|pick a feature)\b/.test(n)) return 'menu';
   // ❌ Bot ne khud OTP bhejne se mana kar diya — "Could not send OTP.
   // Swiggy response: Your account is suspended" ya "login attempts exceeded".
   // Ye number ka faisla hai, 20s wait/retry ka koi matlab nahi.
@@ -494,10 +521,12 @@ export function worldBotAwaitingKind(messages = []) {
 export function shouldReissueWorldOtp(kind = '') {
   const k = String(kind || '').trim().toLowerCase();
   if (!k) return false;
-  if (/^(aborted|queued_timeout|failed_otp_miss|failed_otp_verify|invalidnumber|failed_invalid_number|number_blocked|bot_unreachable|worldbot_setup|flood_wait|network)$/.test(k)) {
+  if (/^(aborted|queued_timeout|failed_otp_miss|failed_otp_verify|invalidnumber|failed_invalid_number|number_blocked|bot_unreachable|worldbot_setup|worldbot_offline|flood_wait|network)$/.test(k)) {
     return false;
   }
-  return /otp_send|no_login|no-login|no-otp-login|no_otp_login|no_button|no-button|no_prompt|number_prompt|timeout|failed_world_bot|send_number|otp-send/.test(k);
+  // `login_cancelled` = bot ne khud flow cancel kiya (OTP send hi nahi hua).
+  // Owner rule: aise me naya number nahi — pehle WAHI number dobara.
+  return /otp_send|login_cancelled|no_login|no-login|no-otp-login|no_otp_login|no_button|no-button|no_prompt|number_prompt|timeout|failed_world_bot|send_number|otp-send/.test(k);
 }
 
 export function classifyWorldBotError(error = {}) {
@@ -506,6 +535,12 @@ export function classifyWorldBotError(error = {}) {
   if (code === 'WORLDBOT_ABORTED' || /owner ne stop|aborted|stop\/skip/i.test(raw)) return 'aborted';
   if (/AUTH_KEY_UNREGISTERED|SESSION_REVOKED|SESSION_EXPIRED|USER_DEACTIVATED|AUTH_KEY_DUPLICATED|SESSION_PASSWORD_NEEDED/i.test(raw)) {
     return 'worldbot_setup';
+  }
+  // 🔌 Telegram socket mar gaya ("Cannot send requests while disconnected") —
+  // ye number/session ki galti nahi hai. Pehle ye `network` ban kar number
+  // jala deta tha; ab alag category (batch rukta hai, number bachta hai).
+  if (/cannot send requests while disconnected|telegram client disconnect|client (is )?not connected|not connected to telegram|connection closed/i.test(raw)) {
+    return 'worldbot_offline';
   }
   if (/FLOOD(_PREMIUM)?_WAIT/i.test(raw)) return 'flood_wait';
   if (/USERNAME_NOT_OCCUPIED|USERNAME_INVALID|no user has|could not find|cannot find any entity|CHANNEL_PRIVATE|PEER_ID_INVALID|USER_BANNED/i.test(raw)) {
@@ -530,6 +565,68 @@ export function isWorldBotPhoneValid(value = '') {
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, Math.max(0, Number(ms) || 0)));
 
 let entityCache = { client: null, username: '', entity: null };
+
+// ---------------------------------------------------------------------------
+// 🔌 CONNECTION GUARD
+// Owner ka production log (2026-11-09, Render):
+//   `help.getConfig … Cannot send requests while disconnected` har 60s,
+//   `GetHistory` 11-13s flood, aur screens `(no text)`.
+// Matlab: poore 90s ke flow ke beech Teleproto ka socket mar chuka tha aur
+// `withTelegramUserClient` ne sirf flow ke SHURU me check kiya tha. Murda
+// socket par har read khali/adhoora aata hai → "45s me jawab nahi aaya" →
+// number jal jata tha (bot kuch galat nahi kar raha tha).
+// Ab har read/send se pehle connection dekha jata hai aur reconnect hota hai.
+const worldConnectState = { at: 0, attempts: 0, lastOkAt: 0, offlineReads: 0 };
+
+function worldBotClientConnected(client) {
+  if (!client) return false;
+  try {
+    if (typeof client.connected === 'boolean') return client.connected;
+    if (typeof client._connected === 'boolean') return client._connected;
+    if (typeof client.isConnected === 'function') return Boolean(client.isConnected());
+  } catch {}
+  return true; // pata na chale to maan lo theek hai
+}
+
+export function worldBotConnectionInfo() {
+  return {
+    reconnectAttempts: worldConnectState.attempts,
+    lastOkAt: worldConnectState.lastOkAt,
+    offlineReads: worldConnectState.offlineReads || 0,
+  };
+}
+
+async function ensureWorldBotOnline(client, { reason = '', force = false } = {}) {
+  if (!client) return false;
+  if (!force && worldBotClientConnected(client)) {
+    worldConnectState.lastOkAt = Date.now();
+    return true;
+  }
+  // Ek hi reconnect ki jid nahi — 8s me ek koshish.
+  if (Date.now() - worldConnectState.at < 8_000) return worldBotClientConnected(client);
+  worldConnectState.at = Date.now();
+  worldConnectState.attempts += 1;
+  console.warn(`[WorldBot] 🔌 Telegram disconnect tha${reason ? ` (${reason})` : ''} — reconnect koshish ${worldConnectState.attempts}`);
+  try {
+    if (typeof client.connect === 'function') {
+      await Promise.race([
+        client.connect(),
+        sleep(15_000).then(() => { throw new Error('connect 15s me nahi hua'); }),
+      ]);
+    }
+  } catch (e) {
+    console.warn(`[WorldBot] 🔌 reconnect fail: ${String(e?.message || e).slice(0, 90)}`);
+  }
+  const ok = worldBotClientConnected(client);
+  if (ok) worldConnectState.lastOkAt = Date.now();
+  console.log(`[WorldBot] 🔌 reconnect ${ok ? 'ho gaya — reads phir chalenge' : 'fail — agla step phir try karega'}`);
+  return ok;
+}
+
+function isDisconnectError(error) {
+  return /cannot send requests while disconnected|telegram client disconnect|client (is )?not connected|not connected to telegram|connection closed/i
+    .test(String(error?.message ?? error ?? ''));
+}
 
 async function getWorldEntity(client, username) {
   const key = String(username || '').toLowerCase();
@@ -576,20 +673,31 @@ function messageDateMs(message) {
 function messageTextOf(message) {
   // Bot kabhi text ke bajaye photo/caption bhejta hai — pehle sirf text padha
   // jata tha, isliye "OTP Sent" wala reply "(no text)" ban jata tha.
-  try {
-    const candidates = [
-      message?.text,
-      message?.message,
-      message?.rawText,
-      message?.caption,
-      message?.media?.caption,
-    ];
-    for (const value of candidates) {
-      const text = plain(value || '');
-      if (text) return text;
-    }
-    return '';
-  } catch { return ''; }
+  //
+  // ⚠️ Owner ke log (2026-11-09) me bot ke puraane screens `(no text)` aate the
+  // aur flow 45s tak "jawab nahi aaya" par khada reh jata tha. Wajah: saare
+  // candidates EK hi try/catch me the — `message.text` (teleproto getter jo
+  // entities unparse karta hai) ek hi message par throw kar de to poora
+  // function '' lautata tha, chahe `message.message` me asli text maujood ho.
+  // Ab har candidate apne try/catch me hai + raw/API fallback bhi.
+  const raw = message?.raw;
+  const candidates = [
+    () => message?.text,
+    () => message?.message,
+    () => message?.rawText,
+    () => raw?.message,
+    () => message?.caption,
+    () => message?.media?.caption,
+    () => raw?.media?.caption,
+    () => message?.media?.document?.attributes?.find?.((a) => a?.fileName)?.fileName,
+  ];
+  for (const get of candidates) {
+    let value = '';
+    try { value = get(); } catch { continue; }
+    const text = plain(value || '');
+    if (text) return text;
+  }
+  return '';
 }
 
 // Photo/sticker/voice/media message — text khali ho to bhi bot ne kuch bheja hai.
@@ -664,6 +772,8 @@ export function _resetWorldBotReadCacheForTests() {
 }
 
 export const _readWorldMessagesForTests = (client, entity, limit) => readWorldMessages(client, entity, limit);
+export const _parseScreenMessagesForTests = (client, entity, limit, readOpts) => parseScreenMessages(client, entity, limit, readOpts);
+export const _messageTextOfForTests = (message) => messageTextOf(message);
 export const _waitForReplyForTests = (opts) => waitForReply(opts);
 
 export function worldBotReadInfo() {
@@ -695,6 +805,10 @@ async function readWorldMessages(client, entity, limit = WORLD_BOT_DEFAULTS.read
   worldReadCache.inflight = (async () => {
     let lastError = null;
     for (let attempt = 1; attempt <= 2; attempt += 1) {
+      // 🔌 Murda socket par read = khali/adhoora screen. Pehle reconnect.
+      if (isDisconnectError(lastError) || attempt === 1) {
+        await ensureWorldBotOnline(client, { reason: `read (try ${attempt})` });
+      }
       const startedAt = Date.now();
       try {
         const messages = await client.getMessages(entity, { limit: take });
@@ -725,6 +839,10 @@ async function readWorldMessages(client, entity, limit = WORLD_BOT_DEFAULTS.read
       } catch (error) {
         worldReadCache.lastReadMs = Date.now() - startedAt;
         lastError = error;
+        if (isDisconnectError(error)) {
+          worldReadCache.offlineReads = (worldReadCache.offlineReads || 0) + 1;
+          console.warn('[WorldBot] 🔌 read fail — Telegram client disconnect ("Cannot send requests while disconnected")');
+        }
       }
       if (attempt < 2) {
         console.warn(`[WorldBot] ⏳ chat read khali/fail (try ${attempt}/2) — ${String(lastError?.message || lastError).slice(0, 80)}`);
@@ -767,8 +885,27 @@ async function parseScreenMessages(client, entity, limit, readOpts = {}) {
   // Latest = bot ka message (apna bheja "/start"/number/OTP nahi) — warna
   // owner ko card me `📺 start: /start · [no buttons]` jaisa blank screen
   // dikhta tha aur buttons ka faisla bhi galat jagah se hota tha.
-  const latest = parsed.find((m) => !m.out) || parsed[0] || null;
+  //
+  // ⚠️ Aur jis message me text/button/media KUCH bhi na ho use "screen" mat
+  // maano: Telegram aise service/khali messages (pin, reaction, blank edit)
+  // bhej deta hai. Pehle wahi sabse upar baith kar `(no text)` screen banta
+  // tha, isliye bot ka asli "OTP Login"/"Main Menu" screen chhup jata tha aur
+  // step 45s baad "jawab nahi aaya" keh kar number jala deta tha.
+  const inbound = parsed.filter((m) => !m.out);
+  const hasContent = (m) => Boolean(m.text || m.buttons.length || m.hasMedia || m.hasDocument);
+  const latest = inbound.find(hasContent)
+    || inbound[0]
+    || parsed.find(hasContent)
+    || parsed[0]
+    || null;
   if (latest) {
+    // Ek baar (30s me max) owner ke log ke liye: screen par text hi nahi aaya.
+    if (!hasContent(latest) && Date.now() - (state.lastBlankScreenLogAt || 0) > 30_000) {
+      state.lastBlankScreenLogAt = Date.now();
+      let keys = '';
+      try { keys = Object.keys(latest.raw || {}).slice(0, 14).join(','); } catch {}
+      console.warn(`[WorldBot] 📭 screen par kuch nahi (id ${latest.id}, out=${latest.out}) — keys: ${keys || 'n/a'}`);
+    }
     state.lastScreenText = String(latest.text || '').slice(0, 400);
     state.lastScreenButtons = latest.buttons.map((b) => b.text);
     // Owner ko pata chale bot exactly kya keh raha hai — /world isi se bharta
@@ -887,10 +1024,21 @@ async function waitForReply({
     client, entity, predicate, baseline, graceMs: grace, shouldAbort, what,
   }).catch(() => null);
   if (late) return late;
-  const tail = lastAll.slice(0, 3).map((m) => String(m.text || '').replace(/\s+/g, ' ').slice(0, 90)).filter(Boolean).join(' || ');
+  // 🔎 Timeout ka reason OWNER ke liye kaam ka hona chahiye. Pehle yahan
+  // apna hi bheja hua message (OTP "230713") chhap jata tha — log me
+  // "last: 230713" dikhta tha aur bot ka asli jawab
+  // ("❌ Could not send OTP … login attempts exceeded") chhup jata tha.
+  // Ab: bot ka screen pehle, apna message alag label se, aur button list bhi.
+  const flat = (m) => String(m.text || '').replace(/\s+/g, ' ').trim().slice(0, 90);
+  const inboundTail = lastAll.filter((m) => !m.out).map(flat).filter(Boolean).slice(0, 3).join(' || ');
+  const ownTail = lastAll.filter((m) => m.out).map(flat).filter(Boolean).slice(0, 1).map((t) => `apna bheja: ${t}`).join('');
+  const buttonsTail = (lastAll.find((m) => m.buttons && m.buttons.length)?.buttons || [])
+    .map((b) => b.text).filter(Boolean).slice(0, 6).join(' | ');
+  const tail = [inboundTail || '(bot ka text nahi aaya)', ownTail, buttonsTail ? `buttons: ${buttonsTail}` : 'buttons: none']
+    .filter(Boolean).join(' · ');
   throw new WorldBotError(
     'worldbot-timeout',
-    `${what} ka jawab ${Math.round(budget / 1000)}s (+${Math.round(extraMs / 1000)}s flood) me nahi aaya${tail ? ` — last: ${tail}` : ''}`
+    `${what} ka jawab ${Math.round(budget / 1000)}s (+${Math.round(extraMs / 1000)}s flood) me nahi aaya — ${tail}`
   );
 }
 
@@ -958,11 +1106,21 @@ async function sendWorldText(client, entity, text) {
   const payload = String(text);
   for (let attempt = 1; attempt <= 2; attempt += 1) {
     try {
+      // 🔌 Send se pehle bhi connection — "Cannot send requests while
+      // disconnected" par command chup-chaap gayab ho jati thi aur flow
+      // phir "jawab nahi aaya" par atak jata tha.
+      await ensureWorldBotOnline(client, { reason: 'send' });
       await client.sendMessage(entity, { message: payload });
       state.lastAction = `send:${payload.slice(0, 24)}`;
       state.lastChatAt = Date.now();
       return true;
     } catch (error) {
+      // 🔌 Disconnect par ek reconnect + wahi message dobara (number/OTP
+      // chup-chaap gum na ho).
+      if (isDisconnectError(error) && attempt === 1) {
+        await ensureWorldBotOnline(client, { reason: 'send retry' });
+        continue;
+      }
       // Telegram "FLOOD_WAIT_34" = 34s ruk kar dobara bhejo (account ki limit).
       const flood = /FLOOD(?:_PREMIUM)?_WAIT_(\d+)/i.exec(String(error?.message || error));
       if (flood && attempt === 1) {
@@ -1145,6 +1303,7 @@ export async function worldBotLogin({
 
         // 4) number prompt (click na chale to "OTP Login" text type hoga)
         setPhase('send-number');
+        let promptError = null;
         await clickOrType({
           client, entity, entry: otpBtn.button, cfg, shouldAbort, baseline: issueBaseline,
           what: 'number prompt',
@@ -1155,7 +1314,33 @@ export async function worldBotLogin({
             const allText = [...freshList, ...all.slice(0, 2)].map((m) => m.text).join('\n');
             return worldBotPromptKind(allText) === 'askNumber' ? true : null;
           },
-        }).then(() => true).catch(() => true); // prompt na mile to bhi number bhej do
+        }).then(() => true).catch((e) => { promptError = e; return true; }); // prompt na mile to bhi number bhej do
+
+        // 🛑 Par agar bot ne isi beech OTP bhejne se MANA kar diya / login
+        // cancel kar diya, to number bhejna bekaar hai (aur Swiggy
+        // "login attempts exceeded" de deta hai). Turant wahi faisla lo.
+        if (promptError) {
+          const blocked = worldBotOtpBlockInfo(String(promptError?.message || ''));
+          if (blocked) {
+            console.warn(`[WorldBot] ❌ number prompt ke bajaye ${blocked.code} — number bhejna band`);
+            return { ok: false, kind: blocked.kind, code: blocked.code, reason: blocked.reason };
+          }
+          const nowScreen = await parseScreenMessages(client, entity, 6, { fresh: true }).catch(() => []);
+          const nowText = nowScreen.slice(0, 4).map((m) => m.text).join('\n');
+          const screenBlocked = worldBotOtpBlockInfo(nowText);
+          if (screenBlocked) {
+            console.warn(`[WorldBot] ❌ screen par ${screenBlocked.code} — number bhejna band`);
+            return { ok: false, kind: screenBlocked.kind, code: screenBlocked.code, reason: screenBlocked.reason };
+          }
+          if (worldBotPromptKind(nowText) === 'cancelled') {
+            return {
+              ok: false,
+              kind: 'login_cancelled',
+              code: 'WORLDBOT_LOGIN_CANCELLED',
+              reason: 'Bot ne number maangne ke bajaye login cancel kar diya — wahi number dobara (naya number nahi)',
+            };
+          }
+        }
 
         await reportCard(report, [
           '🌍 <b>Swiggy World Bot — OTP Login</b>',
@@ -1293,6 +1478,15 @@ export async function worldBotLogin({
       const typed = await sendWorldCode(client, entity, otpCode, cfg);
       if (!typed.ok) {
         await safeCancel(client, entity, cfg).catch(() => {});
+        if (typed.reason === 'bot-login-cancelled' || String(typed.reason || '').startsWith('bot-SWIGGY_')) {
+          return {
+            ok: false,
+            kind: 'login_cancelled',
+            code: 'WORLDBOT_LOGIN_CANCELLED',
+            phone: cleanPhone,
+            reason: `Bot ne login cancel/block kar diya — OTP type nahi kiya (${typed.reason})`,
+          };
+        }
         return {
           ok: false,
           kind: 'failed_otp_verify',
@@ -1428,18 +1622,37 @@ export async function worldBotLogin({
     // (worldbot_setup), ya sirf number defer karna hai (flood/network).
     const category = classifyWorldBotError(error);
     console.warn(`[WorldBot] login fail (${cleanPhone}) [${category}]: ${error?.message || error}`);
+    // ❌ Timeout wale error ke message me bot ka asli jawab chipka hota hai
+    // ("… last: ❌ Could not send OTP. Swiggy response: login attempts
+    // exceeded"). Pehle wo `failed_world_bot` → `failed_otp_send` ban kar bot
+    // SWITCH kar deta tha (owner: galat). Ab seedha number ka faisla.
+    const blockedInText = category === 'aborted' ? null : worldBotOtpBlockInfo(String(error?.message ?? ''));
+    if (blockedInText) {
+      console.warn(`[WorldBot] ❌ error text me ${blockedInText.code} — bot switch/retry nahi (number ka faisla)`);
+      return {
+        ok: false,
+        kind: blockedInText.kind,
+        code: blockedInText.code,
+        phone: cleanPhone,
+        reason: blockedInText.reason,
+        errorCategory: 'number_blocked',
+      };
+    }
     const kind = category === 'aborted'
       ? 'aborted'
       : category === 'worldbot_setup'
         ? 'worldbot_setup'
-        : category === 'bot_unreachable'
-          ? 'bot_unreachable'
-          // ⏱ Bot ka jawab window ke andar nahi aaya — ye bot/number ka
-          // "fail" nahi, sirf late hai. Pipeline ise wahi number par dobara
-          // try karti hai (number jalana galat hoga).
-          : error?.code === 'worldbot-timeout'
-            ? 'login_result_timeout'
-            : 'failed_world_bot';
+        : category === 'worldbot_offline'
+          // 🔌 Telegram socket mara hua tha — na number ki galti, na bot ki.
+          ? 'worldbot_offline'
+          : category === 'bot_unreachable'
+            ? 'bot_unreachable'
+            // ⏱ Bot ka jawab window ke andar nahi aaya — ye bot/number ka
+            // "fail" nahi, sirf late hai. Pipeline ise wahi number par dobara
+            // try karti hai (number jalana galat hoga).
+            : error?.code === 'worldbot-timeout'
+              ? 'login_result_timeout'
+              : 'failed_world_bot';
     return {
       ok: false,
       kind,
@@ -1496,12 +1709,17 @@ async function waitForOtpSent({ client, entity, baseline, cfg, shouldAbort }) {
       const kind = worldBotPromptKind(message.text);
       if (kind === 'otpSent') return { ok: true, kind: 'otpSent', message };
       if (kind === 'invalidNumber') return { ok: false, kind: 'invalidNumber', message };
-      // Bot ka jawab aaya par text nahi (photo/blank) — OTP Sent maan lo.
+      // Bot ka jawab aaya par text nahi (photo/blank) — ise turant "OTP Sent"
+      // mat maano. Owner ke log me yahi hua: blank reply ke 3s baad hum OTP
+      // bot par chale gaye, jabki usi chat me "❌ Could not send OTP. Swiggy
+      // response: login attempts exceeded" likha tha → 20 refresh, code hi
+      // nahi → `failed_otp_miss` aur number jal gaya.
+      // Ab pehle poora screen padh kar dekhte hain; text mila to wahi sach hai.
       if (!message.out && !String(message.text || '').trim()) {
         if (!blankReplyAt) {
           blankReplyAt = Date.now();
           blankReplyMedia = Boolean(message.hasMedia);
-          console.log(`[WorldBot] 🤖 bot ne reply diya (${blankReplyMedia ? 'media, text khali' : 'text khali'}) — OTP Sent maan raha hoon`);
+          console.log(`[WorldBot] 🤔 bot ka jawab aaya par text nahi (${blankReplyMedia ? 'media' : 'blank'}) — screen dobara padhta hoon`);
         }
         continue;
       }
@@ -1515,9 +1733,25 @@ async function waitForOtpSent({ client, entity, baseline, cfg, shouldAbort }) {
       }
     }
     // Blank/media reply ke baad thoda intezaar — ho sakta hai asli text agle
-    // message me aaye. 3s tak kuch na aaye to OTP Sent maan kar OTP fetch par.
+    // message me aaye. 3s tak kuch na aaye to poora screen dobara padho:
+    // agar `Could not send OTP` / `suspended` / `attempts exceeded` wahan hai
+    // to wahi jeetta hai (blank reply ka matlab OTP Sent NAHI).
     if (blankReplyAt && Date.now() - blankReplyAt >= 3_000) {
-      console.log('[WorldBot] ✅ OTP Sent confirm (blank/media reply) — ab OTP bot se code');
+      const screen = await parseScreenMessages(client, entity, 8, { fresh: true }).catch(() => []);
+      const recentText = screen.slice(0, 6).map((m) => m.text).join('\n');
+      const blocked = worldBotOtpBlockInfo(recentText);
+      if (blocked) {
+        console.warn(`[WorldBot] ❌ blank reply ke peeche ${blocked.code}: ${blocked.reason} — OTP Sent nahi maan raha`);
+        return { ok: false, kind: blocked.kind, code: blocked.code, reason: blocked.reason };
+      }
+      if (worldBotPromptKind(recentText) === 'otpSent') {
+        console.log('[WorldBot] ✅ OTP Sent confirm (blank reply + screen text)');
+        return { ok: true, kind: 'otpSent', confirmedBy: 'blank-reply+screen' };
+      }
+      if (worldBotPromptKind(recentText) === 'cancelled') {
+        return { ok: false, kind: 'login_cancelled', code: 'WORLDBOT_LOGIN_CANCELLED', reason: 'Bot ne login cancel kar diya (screen: Login Cancelled)' };
+      }
+      console.log('[WorldBot] ✅ OTP Sent confirm (blank/media reply, screen khali) — ab OTP bot se code');
       return { ok: true, kind: 'otpSent', confirmedBy: blankReplyMedia ? 'media-reply' : 'blank-reply' };
     }
     await sleep(Math.max(300, Number(cfg?.pollMs) || WORLD_BOT_DEFAULTS.pollMs));
@@ -1550,12 +1784,27 @@ async function sendWorldCode(client, entity, code, cfg = {}) {
 
   // "OTP Sent" message parse hone me kabhi 1-2s lag jate hain — 4s tak dekho.
   let awaiting = '';
+  let lookScreen = [];
   const lookUntil = Date.now() + 4_000;
   for (;;) {
-    awaiting = worldBotAwaitingKind(await parseScreenMessages(client, entity));
+    lookScreen = await parseScreenMessages(client, entity);
+    awaiting = worldBotAwaitingKind(lookScreen);
     if (awaiting === 'otp' || awaiting === 'number' || awaiting === 'name') break;
     if (Date.now() >= lookUntil) break;
     await sleep(pollMs);
+  }
+  // 🛑 Bot ne login hi cancel kar diya / OTP bhejne se mana kar diya — OTP
+  // type karna bekar hai (owner ke log: "📺 otp-type: ❌ Login Cancelled" ke
+  // baad bhi OTP chala jata tha aur bot usko number samajh leta tha).
+  const lookText = lookScreen.slice(0, 4).map((m) => m.text).join('\n');
+  const lookBlocked = worldBotOtpBlockInfo(lookText);
+  if (lookBlocked) {
+    console.warn(`[WorldBot] OTP type nahi kiya — screen par ${lookBlocked.code}: ${lookBlocked.reason}`);
+    return { ok: false, reason: `bot-${lookBlocked.code}` };
+  }
+  if (worldBotPromptKind(lookText) === 'cancelled') {
+    console.warn('[WorldBot] OTP type nahi kiya — bot ne login cancel kar diya (Login Cancelled screen)');
+    return { ok: false, reason: 'bot-login-cancelled' };
   }
   if (awaiting === 'number' || awaiting === 'name') {
     console.warn(`[WorldBot] OTP type nahi kiya — bot abhi ${awaiting} maang raha hai`);
@@ -1877,6 +2126,13 @@ export async function worldBotDeleteAccount({
     return await withTelegramUserClient(async ({ client }) => {
       const entity = await getWorldEntity(client, cfg.username);
 
+      // 0) 🏠 Transcript: login/JSON ke baad pehle Main Menu, phir Order Hub.
+      // (Direct Order Hub dabane se JSON screen par wo button hi nahi hota
+      // tha aur flow /start par chala jata tha.)
+      setPhase('delete-main-menu');
+      const menuForDelete = await worldResetToMenu(client, entity, cfg).catch(() => false);
+      if (!menuForDelete) console.warn('[WorldBot] delete: Main Menu saaf nahi hua — Order Hub seedha try karunga');
+
       // 1) Order Hub
       setPhase('delete-order-hub');
       let before = screenSignature(await parseScreenMessages(client, entity));
@@ -2150,14 +2406,16 @@ export async function worldBotDeleteAccount({
       ? 'aborted'
       : category === 'worldbot_setup'
         ? 'worldbot_setup'
-        : category === 'bot_unreachable'
-          ? 'bot_unreachable'
-          // ⏱ Delete ka jawab window me nahi aaya (flood wait) — iska matlab
-          // "delete blocked" NAHI. Pipeline wahi number se state check karke
-          // aage badhti hai; number skip nahi hota.
-          : error?.code === 'worldbot-timeout'
-            ? 'delete_result_timeout'
-            : 'delete_failed';
+        : category === 'worldbot_offline'
+          ? 'worldbot_offline'
+          : category === 'bot_unreachable'
+            ? 'bot_unreachable'
+            // ⏱ Delete ka jawab window me nahi aaya (flood wait) — iska matlab
+            // "delete blocked" NAHI. Pipeline wahi number se state check karke
+            // aage badhti hai; number skip nahi hota.
+            : error?.code === 'worldbot-timeout'
+              ? 'delete_result_timeout'
+              : 'delete_failed';
     return {
       ok: false,
       kind,
@@ -2223,7 +2481,23 @@ async function logoutAccountUnlocked(client, entity, cfg, cleanPhone, { shouldAb
     switched = true;
   };
 
-  const menuSwitch = await waitFor((msgs) => roleOnLatest(msgs, 'switchAccounts'), 1_500);
+  // 📇 Transcript ka pehla rasta: Main Menu → Swiggy Accounts → number →
+  // account menu (wahan Permanent Logout hota hai).
+  const accountsTab = await waitFor((msgs) => roleOnLatest(msgs, 'swiggyAccounts'), 1_500);
+  if (accountsTab) {
+    const beforeId = Number((await latest(1))[0]?.id) || 0;
+    await clickBtn(accountsTab.button, (fresh, all) => accountBtn(fresh) || accountBtn(all) || null, 'logout: Swiggy Accounts');
+    const listed = await waitFor((msgs) => accountBtn(msgs.filter((m) => Number(m.id) > beforeId))
+      || accountBtn(msgs), 12_000);
+    if (listed) {
+      await clickBtn(listed, (fresh) => roleOnLatest(fresh, 'permanentLogout')
+        || roleOnLatest(fresh, 'switchAccounts') || roleOnLatest(fresh, 'deleteAccount'),
+      'logout: Swiggy Accounts me account');
+      switched = true;
+    }
+  }
+
+  const menuSwitch = switched ? null : await waitFor((msgs) => roleOnLatest(msgs, 'switchAccounts'), 1_500);
   if (menuSwitch) await switchAndPick(menuSwitch, 'logout: Switch Accounts (Main Menu)');
 
   // 1) Account list — Order Hub se (menu par "Switch Accounts" nahi hota).
@@ -2316,7 +2590,13 @@ export async function worldBotPermanentLogout({
     const category = classifyWorldBotError(error);
     return {
       ok: false,
-      kind: category === 'aborted' ? 'aborted' : category === 'bot_unreachable' ? 'bot_unreachable' : 'logout_failed',
+      kind: category === 'aborted'
+        ? 'aborted'
+        : category === 'bot_unreachable'
+          ? 'bot_unreachable'
+          : category === 'worldbot_offline'
+            ? 'worldbot_offline'
+            : 'logout_failed',
       phone: cleanPhone,
       reason: String(error?.message || error).slice(0, 200),
       errorCategory: category,

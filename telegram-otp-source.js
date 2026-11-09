@@ -1008,6 +1008,13 @@ async function refreshHermesChatUnlocked({ phone = '', attempt = 0 } = {}) {
   const profile = getActiveOtpBotProfile();
   const allowed = profile.refreshRoles || ['refresh'];
   let lastReason = 'no-refresh-button';
+  // 🟡 Card kisi aur number ka ho (world bot ka pichla number) tab pehle usko
+  // chhodte the — aur agar chat me sirf wahi card pada ho to 20-21 refresh
+  // attempts ke baad bhi "Refresh" kabhi click hi nahi hota tha (`latest-screen-
+  // different-number`), isliye naye number ka card kabhi banta hi nahi.
+  // Ab 2 attempt ke baad us nayi card par Refresh dabaya jata hai (Refresh
+  // number-specific nahi hota — bot apna inbox dobara padhta hai).
+  let fallbackRefresh = null;
 
   try {
     const recent = await fetchIncomingUnlocked(12);
@@ -1028,6 +1035,8 @@ async function refreshHermesChatUnlocked({ phone = '', attempt = 0 } = {}) {
       const cardPhone = parseTelegramNumberCard(text)?.phone || '';
       if (wanted && cardPhone && cardPhone !== wanted) {
         lastReason = 'latest-screen-different-number';
+        const alt = entries.find((e) => allowed.includes(e.role));
+        if (alt && !fallbackRefresh) fallbackRefresh = { entry: alt, phone: cardPhone };
         continue;
       }
       const index = entries.findIndex((entry) => allowed.includes(entry.role));
@@ -1048,6 +1057,22 @@ async function refreshHermesChatUnlocked({ phone = '', attempt = 0 } = {}) {
     }
   } catch (error) {
     lastReason = `read-fail: ${String(error?.message || error).slice(0, 60)}`;
+  }
+
+  // 1b) Sirf doosre number ki card mili — 2nd attempt se usi par Refresh.
+  if (fallbackRefresh && Number(attempt) >= 2) {
+    try {
+      const answer = await fallbackRefresh.entry.button.click({});
+      providerState.lastActionAt = Date.now();
+      providerState.lastClickedButton = fallbackRefresh.entry.text;
+      providerState.lastClickedRole = fallbackRefresh.entry.role;
+      providerState.lastCallbackMessage = String(answer?.message || '').trim().slice(0, 180);
+      providerState.claimPhase = `refresh-${attempt || 1}`;
+      console.log(`[Hermes] 🔄 REFRESH #${attempt || 1} (click: ${fallbackRefresh.entry.text} — card +${fallbackRefresh.phone}, wanted +${wanted || '?'}: naye card ke liye) `);
+      return { ok: true, via: 'click-fallback', buttonText: fallbackRefresh.entry.text, reason: 'different-number-card' };
+    } catch (error) {
+      lastReason = `fallback-click-fail: ${String(error?.message || error).slice(0, 60)}`;
+    }
   }
 
   // 2) Text fallback — bot ke button ka naam type karke bhi refresh hota hai.

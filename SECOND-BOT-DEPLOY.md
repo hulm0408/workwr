@@ -458,7 +458,18 @@ World bots ka default pool: `@SwiggyByworldBot`, `@SwiggyByworld1Bot` …
   jata hai. Uske baad wahi number: Login → OTP Login → number → OTP → naam.
 - **Logout par do confirmation:** Permanently Logged Out → "konsa account" →
   `✅ Yes / ❌ Cancel` → **Yes** dabta hai (Cancel kabhi nahi). Yes na aaye to
-  result `logout_not_confirmed` (jhoothi success nahi).
+  result `logout_not_confirmed` (jhoothi success nahi). Transcript wala rasta
+  pehle try hota hai: `Main Menu → 📇 Swiggy Accounts → woh number → 🗑 Permanent
+  Logout`, uske baad Switch Accounts / Order Hub.
+- **Delete OTP ≠ delete success:** `✅ Delete OTP Sent … account will be
+  permanently deleted` ab `deleteSent` hai (pehle "deleted" shabd ki wajah se
+  delete-success maan liya jata tha).
+- **Telegram disconnect:** har read/send se pehle connection check + reconnect;
+  socket mara ho to `worldbot_offline` — batch rukta hai, number retire nahi
+  hota ("Cannot send requests while disconnected" wala 60s spam dekha gaya tha).
+- **Blank reply verify hota hai:** text khali/photo reply par pehle poora screen
+  padha jata hai — `Could not send OTP … login attempts exceeded` mile to OTP
+  Sent nahi maana jata (20 refresh se pehle hi number ka faisla).
 - **Flood wait friendly:** `messages.GetHistory` flood wait ya khali read par 3
   koshish + 0.4s read-cache; `Login button nahi mila — screen: none` par bot
   switch nahi, pehle menu reset karke ek aur koshish.

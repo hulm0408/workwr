@@ -3552,11 +3552,15 @@ Thanks`)),
 
   // Pipeline ka order: file → worker bot → logout → stock.
   const pipelineT = pipelineCharges;
-  ok(pipelineT.includes("from './session-file.js'") && pipelineT.includes('writeSessionFile({ phone, accountKey: imported.key'),
-    'pipeline: login ke baad JSON ki file banti hai');
+  ok(pipelineT.includes("from './session-file.js'")
+    && pipelineT.includes('writeSessionFile({')
+    && pipelineT.includes('accountKey: imported.key')
+    && pipelineT.includes("name: exported?.fileName ? `${imported.key}-${exported.fileName}` : ''"),
+  'pipeline: login ke baad JSON ki file banti hai (bot ke export document se, naam bhi bot ka)');
   ok(pipelineT.includes('jsonText: fileText')
-    && pipelineT.includes('fileName: file.ok ? file.name'),
-  'pipeline: wahi file worker bot ko jaati hai (jsonText + fileName)');
+    && pipelineT.includes("fileName: exported?.fileName || (file.ok ? file.name : '')")
+    && pipelineT.includes('buffer: exported?.buffer'),
+  'pipeline: wahi file worker bot ko jaati hai (jsonText + bot ka fileName + asli bytes)');
   const sendAt = pipelineT.indexOf('const out = await sendSession({');
   const logoutAt = pipelineT.indexOf('const out = await worldBotPermanentLogout({ phone, shouldAbort, config: botCfg || worldCfg })');
   const stockAt = pipelineT.indexOf('const stock = await pushSessionToShopStock({');
@@ -4009,7 +4013,7 @@ Thanks`)),
   // OTP → naam → JSON, phir Switch Account → account → Permanent Logout → Yes.
   // ---------------------------------------------------------------------
   const JSON_SAMPLE = '{"tid":"abc123","token":"tok","cookies":[{"name":"a","value":"b"}]}';
-  const makeFakeWorldBot = ({ startWithAccount = false, silentAfterNumber = false } = {}) => {
+  const makeFakeWorldBot = ({ startWithAccount = false, silentAfterNumber = false, bareDetection = false, namePromptDelayMs = 0, withExport = false } = {}) => {
     const chat = [];
     let id = 0;
     const accounts = new Map(startWithAccount ? [['9876543210', { name: 'ihgfe' }]] : []);
@@ -4017,8 +4021,9 @@ Thanks`)),
     let pendingPhone = '';
     let loggedIn = startWithAccount ? '9876543210' : '';
     let startSendsDuringFlow = 0;
-    const push = (text, buttons = [], out = false) => {
-      const m = { id: ++id, out, text, buttons, date: new Date() };
+    let exportSends = 0;
+    const push = (text, buttons = [], out = false, extra = {}) => {
+      const m = { id: ++id, out, text, buttons, date: new Date(), ...(extra || {}) };
       chat.unshift(m);
       return m;
     };
@@ -4044,15 +4049,48 @@ Thanks`)),
         btn('1️⃣ JSON/TID Login', async () => push('JSON login')),
         btn('2️⃣ OTP Login', async () => { awaiting = 'number'; push('📱 OTP Login\n\nSend your 10-digit Swiggy number.'); }),
       ], [btn('Cancel')]]))],
-      [btn('Swiggy Accounts', async () => accountList())],
+      [btn('Swiggy Accounts', async () => (withExport ? myAccounts() : accountList()))],
       [btn('Order Hub', async () => accountList())],
       [btn('Switch Accounts', async () => accountList())],
+    ]);
+    // 📇 Owner ka Part 4–5: My Swiggy Accounts → account → detail (Name ·
+    // Mobile · Status + Export Login JSON | Login | Permanent Logout) → export
+    // par bot ek ASLI .json document (swiggy-login-3.json) bhejta hai.
+    const accountDetail = (ph) => push(
+      `👤 ${accounts.get(ph)?.name || '—'}\n📱 ${ph}\n📌 Status: ${ph === loggedIn ? 'Logged in' : 'Saved'}`,
+      [
+        [btn('📤 Export Login JSON', async () => {
+          const payload = JSON_SAMPLE;
+          push('📤 Login JSON Export', [], false);
+          push('swiggy-login-3.json', [], false, {
+            document: {
+              attributes: [{ className: 'DocumentAttributeFilename', fileName: 'swiggy-login-3.json' }],
+              size: Buffer.byteLength(payload, 'utf8'),
+              json: payload,
+            },
+          });
+          exportSends += 1;
+        })],
+        [btn('🔐 Login')],
+        [btn('🗑 Permanent Logout', async () => logoutConfirm())],
+      ],
+    );
+    const myAccounts = () => push('📇 My Swiggy Accounts', [
+      ...[...accounts.entries()].map(([ph]) => [
+        btn(`📱 ${ph} · ${ph === loggedIn ? 'Logged in' : 'Saved'}`, async () => accountDetail(ph)),
+      ]),
+      [btn('🗑 Delete All Accounts')],
+      [btn('🏠 Main Menu', async () => pushMenu())],
     ]);
     pushMenu();
     const client = {
       async getMessages(_e, { limit = 10 } = {}) { return chat.slice(0, Math.max(1, limit)); },
       async getEntity() { return { id: 'bot' }; },
-      async downloadMedia() { return Buffer.from('{}'); },
+      async downloadMedia(msg) {
+        const doc = msg?.document || msg?.media?.document || null;
+        if (doc?.json) return Buffer.from(String(doc.json), 'utf8');
+        return Buffer.from('{}');
+      },
       async sendMessage(_e, { message }) {
         push(message, [], true);
         const text = String(message || '').trim();
@@ -4076,7 +4114,18 @@ Thanks`)),
         }
         if (awaiting === 'otp' && /^\d{6}$/.test(text)) {
           if (accounts.has(pendingPhone)) { loggedIn = pendingPhone; awaiting = ''; loginJson(); }
-          else { awaiting = 'name'; push('🆕 New Account Detected!\n\nTell us the name to set on your Swiggy account.'); }
+          else if (bareDetection) {
+            // Asli bot ka chhota version: sirf "New Account Detected!" (isme
+            // "name" shabd nahi) aur ek inline button — yahi woh screen hai
+            // jahan naam kabhi type nahi hota tha.
+            awaiting = 'name';
+            const say = () => push('🆕 New Account Detected!', [[btn('📋 Copy Code')]]);
+            if (namePromptDelayMs > 0) setTimeout(say, namePromptDelayMs); else say();
+          } else {
+            awaiting = 'name';
+            const say = () => push('🆕 New Account Detected!\n\nTell us the name to set on your Swiggy account.');
+            if (namePromptDelayMs > 0) setTimeout(say, namePromptDelayMs); else say();
+          }
           return { id: ++id };
         }
         if (awaiting === 'delete-otp' && /^\d{6}$/.test(text)) {
@@ -4091,7 +4140,16 @@ Thanks`)),
           accounts.set(pendingPhone, { name: text });
           loggedIn = pendingPhone;
           awaiting = '';
-          loginJson();
+          if (bareDetection) {
+            // Pehle "✅ Name set" (jo pehle galti se askAgain banta tha), JSON
+            // ~800ms baad alag message me.
+            push(`✅ Name set: ${text}`);
+            setTimeout(() => {
+              push(`Login JSON\n\n\`\`\`json\n${JSON_SAMPLE}\n\`\`\``);
+            }, 800);
+          } else {
+            loginJson();
+          }
           return { id: ++id };
         }
         return { id: ++id };
@@ -4099,7 +4157,7 @@ Thanks`)),
     };
     return {
       client, chat,
-      state: () => ({ awaiting, pendingPhone, loggedIn, accounts: [...accounts.keys()], startSendsDuringFlow }),
+      state: () => ({ awaiting, pendingPhone, loggedIn, accounts: [...accounts.keys()], startSendsDuringFlow, exportSends }),
     };
   };
   const flowCfg = {
@@ -4297,6 +4355,206 @@ Thanks`)),
       ok(sent.includes('Sudhani Kumar') && !sent.includes('/start') && otpCalls === 0
         && !sent.some((t) => /^\d{6}$/.test(t)),
         `naam: naya OTP/number//start nahi gaya (${sent.join(' · ') || 'kuch nahi'})`);
+    } finally {
+      wb._setWorldBotClientOverrideForTests(null);
+    }
+  }
+
+  // 🆕 "New Account Detected" par naam — asli bug (2026-11-09, dusra round):
+  // detection line me "name" shabd hi nahi hota, isliye kind '' aata tha aur
+  // teeno strict call sites ise miss kar jate the → naam kabhi type nahi hota
+  // tha (ya OTP naam ki jagah chala jata tha).
+  ok(wb.worldBotPromptKind('🆕 New Account Detected!') === 'askName'
+    && wb.worldBotNamePromptOnScreen([
+      { id: 9, out: false, text: '🆕 New Account Detected!', buttons: [[{ text: '📋 Copy Code' }]] },
+    ], { strict: true })?.id === 9,
+  'naam: "New Account Detected" (bina "name" shabd, button ke saath) bhi naam ka step hai');
+  ok(wb.worldBotAwaitingKind([{ out: false, text: '🆕 New Account Detected!', buttons: [] }]) === 'name',
+    'naam: awaiting-kind bhi use naam maanta hai (OTP uski jagah nahi jata)');
+  ok(wb.worldBotPromptKind('✅ Name set: Sudhani Kumar') === 'nameOk'
+    && wb.worldBotPromptKind('Naam set ho gaya') === 'nameOk'
+    && wb.worldBotPromptKind('Tell us the name to set on your Swiggy account.') === 'askName',
+  'naam: "Name set" = accept (nameOk), "name to set" = sawaal (askName)');
+
+  // Poora flow: bare "New Account Detected!" (button ke saath) → naam → "✅ Name
+  // set" → JSON. Pehle yahan OTP naam ki jagah jata tha / 4 naam jalte the.
+  wb._resetWorldBotReadCacheForTests();
+  {
+    const fake = makeFakeWorldBot({ bareDetection: true });
+    wb._setWorldBotClientOverrideForTests(fake.client);
+    try {
+      const login = await wb.worldBotLogin({
+        phone: '9123456780',
+        otpProvider: async () => ({ code: '778899' }),
+        otpWatermark: async () => ({}),
+        nameProvider: async () => 'ihgfe',
+        config: flowCfg,
+      });
+      const sent = fake.chat.filter((m) => m.out).map((m) => String(m.text));
+      ok(login.ok && login.askedName && String(login.jsonText || '').includes('"tid"'),
+        `naam: bare detection → naam → JSON (${login.kind || login.reason})`);
+      ok(sent.filter((t) => t === 'Sudhani Kumar').length === 1 && !sent.includes('ihgfe'),
+        `naam: sirf EK naam gaya (\"Name set\" ko askAgain nahi samjha) — ${sent.join(' · ')}`);
+      ok(sent.includes('778899') && !sent.includes('/start'),
+        'naam: OTP type hua (naam ki jagah nahi) aur /start nahi gaya');
+    } finally {
+      wb._setWorldBotClientOverrideForTests(null);
+    }
+  }
+
+  // ⏳ OTP ke baad bot ka jawab DER se aata hai (8s). Pehle yahan sirf 6s thi →
+  // OTP DOBARA jata tha → "otp-not-accepted" → /cancel → "❌ Login Cancelled"
+  // → naam ka screen kabhi nahi aata tha. Ab: ek hi OTP, naam type hota hai,
+  // Cancel nahi, JSON milta hai.
+  wb._resetWorldBotReadCacheForTests();
+  {
+    const fake = makeFakeWorldBot({ bareDetection: true, namePromptDelayMs: 8_000 });
+    wb._setWorldBotClientOverrideForTests(fake.client);
+    try {
+      const login = await wb.worldBotLogin({
+        phone: '9123456791',
+        otpProvider: async () => ({ code: '889900' }),
+        otpWatermark: async () => ({}),
+        nameProvider: async () => 'ihgfe',
+        config: { ...flowCfg, otpVerifyWaitMs: 20_000, stepTimeoutMs: 25_000 },
+      });
+      const sent = fake.chat.filter((m) => m.out).map((m) => String(m.text));
+      ok(login.ok && login.askedName && String(login.jsonText || '').includes('"tid"'),
+        `late: OTP ke 8s baad aaya naam ka screen — phir bhi naam → JSON (${login.kind || login.reason})`);
+      ok(sent.filter((t) => t === '889900').length === 1,
+        `late: OTP sirf EK baar gaya (duplicate OTP = Invalid OTP) — ${sent.join(' · ')}`);
+      ok(sent.filter((t) => t === 'Sudhani Kumar').length === 1,
+        `late: naam type hua (OTP nahi) — ${sent.join(' · ')}`);
+      ok(!sent.includes('/cancel') && !sent.includes('/start') && !sent.includes('Cancel'),
+        `late: koi /cancel ya /start nahi gaya — ${sent.join(' · ')}`);
+    } finally {
+      wb._setWorldBotClientOverrideForTests(null);
+    }
+  }
+
+  // ⛔ Naam ke screen par Cancel bilkul nahi (account aadha ban chuka hai).
+  wb._resetWorldBotReadCacheForTests();
+  {
+    const chat = [
+      { id: 42, out: false, text: '🆕 New Account Detected!', buttons: [[
+        { text: '📋 Copy Code', click: async () => ({ message: 'ok' }) },
+        { text: 'Cancel', click: async () => ({ message: 'cancelled' }) },
+      ]], date: new Date() },
+      { id: 41, out: true, text: '889900', buttons: [], date: new Date() },
+    ];
+    const client = {
+      async getMessages() { return chat.slice(); },
+      async getEntity() { return { id: 'bot' }; },
+      async sendMessage(_e, { message }) { chat.unshift({ id: 99, out: true, text: message, buttons: [], date: new Date() }); return { id: 99 }; },
+    };
+    wb._closeLoginFlowForTests();
+    const did = await wb._safeCancelForTests(client, { id: 'bot' }, { pollMs: 600 });
+    const outText = chat.filter((m) => m.out).map((m) => String(m.text));
+    ok(did === false && !outText.some((t) => /cancel/i.test(t)),
+      `cancel: naam ka screen par Cancel nahi jata (${outText.join(' · ') || 'kuch nahi'})`);
+
+    // Control: number maang raha ho to Cancel pehle jaisa chalta hai.
+    const chat2 = [
+      { id: 7, out: false, text: '📱 OTP Login\n\nSend your 10-digit Swiggy number.', buttons: [], date: new Date() },
+    ];
+    const client2 = {
+      async getMessages() { return chat2.slice(); },
+      async getEntity() { return { id: 'bot' }; },
+      async sendMessage(_e, { message }) { chat2.unshift({ id: 8, out: true, text: message, buttons: [], date: new Date() }); return { id: 8 }; },
+    };
+    wb._resetWorldBotReadCacheForTests();
+    wb._closeLoginFlowForTests();
+    const did2 = await wb._safeCancelForTests(client2, { id: 'bot' }, { pollMs: 600 });
+    ok(did2 === true && chat2.some((m) => m.out && m.text === '/cancel'),
+      `cancel: number ke prompt par Cancel chalta hai (guard sirf naam ke liye) — ${chat2.filter((m) => m.out).map((m) => m.text).join(' · ')}`);
+  }
+
+  // ============ 📇 MY SWIGGY ACCOUNTS + 📤 EXPORT LOGIN JSON ============
+  // Owner ka Part 4–7: Swiggy Accounts → account → detail → Export Login JSON
+  // (ASLI .json document) → destination bot ko wahi file → Permanent Logout.
+  ok(wb.worldBotButtonRole('📤 Export Login JSON') === 'exportJson'
+    && wb.worldBotButtonRole('Export Login JSON') !== 'jsonLogin'
+    && wb.worldBotButtonRole('2️⃣ JSON/TID Login') === 'jsonLogin'
+    && wb.worldBotButtonRole('🗑 Delete All Accounts') === 'deleteAllAccounts'
+    && wb.worldBotButtonRole('🗑 Delete Account') === 'deleteAccount',
+  'accounts: "Export Login JSON" aur "Delete All Accounts" ka role alag (galat flow nahi khulta)');
+
+  // Part 8 — chaar jawab chaar alag states, ek me do nahi.
+  ok(wb.worldBotOutcome('❌ Login Cancelled\nNo account was logged in.') === 'login_cancelled'
+    && wb.worldBotOutcome('Session Expired\nYour Swiggy JSON/session has expired.') === 'session_expired'
+    && wb.worldBotOutcome('🗑 Permanent Logout Successful') === 'permanent_logout'
+    && wb.worldBotOutcome('✅ Account Deleted Successfully\n🧾 Swiggy: User successfully archived\n📌 StatusCode: 33') === 'account_deleted',
+  'states: login cancelled / session expired / permanent logout / account deleted — chaar alag');
+  ok(wb.worldBotPromptKind('You have been logged out automatically. Please Login again (OTP or fresh JSON).') === 'sessionExpired'
+    && wb.worldBotOutcome('You have been logged out automatically.') === 'session_expired',
+  'states: "logged out automatically" = session expiry (Permanent Logout NAHI)');
+  ok(wb.worldBotOutcome('❌ This Account Cannot Be Deleted\nSwiggy refused the request: Session expired. Please login again.') === 'session_expired'
+    && wb.worldBotDeleteBlockedInfo('❌ This Account Cannot Be Deleted (user charges present)').code === 'charges',
+  'states: delete failure ka karan alag — session expired vs charges/dues');
+
+  wb._resetWorldBotReadCacheForTests();
+  {
+    const fake = makeFakeWorldBot({ startWithAccount: true, withExport: true });
+    wb._setWorldBotClientOverrideForTests(fake.client);
+    try {
+      const accs = await wb.worldBotAccounts({ config: flowCfg });
+      ok(accs.ok && accs.count === 1 && accs.accounts[0].phone === '9876543210'
+        && accs.accounts[0].status === 'logged_in' && accs.deleteAllVisible,
+      `accounts: My Swiggy Accounts list (phone + status + Delete All) — ${JSON.stringify(accs.accounts)}`);
+
+      const detail = await wb.worldBotAccountDetail({ phone: '9876543210', config: flowCfg });
+      ok(detail.ok && detail.phone === '9876543210' && detail.name === 'ihgfe'
+        && detail.buttons.includes('📤 Export Login JSON')
+        && detail.buttons.includes('🗑 Permanent Logout'),
+      `accounts: detail screen (Name/Mobile/Status + 3 buttons) — ${detail.name} · ${detail.buttons.join(' | ')}`);
+
+      const exp = await wb.worldBotExportLoginJson({ phone: '9876543210', config: flowCfg });
+      ok(exp.ok && exp.kind === 'exported' && exp.viaDocument === true
+        && exp.fileName === 'swiggy-login-3.json'
+        && String(exp.text).includes('"tid"') && exp.bytes > 0,
+      `export: bot ka ASLI .json document mila (${exp.fileName}, ${exp.bytes} bytes, ${exp.kind})`);
+      ok(Buffer.isBuffer(exp.buffer) && exp.buffer.length === exp.bytes,
+        'export: document ke asli bytes saath (destination ko wahi file jayegi, re-encoded text nahi)');
+      ok(fake.state().exportSends === 1,
+        `export: "Export Login JSON" sirf ek baar dabaya (${fake.state().exportSends})`);
+
+      const out = await wb.worldBotPermanentLogout({ phone: '9876543210', config: flowCfg });
+      ok(out.ok && out.kind === 'logged_out' && !fake.state().accounts.includes('9876543210'),
+        `export ke baad: detail screen se seedha Permanent Logout (${out.kind})`);
+    } finally {
+      wb._setWorldBotClientOverrideForTests(null);
+    }
+  }
+
+  // 📤 Destination bot ko file (document) — text nahi. Mock JSON se poori
+  // chain: export document → file → destination, aur record (name/size/result).
+  wb._resetWorldBotReadCacheForTests();
+  {
+    const fake = makeFakeWorldBot({ startWithAccount: true, withExport: true });
+    wb._setWorldBotClientOverrideForTests(fake.client);
+    try {
+      const exp = await wb.worldBotExportLoginJson({ phone: '9876543210', config: flowCfg });
+      const delivered = [];
+      const sendToDestination = async (payload) => {
+        // Owner Part 43/44: document jaata hai aur confirmation ka intezaar hota hai.
+        const doc = payload.buffer || Buffer.from(String(payload.jsonText || ''), 'utf8');
+        const parsed = JSON.parse(doc.toString('utf8'));
+        delivered.push({
+          fileName: payload.fileName || 'swiggy-login-3.json',
+          bytes: doc.length,
+          destination: '@its_shop_bot',
+          result: parsed?.tid ? 'delivered' : 'rejected',
+        });
+        return true;
+      };
+      const okSend = await sendToDestination({
+        fileName: exp.fileName, bytes: exp.bytes, buffer: exp.buffer, jsonText: exp.text,
+      });
+      ok(okSend && delivered.length === 1
+        && delivered[0].fileName === 'swiggy-login-3.json'
+        && delivered[0].bytes === exp.bytes
+        && delivered[0].result === 'delivered',
+      `export→destination: file hi gayi (${delivered[0]?.fileName}, ${delivered[0]?.bytes} bytes, ${delivered[0]?.result})`);
     } finally {
       wb._setWorldBotClientOverrideForTests(null);
     }
@@ -4555,10 +4813,12 @@ Thanks`)),
   // EK baar (purana "OTP Sent" message dekh kar dobara nahi).
   ok(wbSrc.includes("setPhase('otp-type')") && wbSrc.includes("return { ok: true, reason: 'typed' }"),
     'worldbot: OTP mila to bot ko TYPE hota hai (guard se skip nahi)');
-  ok(wbSrc.includes("bot-${awaiting}-maang-raha-hai") && wbSrc.includes('OTP screen saaf nahi mili'),
-    'worldbot: OTP sirf tab skip jab bot number/naam maang raha ho');
-  ok(wbSrc.includes('SIRF latest screen dekho'),
-    'worldbot: OTP ek hi baar jata hai (latest screen se verify)');
+  ok(wbSrc.includes("bot-${pending}-maang-raha-hai") && wbSrc.includes("const pending = awaiting || 'name'")
+    && wbSrc.includes('OTP screen saaf nahi mili'),
+  'worldbot: OTP sirf tab skip jab bot number/naam (New Account Detected) maang raha ho');
+  ok(wbSrc.includes('verifyBudget') && wbSrc.includes('OTP dobara nahi bhejunga')
+    && wbSrc.includes('latestKind === \'otpFail\''),
+  'worldbot: OTP ke baad jawab aane tak wait (6s nahi) aur duplicate OTP nahi');
   ok(wbSrc.includes('OTP source (Hermes/Firebase) me is number ka code hi nahi aaya')
     && wbSrc.includes("code: 'OTP_SOURCE_EMPTY'"),
   'worldbot: OTP source khali ho to saaf reason (bot ne type nahi kiya kyunki code hi nahi tha)');

@@ -72,15 +72,27 @@ export function sessionFileName(phone = '', accountKey = '') {
 }
 
 // File banao. Fail ho (permission/disk) to bhi flow na ruke — ok:false.
+// Bot ka apna filename ("swiggy-login-3.json") — safe banao, .json rakho.
+// Owner ka rule: jo file bot ne bheji hai, wahi naam aage jaana chahiye.
+export function safeSessionFileName(value = '') {
+  const raw = String(value || '').trim().replace(/^.*[\\/]/, '');
+  const base = raw.replace(/[^\w.-]+/g, '_').replace(/^[._]+/, '') || 'session.json';
+  return /\.json$/i.test(base) ? base : `${base}.json`;
+}
+
 export function writeSessionFile({
   phone = '',
   accountKey = '',
   text = '',
   dir = SESSION_FILE_DIR,
+  // name: bot ka diya naam (export document) — diya ho to wahi file banti hai.
+  name: preferredName = '',
 } = {}) {
   const body = String(text || '').trim();
   if (!body) return { ok: false, kind: 'no-json' };
-  const name = sessionFileName(phone, accountKey);
+  const name = String(preferredName || '').trim()
+    ? safeSessionFileName(preferredName)
+    : sessionFileName(phone, accountKey);
   try {
     fs.mkdirSync(dir, { recursive: true });
     const filePath = path.join(dir, name);

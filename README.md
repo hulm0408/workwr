@@ -67,13 +67,75 @@ hai.
 > (Hermes/Firebase) ka hai — OTP type karne ke baad alag budget
 > (`SWIGGY_WORLD_OTP_VERIFY_WAIT_MS`, default 90s) chalta hai.
 >
-> 👤 **“New Account Detected” ka naam step:** ye screen jahan bhi dikhe — login
+> 🆕 **“New Account Detected” ko pehchanne wala fix (2026-11-09, round 2):** bot
+> ka asli screen sirf `🆕 New Account Detected!` hota hai — isme “name” shabd hi
+> nahi hota, isliye pehle kind `''` aata tha aur naam ka step **kabhi pehchana hi
+> nahi jata tha** (OTP naam ki jagah chala jata tha / 4 naam jal kar
+> `name_rejected`). Ab: detection line = `askName` (strict mode me bhi), button
+> ya digit ho to bhi; `✅ Name set: Sudhani Kumar` = **accept** (`nameOk`) — uske
+> baad agla naam nahi, seedha JSON; aur wahi purana prompt dobara dikhe to naya
+> naam nahi bhejte.
+>
+> 
+> ⏳ **OTP ke baad koi 6-second wala timeout nahi (2026-11-09, round 3):** asli
+> blocker OTP ke *baad* tha — Swiggy account banane me 10–60s lagte hain, par
+> code sirf 6s wait karke OTP **dobara** bhej deta tha → bot `Invalid OTP` →
+> `otp-not-accepted` → `safeCancel` → **“❌ Login Cancelled”** → naam ka screen
+> kabhi aata hi nahi tha. Ab: OTP type karne ke baad bot ke **agle message** ka
+> wait (`SWIGGY_WORLD_OTP_VERIFY_WAIT_MS`, default 300s) — koi naya message (ya
+> seedha naam ka screen) = OTP accept; OTP dobara sirf tab jab bot khud
+> `Invalid OTP` kahe; wait khatam hone par bhi duplicate OTP **nahi**. Aur jab
+> bot naam maang raha ho to `safeCancel` Cancel bhejne se **mana** karta hai
+> (`⛔ bot naam maang raha hai — Cancel nahi bhejunga`); us jagah `rescueNameStep`
+> seedha naam bhej kar JSON le aata hai.
+
+👤 **“New Account Detected” ka naam step:** ye screen jahan bhi dikhe — login
 > ke shuru me, OTP type karne se pehle, ya login ke result ka intezaar me —
 > wahan **turant naam (`Sudhani Kumar`) chala jata hai** aur JSON liya jata hai
 > (naya OTP/naya number/`/start` bilkul nahi). Screen par koi dusra number
 > likha ho (pichhle number ka aadha account) to usme naam nahi bharta —
 > pehle Cancel karke saaf menu. `/cancel` bhi naam ke step par kabhi nahi
 > jata (warna poora naya-account flow jal jata tha).
+
+### 📇 Poore account ka cycle — login → delete → wapas login → accounts → export → logout
+
+Owner ka workflow (screenshots ke saath) aur code me uska hissa — har step ka
+jawab **asli message/document** se verify hota hai, koi step "bhej diya to ho
+gaya" nahi maana jata:
+
+| Step | Bot | Code |
+|---|---|---|
+| **Login #1** | `/start` → Login → OTP Login → number → OTP → `✅ Login Successful` + Login JSON | `worldBotLogin()` |
+| **Delete** | Order Hub → account → Delete Account → Delete OTP → `✅ Account Deleted Successfully` (`StatusCode: 33`) | `worldBotDeleteAccount()` |
+| **Login #2 (wahi number)** | number → OTP → `🆕 New Account Detected!` → naam (`Sudhani Kumar`) → `✅ Login Successful` + JSON | `worldBotLogin()` (naam step) |
+| **My Swiggy Accounts** | `📇 My Swiggy Accounts` — accounts + `Expired / Logged in / Saved` + `Delete All Accounts` | `worldBotAccounts()` |
+| **Account detail** | Name · Mobile · Status + `Export Login JSON` · `Login` · `Permanent Logout` | `worldBotAccountDetail()` |
+| **📤 Export Login JSON** | bot **.json document** bhejta hai (`swiggy-login-3.json`, 1.2 KB) | `worldBotExportLoginJson()` |
+| **📎 Destination** | wahi file Telegram **document** ke roop me (text nahi), delivery confirm hone par hi "bhej diya" | pipeline `sendSession` / fresh-bot `sendSessionFile` |
+| **Permanent Logout** | detail screen → Permanent Logout → `Yes` → `🗑 Permanent Logout Successful` | `worldBotPermanentLogout()` |
+
+Kuch cheezein jo spec me galat likhi hoti hain, code me sahi hain:
+
+* **Number kahan se aata hai** — user se poochha nahi jata. Number (aur OTP)
+  owner ke **OTP bot** (Hermes / Hathi / HardXotp / Firebase) se aata hai; Shop
+  Bot sirf World Bot par number/OTP/naam type karta hai.
+* **File kahan jaati hai** — pehle se tay hai: wahi worker/Shop Bot chat
+  (`sendSession`). Koi naya destination configure nahi karna.
+* **Naam** — default `Sudhani Kumar`; badalna ho to `SWIGGY_WORLD_NAME`
+  (code chhedne ki zaroorat nahi).
+* **Export = document, text nahi** — export se aaye document ke **asli bytes**
+  aage jaate hain (`buffer`), naam bhi bot ka (`swiggy-login-3.json`); file
+  na milne par hi login ke JSON text se file banti hai.
+* **Chaar jawab = chaar states** (`worldBotOutcome`): `login_cancelled` /
+  `session_expired` / `delete_refused` / `permanent_logout` — `"You have been
+  logged out automatically"` ko Permanent Logout nahi samajhte, aur delete
+  failure ka karan (`charges` vs `session expired`) alag rehta hai.
+
+Export step ka behaviour: pipeline login ke baad `Export Login JSON` bhi try
+karta hai — mil gaya to **wahi document** file ban kar destination jaati hai,
+na mile/chale to login ke JSON se file banti hai (number nahi jalta).
+`SWIGGY_WORLD_EXPORT_JSON=0` se export step band, `SWIGGY_WORLD_EXPORT_TIMEOUT_MS`
+se uska budget (default 90s) — dono optional.
 
 ### 🐘 Hathi + 🔐 HardXotp — OTP bots
 

@@ -79,6 +79,11 @@ export const WORLD_BOT_DEFAULTS = {
   // OTP send confirm na ho (aur bot ne Cancel bhi na bheja ho) to number SKIP
   // nahi hota — wahi number itni baar dobara issue hota hai (Login → 2 → number).
   numberRetries: 1,
+  // ⏱ OTP type karne ke BAAD bot ka jawab (naam/JSON) ka budget. Account
+  // creation Swiggy par queue me hoti hai — 45s bahut kam padta tha aur hum
+  // beech me /start bhej kar poora login cancel kar dete the (owner:
+  // "Cancel kiu ho ja raha"). 20s sirf OTP SOURCE ka rule hai, ye alag.
+  otpVerifyWaitMs: 90_000,
   // ⏱ Telegram flood wait ke baad bot ka jawab late padha jata hai. Step ka
   // budget khatam hone par turant "fail" na karo — itni der dheemi scan
   // chalti hai (delete/login result ke liye). Warna delete ho chuka account
@@ -131,6 +136,51 @@ export function resetWorldBotRunState() {
 
 function setError(error) {
   state.lastError = String(error?.message || error || '').slice(0, 240);
+}
+
+// ---------------------------------------------------------------------------
+// ⛔ LOGIN GUARD — "Cancel kiu ho ja raha?"
+//
+// Owner ka log (2026-11-09): number → OTP type → bot account bana raha tha →
+// humne /start bhej diya → World Bot ne "❌ Login Cancelled / No account was
+// logged in" bhej diya, aur account bekaar. Uske baad dobara Login → OTP Login
+// → number → Cancel.
+//
+// Rule: jab tak koi login flow KHULA hai (number/OTP bheja gaya hai aur bot ka
+// final jawab — naam/JSON/Cancel — nahi aaya), /start aur Cancel bilkul nahi.
+// Bas intezaar. OTP 20s ka rule sirf OTP SOURCE ka hai, yahan account creation
+// ka waqt alag hai.
+// ---------------------------------------------------------------------------
+function markLoginFlowOpen(extra = {}) {
+  state.loginFlowAt = Date.now();
+  Object.assign(state, extra);
+}
+
+function closeLoginFlow() {
+  state.loginFlowAt = 0;
+  state.otpTypedAt = 0;
+  state.loginFlowPhone = '';
+}
+
+function worldLoginFlowOpenMs(cfg = {}) {
+  const guardMs = Math.max(60_000, Number(cfg?.loginGuardMs) || 300_000);
+  const at = Number(state.loginFlowAt) || 0;
+  if (!at) return 0;
+  // Flow kisi DUSRE number ka hai — us par naya /start chal sakta hai
+  // (purana pending account chhod diya gaya).
+  const flowPhone = String(state.loginFlowPhone || '');
+  const nowPhone = String(state.phone || '');
+  if (flowPhone && nowPhone && flowPhone !== nowPhone) return 0;
+  const left = guardMs - (Date.now() - at);
+  return left > 0 ? left : 0;
+}
+
+export function worldBotLoginFlowInfo() {
+  return {
+    openForMs: worldLoginFlowOpenMs(worldBotConfig()),
+    loginFlowAt: Number(state.loginFlowAt) || 0,
+    otpTypedAt: Number(state.otpTypedAt) || 0,
+  };
 }
 
 export function worldBotUsername(env = process.env) {
@@ -212,6 +262,15 @@ export function worldBotConfig(env = process.env) {
     pollMs: num('SWIGGY_WORLD_POLL_MS', WORLD_BOT_DEFAULTS.pollMs, 300),
     otpTimeoutMs: num('SWIGGY_WORLD_OTP_TIMEOUT_MS', WORLD_BOT_DEFAULTS.otpTimeoutMs, 5_000),
     otpSendTimeoutMs: num('SWIGGY_WORLD_OTP_SEND_TIMEOUT_MS', WORLD_BOT_DEFAULTS.otpSendTimeoutMs, 5_000),
+    // OTP type karne ke baad bot ke jawab (naam/JSON) ka budget — account
+    // creation me waqt lagta hai. Default 90s (30s–240s clamp).
+    otpVerifyWaitMs: Math.max(30_000, Math.min(240_000,
+      num('SWIGGY_WORLD_OTP_VERIFY_WAIT_MS', WORLD_BOT_DEFAULTS.otpVerifyWaitMs, 30_000))),
+    // Itne waqt tak /start aur Cancel band rehte hain jab login flow khula ho
+    // (number/OTP bheja gaya ho par jawab na aaya ho) — warna World Bot
+    // "❌ Login Cancelled" de deta hai.
+    loginGuardMs: Math.max(60_000, Math.min(900_000,
+      num('SWIGGY_WORLD_LOGIN_GUARD_MS', 300_000, 60_000))),
     queueWaitMs: num('SWIGGY_WORLD_QUEUE_WAIT_MS', WORLD_BOT_DEFAULTS.queueWaitMs, 5_000),
     // Button trigger: 'auto' = pehle click; screen na badle to button ka TEXT
     // type karke action trigger. 'type' = click bilkul nahi, seedha text.
@@ -1013,6 +1072,12 @@ async function parseScreenMessages(client, entity, limit, readOpts = {}) {
       try { keys = Object.keys(latest.raw || {}).slice(0, 14).join(','); } catch {}
       console.warn(`[WorldBot] 📭 screen par kuch nahi (id ${latest.id}, out=${latest.out}) — keys: ${keys || 'n/a'}`);
     }
+    // ⛔ Guard khol do jab bot khud flow khatam kar de (cancel/menu/login ok)
+    // — warna /start hamesha band rahega.
+    const latestKind = worldBotPromptKind(latest.text);
+    if (latestKind === 'cancelled' || latestKind === 'menu' || latestKind === 'loginOk' || latestKind === 'deleted') {
+      if (Number(state.loginFlowAt)) closeLoginFlow();
+    }
     state.lastScreenText = String(latest.text || '').slice(0, 400);
     state.lastScreenButtons = latest.buttons.map((b) => b.text);
     // Owner ko pata chale bot exactly kya keh raha hai — /world isi se bharta
@@ -1297,7 +1362,12 @@ function findRoleOnScreens(messages, role) {
 async function ensureWorldScreen(client, entity, role, { cfg, shouldAbort, what } = {}) {
   const hit = findRoleOnScreens(await parseScreenMessages(client, entity), role);
   if (hit) return hit;
-  // Kuch nahi mila to /start bhej kar main menu maango.
+  // Kuch nahi mila to /start bhej kar main menu maango — par khula login ho
+  // to /start usko cancel kar deta hai (owner: "Cancel kiu ho ja raha").
+  if (worldLoginFlowOpenMs(cfg) > 0) {
+    console.warn('[WorldBot] ⛔ /start nahi bhej raha — login khula hai (Login Cancelled se bachaav)');
+    return null;
+  }
   const before = screenSignature(await parseScreenMessages(client, entity));
   await sendWorldText(client, entity, '/start');
   const reply = await waitForReply({
@@ -1452,6 +1522,70 @@ export async function worldBotLogin({
         };
       }
 
+      // ⏳ Pichhla login abhi KHULA hai (is WAHI number par number/OTP gaya
+      // tha) aur screen par kuch nahi — bot account bana raha hoga. /start
+      // ya Cancel bhejna usko cancel kar deta hai (owner: "Cancel kiu ho ja
+      // raha, 20s to diye hain"). Pehle itna intezaar ki bot apna jawab de de:
+      // naam aaya → naam + JSON (account bach gaya), JSON aaya → wahi.
+      if (worldLoginFlowOpenMs(cfg) > 0) {
+        const sameFlowPhone = !state.loginFlowPhone || state.loginFlowPhone === cleanPhone;
+        if (sameFlowPhone) {
+          setPhase('login-wait');
+          const waitMs = Math.max(1_000, Math.min(120_000, Number(cfg.otpVerifyWaitMs) || 90_000));
+          console.log(`[WorldBot] ⏳ login khula hai — /start nahi, ${Math.round(waitMs / 1000)}s tak bot ka jawab dekh raha hoon (${cleanPhone})`);
+          const openBaseline = screenSignature(await parseScreenMessages(client, entity).catch(() => []));
+          const late = await waitForReply({
+            client, entity, baseline: openBaseline, timeoutMs: waitMs, shouldAbort,
+            what: 'khula login ka jawab', graceMs: 0, pollMs: cfg.pollMs,
+            predicate: (freshList, all) => {
+              for (const message of freshList) {
+                if (message.hasDocument) return { kind: 'document', message };
+                const json = extractWorldBotJson(message.text);
+                if (json) return { kind: 'json', message, json };
+                const kind = worldBotPromptKind(message.text);
+                if (kind === 'askName') return { kind: 'askName', message };
+                if (kind === 'otpFail') return { kind: 'otpFail', message };
+                if (kind === 'cancelled') return { kind: 'cancelled', message };
+              }
+              const nm = worldBotNamePromptOnScreen(all, { strict: true });
+              if (nm) return { kind: 'askName', message: nm, fromScreen: true };
+              return null;
+            },
+          }).catch(() => null);
+          if (late?.kind === 'askName') {
+            const nameRes = await submitWorldBotName({
+              client, entity, cfg, shouldAbort, nameProvider, phone: cleanPhone,
+            }).catch(() => null);
+            if (nameRes?.ok) {
+              const jsonText = await resolveWorldJsonText({ client, entity, cfg, shouldAbort, final: nameRes.final });
+              state.lastOkAt = Date.now();
+              closeLoginFlow();
+              setPhase('done');
+              console.log(`[WorldBot] ✅ Login ready (late naam): ${cleanPhone} · NEW · JSON ${jsonText.length} chars`);
+              return {
+                ok: true, kind: 'fresh_new', phone: cleanPhone, askedName: true, jsonText,
+                viaWorldBot: true, username: cfg.username,
+                screenButtons: [...(state.lastScreenButtons || [])],
+              };
+            }
+          } else if (late && ['json', 'document'].includes(late.kind)) {
+            const jsonText = await resolveWorldJsonText({ client, entity, cfg, shouldAbort, final: late });
+            state.lastOkAt = Date.now();
+            closeLoginFlow();
+            setPhase('done');
+            console.log(`[WorldBot] ✅ Login ready (late JSON): ${cleanPhone} · OLD · JSON ${jsonText.length} chars`);
+            return {
+              ok: true, kind: 'existing_account', phone: cleanPhone, askedName: false, jsonText,
+              viaWorldBot: true, username: cfg.username,
+              screenButtons: [...(state.lastScreenButtons || [])],
+            };
+          } else if (late?.kind === 'cancelled') {
+            closeLoginFlow();
+            console.warn('[WorldBot] ⛔ bot ne khud login cancel kar diya (Login Cancelled) — flow band');
+          }
+        }
+      }
+
       // 1) Main menu — delete ke baad owner ka flow: Main Menu → Login → OTP
       // Login → number. `/start` sirf tab jab Main Menu/Login kuch na mile.
       setPhase('start');
@@ -1588,6 +1722,9 @@ export async function worldBotLogin({
             console.warn(`[WorldBot] ⚠️ OTP watermark fail: ${String(error?.message || error).slice(0, 90)}`);
           }
         }
+        // ⛔ yahan se login flow KHULA hai — jab tak naam/JSON/Cancel na aaye,
+        // /start ya Cancel nahi jayega (warna bot Login Cancelled deta hai).
+        markLoginFlowOpen({ loginFlowPhone: cleanPhone });
         await sendWorldText(client, entity, cleanPhone);
 
         // ⏱ Owner rule: OTP send ka budget 20s (queue bola ho to +20s).
@@ -1723,6 +1860,7 @@ export async function worldBotLogin({
         }
       }
       const typed = await sendWorldCode(client, entity, otpCode, cfg);
+      if (typed.ok) markLoginFlowOpen({ otpTypedAt: Date.now() });
       if (!typed.ok) {
         await safeCancel(client, entity, cfg).catch(() => {});
         if (typed.reason === 'bot-login-cancelled' || String(typed.reason || '').startsWith('bot-SWIGGY_')) {
@@ -1752,8 +1890,13 @@ export async function worldBotLogin({
       // log me yahi hua: 2 min baith kar number jala aur naam ka step kabhi
       // aaya hi nahi).
       let menuBackAt = 0;
+      // ⏱ Account creation me waqt lagta hai — 45s ke step budget ki jagah
+      // alag (bada) budget. Owner: "20s to diye hain" — haan, 20s sirf OTP
+      // SOURCE ka rule hai; OTP type karne ke baad Swiggy ka jawab isse alag
+      // budget me aata hai, aur tab tak /start/Cancel bilkul nahi.
+      const verifyWait = Math.max(Number(cfg.stepTimeoutMs) || 0, Number(cfg.otpVerifyWaitMs) || 90_000);
       const outcome = await waitForReply({
-        client, entity, baseline: before, timeoutMs: cfg.stepTimeoutMs, shouldAbort,
+        client, entity, baseline: before, timeoutMs: verifyWait, shouldAbort,
         what: 'login result',
         graceMs: Number(cfg.lateReplyGraceMs) || 90_000,
         predicate: (freshList, all) => {
@@ -1855,6 +1998,7 @@ export async function worldBotLogin({
       const jsonText = await resolveWorldJsonText({ client, entity, cfg, shouldAbort, final });
 
       state.lastOkAt = Date.now();
+      closeLoginFlow();
       setPhase('done');
       console.log(`[WorldBot] ✅ Login ready: ${cleanPhone} · ${askedName ? 'NEW (name poochha)' : 'OLD (name nahi poochha)'} · JSON ${jsonText.length} chars`);
       return {
@@ -2526,6 +2670,16 @@ async function clickOrType({
 }
 
 async function safeCancel(client, entity, cfg = {}) {
+  // ⛔ OTP type karne ke baad Cancel = poora login jala dena (World Bot
+  // "❌ Login Cancelled" bhej deta hai). Us waqt Cancel nahi karte — bot ko
+  // apna jawab (naam/JSON) dene do. Ye guard sirf OTP-typed window ka hai,
+  // number prompt atakne par Cancel pehle jaisa chalta hai.
+  const otpGuardMs = Math.max(20_000, Math.min(300_000, Number(cfg?.otpVerifyWaitMs) || 90_000));
+  const otpTypedAgo = Date.now() - (Number(state.otpTypedAt) || 0);
+  if (state.otpTypedAt && otpTypedAgo < otpGuardMs) {
+    console.warn(`[WorldBot] ⛔ OTP ${Math.round(otpTypedAgo / 1000)}s pehle type kiya tha — Cancel nahi bhejunga (Login Cancelled se bachaav)`);
+    return false;
+  }
   const waitMs = Math.min(1_800, Math.max(600, Number(cfg?.pollMs) || 1_500));
   const screens = await parseScreenMessages(client, entity);
   const cancelFromId = Number(screens[0]?.id) || 0;
@@ -2613,6 +2767,13 @@ async function worldResetToMenu(client, entity, cfg = {}) {
     .some((b) => String(b?.role || '') === 'cancel'));
   if (String(cfg?.resetMode || '') === 'menu-only' || pendingNow || hasFlowButton) {
     console.warn(`[WorldBot] ⛔ /start nahi bhej raha (${pendingNow ? `bot ${pendingNow} maang raha hai` : hasFlowButton ? 'screen par Cancel button hai (flow chalu)' : 'resetMode=menu-only'}) — Cancel/button se kaam karenge`);
+    return false;
+  }
+  // ⛔ LOGIN GUARD: pichhla login abhi khatam nahi hua (number/OTP gaya tha,
+  // bot ka naam/JSON jawab nahi aaya) — /start usko CANCEL kar deta hai.
+  // Owner ka exact case: "Cancel kiu ho ja raha, 20s to diye hain".
+  if (worldLoginFlowOpenMs(cfg) > 0) {
+    console.warn(`[WorldBot] ⛔ /start nahi bhej raha — pichhla login abhi khula hai (${Math.round(worldLoginFlowOpenMs(cfg) / 1000)}s baaki) · Login Cancelled se bachaav`);
     return false;
   }
   await sendWorldText(client, entity, '/start').catch(() => {});

@@ -46,6 +46,15 @@ hai.
 > **type nahi** hota, wahi number dobara issue hota hai (pehle yahan OTP
 > bekaar chala jata tha aur naam ka step kabhi aata hi nahi tha).
 >
+> ⛔ **“Cancel kiu ho ja raha?” (2026-11-09):** OTP type karne ke baad bot account
+> bana raha hota hai (queue me 1–2 minute). Us waqt `/start` ya `Cancel` bhejna
+> poora login jala deta hai — bot `❌ Login Cancelled / No account was logged in`
+> deta hai. Ab jab tak login **khula** hai (`SWIGGY_WORLD_LOGIN_GUARD_MS`, default
+> 5 min) `/start`/`Cancel` band rehte hain: pehle bot ka late jawab dekha jata
+> hai (naam → naam + JSON, JSON → seedha save). 20s ka rule sirf OTP **source**
+> (Hermes/Firebase) ka hai — OTP type karne ke baad alag budget
+> (`SWIGGY_WORLD_OTP_VERIFY_WAIT_MS`, default 90s) chalta hai.
+>
 > 👤 **“New Account Detected” ka naam step:** ye screen jahan bhi dikhe — login
 > ke shuru me, OTP type karne se pehle, ya login ke result ka intezaar me —
 > wahan **turant naam (`Sudhani Kumar`) chala jata hai** aur JSON liya jata hai
@@ -649,6 +658,8 @@ Helpers `rich-text.js` me hain: `fancy()`, `bracketHeader()`, `headerRule()`, `s
 | `SWIGGY_WORLD_QUEUE_WAIT_MS` | 45000 | Bot "queue/wait" bole to itna wait (asli run me OTP Sent ~40-60s baad aata hai); isse zyada → **bot badlo** |
 | `SWIGGY_WORLD_TRIGGER` | `auto` | Button **click** → screen na badle to **button ka text likh kar bhej** (`type` = click bilkul nahi) |
 | `SWIGGY_WORLD_CLICK_GRACE_MS` | 4000 | Click ke baad screen badalne ka intezaar, phir text trigger |
+| `SWIGGY_WORLD_OTP_VERIFY_WAIT_MS` | 90000 | OTP type karne ke **baad** bot ke jawab (naam/JSON) ka budget — account creation me waqt lagta hai (30s–240s). 20s sirf OTP **source** ka rule hai |
+| `SWIGGY_WORLD_LOGIN_GUARD_MS` | 300000 | Itne waqt tak `/start` aur `Cancel` **band** jab login khula ho (number/OTP gaya, jawab nahi aaya) — warna World Bot "❌ Login Cancelled" de deta hai |
 | `SWIGGY_WORLD_LATE_REPLY_GRACE_MS` | 90000 | Step ka budget khatam hone par aakhri dheemi scan — **flood wait hua ho tab hi poora** (warna max 20s), `0` = band. Isse "bekaar me minute bhar baithna" band hua |
 | `SWIGGY_WORLD_NUMBER_RETRIES` | 1 | OTP send confirm na ho (aur bot ne Cancel bhi na bheja ho) to number **skip nahi** — wahi number itni baar `Login → 2 → number` se dobara issue (max 2, `0` = off) |
 | `SWIGGY_WORLD_LOGOUT_AFTER_DELETE` | 1 | JSON file worker bot par jaane ke baad `Switch Accounts → Permanently Logged Out` try kare |

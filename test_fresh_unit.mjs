@@ -4009,7 +4009,7 @@ Thanks`)),
   // OTP → naam → JSON, phir Switch Account → account → Permanent Logout → Yes.
   // ---------------------------------------------------------------------
   const JSON_SAMPLE = '{"tid":"abc123","token":"tok","cookies":[{"name":"a","value":"b"}]}';
-  const makeFakeWorldBot = ({ startWithAccount = false } = {}) => {
+  const makeFakeWorldBot = ({ startWithAccount = false, silentAfterNumber = false } = {}) => {
     const chat = [];
     let id = 0;
     const accounts = new Map(startWithAccount ? [['9876543210', { name: 'ihgfe' }]] : []);
@@ -4066,6 +4066,10 @@ Thanks`)),
         }
         if (awaiting === 'number' && /^[6-9]\d{9}$/.test(text)) {
           pendingPhone = text;
+          if (silentAfterNumber) {
+            // Bot number le kar chup — account creation me atka hua bot.
+            return { id: ++id };
+          }
           awaiting = 'otp';
           push('✅ OTP Sent\n\nSend the 6-digit OTP you received from Swiggy.');
           return { id: ++id };
@@ -4294,6 +4298,55 @@ Thanks`)),
       ok(sent.includes('Sudhani Kumar') && !sent.includes('/start') && otpCalls === 0
         && !sent.some((t) => /^\d{6}$/.test(t)),
         `naam: naya OTP/number//start nahi gaya (${sent.join(' · ') || 'kuch nahi'})`);
+    } finally {
+      wb._setWorldBotClientOverrideForTests(null);
+    }
+  }
+
+  // ⛔ "Cancel kiu ho ja raha" — login khula hone par /start bilkul nahi.
+  // Owner ka log (2026-11-09): number → OTP type → bot account bana raha tha →
+  // humne /start bhej diya → "❌ Login Cancelled / No account was logged in".
+  wb._resetWorldBotReadCacheForTests();
+  {
+    const fake = makeFakeWorldBot({ silentAfterNumber: true });
+    wb._setWorldBotClientOverrideForTests(fake.client);
+    const guardCfg = {
+      ...flowCfg,
+      otpSendTimeoutMs: 1_200,
+      numberRetries: 0,
+      otpVerifyWaitMs: 500,
+      loginGuardMs: 120_000,
+    };
+    try {
+      const first = await wb.worldBotLogin({
+        phone: '9876543210',
+        otpProvider: async () => ({ code: '445566' }),
+        otpWatermark: async () => ({}),
+        nameProvider: async () => 'ihgfe',
+        config: guardCfg,
+      });
+      ok(!first.ok && wb.worldBotLoginFlowInfo().openForMs > 0,
+        `guard: bot chup raha → login fail par flow KHULA rehta hai (${first.kind || first.reason})`);
+      const sentBefore = fake.chat.filter((m) => m.out).map((m) => String(m.text));
+      ok(!sentBefore.includes('/start'),
+        `guard: pehle attempt me /start nahi gaya (${sentBefore.join(' · ') || 'kuch nahi'})`);
+
+      // Wahi number dobara (pipeline ka retry) — /start se flow cancel nahi hona chahiye.
+      await wb.worldBotLogin({
+        phone: '9876543210',
+        otpProvider: async () => ({ code: '445566' }),
+        otpWatermark: async () => ({}),
+        nameProvider: async () => 'ihgfe',
+        config: guardCfg,
+        fresh: true,
+      }).catch(() => null);
+      const sentAfter = fake.chat.filter((m) => m.out).map((m) => String(m.text));
+      ok(!sentAfter.includes('/start'),
+        `guard: retry par bhi /start nahi (Login Cancelled nahi hoga) — ${sentAfter.join(' · ') || 'kuch nahi'}`);
+      ok(wb.worldBotConfig({}).otpVerifyWaitMs === 90_000
+        && wb.worldBotConfig({ SWIGGY_WORLD_OTP_VERIFY_WAIT_MS: '45000' }).otpVerifyWaitMs === 45_000
+        && wb.worldBotConfig({ SWIGGY_WORLD_OTP_VERIFY_WAIT_MS: '999999' }).otpVerifyWaitMs === 240_000,
+      'guard: OTP ke baad ka budget alag (default 90s, 30s–240s clamp)');
     } finally {
       wb._setWorldBotClientOverrideForTests(null);
     }

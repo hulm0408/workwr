@@ -1202,7 +1202,8 @@ export async function processSingleNumberViaWorldBot({
         first.kind === 'name_rejected'
           ? '→ Bot ne naam accept nahi kiya — naya number nahi, /start nahi.'
           : '→ Bot ka jawab Telegram flood wait me late aaya (OTP accept ho gaya tha) — number skip nahi kar raha.',
-        '→ Ab wahi number dobara: Main Menu → Login → OTP Login → number → OTP.',
+        '→ Ab wahi number dobara: pehle bot ka late jawab dekha jayega (naam/JSON).',
+        '→ /start aur Cancel tab tak <b>band</b> hain — warna World Bot "Login Cancelled" de deta hai.',
       ].join('\n')));
       first = await loginOnce(true);
     }

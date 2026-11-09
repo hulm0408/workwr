@@ -455,6 +455,11 @@ World bots ka default pool: `@SwiggyByworldBot`, `@SwiggyByworld1Bot` …
   nahi banta). Sirf reject hone par fallback: pipeline ka naam, phir
   `swiggyNameFromPhone(phone)` (pehle 5 digit → alphabetic, 1→a … 9→i,
   **0→x**: `98765…` → `ihgfe`).
+- **Naam ka prompt kabhi miss nahi:** `New Account Detected` marker sabse
+  pehle dekha jata hai — chahe usi message me `✅ OTP Verified` ya `this number
+  is not registered` likha ho, ya `Cancel` button ho. Prompt bina reject dobara
+  aaye to wahi naam ek baar phir jata hai; `✍️ Send Name` jaisa button ho to
+  pehle wahi dabta hai; `✅ Name set: …` echo par naam dobara nahi bhejta.
 - **Delete success = turant Main Menu:** delete confirmation ka poll 500ms aur
   Main Menu click bina settle-wait (`settle:false`) — screen aate hi button dab
   jata hai. Uske baad wahi number: Login → OTP Login → number → OTP → naam.

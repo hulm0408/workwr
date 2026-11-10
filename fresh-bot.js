@@ -3054,7 +3054,7 @@ bot.on('text', async (ctx) => {
     return;
   }
 
-  if (st.action === 'setup_wizard_proxy') {
+  if (st.action === 'setup_wizard' && st.stage === 'proxy_paste') {
     const wizardSt = pending.get(uid);
     pending.delete(uid);
     if (!wizardSt || wizardSt.action !== 'setup_wizard') return;
@@ -3067,8 +3067,8 @@ bot.on('text', async (ctx) => {
       else errs.push(`${raw.slice(0, 30)}: ${r.error}`);
     }
     if (added.length === 0) {
-      // Invalid proxy — ask again
-      pending.set(uid, { action: 'setup_wizard_proxy', stage: 'proxy_paste', choices: wizardSt.choices });
+      // Invalid proxy — ask again, keep wizard state
+      pending.set(uid, { action: 'setup_wizard', stage: 'proxy_paste', choices: wizardSt.choices });
       await ctx.reply(section('❌ Proxy Invalid', [
         errs.slice(0, 3).map((e) => `• ${esc(e)}`).join('\n'),
         '',

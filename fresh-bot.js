@@ -422,6 +422,8 @@ const settingsRows = () => [
   [{ text: `🚦 Gap: ${bs.fmtSetting('gapMs')}`, callback_data: 'ap_pick_gap' }],
   [{ text: `📴 Offline: ${bs.getSetting('allowOffline') ? 'ON' : 'OFF'}`, callback_data: 'ap_toggle_offline' }],
   [{ text: `🔁 Never-stop: ${bs.getSetting('autoContinue') ? 'ON' : 'OFF'}`, callback_data: 'ap_toggle_neverstop', style: 'success' }],
+  // 🧙‍♂️ Quick Setup wizard — ek tap me saara setup (engine + OTP bot + proxy + start)
+  [{ text: '🧙‍♂️ Quick Setup (Account + OTP Bot + Proxy)', callback_data: 'ap_setup_wizard', style: 'success' }],
   // 👤 Owner: "otp bot + chromium" aur "otp bot + swiggy world" — dono options
   // ek hi screen par, jo chalu hai us par ✓.
   [
@@ -2196,6 +2198,179 @@ bot.action('ap_px_add', async (ctx) => {
   ].join('\n')), [[{ text: '↩️ Cancel', callback_data: 'ap_proxies', style: 'primary' }]]);
 });
 
+// ===== 🧙‍♂️ QUICK SETUP WIZARD — ek tap me saara setup =====
+//   1) Account engine: Chromium vs Swiggy World Bot
+//   2) OTP bot: Hermes / Hathi / Chauhan
+//   3) Proxy: with or without (agar with to URL paste karo)
+//   4) Confirm: saara setup dikhao → Start / Cancel
+
+function setupWizardCard(st) {
+  const c = st.choices || {};
+  const engineLabel = c.accountEngine === 'worldbot' ? '🌍 Swiggy World Bot' : '🧩 Chromium (Direct API)';
+  const otpLabel = c.otpBotProfile ? otpBotProfiles.getOtpBotProfile(c.otpBotProfile).uiLabel : '—';
+  const proxyLabel = c.proxy === 'yes' ? '✅ With Proxy' : '❌ Without Proxy (Direct)';
+  const proxyDetail = c.proxyUrl ? ` · <code>${esc(c.proxyUrl.replace(/\/\/[^@]*@/, '//***:***@'))}</code>` : '';
+
+  const lines = [
+    '🧙‍♂️ <b>Quick Setup — sab kuch ek saath</b>',
+    '',
+    `1️⃣ Account Engine: <b>${engineLabel}</b>`,
+    `2️⃣ OTP Bot: <b>${otpLabel}</b>`,
+    `3️⃣ Proxy: <b>${proxyLabel}</b>${proxyDetail}`,
+    '',
+  ];
+
+  const rows = [];
+  const stage = st.stage;
+
+  if (stage === 'engine') {
+    lines.push('Kaunsa Swiggy account engine chahiye?');
+    rows.push([
+      { text: '🧩 Chromium (Direct API)', callback_data: 'ap_setup_engine_direct', style: 'success' },
+      { text: '🌍 Swiggy World Bot', callback_data: 'ap_setup_engine_worldbot', style: 'primary' },
+    ]);
+  } else if (stage === 'otp_bot') {
+    lines.push('Kaunsa OTP bot number + OTP dega?');
+    const profiles = otpBotProfiles.listOtpBotProfiles();
+    for (const p of profiles) {
+      rows.push([{ text: `${p.emoji} ${p.uiLabel} (@${p.username})`, callback_data: `ap_setup_otp_${p.id}`, style: 'success' }]);
+    }
+  } else if (stage === 'proxy_choice') {
+    lines.push('Proxy use karna hai?');
+    rows.push([
+      { text: '✅ Haan — apna proxy URL paanga', callback_data: 'ap_setup_proxy_yes', style: 'success' },
+      { text: '❌ Nahi — direct (bina proxy)', callback_data: 'ap_setup_proxy_no', style: 'primary' },
+    ]);
+  } else if (stage === 'confirm') {
+    lines.push('Sab set hai. Start dabao taaki batch shuru ho, ya Cancel karke wapas jao.');
+    rows.push([
+      { text: '🚀 START BATCH', callback_data: 'ap_setup_confirm_start', style: 'success' },
+      { text: '❌ Cancel', callback_data: 'ap_setup_confirm_cancel', style: 'danger' },
+    ]);
+  }
+
+  rows.push([{ text: '↩️ Back', callback_data: 'ap_settings', style: 'primary' }]);
+
+  return { text: lines.join('\n'), rows };
+}
+
+// Start wizard
+bot.action('ap_setup_wizard', async (ctx) => {
+  if (!(await gate(ctx))) return;
+  await ctx.answerCbQuery().catch(() => {});
+  pending.set(String(ctx.from.id), { action: 'setup_wizard', stage: 'engine', choices: {} });
+  const card = setupWizardCard(pending.get(String(ctx.from.id)));
+  await editOrSend(ctx, card.text, card.rows);
+});
+
+// Engine choice
+bot.action('ap_setup_engine_direct', async (ctx) => {
+  if (!(await gate(ctx))) return;
+  await ctx.answerCbQuery().catch(() => {});
+  const st = pending.get(String(ctx.from.id));
+  if (!st || st.action !== 'setup_wizard') return;
+  st.choices.accountEngine = 'direct';
+  st.stage = 'otp_bot';
+  pending.set(String(ctx.from.id), st);
+  const card = setupWizardCard(st);
+  await editOrSend(ctx, card.text, card.rows);
+});
+
+bot.action('ap_setup_engine_worldbot', async (ctx) => {
+  if (!(await gate(ctx))) return;
+  await ctx.answerCbQuery().catch(() => {});
+  const st = pending.get(String(ctx.from.id));
+  if (!st || st.action !== 'setup_wizard') return;
+  st.choices.accountEngine = 'worldbot';
+  st.stage = 'otp_bot';
+  pending.set(String(ctx.from.id), st);
+  const card = setupWizardCard(st);
+  await editOrSend(ctx, card.text, card.rows);
+});
+
+// OTP bot choice
+bot.action(/^ap_setup_otp_(hermes|hathi|chauhan)$/, async (ctx) => {
+  if (!(await gate(ctx))) return;
+  await ctx.answerCbQuery().catch(() => {});
+  const st = pending.get(String(ctx.from.id));
+  if (!st || st.action !== 'setup_wizard') return;
+  st.choices.otpBotProfile = ctx.match[1];
+  st.stage = 'proxy_choice';
+  pending.set(String(ctx.from.id), st);
+  const card = setupWizardCard(st);
+  await editOrSend(ctx, card.text, card.rows);
+});
+
+// Proxy choice — yes -> paste URL
+bot.action('ap_setup_proxy_yes', async (ctx) => {
+  if (!(await gate(ctx))) return;
+  await ctx.answerCbQuery().catch(() => {});
+  const st = pending.get(String(ctx.from.id));
+  if (!st || st.action !== 'setup_wizard') return;
+  st.choices.proxy = 'yes';
+  st.stage = 'proxy_paste';
+  pending.set(String(ctx.from.id), st);
+  await editOrSend(ctx, section('🌐 Proxy Paste', [
+    `Ab <b>proxy URL bhejo</b>. Format:`,
+    `<code>http://user:pass@host:port</code>`,
+    '',
+    `Jaise:`,
+    `<code>http://res-in-sid-qopmefn2:pgw-968e1db878249b7d70e51b0a1b8279758a0a5f6a3c19ac18@gw.proxyrise.com:443</code>`,
+    '',
+    sub('Add hote hi rotation ON ho jayegi. Cancel se wapas settings par.'),
+  ].join('\n')), [[{ text: '❌ Cancel', callback_data: 'ap_setup_confirm_cancel', style: 'danger' }]]);
+});
+
+// Proxy choice — no -> skip to confirm
+bot.action('ap_setup_proxy_no', async (ctx) => {
+  if (!(await gate(ctx))) return;
+  await ctx.answerCbQuery().catch(() => {});
+  const st = pending.get(String(ctx.from.id));
+  if (!st || st.action !== 'setup_wizard') return;
+  st.choices.proxy = 'no';
+  st.stage = 'confirm';
+  pending.set(String(ctx.from.id), st);
+  const card = setupWizardCard(st);
+  await editOrSend(ctx, card.text, card.rows);
+});
+
+// Confirm — apply settings and start batch
+bot.action('ap_setup_confirm_start', async (ctx) => {
+  if (!(await gate(ctx))) return;
+  if (isAutopilotRunning()) {
+    await ctx.answerCbQuery('Pehle se chal raha hai!', { show_alert: true }).catch(() => {});
+    return;
+  }
+  await ctx.answerCbQuery('🚀 Setup apply kar raha hoon…').catch(() => {});
+  const st = pending.get(String(ctx.from.id));
+  if (!st || st.action !== 'setup_wizard') return;
+  const c = st.choices || {};
+
+  // Apply all settings
+  try { bs.setSetting('accountEngine', c.accountEngine === 'worldbot' ? 'worldbot' : 'direct'); } catch {}
+  try { bs.setSetting('telegramOtpMode', true); } catch {}
+  if (c.otpBotProfile) {
+    try { bs.setSetting('otpBotProfile', c.otpBotProfile); } catch {}
+    try { telegramOtp.setActiveOtpBotProfile(c.otpBotProfile); } catch {}
+  }
+
+  // Source preset based on engine
+  const sourcePreset = c.accountEngine === 'worldbot' ? 'otp_world' : 'otp_chromium';
+
+  pending.delete(String(ctx.from.id));
+
+  // Launch via existing launchBatch (validates prereqs, starts autopilot)
+  await launchBatch(ctx, { source: sourcePreset });
+});
+
+// Cancel wizard
+bot.action('ap_setup_confirm_cancel', async (ctx) => {
+  if (!(await gate(ctx))) return;
+  await ctx.answerCbQuery('Cancel kar diya.').catch(() => {});
+  pending.delete(String(ctx.from.id));
+  await editOrSend(ctx, settingsCard(), settingsRows());
+});
+
 // 🎯/⏱/🚦 pickers
 bot.action('ap_pick_target', async (ctx) => {
   if (!(await gate(ctx))) return;
@@ -2876,6 +3051,38 @@ bot.on('text', async (ctx) => {
     if (errs.length) lines.push(`⚠️ ${errs.slice(0, 3).map(esc).join('\n')}`);
     lines.push('', sub('Ab bot nayi-nayi IPs se traffic bhejega — rukna bilkul band.'));
     await ctx.reply(section('🔀 Proxy Pool Updated', lines.join('\n')), kb([[{ text: '↩️ Proxies', callback_data: 'ap_proxies', style: 'primary' }]])).catch(() => {});
+    return;
+  }
+
+  if (st.action === 'setup_wizard_proxy') {
+    const wizardSt = pending.get(uid);
+    pending.delete(uid);
+    if (!wizardSt || wizardSt.action !== 'setup_wizard') return;
+    const parts = txt.split(/[,\n]/).map((x) => x.trim()).filter(Boolean);
+    const added = [];
+    const errs = [];
+    for (const raw of parts) {
+      const r = proxyPool.addProxy(raw);
+      if (r.ok) added.push(r.proxy.label);
+      else errs.push(`${raw.slice(0, 30)}: ${r.error}`);
+    }
+    if (added.length === 0) {
+      // Invalid proxy — ask again
+      pending.set(uid, { action: 'setup_wizard_proxy', stage: 'proxy_paste', choices: wizardSt.choices });
+      await ctx.reply(section('❌ Proxy Invalid', [
+        errs.slice(0, 3).map((e) => `• ${esc(e)}`).join('\n'),
+        '',
+        'Dobara proxy URL bhejo (format: <code>http://user:pass@host:port</code>), ya Cancel karo.',
+      ].join('\n')), [[{ text: '❌ Cancel', callback_data: 'ap_setup_confirm_cancel', style: 'danger' }]]).catch(() => {});
+      return;
+    }
+    // Save proxy info and move to confirm
+    wizardSt.choices.proxyUrl = parts[0];
+    wizardSt.choices.proxy = 'yes';
+    wizardSt.stage = 'confirm';
+    pending.set(uid, wizardSt);
+    const card = setupWizardCard(wizardSt);
+    await ctx.reply(card.text, kb(card.rows)).catch(() => {});
     return;
   }
 

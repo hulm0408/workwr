@@ -78,6 +78,36 @@ export const OTP_BOT_PROFILES = {
 
 export const DEFAULT_OTP_BOT_PROFILE_ID = 'hermes';
 
+// ---------------------------------------------------------------------------
+// 🎓 CUSTOM BOT PROFILES — owner UI se add/train kiye gaye bots.
+// custom-bots.js (jo store dekhta hai) boot par apna provider register karta
+// hai; is file ko PURE rehne dene ke liye direct import nahi, DI use karte hain.
+// Provider register na ho (unit tests) to list hamesha khali = purana behaviour.
+// ---------------------------------------------------------------------------
+let customProfileProvider = null;
+export function registerOtpBotProfileProvider(provider) {
+  customProfileProvider = typeof provider === 'function' ? provider : null;
+}
+function customProfiles() {
+  try {
+    const list = customProfileProvider ? customProfileProvider() : [];
+    if (!Array.isArray(list)) return [];
+    return list.filter((p) => p && p.id && p.username);
+  } catch {
+    return [];
+  }
+}
+function customProfileById(id = '') {
+  const key = String(id || '').trim().toLowerCase();
+  if (!key) return null;
+  return customProfiles().find((p) => String(p.id).toLowerCase() === key) || null;
+}
+function customProfileByUsername(handle = '') {
+  const key = String(handle || '').trim().toLowerCase();
+  if (!key) return null;
+  return customProfiles().find((p) => String(p.username).toLowerCase() === key) || null;
+}
+
 export function normalizeOtpBotProfileId(value = '') {
   const key = String(value || '').trim().toLowerCase().replace(/^@+/, '');
   if (!key) return DEFAULT_OTP_BOT_PROFILE_ID;
@@ -86,6 +116,9 @@ export function normalizeOtpBotProfileId(value = '') {
   for (const profile of Object.values(OTP_BOT_PROFILES)) {
     if (key === String(profile.username).toLowerCase()) return profile.id;
   }
+  // Custom trained bots (id ya username se).
+  const custom = customProfileById(key) || customProfileByUsername(key);
+  if (custom) return String(custom.id).toLowerCase();
   if (/hard\s*x?\s*otp|chauhan/.test(key)) return 'chauhan';
   if (/hathi|haathi|elephant/.test(key)) return 'hathi';
   if (/hermes/.test(key)) return 'hermes';
@@ -95,16 +128,22 @@ export function normalizeOtpBotProfileId(value = '') {
 // UI ke liye ordered list — START picker aur Settings dono isi se bante hain,
 // taaki naya bot add karne par dono jagah khud aa jaye.
 export function listOtpBotProfiles() {
-  return OTP_BOT_PROFILE_IDS.map((id) => OTP_BOT_PROFILES[id]).filter(Boolean);
+  return [...OTP_BOT_PROFILE_IDS.map((id) => OTP_BOT_PROFILES[id]).filter(Boolean), ...customProfiles()];
 }
 
 export function getOtpBotProfile(value = '') {
-  return OTP_BOT_PROFILES[normalizeOtpBotProfileId(value)] || OTP_BOT_PROFILES[DEFAULT_OTP_BOT_PROFILE_ID];
+  const key = String(value || '').trim().toLowerCase().replace(/^@+/, '');
+  if (OTP_BOT_PROFILES[key]) return OTP_BOT_PROFILES[key];
+  const custom = customProfileById(key) || customProfileByUsername(key);
+  if (custom) return custom;
+  return OTP_BOT_PROFILES[normalizeOtpBotProfileId(key)] || OTP_BOT_PROFILES[DEFAULT_OTP_BOT_PROFILE_ID];
 }
 
 // Profile id/username hi valid choice hai (START picker ki whitelist).
 export function isOtpBotProfileId(value = '') {
-  return OTP_BOT_PROFILE_IDS.includes(String(value || '').trim().toLowerCase());
+  const key = String(value || '').trim().toLowerCase();
+  if (OTP_BOT_PROFILE_IDS.includes(key)) return true;
+  return Boolean(customProfileById(key));
 }
 
 export function otpBotProfileForUsername(username = '') {
@@ -113,7 +152,7 @@ export function otpBotProfileForUsername(username = '') {
   for (const profile of Object.values(OTP_BOT_PROFILES)) {
     if (String(profile.username).toLowerCase() === handle) return profile;
   }
-  return null;
+  return customProfileByUsername(handle);
 }
 
 // Fancy/small-caps text normalize (Hermes ka welcome card aisa hi hota hai).

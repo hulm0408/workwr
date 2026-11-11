@@ -63,6 +63,8 @@ const sources = await import('./firebase-sources.js');
 const otpBotProfiles = await import('./otp-bot-profiles.js');
 const startPresets = await import('./start-source-presets.js');
 const shopStock = await import('./shop-bot-stock.js');
+const customBots = await import('./custom-bots.js');
+const customRunner = await import('./custom-bot-runner.js');
 const bs = await import('./bot-settings.js');
 const proxyPool = await import('./proxy-pool.js');
 const {
@@ -78,6 +80,12 @@ const { startKeepAlive } = await import('./keep-alive.js');
 const instanceInfo = await import('./instance-info.js');
 const instanceShard = await import('./instance-shard.js');
 const worldBot = await import('./swiggy-world-bot.js');
+// 🎓 Custom trained OTP bots — claim/refresh hooks telegram-otp-source me
+// inject karo (coding wala Hermes/Hathi flow jab custom profile active ho to
+// owner ki training se replace ho jata hai). Custom profiles provider custom-
+// bots.js ne otp-bot-profiles.js me already register kar diya hai.
+try { telegramOtp.setCustomBotClaimRunner(customRunner.runCustomClaim); } catch (e) { console.warn('[FreshBot] custom claim runner wire fail:', e?.message || e); }
+try { telegramOtp.setCustomBotRefreshRunner(customRunner.runCustomRefresh); } catch (e) { console.warn('[FreshBot] custom refresh runner wire fail:', e?.message || e); }
 
 // ---------------------------------------------------------------------------
 // Process guards — ek stray async error poore bot ko NA maare.
@@ -440,6 +448,8 @@ const settingsRows = () => {
       { text: '📦 Shop Stock', callback_data: 'ap_shop_stock', style: 'success' },
       { text: '🔎 World screen', callback_data: 'ap_world_probe' },
     ],
+    // 🎓 Custom bot training — owner apna koi bhi OTP/SMS bot add + train kare
+    [{ text: '🎓 Train Custom Bot', callback_data: 'ap_train_bots', style: 'success' }],
     [
       { text: '🩺 Diagnose', callback_data: 'ap_diag' },
       { text: '🗑 Remove Telegram', callback_data: 'ap_remove_telegram', style: 'danger' },
@@ -1418,7 +1428,7 @@ bot.command('session', async (ctx) => {
 bot.action('ap_start', showStartSourcePicker);
 // Engine ke rows premium callback names bhi bhejta hai — same kaam, same handler
 bot.action('prem_batch_start', showStartSourcePicker);
-bot.action(new RegExp(`^ap_start_go_(${[...startPresets.START_SOURCE_PRESET_IDS, ...otpBotProfiles.OTP_BOT_PROFILE_IDS, 'firebase'].join('|')})$`), async (ctx) => {
+bot.action(new RegExp(`^ap_start_go_(${[...startPresets.START_SOURCE_PRESET_IDS, ...otpBotProfiles.OTP_BOT_PROFILE_IDS, 'firebase'].join('|')}|custom_[a-z0-9]+)$`), async (ctx) => {
   await launchBatch(ctx, { source: ctx.match[1] });
 });
 
@@ -2313,7 +2323,7 @@ bot.action('ap_setup_engine_worldbot', async (ctx) => {
 });
 
 // OTP bot choice
-bot.action(/^ap_setup_otp_(hermes|hathi|chauhan)$/, async (ctx) => {
+bot.action(/^ap_setup_otp_(hermes|hathi|chauhan|custom_[a-z0-9]+)$/, async (ctx) => {
   if (!(await gate(ctx))) return;
   await ctx.answerCbQuery().catch(() => {});
   const st = pending.get(String(ctx.from.id));
@@ -2711,7 +2721,7 @@ bot.action('ap_pick_otp_bot', async (ctx) => {
     .catch(async () => { await ctx.reply(text, kb(rows)).catch(() => {}); });
 });
 
-bot.action(new RegExp(`^ap_set_otp_bot_(${otpBotProfiles.OTP_BOT_PROFILE_IDS.join('|')})$`), async (ctx) => {
+bot.action(new RegExp(`^ap_set_otp_bot_(${otpBotProfiles.OTP_BOT_PROFILE_IDS.join('|')}|custom_[a-z0-9]+)$`), async (ctx) => {
   if (!(await gate(ctx))) return;
   if (isAutopilotRunning()) {
     await ctx.answerCbQuery('⏳ Batch chal raha hai — pehle STOP karo.', { show_alert: true }).catch(() => {});
@@ -2963,6 +2973,830 @@ bot.action('ap_remove_telegram_confirm', async (ctx) => {
 // ---------------------------------------------------------------------------
 // Text input — add-source URL / custom target (wait-state)
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// 🎓 CUSTOM BOT TRAINING — owner ka apna OTP/SMS bot add + train karna
+//   Add bot → Claim/Refresh training steps → buttons se order badlo,
+//   har step par OPTIONAL condition ("agar response me ye ho to…"),
+//   built-in (Hermes/HardXotp) training template se shuru karo, live Test,
+//   aur ek tap me is bot ko batch ka OTP bot banao.
+// ---------------------------------------------------------------------------
+const TRAIN_EMOJI_CHOICES = ['🤖', '📨', '🐘', '🔐', '📡', '🦾', '📲', '🚀'];
+const routineKey = (routine) => (routine === 'refresh' ? 'r' : 'c');
+const routineFromKey = (key) => (key === 'r' ? 'refresh' : 'claim');
+const trainBackRow = (text, callback_data) => [[{ text, callback_data }]];
+
+function trainStepCountLabel(bot) {
+  const c = bot?.routines?.claim?.length || 0;
+  const r = bot?.routines?.refresh?.length || 0;
+  return `claim ${c} steps · refresh ${r} steps`;
+}
+
+function trainListText() {
+  const bots = customBots.listCustomBots();
+  return section('🎓 Train Custom Bot', [
+    `Koi bhi OTP/SMS bot add karo aur use KHUD train karo —`,
+    `"ye message bhejo → agar ye response aaye to ye likho / ye button dabao /`,
+    `doosre bot par jao / Refresh dabao". Har cheez ka BUTTON hai.`,
+    ``,
+    ...(bots.length
+      ? bots.flatMap((bot) => [
+        `${bot.emoji} <b>${esc(bot.name)}</b> — <code>@${esc(bot.username)}</code>`,
+        sub(trainStepCountLabel(bot)),
+        '',
+      ])
+      : ['Abhi koi custom bot nahi hai. Neeche ➕ dabao.', '']),
+    sub('Training poori hone ke baad bot card se "Batch ka OTP bot banao" dabao.'),
+  ].join('\n'));
+}
+
+function trainListRows() {
+  const bots = customBots.listCustomBots();
+  const rows = bots.map((bot) => [{
+    text: `${bot.emoji} ${bot.name}`,
+    callback_data: `tr_view_${bot.id}`,
+    style: 'primary',
+  }]);
+  rows.push([{ text: '➕ Naya bot add karo', callback_data: 'ap_train_add', style: 'success' }]);
+  rows.push([{ text: '↩️ Settings', callback_data: 'ap_settings', style: 'primary' }]);
+  return rows;
+}
+
+function customBotCardText(bot) {
+  const claim = bot.routines.claim || [];
+  const refresh = bot.routines.refresh || [];
+  const selected = bs.getSetting('otpBotProfile') === bot.id;
+  return section(`${bot.emoji} ${bot.name}`, [
+    field('Bot', `@${esc(bot.username)}`),
+    field('Batch me', selected ? '✅ Haan — yahi OTP bot hai' : 'Nahi'),
+    field('Claim training', claim.length ? `${claim.length} steps (number lene ka flow)` : '— khali —'),
+    field('Refresh training', refresh.length ? `${refresh.length} steps (OTP check ka flow)` : '— khali —'),
+    '',
+    sub('Claim = number kaise aayega (START/click/type). Refresh = OTP kaise check hoga.'),
+    sub('Har step par OPTIONAL condition: "jab latest response me ye text ho tabhi step".'),
+  ].join('\n'));
+}
+
+function customBotCardRows(bot) {
+  const selected = bs.getSetting('otpBotProfile') === bot.id;
+  return [
+    [
+      { text: `📋 Claim (${bot.routines.claim.length})`, callback_data: `tr_cl_${bot.id}`, style: 'primary' },
+      { text: `🔄 Refresh (${bot.routines.refresh.length})`, callback_data: `tr_rf_${bot.id}` },
+    ],
+    [
+      { text: '🧪 Test claim (live)', callback_data: `tr_testc_${bot.id}` },
+      { text: '🧪 Test refresh (live)', callback_data: `tr_testr_${bot.id}` },
+    ],
+    [{ text: selected ? '✅ Batch ka OTP bot hai (tap = hata do)' : '▶️ Batch ka OTP bot banao', callback_data: `tr_use_${bot.id}`, style: selected ? 'success' : 'primary' }],
+    [
+      { text: '✏️ Naam badlo', callback_data: `tr_rename_${bot.id}` },
+      { text: `😀 Emoji: ${bot.emoji}`, callback_data: `tr_emoji_${bot.id}` },
+    ],
+    [{ text: '🗑 Delete bot', callback_data: `tr_delbot_${bot.id}`, style: 'danger' }],
+    [{ text: '↩️ Train Bots', callback_data: 'ap_train_bots', style: 'primary' }],
+  ];
+}
+
+function trainRoutineLines(bot, routine) {
+  const steps = bot.routines[routine] || [];
+  if (!steps.length) return ['— khali — neeche ➕ se steps add karo —'];
+  return steps.map((step, i) => `${i + 1}. ${esc(customBots.describeStep(step))}`);
+}
+
+function trainRoutineCard(bot, routine) {
+  const meta = customBots.ROUTINE_META[routine];
+  const steps = bot.routines[routine] || [];
+  return section(`${meta.icon} ${meta.label} — ${bot.name}`, [
+    field('Bot', `@${esc(bot.username)}`),
+    field('Steps', `${steps.length}/${customBots.MAX_STEPS_PER_ROUTINE}`),
+    sub(meta.desc),
+    '',
+    ...trainRoutineLines(bot, routine),
+    '',
+    sub('Step number dabao → condition/order/type-fallback badlo.'),
+    sub('Condition = "jab latest response me ye text ho TABHI step" (blank = hamesha).'),
+  ].join('\n'));
+}
+
+function trainRoutineRows(bot, routine) {
+  const k = routineKey(routine);
+  const steps = bot.routines[routine] || [];
+  const rows = [];
+  for (let i = 0; i < steps.length; i += 6) {
+    rows.push(steps.slice(i, i + 6).map((_, offset) => {
+      const idx = i + offset;
+      return { text: `${idx + 1}`, callback_data: `tr_step_${bot.id}_${k}_${idx}` };
+    }));
+  }
+  rows.push([
+    { text: '➕ Step add karo', callback_data: `tr_add_${bot.id}_${k}`, style: 'success' },
+    { text: '🧹 Saaf karo', callback_data: `tr_clear_${bot.id}_${k}`, style: 'danger' },
+  ]);
+  if (routine === 'claim') {
+    rows.push([
+      { text: '📋 Hermes template', callback_data: `tr_tmpl_${bot.id}_${k}_hermes` },
+      { text: '🔐 HardXotp template', callback_data: `tr_tmpl_${bot.id}_${k}_chauhan` },
+    ]);
+    rows.push([{ text: '🧪 Test claim (live)', callback_data: `tr_testc_${bot.id}`, style: 'primary' }]);
+  } else {
+    rows.push([
+      { text: '📋 Hermes refresh template', callback_data: `tr_tmpl_${bot.id}_${k}_hermes` },
+      { text: '🔐 HardXotp refresh template', callback_data: `tr_tmpl_${bot.id}_${k}_chauhan` },
+    ]);
+    rows.push([{ text: '🧪 Test refresh (live)', callback_data: `tr_testr_${bot.id}`, style: 'primary' }]);
+  }
+  rows.push([{ text: '↩️ Bot card', callback_data: `tr_view_${bot.id}`, style: 'primary' }]);
+  return rows;
+}
+
+function trainStepCard(bot, routine, idx) {
+  const step = bot.routines[routine][idx];
+  if (!step) return null;
+  const meta = customBots.STEP_KINDS[step.kind] || { icon: '❓', label: step.kind };
+  const lines = [
+    field('Step', `${idx + 1} · ${meta.icon} ${meta.label}`),
+    field('Kya karega', esc(customBots.describeStep(step))),
+    field('Condition', step.when?.match ? `jab response me "${esc(step.when.match)}" ho` : '— (hamesha chale)'),
+    field('Fail par', step.onFail === 'continue' ? 'Aage badho' : 'Routine rok do'),
+  ];
+  if (step.kind === 'click_button') {
+    lines.push(field('Type fallback', step.typeIfMissing ? `ON — na mile to "${esc(step.typeText || step.match)}" type karo` : 'OFF — sirf click'));
+  }
+  return section(`${meta.icon} Step ${idx + 1} — ${meta.label}`, lines.join('\n'));
+}
+
+function trainStepRows(bot, routine, idx) {
+  const k = routineKey(routine);
+  const step = bot.routines[routine][idx];
+  const kBack = routine === 'refresh' ? `tr_rf_${bot.id}` : `tr_cl_${bot.id}`;
+  const rows = [
+    [
+      { text: '⬆️ Upar', callback_data: `tr_mv_${bot.id}_${k}_${idx}_u` },
+      { text: '⬇️ Neeche', callback_data: `tr_mv_${bot.id}_${k}_${idx}_d` },
+      { text: '🗑 Delete', callback_data: `tr_del_${bot.id}_${k}_${idx}`, style: 'danger' },
+    ],
+    [
+      { text: '⚙️ Condition badlo', callback_data: `tr_cond_${bot.id}_${k}_${idx}` },
+      { text: step.onFail === 'continue' ? '🛑 Fail par: AAGE (tap = STOP)' : '🛑 Fail par: STOP (tap = AAGE)', callback_data: `tr_fail_${bot.id}_${k}_${idx}` },
+    ],
+  ];
+  if (['send_text', 'click_button', 'wait', 'switch_bot'].includes(step.kind)) {
+    rows.push([{ text: '✏️ Text/value badlo', callback_data: `tr_param_${bot.id}_${k}_${idx}` }]);
+  }
+  if (step.kind === 'click_button') {
+    rows.push([
+      { text: step.typeIfMissing ? '🔁 Type fallback: ON (tap = OFF)' : '🔁 Type fallback: OFF (tap = ON)', callback_data: `tr_clicktype_${bot.id}_${k}_${idx}` },
+      { text: '⌨️ Type text badlo', callback_data: `tr_typetext_${bot.id}_${k}_${idx}` },
+    ]);
+  }
+  rows.push([{ text: '↩️ Steps', callback_data: kBack, style: 'primary' }]);
+  return rows;
+}
+
+function trainAddKindRows(bot, routine) {
+  const k = routineKey(routine);
+  const kinds = ['send_text', 'click_button', 'wait', 'switch_bot', 'expect_number', 'expect_otp'];
+  const rows = [];
+  for (let i = 0; i < kinds.length; i += 2) {
+    rows.push(kinds.slice(i, i + 2).map((kind) => ({
+      text: `${customBots.STEP_KINDS[kind].icon} ${customBots.STEP_KINDS[kind].label}`,
+      callback_data: `tr_addkind_${bot.id}_${k}_${kind}`,
+    })));
+  }
+  rows.push([{ text: '↩️ Steps', callback_data: routine === 'refresh' ? `tr_rf_${bot.id}` : `tr_cl_${bot.id}`, style: 'primary' }]);
+  return rows;
+}
+
+function trainParseStepParam(kind, raw) {
+  const txt = String(raw || '').trim();
+  switch (kind) {
+    case 'send_text': {
+      if (!txt) return { error: 'Message khali hai — /start jaisa text bhejo.' };
+      return { patch: { text: txt.slice(0, customBots.MAX_TEXT_LEN) } };
+    }
+    case 'click_button': {
+      if (!txt) return { error: 'Button ka text khali hai — jaise: NEW NUMBER' };
+      // Sirf match badlo — typeText (type-fallback ka text) alag se editable hai.
+      return { patch: { match: txt.slice(0, customBots.MAX_MATCH_LEN) } };
+    }
+    case 'wait': {
+      const ms = Math.round(Number(txt.replace(/\D/g, '')));
+      if (!Number.isFinite(ms) || ms < 100) return { error: 'Milliseconds me number bhejo (jaise 2000).' };
+      return { patch: { ms: Math.min(30000, ms) } };
+    }
+    case 'switch_bot': {
+      const username = customBots.normalizeCustomUsername(txt);
+      if (!username) return { error: 'Username galat hai (@ ke bina, 5–32 chars). Jaise: AnotherBot123' };
+      return { patch: { username } };
+    }
+    default:
+      return { error: 'Is step me koi text nahi lagta.' };
+  }
+}
+
+async function showTrainRoutine(ctx, bot, routine) {
+  const text = trainRoutineCard(bot, routine);
+  await ctx.editMessageText(text, kb(trainRoutineRows(bot, routine)))
+    .catch(async () => { await ctx.reply(text, kb(trainRoutineRows(bot, routine))).catch(() => {}); });
+}
+
+async function showTrainBotCard(ctx, bot) {
+  const text = customBotCardText(bot);
+  await ctx.editMessageText(text, kb(customBotCardRows(bot)))
+    .catch(async () => { await ctx.reply(text, kb(customBotCardRows(bot))).catch(() => {}); });
+}
+
+async function showTrainStep(ctx, bot, routine, idx) {
+  const text = trainStepCard(bot, routine, idx);
+  if (!text) { await showTrainRoutine(ctx, bot, routine); return; }
+  const rows = trainStepRows(bot, routine, idx);
+  await ctx.editMessageText(text, kb(rows))
+    .catch(async () => { await ctx.reply(text, kb(rows)).catch(() => {}); });
+}
+
+// ---- Text input se aane wale training answers ---------------------------
+async function handleCustomBotPending(ctx, st, rawTxt) {
+  const uid = String(ctx.from?.id || '');
+  const pendingClear = () => pending.delete(uid);
+  const txt = String(rawTxt || '').trim();
+  if (st.ts && Date.now() - st.ts > 10 * 60_000) {
+    pendingClear();
+    await ctx.reply('⌛ Timeout ho gaya — phir se try karo.', kb(trainBackRow('↩️ Train Bots', 'ap_train_bots'))).catch(() => {});
+    return;
+  }
+
+  if (st.action === 'custom_bot_username') {
+    pendingClear();
+    const username = customBots.normalizeCustomUsername(txt);
+    if (!username) {
+      await ctx.reply('❌ Username galat hai. @ ke bina bhejo (5–32 letters/digits/underscore). Jaise: <code>HermeshuOTPROBOT</code>', kb(trainBackRow('↩️ Train Bots', 'ap_train_bots'))).catch(() => {});
+      return;
+    }
+    pending.set(uid, { ts: Date.now(), action: 'custom_bot_name', username });
+    await ctx.reply([
+      `👍 Bot: <code>@${esc(username)}</code>`,
+      '',
+      'Ab is bot ka <b>Naam</b> bhejo (jo lista me dikhe). Jaise: <code>Mera FastBot</code>',
+      sub('Blank/`-` bhejo to @' + esc(username) + ' hi naam rehega.'),
+    ].join('\n'), kb(trainBackRow('❌ Cancel', 'ap_train_bots'))).catch(() => {});
+    return;
+  }
+
+  if (st.action === 'custom_bot_name') {
+    pendingClear();
+    const name = txt === '-' ? '' : txt;
+    const r = customBots.createCustomBot({ name, username: st.username, emoji: '🤖' });
+    if (!r.ok) {
+      await ctx.reply(`❌ ${esc(r.error)}`, kb(trainBackRow('↩️ Train Bots', 'ap_train_bots'))).catch(() => {});
+      return;
+    }
+    const bot = r.bot;
+    await ctx.reply(section('✅ Bot add ho gaya', [
+      field('Bot', `${bot.emoji} <b>${esc(bot.name)}</b> — <code>@${esc(bot.username)}</code>`),
+      '',
+      'Ab iske do flows train karo:',
+      '📋 <b>Claim</b> — number kaise lena hai',
+      '🔄 <b>Refresh</b> — OTP kaise check karna hai',
+      '',
+      sub('Tip: pehle "📋 Hermes template" dabao — saari coding kiya hua default training ek tap me copy ho jata hai, phir edit karo.'),
+    ].join('\n')), kb(customBotCardRows(bot))).catch(() => {});
+    return;
+  }
+
+  if (st.action === 'custom_bot_rename') {
+    pendingClear();
+    if (txt === '-' || !txt) { await ctx.reply('Rename cancel.', kb(trainBackRow('↩️ Train Bots', 'ap_train_bots'))).catch(() => {}); return; }
+    const r = customBots.updateCustomBot(st.botId, { name: txt });
+    if (!r.ok) { await ctx.reply(`❌ ${esc(r.error)}`, kb(trainBackRow('↩️ Train Bots', 'ap_train_bots'))).catch(() => {}); return; }
+    await ctx.reply(`✅ Naam = <b>${esc(r.bot.name)}</b>`, kb(customBotCardRows(r.bot))).catch(() => {});
+    return;
+  }
+
+  if (st.action === 'custom_step_param' || st.action === 'custom_step_param_edit') {
+    pendingClear();
+    const kind = st.kind || customBots.getCustomBot(st.botId)?.routines?.[st.routine]?.[st.idx]?.kind;
+    const parsed = trainParseStepParam(kind, txt);
+    if (parsed.error) {
+      await ctx.reply(`❌ ${parsed.error}`, kb(trainBackRow('↩️ Steps', st.routine === 'refresh' ? `tr_rf_${st.botId}` : `tr_cl_${st.botId}`))).catch(() => {});
+      return;
+    }
+    if (st.action === 'custom_step_param') {
+      const r = customBots.addStep(st.botId, st.routine, { kind, ...parsed.patch });
+      if (!r.ok) { await ctx.reply(`❌ ${esc(r.error)}`, kb(trainBackRow('↩️ Steps', st.routine === 'refresh' ? `tr_rf_${st.botId}` : `tr_cl_${st.botId}`))).catch(() => {}); return; }
+      const added = (r.routine || [])[r.routine.length - 1];
+      pending.set(uid, { ts: Date.now(), action: 'custom_step_cond', botId: st.botId, routine: st.routine, stepId: added?.id || '' });
+      await ctx.reply([
+        `✅ Step add: <b>${esc(customBots.describeStep(added || parsed.patch))}</b>`,
+        '',
+        '⚙️ <b>Condition?</b> — "jab LATEST response me ye text ho TABHI ye step chale"',
+        sub('Jaise: <code>OTP Sent</code> ya <code>Login</code>. re: ke saath regex bhi chalti hai.'),
+        sub('Blank/`-` bhejo = hamesha chale (koi condition nahi).'),
+      ].join('\n'), kb(trainBackRow('⏭️ Condition skip', `tr_condskip_${st.botId}_${routineKey(st.routine)}_${added?.id || ''}`))).catch(() => {});
+      return;
+    }
+    // Edit mode — existing step ka param badalna hai
+    const bot = customBots.getCustomBot(st.botId);
+    const step = bot?.routines?.[st.routine]?.[st.idx];
+    if (!step) { await ctx.reply('❌ Step nahi mila.', kb(trainBackRow('↩️ Steps', st.routine === 'refresh' ? `tr_rf_${st.botId}` : `tr_cl_${st.botId}`))).catch(() => {}); return; }
+    const r = customBots.updateStep(st.botId, st.routine, step.id, parsed.patch);
+    if (!r.ok) { await ctx.reply(`❌ ${esc(r.error)}`).catch(() => {}); return; }
+    const botAfter = customBots.getCustomBot(st.botId);
+    const newIdx = botAfter.routines[st.routine].findIndex((s) => s.id === step.id);
+    await ctx.reply('✅ Badal gaya.', kb(trainStepRows(botAfter, st.routine, newIdx))).catch(() => {});
+    return;
+  }
+
+  if (st.action === 'custom_step_typetext') {
+    pendingClear();
+    const bot = customBots.getCustomBot(st.botId);
+    const step = bot?.routines?.[st.routine]?.[st.idx];
+    if (!step) { await ctx.reply('❌ Step nahi mila.').catch(() => {}); return; }
+    const value = txt.replace(/\s+$/g, '').slice(0, customBots.MAX_MATCH_LEN);
+    if (!value) { await ctx.reply('❌ Khali nahi ho sakta — typeText bhejo.').catch(() => {}); return; }
+    const r = customBots.updateStep(st.botId, st.routine, step.id, { typeText: value });
+    const botAfter = customBots.getCustomBot(st.botId);
+    const newIdx = botAfter?.routines?.[st.routine]?.findIndex((s) => s.id === step.id) ?? st.idx;
+    await ctx.reply(r.ok ? `✅ Type fallback text = "${esc(value)}"` : `❌ ${esc(r.error || 'update fail')}`,
+      botAfter ? kb(trainStepRows(botAfter, st.routine, newIdx)) : undefined).catch(() => {});
+    return;
+  }
+
+  if (st.action === 'custom_step_cond') {
+    pendingClear();
+    const bot = customBots.getCustomBot(st.botId);
+    const step = bot?.routines?.[st.routine]?.find((s) => s.id === st.stepId);
+    if (!step) { await ctx.reply('❌ Step nahi mila.', kb(trainBackRow('↩️ Train Bots', 'ap_train_bots'))).catch(() => {}); return; }
+    const clear = (txt === '-' || txt === '');
+    const r = customBots.updateStep(st.botId, st.routine, st.stepId, { when: clear ? null : { match: txt.slice(0, customBots.MAX_MATCH_LEN) } });
+    if (!r.ok) { await ctx.reply(`❌ ${esc(r.error)}`).catch(() => {}); return; }
+    const botAfter = customBots.getCustomBot(st.botId);
+    await ctx.reply(clear
+      ? '✅ Condition hata di — step hamesha chalega.'
+      : `✅ Condition lag gayi — step sirf tab chalega jab response me "${esc(txt.slice(0, 60))}" ho.`,
+      kb(trainRoutineRows(botAfter, st.routine))).catch(() => {});
+    return;
+  }
+
+  pendingClear();
+}
+
+// ---- Action handlers ------------------------------------------------------
+bot.action(['ap_train_bots', 'ap_train_list'], async (ctx) => {
+  if (!(await gate(ctx))) return;
+  await ctx.answerCbQuery().catch(() => {});
+  await ctx.editMessageText(trainListText(), kb(trainListRows()))
+    .catch(async () => { await ctx.reply(trainListText(), kb(trainListRows())).catch(() => {}); });
+});
+
+bot.action('ap_train_add', async (ctx) => {
+  if (!(await gate(ctx))) return;
+  await ctx.answerCbQuery().catch(() => {});
+  pending.set(String(ctx.from.id), { ts: Date.now(), action: 'custom_bot_username' });
+  await editOrSend(ctx, section('➕ Naya Custom Bot', [
+    'Bot ka <b>username</b> bhejo (@ ke bina). Jaise:',
+    '<code>MyOtpBot123</code>',
+    '',
+    sub('Woh bot Telegram par maujood aur spare account se message/button-able hona chahiye (OTP bots, SMS forwarders…).'),
+  ].join('\n')), trainBackRow('❌ Cancel', 'ap_train_bots'));
+});
+
+bot.action(/^tr_view_(custom_[a-z0-9]+)$/, async (ctx) => {
+  if (!(await gate(ctx))) return;
+  await ctx.answerCbQuery().catch(() => {});
+  const bot2 = customBotById(ctx.match[1]);
+  if (!bot2) { await ctx.editMessageText('❌ Ye bot nahi mila (delete ho gaya?).', kb(trainBackRow('↩️ Train Bots', 'ap_train_bots'))).catch(() => {}); return; }
+  await showTrainBotCard(ctx, bot2);
+});
+
+bot.action(/^tr_rename_(custom_[a-z0-9]+)$/, async (ctx) => {
+  if (!(await gate(ctx))) return;
+  await ctx.answerCbQuery().catch(() => {});
+  const id = ctx.match[1];
+  if (!customBotById(id)) { await ctx.answerCbQuery('Bot nahi mila', { show_alert: true }).catch(() => {}); return; }
+  pending.set(String(ctx.from.id), { ts: Date.now(), action: 'custom_bot_rename', botId: id });
+  await editOrSend(ctx, '✏️ Naya Naam bhejo (ya `-` se cancel):', trainBackRow('❌ Cancel', `tr_view_${id}`));
+});
+
+bot.action(/^tr_emoji_(custom_[a-z0-9]+)$/, async (ctx) => {
+  if (!(await gate(ctx))) return;
+  const id = ctx.match[1];
+  const bot2 = customBotById(id);
+  if (!bot2) { await ctx.answerCbQuery('Bot nahi mila', { show_alert: true }).catch(() => {}); return; }
+  const idx = TRAIN_EMOJI_CHOICES.indexOf(bot2.emoji);
+  const next = TRAIN_EMOJI_CHOICES[(idx + 1) % TRAIN_EMOJI_CHOICES.length];
+  const r = customBots.updateCustomBot(id, { emoji: next });
+  await ctx.answerCbQuery(r.ok ? `Emoji ${next}` : 'Update fail').catch(() => {});
+  if (r.ok) await showTrainBotCard(ctx, r.bot);
+});
+
+// Is bot ko batch ka OTP bot banao (empty training par rok do).
+bot.action(/^tr_use(?:force)?_(custom_[a-z0-9]+)$/, async (ctx) => {
+  if (!(await gate(ctx))) return;
+  if (isAutopilotRunning()) {
+    await ctx.answerCbQuery('⏳ Batch chal raha hai — pehle STOP karo.', { show_alert: true }).catch(() => {});
+    return;
+  }
+  const id = ctx.match[1];
+  const force = ctx.callbackQuery.data.startsWith('tr_useforce_');
+  const bot2 = customBotById(id);
+  if (!bot2) { await ctx.answerCbQuery('Bot nahi mila', { show_alert: true }).catch(() => {}); return; }
+  // Toggle OFF — pehle se yahi OTP bot hai to Hermes wapas select kar do.
+  if (!force && bs.getSetting('otpBotProfile') === id) {
+    try { bs.setSetting('otpBotProfile', 'hermes'); } catch {}
+    try { telegramOtp.setActiveOtpBotProfile('hermes'); } catch {}
+    await ctx.answerCbQuery('Hermes wapas select ho gaya').catch(() => {});
+    const botOff = customBots.getCustomBot(id);
+    if (botOff) await showTrainBotCard(ctx, botOff);
+    return;
+  }
+  const claimEmpty = (bot2.routines.claim || []).length === 0;
+  const refreshEmpty = (bot2.routines.refresh || []).length === 0;
+  if ((claimEmpty || refreshEmpty) && !force) {
+    const missing = [claimEmpty ? 'CLAIM' : '', refreshEmpty ? 'REFRESH' : ''].filter(Boolean).join(' + ');
+    await ctx.answerCbQuery(`⚠️ ${missing} training khali hai!`, { show_alert: true }).catch(() => {});
+    await editOrSend(ctx, section('⚠️ Training khali hai', [
+      field('Bot', `${bot2.emoji} <b>${esc(bot2.name)}</b>`),
+      `${missing} ke steps nahi hain — batch me number/OTP nahi aayega.`,
+      '',
+      sub('Pehle training poori karo, ya jaanke force banao.'),
+    ].join('\n')), [
+      [{ text: '📋 Claim train karo', callback_data: `tr_cl_${id}`, style: 'primary' }, { text: '🔄 Refresh train karo', callback_data: `tr_rf_${id}` }],
+      [{ text: '⚠️ Phir bhi yahi banao', callback_data: `tr_useforce_${id}`, style: 'danger' }],
+      [{ text: '↩️ Bot card', callback_data: `tr_view_${id}`, style: 'primary' }],
+    ]);
+    return;
+  }
+  try { bs.setSetting('otpBotProfile', id); } catch {}
+  try { bs.setSetting('telegramOtpMode', true); } catch {}
+  try { telegramOtp.setActiveOtpBotProfile(id); } catch {}
+  await ctx.answerCbQuery(`🎓 ${bot2.name} ab batch ka OTP bot hai`).catch(() => {});
+  await editOrSend(ctx, section('🎓 Batch ka OTP bot', [
+    `<b>${esc(bot2.emoji)} ${esc(bot2.name)}</b> (<code>@${esc(bot2.username)}</code>) ab batch ka OTP bot hai.`,
+    '',
+    `Claim: <b>${(bot2.routines.claim || []).length} steps</b> · Refresh: <b>${(bot2.routines.refresh || []).length} steps</b>`,
+    sub('START dabao — training ke mutabik number/OTP aayega.'),
+  ].join('\n')), trainBackRow('▶️ START / Settings', 'ap_settings'));
+});
+
+bot.action(/^tr_delbot_(custom_[a-z0-9]+)$/, async (ctx) => {
+  if (!(await gate(ctx))) return;
+  await ctx.answerCbQuery().catch(() => {});
+  const id = ctx.match[1];
+  const bot2 = customBotById(id);
+  if (!bot2) { await ctx.editMessageText('❌ Bot nahi mila.', kb(trainBackRow('↩️ Train Bots', 'ap_train_bots'))).catch(() => {}); return; }
+  await editOrSend(ctx, section('🗑 Custom bot delete karein?', [
+    field('Bot', `${bot2.emoji} <b>${esc(bot2.name)}</b> — <code>@${esc(bot2.username)}</code>`),
+    field('Training', trainStepCountLabel(bot2)),
+    '',
+    sub('Training steps bhi delete ho jayenge. Batch me ye selected ho to Hermes wapas aa jayega.'),
+  ].join('\n')), [
+    [{ text: '🗑 Haan, delete karo', callback_data: `tr_delbot_yes_${id}`, style: 'danger' }],
+    [{ text: '↩️ Nahi, wapas', callback_data: `tr_view_${id}`, style: 'primary' }],
+  ]);
+});
+
+bot.action(/^tr_delbot_yes_(custom_[a-z0-9]+)$/, async (ctx) => {
+  if (!(await gate(ctx))) return;
+  const id = ctx.match[1];
+  // Agar ye batch ka OTP bot tha → Hermes wapas set karo (dangling id na rahe).
+  try {
+    if (bs.getSetting('otpBotProfile') === id) {
+      bs.setSetting('otpBotProfile', 'hermes');
+      telegramOtp.setActiveOtpBotProfile('hermes');
+    }
+  } catch {}
+  const r = customBots.deleteCustomBot(id);
+  await ctx.answerCbQuery(r.ok ? '🗑 Delete ho gaya' : 'Delete fail').catch(() => {});
+  await ctx.editMessageText(r.ok ? '🗑 Custom bot delete ho gaya.' : `❌ ${esc(r.error || 'delete fail')}`, kb(trainBackRow('↩️ Train Bots', 'ap_train_bots'))).catch(() => {});
+});
+
+// ---- Routine list (Claim / Refresh) --------------------------------------
+bot.action(/^tr_(cl|rf)_(custom_[a-z0-9]+)$/, async (ctx) => {
+  if (!(await gate(ctx))) return;
+  await ctx.answerCbQuery().catch(() => {});
+  const routine = routineFromKey(ctx.match[1]);
+  const bot2 = customBotById(ctx.match[2]);
+  if (!bot2) { await ctx.editMessageText('❌ Bot nahi mila.', kb(trainBackRow('↩️ Train Bots', 'ap_train_bots'))).catch(() => {}); return; }
+  await showTrainRoutine(ctx, bot2, routine);
+});
+
+bot.action(/^tr_add_(custom_[a-z0-9]+)_(c|r)$/, async (ctx) => {
+  if (!(await gate(ctx))) return;
+  await ctx.answerCbQuery().catch(() => {});
+  const bot2 = customBotById(ctx.match[1]);
+  const routine = routineFromKey(ctx.match[2]);
+  if (!bot2) { await ctx.answerCbQuery('Bot nahi mila', { show_alert: true }).catch(() => {}); return; }
+  if ((bot2.routines[routine] || []).length >= customBots.MAX_STEPS_PER_ROUTINE) {
+    await ctx.answerCbQuery(`Max ${customBots.MAX_STEPS_PER_ROUTINE} steps — pehle kuch delete karo`, { show_alert: true }).catch(() => {});
+    return;
+  }
+  await editOrSend(ctx, section('➕ Kaunsa step add karu?', [
+    sub('Button dabao — "✉️ Message bhejo" / "🖱 Button dabao" waali detail next message me maangunga.'),
+    sub('expect_* steps me koi input nahi lagta — seedha add ho jayenge.'),
+  ].join('\n')), trainAddKindRows(bot2, routine));
+});
+
+bot.action(/^tr_addkind_(custom_[a-z0-9]+)_(c|r)_(send_text|click_button|wait|switch_bot|expect_number|expect_otp)$/, async (ctx) => {
+  if (!(await gate(ctx))) return;
+  await ctx.answerCbQuery().catch(() => {});
+  const id = ctx.match[1];
+  const routine = routineFromKey(ctx.match[2]);
+  const kind = ctx.match[3];
+  const bot2 = customBotById(id);
+  if (!bot2) { await ctx.answerCbQuery('Bot nahi mila', { show_alert: true }).catch(() => {}); return; }
+  if ((bot2.routines[routine] || []).length >= customBots.MAX_STEPS_PER_ROUTINE) {
+    await ctx.answerCbQuery(`Max ${customBots.MAX_STEPS_PER_ROUTINE} steps`, { show_alert: true }).catch(() => {});
+    return;
+  }
+  const uid = String(ctx.from.id);
+  if (kind === 'expect_number' || kind === 'expect_otp') {
+    const r = customBots.addStep(id, routine, { kind });
+    if (!r.ok) { await ctx.reply(`❌ ${esc(r.error)}`).catch(() => {}); return; }
+    const added = (r.routine || [])[r.routine.length - 1];
+    pending.set(uid, { ts: Date.now(), action: 'custom_step_cond', botId: id, routine, stepId: added?.id || '' });
+    await editOrSend(ctx, [
+      `✅ Step add: <b>${esc(customBots.describeStep(added))}</b>`,
+      '',
+      '⚙️ <b>Condition?</b> — "jab LATEST response me ye text ho TABHI ye step chale"',
+      sub('Blank/`-` bhejo = hamesha chale.'),
+    ].join('\n'), trainBackRow('⏭️ Condition skip', `tr_condskip_${id}_${routineKey(routine)}_${added?.id || ''}`));
+    return;
+  }
+  const meta = customBots.STEP_KINDS[kind];
+  pending.set(uid, { ts: Date.now(), action: 'custom_step_param', botId: id, routine, kind });
+  await editOrSend(ctx, [
+    `${meta.icon} <b>${esc(meta.label)}</b>`,
+    '',
+    `${meta.paramIcon} <b>${esc(meta.paramLabel)}</b> bhejo:`,
+    sub(`Example: <code>${esc(meta.placeholder)}</code>`),
+    ...(kind === 'click_button' ? [sub('Click se nahi chalega to wahi text AUTO type hoga (OFF karne ke liye step khulne ke baad 🔁 dabao). Regex chahiye to re: prefix (advanced).')] : []),
+    ...(kind === 'wait' ? [sub('100–30000 ms.')] : []),
+  ].join('\n'), trainBackRow('❌ Cancel', `tr_${routineKey(routine) === 'r' ? 'rf' : 'cl'}_${id}`));
+});
+
+bot.action(/^tr_step_(custom_[a-z0-9]+)_(c|r)_(\d{1,2})$/, async (ctx) => {
+  if (!(await gate(ctx))) return;
+  await ctx.answerCbQuery().catch(() => {});
+  const id = ctx.match[1];
+  const routine = routineFromKey(ctx.match[2]);
+  const idx = Number(ctx.match[3]);
+  const bot2 = customBotById(id);
+  if (!bot2) { await ctx.answerCbQuery('Bot nahi mila', { show_alert: true }).catch(() => {}); return; }
+  await showTrainStep(ctx, bot2, routine, idx);
+});
+
+bot.action(/^tr_mv_(custom_[a-z0-9]+)_(c|r)_(\d{1,2})_(u|d)$/, async (ctx) => {
+  if (!(await gate(ctx))) return;
+  const id = ctx.match[1];
+  const routine = routineFromKey(ctx.match[2]);
+  const idx = Number(ctx.match[3]);
+  const dir = ctx.match[4] === 'u' ? -1 : 1;
+  const bot2 = customBotById(id);
+  const step = bot2?.routines?.[routine]?.[idx];
+  if (!step) { await ctx.answerCbQuery('Step nahi mila', { show_alert: true }).catch(() => {}); return; }
+  const r = customBots.moveStep(id, routine, step.id, dir);
+  await ctx.answerCbQuery(r.ok ? '↕️ Moved' : 'Move fail').catch(() => {});
+  if (r.ok) {
+    const botAfter = customBots.getCustomBot(id);
+    const newIdx = botAfter.routines[routine].findIndex((s) => s.id === step.id);
+    await showTrainStep(ctx, botAfter, routine, newIdx);
+  }
+});
+
+bot.action(/^tr_del_(custom_[a-z0-9]+)_(c|r)_(\d{1,2})$/, async (ctx) => {
+  if (!(await gate(ctx))) return;
+  const id = ctx.match[1];
+  const routine = routineFromKey(ctx.match[2]);
+  const idx = Number(ctx.match[3]);
+  const bot2 = customBotById(id);
+  const step = bot2?.routines?.[routine]?.[idx];
+  if (!step) { await ctx.answerCbQuery('Step nahi mila', { show_alert: true }).catch(() => {}); return; }
+  const r = customBots.removeStep(id, routine, step.id);
+  await ctx.answerCbQuery(r.ok ? '🗑 Step delete' : 'Delete fail').catch(() => {});
+  if (r.ok) await showTrainRoutine(ctx, customBots.getCustomBot(id), routine);
+});
+
+bot.action(/^tr_cond_(custom_[a-z0-9]+)_(c|r)_(\d{1,2})$/, async (ctx) => {
+  if (!(await gate(ctx))) return;
+  await ctx.answerCbQuery().catch(() => {});
+  const id = ctx.match[1];
+  const routine = routineFromKey(ctx.match[2]);
+  const idx = Number(ctx.match[3]);
+  const bot2 = customBotById(id);
+  const step = bot2?.routines?.[routine]?.[idx];
+  if (!step) { await ctx.answerCbQuery('Step nahi mila', { show_alert: true }).catch(() => {}); return; }
+  pending.set(String(ctx.from.id), { ts: Date.now(), action: 'custom_step_cond', botId: id, routine, stepId: step.id });
+  await editOrSend(ctx, [
+    '⚙️ <b>Condition</b> — "jab LATEST response me ye text ho TABHI ye step chale"',
+    '',
+    `Abhi: ${step.when?.match ? `"${esc(step.when.match)}"` : '— (koi condition nahi)'}`,
+    '',
+    sub('Naya text bhejo (jaise <code>OTP Sent</code>). re: ke saath regex bhi.'),
+    sub('Blank/`-` bhejo = condition hata do.'),
+  ].join('\n'), trainBackRow('❌ Cancel', routine === 'refresh' ? `tr_rf_${id}` : `tr_cl_${id}`));
+});
+
+bot.action(/^tr_condskip_(custom_[a-z0-9]+)_(c|r)_(st_[a-z0-9]+)$/, async (ctx) => {
+  if (!(await gate(ctx))) return;
+  await ctx.answerCbQuery().catch(() => {});
+  const id = ctx.match[1];
+  const routine = routineFromKey(ctx.match[2]);
+  pending.delete(String(ctx.from.id));
+  const bot2 = customBotById(id);
+  if (bot2) await showTrainRoutine(ctx, bot2, routine);
+});
+
+bot.action(/^tr_fail_(custom_[a-z0-9]+)_(c|r)_(\d{1,2})$/, async (ctx) => {
+  if (!(await gate(ctx))) return;
+  const id = ctx.match[1];
+  const routine = routineFromKey(ctx.match[2]);
+  const idx = Number(ctx.match[3]);
+  const bot2 = customBotById(id);
+  const step = bot2?.routines?.[routine]?.[idx];
+  if (!step) { await ctx.answerCbQuery('Step nahi mila', { show_alert: true }).catch(() => {}); return; }
+  const next = step.onFail === 'continue' ? 'stop' : 'continue';
+  const r = customBots.updateStep(id, routine, step.id, { onFail: next });
+  await ctx.answerCbQuery(next === 'continue' ? 'Fail par: AAGE' : 'Fail par: STOP').catch(() => {});
+  if (r.ok) await showTrainStep(ctx, customBots.getCustomBot(id), routine, idx);
+});
+
+bot.action(/^tr_clicktype_(custom_[a-z0-9]+)_(c|r)_(\d{1,2})$/, async (ctx) => {
+  if (!(await gate(ctx))) return;
+  const id = ctx.match[1];
+  const routine = routineFromKey(ctx.match[2]);
+  const idx = Number(ctx.match[3]);
+  const bot2 = customBotById(id);
+  const step = bot2?.routines?.[routine]?.[idx];
+  if (!step) { await ctx.answerCbQuery('Step nahi mila', { show_alert: true }).catch(() => {}); return; }
+  const r = customBots.updateStep(id, routine, step.id, { typeIfMissing: !step.typeIfMissing });
+  await ctx.answerCbQuery(!step.typeIfMissing ? '🔁 Type fallback ON' : '🔁 Type fallback OFF').catch(() => {});
+  if (r.ok) await showTrainStep(ctx, customBots.getCustomBot(id), routine, idx);
+});
+
+bot.action(/^tr_typetext_(custom_[a-z0-9]+)_(c|r)_(\d{1,2})$/, async (ctx) => {
+  if (!(await gate(ctx))) return;
+  await ctx.answerCbQuery().catch(() => {});
+  const id = ctx.match[1];
+  const routine = routineFromKey(ctx.match[2]);
+  const idx = Number(ctx.match[3]);
+  const bot2 = customBotById(id);
+  const step = bot2?.routines?.[routine]?.[idx];
+  if (!step) { await ctx.answerCbQuery('Step nahi mila', { show_alert: true }).catch(() => {}); return; }
+  pending.set(String(ctx.from.id), { ts: Date.now(), action: 'custom_step_typetext', botId: id, routine, idx });
+  await editOrSend(ctx, [
+    '⌨️ <b>Type fallback text</b> — button na mile/click na chale to BOT KO YEH bhejunga:',
+    `Abhi: <code>${esc(step.typeText || step.match)}</code>`,
+    '',
+    sub('Naya text bhejo (jaise <code>Refresh</code> ya <code>View Messages</code>).'),
+  ].join('\n'), trainBackRow('❌ Cancel', routine === 'refresh' ? `tr_rf_${id}` : `tr_cl_${id}`));
+});
+
+bot.action(/^tr_param_(custom_[a-z0-9]+)_(c|r)_(\d{1,2})$/, async (ctx) => {
+  if (!(await gate(ctx))) return;
+  await ctx.answerCbQuery().catch(() => {});
+  const id = ctx.match[1];
+  const routine = routineFromKey(ctx.match[2]);
+  const idx = Number(ctx.match[3]);
+  const bot2 = customBotById(id);
+  const step = bot2?.routines?.[routine]?.[idx];
+  if (!step) { await ctx.answerCbQuery('Step nahi mila', { show_alert: true }).catch(() => {}); return; }
+  pending.set(String(ctx.from.id), { ts: Date.now(), action: 'custom_step_param_edit', botId: id, routine, kind: step.kind, idx });
+  const meta = customBots.STEP_KINDS[step.kind] || {};
+  await editOrSend(ctx, [
+    `✏️ <b>${esc(meta.label || step.kind)}</b> — naya value bhejo:`,
+    step.kind === 'wait' ? sub('100–30000 ms (jaise 2000)') : '',
+    step.kind === 'switch_bot' ? sub('Bot ka username (@ ke bina)') : '',
+    step.kind === 'click_button' ? sub('Button ka text jaisa screen par dikhta hai') : '',
+  ].filter(Boolean).join('\n'), trainBackRow('❌ Cancel', routine === 'refresh' ? `tr_rf_${id}` : `tr_cl_${id}`));
+});
+
+bot.action(/^tr_clear_(custom_[a-z0-9]+)_(c|r)$/, async (ctx) => {
+  if (!(await gate(ctx))) return;
+  await ctx.answerCbQuery().catch(() => {});
+  const id = ctx.match[1];
+  const routine = routineFromKey(ctx.match[2]);
+  const bot2 = customBotById(id);
+  if (!bot2) { await ctx.answerCbQuery('Bot nahi mila', { show_alert: true }).catch(() => {}); return; }
+  const meta = customBots.ROUTINE_META[routine];
+  await editOrSend(ctx, section(`🧹 ${meta.label} saaf karein?`, [
+    `Saare ${bot2.routines[routine].length} steps delete ho jayenge.`,
+  ].join('\n')), [
+    [{ text: '🧹 Haan, saaf karo', callback_data: `tr_clear_yes_${id}_${routineKey(routine)}`, style: 'danger' }],
+    [{ text: '↩️ Wapas', callback_data: routine === 'refresh' ? `tr_rf_${id}` : `tr_cl_${id}`, style: 'primary' }],
+  ]);
+});
+
+bot.action(/^tr_clear_yes_(custom_[a-z0-9]+)_(c|r)$/, async (ctx) => {
+  if (!(await gate(ctx))) return;
+  const id = ctx.match[1];
+  const routine = routineFromKey(ctx.match[2]);
+  const r = customBots.clearRoutine(id, routine);
+  await ctx.answerCbQuery(r.ok ? '🧹 Saaf ho gaya' : 'Fail').catch(() => {});
+  const bot2 = customBots.getCustomBot(id);
+  if (bot2) await showTrainRoutine(ctx, bot2, routine);
+});
+
+// Built-in (ab tak coding kiya hua) training template → confirmable replace
+bot.action(/^tr_tmpl_(custom_[a-z0-9]+)_(c|r)_(hermes|chauhan)$/, async (ctx) => {
+  if (!(await gate(ctx))) return;
+  await ctx.answerCbQuery().catch(() => {});
+  const id = ctx.match[1];
+  const routine = routineFromKey(ctx.match[2]);
+  const template = ctx.match[3];
+  const bot2 = customBotById(id);
+  if (!bot2) { await ctx.answerCbQuery('Bot nahi mila', { show_alert: true }).catch(() => {}); return; }
+  const steps = customBots.builtinTemplateSteps(routine, template);
+  await editOrSend(ctx, section('📋 Template lagayein?', [
+    `"${esc(customBots.BUILTIN_TEMPLATE_META[template]?.[routine] || template)}"`,
+    '',
+    ...steps.map((s, i) => `${i + 1}. ${esc(customBots.describeStep(s))}`),
+    '',
+    sub(`Current ${bot2.routines[routine].length} steps REPLACE ho jayenge.`),
+  ].join('\n')), [
+    [{ text: '✅ Template laga do', callback_data: `tr_tmpl_yes_${id}_${routineKey(routine)}_${template}`, style: 'success' }],
+    [{ text: '↩️ Wapas', callback_data: routine === 'refresh' ? `tr_rf_${id}` : `tr_cl_${id}`, style: 'primary' }],
+  ]);
+});
+
+bot.action(/^tr_tmpl_yes_(custom_[a-z0-9]+)_(c|r)_(hermes|chauhan)$/, async (ctx) => {
+  if (!(await gate(ctx))) return;
+  const id = ctx.match[1];
+  const routine = routineFromKey(ctx.match[2]);
+  const template = ctx.match[3];
+  const r = customBots.applyBuiltinTemplate(id, routine, template);
+  await ctx.answerCbQuery(r.ok ? '📋 Template lag gaya' : 'Fail').catch(() => {});
+  const bot2 = customBots.getCustomBot(id);
+  if (bot2) await showTrainRoutine(ctx, bot2, routine);
+});
+
+// ---- Live test (spare Telegram account se real bot ko message/click) ------
+async function runTrainTest(ctx, id, routine) {
+  const bot2 = customBotById(id);
+  if (!bot2) { await ctx.answerCbQuery('Bot nahi mila', { show_alert: true }).catch(() => {}); return; }
+  if (!(await requirePrivateTelegramChat(ctx, 'Training test'))) return;
+  if (isAutopilotRunning()) {
+    await ctx.answerCbQuery('⏳ Batch chal raha hai — test baad me karo (spare account busy hai).', { show_alert: true }).catch(() => {});
+    return;
+  }
+  if (telegramLoginFlow || telegramProviderStatus().loginInProgress) {
+    await ctx.answerCbQuery('⏳ Telegram login chal raha hai — pehle complete/cancel karo.', { show_alert: true }).catch(() => {});
+    return;
+  }
+  const status = telegramProviderStatus();
+  if (!status.configured) {
+    await ctx.answerCbQuery('⚙️ Telegram setup pending — pehle Add Telegram Account karo.', { show_alert: true }).catch(() => {});
+    return;
+  }
+  await ctx.answerCbQuery('🧪 Training test chal raha hai…').catch(() => {});
+  const meta = customBots.ROUTINE_META[routine];
+  await editOrSend(ctx, section(`🧪 Test ${meta.label} — ${bot2.name}`, [
+    `Spare account se <code>@${esc(bot2.username)}</code> ko training ke hisaab se message/click bhej raha hoon…`,
+    sub('Test REAL bot ko asli actions bhejta hai — claim test ek naya number nikaal sakta hai.'),
+  ].join('\n')), trainBackRow('↩️ Bot card', `tr_view_${id}`));
+  const ICON = { ok: '✅', skip: '⏭️', fail: '❌' };
+  try {
+    const r = await customRunner.testCustomBotRoutine({ botId: id, routine, phone: '', timeoutMs: 25_000 });
+    const stepLines = (r.steps || []).map((s) => `${ICON[s.status] || '•'} ${s.index}. ${esc(String(s.kind))} — ${esc(s.detail || '')}`);
+    const resultLines = [];
+    if (r.ok && r.card?.phone) {
+      resultLines.push('', field('📱 Number card', `<code>${esc(r.card.phone)}</code>${r.card.device ? ` · ${esc(r.card.device)}` : ''}`));
+    }
+    if (r.ok && r.code) resultLines.push('', field('🔢 OTP', `<code>${esc(r.code)}</code>`));
+    if (!r.ok) resultLines.push('', field('❌ Fail', esc(r.error || 'unknown')));
+    await editOrSend(ctx, section(r.ok ? `✅ ${meta.label} — PASS` : `❌ ${meta.label} — FAIL`, [
+      ...stepLines,
+      ...resultLines,
+      '',
+      sub(r.ok ? 'Training chal rahi hai. Batch me use karne ke liye bot card → "▶️ Batch ka OTP bot banao".'
+        : 'Jo step fail hua wahan se training fix karo (⚙️ Condition / fail-mode / ✏️ Text badlo).'),
+    ].join('\n')), [
+      [{ text: '📋 Claim', callback_data: `tr_cl_${id}`, style: 'primary' }, { text: '🔄 Refresh', callback_data: `tr_rf_${id}` }],
+      [{ text: '▶️ Batch ka OTP bot banao', callback_data: `tr_use_${id}`, style: 'success' }],
+      [{ text: '↩️ Bot card', callback_data: `tr_view_${id}`, style: 'primary' }],
+    ]);
+  } catch (error) {
+    await editOrSend(ctx, section('❌ Test crash', [
+      esc(shortTelegramLoginError(error)),
+      '',
+      sub('Session expire hua? Settings → Add Telegram Account se dobara login karo.'),
+    ].join('\n')), [
+      [{ text: '👤 Add Telegram Account', callback_data: 'ap_telegram_account', style: 'success' }],
+      [{ text: '↩️ Bot card', callback_data: `tr_view_${id}`, style: 'primary' }],
+    ]);
+  }
+}
+
+bot.action(/^tr_testc_(custom_[a-z0-9]+)$/, async (ctx) => {
+  if (!(await gate(ctx))) return;
+  await runTrainTest(ctx, ctx.match[1], 'claim');
+});
+
+bot.action(/^tr_testr_(custom_[a-z0-9]+)$/, async (ctx) => {
+  if (!(await gate(ctx))) return;
+  await runTrainTest(ctx, ctx.match[1], 'refresh');
+});
+
+
 bot.on('text', async (ctx) => {
   const uid = String(ctx.from?.id);
   if (!isOwner(ctx.from?.id)) return;
@@ -2970,6 +3804,11 @@ bot.on('text', async (ctx) => {
   if (!st) return;
   const rawMessageText = String(ctx.message?.text || '');
   const txt = rawMessageText.trim();
+
+  if (typeof st.action === 'string' && st.action.startsWith('custom_')) {
+    await handleCustomBotPending(ctx, st, txt);
+    return;
+  }
 
   if (st.action === 'telegram_login') {
     const flow = telegramLoginFlow;

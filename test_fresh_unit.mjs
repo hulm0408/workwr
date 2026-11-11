@@ -5329,4 +5329,274 @@ Thanks`)),
     'text: "koi proxy/WAF nahi" jaisi koi line user ko nahi dikhti');
 }
 
+// ---------------------------------------------------------------------------
+console.log('🎓 CUSTOM BOT TRAINING (owner ka apna bot add + train):');
+{
+  const customBots = await import('./custom-bots.js');
+  const customRunner = await import('./custom-bot-runner.js');
+  const profiles = await import('./otp-bot-profiles.js');
+  const bsMod = await import('./bot-settings.js');
+  const fsp = await import('node:fs/promises');
+
+  // 🧹 Clean slate — test-data me purane custom bots ho to pehle saaf karo.
+  for (const stale of customBots.listCustomBots()) customBots.deleteCustomBot(stale.id);
+
+  // ---- Validation ----
+  ok(customBots.createCustomBot({ name: '', username: 'x' }).ok === false, 'custom bot: galat username reject');
+  ok(customBots.createCustomBot({ name: '', username: '@bad handle!' }).ok === false, 'custom bot: space wala username reject');
+  const created = customBots.createCustomBot({ name: 'TestBot', username: 'TestOtpBot99' });
+  ok(created.ok && created.bot.id.startsWith('custom_'), 'custom bot: valid username se create');
+  ok(created.bot.name === 'TestBot' && created.bot.username === 'TestOtpBot99', 'custom bot: name/username save');
+  const dup = customBots.createCustomBot({ name: 'Dup', username: 'testotpbot99' });
+  ok(!dup.ok, 'custom bot: duplicate username (case-insensitive) reject');
+  const noName = customBots.createCustomBot({ name: '', username: 'SecondBot55', emoji: '📨' });
+  ok(noName.ok && noName.bot.name === '@SecondBot55', 'custom bot: blank naam = @username');
+  customBots.deleteCustomBot(noName.bot.id);
+
+  const botId = created.bot.id;
+
+  // ---- Steps CRUD ----
+  customBots.clearRoutine(botId, 'claim');
+  const added = customBots.addStep(botId, 'claim', { kind: 'send_text', text: '/start' });
+  ok(added.ok && added.routine.length === 1, 'custom steps: send_text add');
+  ok(customBots.addStep(botId, 'claim', { kind: 'click_button', match: 'NEW NUMBER' }).ok, 'custom steps: click_button add');
+  ok(customBots.addStep(botId, 'claim', { kind: 'expect_number' }).ok, 'custom steps: expect_number add');
+  const waitAdd = customBots.addStep(botId, 'claim', { kind: 'wait', ms: 999999 });
+  ok(waitAdd.ok && waitAdd.routine.at(-1).ms === 30000, 'custom steps: wait clamp 30000');
+  ok(customBots.addStep(botId, 'claim', { kind: 'galat_kind' }).ok === false, 'custom steps: unknown kind reject');
+  ok(customBots.addStep(botId, 'claim', { kind: 'send_text', text: '' }).ok === false, 'custom steps: blank text reject');
+  ok(customBots.routineSteps(botId, 'claim').length === 4, 'custom steps: 4 steps saved');
+
+  // Order badlo
+  const stepsAll = customBots.routineSteps(botId, 'claim');
+  const moved = customBots.moveStep(botId, 'claim', stepsAll[0].id, 1);
+  ok(moved.ok && moved.routine[1]?.id === stepsAll[0].id, 'custom steps: order upar/neeche');
+  const waitStep = customBots.routineSteps(botId, 'claim').find((s) => s.kind === 'wait');
+  customBots.removeStep(botId, 'claim', waitStep.id);
+  ok(customBots.routineSteps(botId, 'claim').length === 3, 'custom steps: delete');
+
+  // Condition / fail-mode / click-fallback update
+  const afterMove = customBots.routineSteps(botId, 'claim');
+  const clickStep = afterMove.find((s) => s.kind === 'click_button');
+  const cond = customBots.updateStep(botId, 'claim', clickStep.id, { when: { match: 'OTP Sent' }, onFail: 'continue', typeIfMissing: true, typeText: 'New Number' });
+  ok(cond.ok, 'custom steps: updateStep ok');
+  const clickAfter = customBots.routineSteps(botId, 'claim').find((s) => s.id === clickStep.id);
+  ok(clickAfter.when?.match === 'OTP Sent' && clickAfter.onFail === 'continue' && clickAfter.typeText === 'New Number',
+    'custom steps: condition + fail-mode + typeText update');
+  customBots.updateStep(botId, 'claim', clickStep.id, { when: null });
+  ok(customBots.routineSteps(botId, 'claim').find((s) => s.id === clickStep.id).when === null, 'custom steps: condition clear');
+
+  // Max cap 12
+  for (let i = 0; i < 20; i++) customBots.addStep(botId, 'refresh', { kind: 'wait', ms: 100 });
+  ok(customBots.routineSteps(botId, 'refresh').length === customBots.MAX_STEPS_PER_ROUTINE, 'custom steps: 12 max cap');
+  customBots.clearRoutine(botId, 'refresh');
+  ok(customBots.routineSteps(botId, 'refresh').length === 0, 'custom steps: clear');
+
+  // ---- Built-in templates (ab tak ki coding = buttons) ----
+  const hermesClaim = customBots.builtinTemplateSteps('claim', 'hermes');
+  ok(hermesClaim.map((s) => s.kind).join(',') === 'click_button,click_button,expect_number', 'template hermes claim: kinds');
+  ok(hermesClaim[0].match === 'NEW NUMBER' && hermesClaim[1].match === 'FIND NUMBER', 'template hermes claim: NEW → FIND order');
+  const chauhanRefresh = customBots.builtinTemplateSteps('refresh', 'chauhan');
+  ok(chauhanRefresh[0].match === 'VIEW MESSAGES' && chauhanRefresh[0].typeIfMissing === true && chauhanRefresh[0].typeText === 'View Messages',
+    'template chauhan refresh: VIEW MESSAGES + type fallback');
+  const hermesRefresh = customBots.builtinTemplateSteps('refresh', 'hathi');
+  ok(hermesRefresh[0].match === 'REFRESH' && hermesRefresh[0].typeText === 'Refresh', 'template hathi refresh: REFRESH + type fallback');
+  const applied = customBots.applyBuiltinTemplate(botId, 'refresh', 'chauhan');
+  ok(applied.ok && applied.routine[0]?.match === 'VIEW MESSAGES', 'template apply: refresh replace');
+  customBots.applyBuiltinTemplate(botId, 'claim', 'hermes');
+  ok(customBots.routineSteps(botId, 'claim')[0]?.match === 'NEW NUMBER', 'template apply: claim replace');
+
+  // ---- describeStep / profile bridge ----
+  ok(customBots.describeStep({ kind: 'send_text', text: '/start' }).includes('/start'), 'describeStep: send_text');
+  const profile = customBots.customBotToProfile(customBots.getCustomBot(botId));
+  ok(profile.id === botId && profile.username === 'TestOtpBot99' && profile.custom === true, 'profile bridge: id/username/custom');
+  const liveProfile = profiles.getOtpBotProfile(botId);
+  ok(liveProfile?.username === 'TestOtpBot99', 'otp-bot-profiles: custom id resolve hota hai (provider)');
+  ok(profiles.getOtpBotProfile('@testotpbot99')?.id === botId, 'otp-bot-profiles: username se bhi resolve');
+  ok(profiles.isOtpBotProfileId(botId) === true, 'otp-bot-profiles: isOtpBotProfileId(custom) true');
+  ok(profiles.normalizeOtpBotProfileId(botId) === botId, 'otp-bot-profiles: normalize(custom id) intact');
+  ok(profiles.normalizeOtpBotProfileId('@TestOtpBot99') === botId, 'otp-bot-profiles: normalize(@username) → id');
+  ok(profiles.listOtpBotProfiles().some((p) => p.id === botId), 'otp-bot-profiles: list me custom bot shamil');
+  ok(profiles.otpBotCardLabels(botId)?.phone?.length > 0, 'otp-bot-profiles: card labels custom ke liye bhi');
+
+  // ---- bot-settings: custom id accepted, bogus rejected ----
+  ok(bsMod.setSetting('otpBotProfile', botId).ok === true, 'settings: custom trained bot id accept');
+  ok(bsMod.getSetting('otpBotProfile') === botId, 'settings: custom id save + read');
+  ok(String(bsMod.fmtSetting('otpBotProfile')).includes('TestBot'), 'settings: fmtSetting custom naam dikhata hai');
+  ok(bsMod.setSetting('otpBotProfile', 'custom_aaaaaaaaaa').ok === false, 'settings: non-existent custom id reject');
+  bsMod.setSetting('otpBotProfile', 'hermes');
+  ok(bsMod.getSetting('otpBotProfile') === 'hermes', 'settings: hermes wapas');
+
+  // ---- Runner: matchCustomText ----
+  ok(customRunner.matchCustomText('OTP Sent ✅', 'otp sent') === true, 'match: substring case-insensitive');
+  ok(customRunner.matchCustomText('𝗢𝗧𝗣 𝗦𝗲𝗻𝘁', 'otp sent') === true, 'match: small-caps se bhi');
+  ok(customRunner.matchCustomText('Welcome back', 'otp sent') === false, 'match: absent → false');
+  ok(customRunner.matchCustomText('CODE: 483920', 're:code:\\s*\\d{6}') === true, 'match: re: regex');
+  ok(customRunner.matchCustomText('anything', '') === false, 'match: khali pattern → false');
+
+  // ---- Runner: findFreshCard / findFreshOtp (baseline aware) ----
+  const oldCard = { id: 3, text: 'NUMBER: 9876543210\nDEVICE: Samsung\nSTATUS: ACTIVE' };
+  const newCard = { id: 9, text: 'NUMBER: 9812345678\nDEVICE: iPhone\nSTATUS: ACTIVE' };
+  ok(customRunner.findFreshCard([newCard], { baselineMaxId: 9, excludePhones: new Set() }) === null,
+    'fresh card: baseline se pehle ki card reject');
+  ok(customRunner.findFreshCard([newCard, oldCard], { baselineMaxId: 0, excludePhones: new Set(['9812345678']) })?.card?.phone === '9876543210',
+    'fresh card: excluded phone skip → agla card');
+  ok(customRunner.findFreshCard([newCard], { baselineMaxId: 5, excludePhones: new Set() })?.card?.phone === '9812345678',
+    'fresh card: nayi card milti hai');
+  const otpMsgFresh = { id: 11, text: 'NEW SMS\nNUMBER: 9812345678\nMESSAGE: 483920 is your Swiggy OTP' };
+  ok(customRunner.findFreshOtp([otpMsgFresh], { baselineMaxId: 5, phone: '9812345678' })?.code === '483920',
+    'fresh otp: 6-digit code parse');
+  ok(customRunner.findFreshOtp([otpMsgFresh], { baselineMaxId: 11, phone: '' }) === null,
+    'fresh otp: baseline se pehle ka code reject');
+
+  // ---- Runner: executeRoutine with FAKE io (koi network nahi) ----
+  const mkFakeIo = () => {
+    const state = {
+      inbox: {
+        claimbot: [
+          { id: 1, text: 'Welcome! Choose an option', buttons: [[{ text: 'NEW NUMBER' }, { text: 'FIND NUMBER' }]] },
+        ],
+        secondbot: [
+          { id: 2, text: 'second bot ready' },
+        ],
+      },
+      sent: [],
+      clicks: 0,
+      cardTarget: 'claimbot',
+      cardText: 'NUMBER: 9555123456\nDEVICE: Pixel 8\nSTATUS: ACTIVE\nLAST SMS: none',
+    };
+    let idCounter = 100;
+    const io = {
+      probe: async (u) => { if (!state.inbox[u]) throw new Error(`unknown bot ${u}`); return {}; },
+      fetchMessages: async (u, limit = 12) => (state.inbox[u] || []).slice(0, limit),
+      maxIncomingId: async (u) => Math.max(0, ...(state.inbox[u] || []).map((m) => m.id)),
+      latestText: async (u) => (state.inbox[u] || [])[0]?.text || '',
+      latestScreen: async (u) => {
+        const list = (state.inbox[u] || []).slice(0, 6);
+        const newest = list[0] || null;
+        const buttons = newest ? (newest.buttons || []).flat().map((b) => ({ button: b, text: b.text })) : [];
+        return { message: newest, text: newest?.text || '', id: newest?.id || 0, buttons };
+      },
+      sendText: async (u, t) => { state.sent.push([u, t]); },
+      clickButton: async () => {
+        state.clicks += 1;
+        state.inbox[state.cardTarget].unshift({ id: ++idCounter, text: state.cardText });
+        return { message: 'ok' };
+      },
+    };
+    return { io, state };
+  };
+  const bot = { id: 'custom_test1', username: 'claimbot', name: 'ClaimBot', emoji: '🤖' };
+
+  // Claim flow: NEW NUMBER click → card
+  {
+    const { io, state } = mkFakeIo();
+    const steps = [
+      { id: 's1', kind: 'click_button', match: 'NEW NUMBER', typeIfMissing: false, onFail: 'stop', when: null },
+      { id: 's2', kind: 'expect_number', when: null, onFail: 'stop' },
+    ];
+    const r = await customRunner.executeRoutine(steps, io, { bot, baselineMaxId: 1, timeoutMs: 5000 });
+    ok(r.ok && r.card?.phone === '9555123456', 'runner: click → card flow kaam karta hai');
+    ok(state.clicks === 1 && state.sent.length === 0, 'runner: click hua, koi extra text nahi');
+  }
+
+  // Condition skip — response me text na ho to step SKIP
+  {
+    const { io, state } = mkFakeIo();
+    const steps = [
+      { id: 's1', kind: 'send_text', text: 'OTP CONFIRM', when: { match: 'OTP Sent' }, onFail: 'stop' },
+    ];
+    const r = await customRunner.executeRoutine(steps, io, { bot, baselineMaxId: 1, timeoutMs: 5000 });
+    ok(r.ok && state.sent.length === 0, 'runner: condition absent → step skip, kuch nahi bheja');
+    state.inbox.claimbot.unshift({ id: 5, text: '✅ OTP Sent! Check your messages' });
+    const r2 = await customRunner.executeRoutine(steps, io, { bot, baselineMaxId: 4, timeoutMs: 5000 });
+    ok(r2.ok && state.sent.length === 1 && state.sent[0][1] === 'OTP CONFIRM', 'runner: condition present → step chala');
+  }
+
+  // Button na mile + typeIfMissing → typeText bheja
+  {
+    const { io, state } = mkFakeIo();
+    state.inbox.claimbot = [{ id: 1, text: 'no buttons here' }];
+    const steps = [
+      { id: 's1', kind: 'click_button', match: 'REFRESH', typeIfMissing: true, typeText: 'Refresh', onFail: 'stop', when: null },
+    ];
+    const r = await customRunner.executeRoutine(steps, io, { bot, baselineMaxId: 1, timeoutMs: 5000 });
+    ok(r.ok && state.sent[0]?.[1] === 'Refresh', 'runner: button na mile → type fallback');
+  }
+
+  // Button na mile + onFail=stop → fail; onFail=continue → aage
+  {
+    const { io, state } = mkFakeIo();
+    state.inbox.claimbot = [{ id: 1, text: 'no buttons' }];
+    const stopSteps = [{ id: 's1', kind: 'click_button', match: 'REFRESH', typeIfMissing: false, onFail: 'stop', when: null }];
+    const rStop = await customRunner.executeRoutine(stopSteps, io, { bot, baselineMaxId: 1, timeoutMs: 5000 });
+    ok(!rStop.ok, 'runner: onFail=stop → routine fail');
+    const contSteps = [
+      { id: 's1', kind: 'click_button', match: 'REFRESH', typeIfMissing: false, onFail: 'continue', when: null },
+      { id: 's2', kind: 'send_text', text: 'after', when: null, onFail: 'stop' },
+    ];
+    const rCont = await customRunner.executeRoutine(contSteps, io, { bot, baselineMaxId: 1, timeoutMs: 5000 });
+    ok(rCont.ok && state.sent.some(([, t]) => t === 'after'), 'runner: onFail=continue → aage ke steps');
+  }
+
+  // switch_bot — baad ke steps doosre bot ko
+  {
+    const { io, state } = mkFakeIo();
+    const steps = [
+      { id: 's1', kind: 'switch_bot', username: 'secondbot', when: null, onFail: 'stop' },
+      { id: 's2', kind: 'send_text', text: 'hello second', when: null, onFail: 'stop' },
+    ];
+    const r = await customRunner.executeRoutine(steps, io, { bot, baselineMaxId: 0, timeoutMs: 5000 });
+    ok(r.ok && state.sent[0]?.[0] === 'secondbot' && state.sent[0]?.[1] === 'hello second', 'runner: switch_bot ke baad doosre bot me bheja');
+    const badSwitch = [{ id: 's1', kind: 'switch_bot', username: 'ghostbot', when: null, onFail: 'stop' }];
+    const rBad = await customRunner.executeRoutine(badSwitch, io, { bot, baselineMaxId: 0, timeoutMs: 5000 });
+    ok(!rBad.ok, 'runner: unknown bot par switch → fail');
+  }
+
+  // expect_otp — fresh OTP message se code
+  {
+    const { io, state } = mkFakeIo();
+    const steps = [{ id: 's1', kind: 'expect_otp', when: null, onFail: 'stop' }];
+    // OTP message BOT click ke baad aati hai — simulate: pehle se queued jawab
+    state.inbox.claimbot.unshift({ id: 50, text: 'NEW SMS\nNUMBER: 9555123456\nMESSAGE: 112233 is your Swiggy OTP' });
+    const r = await customRunner.executeRoutine(steps, io, { bot, phone: '9555123456', baselineMaxId: 1, timeoutMs: 5000 });
+    ok(r.ok && r.code === '112233', 'runner: expect_otp fresh code leta hai');
+  }
+
+  // Abort kaam karta hai
+  {
+    const { io } = mkFakeIo();
+    const steps = [{ id: 's1', kind: 'send_text', text: 'hi', when: null, onFail: 'stop' }];
+    const r = await customRunner.executeRoutine(steps, io, { bot, baselineMaxId: 0, timeoutMs: 5000, shouldAbort: () => true });
+    ok(!r.ok, 'runner: shouldAbort → fail');
+  }
+
+  // ---- Template-driven end-to-end (Hermes claim template se train) ----
+  {
+    const { io, state } = mkFakeIo();
+    const hermesSteps = customBots.builtinTemplateSteps('claim', 'hermes');
+    const r = await customRunner.executeRoutine(hermesSteps, io, { bot, baselineMaxId: 1, timeoutMs: 5000 });
+    ok(r.ok && r.card?.phone === '9555123456', 'runner: Hermes claim template end-to-end');
+    ok(state.clicks === 1, 'runner: NEW NUMBER pehle hi click hota hai (FIND nahi)');
+  }
+
+  // ---- Training wiring strings (repo style source check) ----
+  const freshSrc = await fsp.readFile(new URL('./fresh-bot.js', import.meta.url), 'utf8');
+  ok(freshSrc.includes("bot.action('ap_train_bots'") || freshSrc.includes("['ap_train_bots', 'ap_train_list']"), 'ui: ap_train_bots handler registered');
+  ok(freshSrc.includes('🎓 Train Custom Bot'), 'ui: Settings me Train Custom Bot button');
+  ok(freshSrc.includes('handleCustomBotPending'), 'ui: training text input wired');
+  ok(freshSrc.includes('tr_tmpl_yes_') && freshSrc.includes('tr_testc_') && freshSrc.includes('tr_use_'), 'ui: template + test + use-as-otp-bot wiring');
+  ok(freshSrc.includes('setCustomBotClaimRunner') && freshSrc.includes('setCustomBotRefreshRunner'), 'ui: claim/refresh runners injected');
+  const tgSrc = await fsp.readFile(new URL('./telegram-otp-source.js', import.meta.url), 'utf8');
+  ok(tgSrc.includes('setCustomBotClaimRunner') && tgSrc.includes('custom-claim-failed'), 'claim: custom runner hook');
+  ok(tgSrc.includes('customBotRefreshRunner') && tgSrc.includes('refresh-training-'), 'refresh: custom runner hook');
+  const bsSrc = await fsp.readFile(new URL('./bot-settings.js', import.meta.url), 'utf8');
+  ok(bsSrc.includes('allowKnownCustom'), 'settings: custom otp bot ids allowed');
+
+  // 🧹 Cleanup — test-data me custom bots na chhodein
+  for (const leftover of customBots.listCustomBots()) customBots.deleteCustomBot(leftover.id);
+  ok(customBots.listCustomBots().length === 0, 'cleanup: custom bots hata diye');
+  bsMod.setSetting('otpBotProfile', 'hermes');
+}
+
 console.log(`\n✅ ALL PASSED — ${passed} checks`);

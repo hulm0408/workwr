@@ -314,27 +314,18 @@ function startCard() {
   const maxMin = Number(bs.getSetting('maxMinutes')) || 120;
   const engineWorld = bs.getSetting('accountEngine') === 'worldbot';
   return statusCard(instanceInfo.instanceTitle('🆕 Swiggy Fresh Bot'), [
-    mono(engineWorld
-      ? '[POOL] › WORLD BOT LOGIN › OTP › JSON'
-      : (telegram ? '[NEW] › OTP › REFRESH › VERIFY › ADDR › FRESH' : '[POOL] › OTP › INBOX › VERIFY › ADDR › FRESH')),
-    engineWorld
-      ? `🌍 ${mono(`WORLD BOT @${worldBot.worldBotUsername()}`)} <i>· login + OTP bot ke andar</i>`
-      : '',
-    '<b>Abhi:</b> START ka wait hai',
+    field('Status', 'READY — START ka wait'),
     telegram
-      ? `📨 ${mono(`${activeOtpBotLabel().toUpperCase()} ONLY`)} · 🔥 Firebase ${mono('OFF')}`
+      ? `📨 <b>Source:</b> ${mono(`${activeOtpBotLabel().toUpperCase()} ONLY`)} · 🔥 Firebase ${mono('OFF')}`
       : activeSourceLine(),
-    `🎯 ${mono(`${target} fresh`)} · ⏱ ${mono(`${maxMin} min`)} · 🔁 ${mono(`NEVER-STOP ${bs.getSetting('autoContinue') ? 'ON' : 'OFF'}`)}`,
-    '⏭ Running card par <b>SKIP NUMBER</b> bhi rahega — sirf current number chhodega, batch nahi rukega.',
-    bs.getSetting('autoContinue')
-      ? (engineWorld
-        ? '🔁 Batch <b>rukega nahi</b> — fail/rate-limit/pool rukawat par khud aage badhega; sirf TARGET ya ⏹ STOP par band.'
-        : '🔁 Batch <b>rukega nahi</b> — time cap/fail/WAF-403/pool rukawat par khud recovery karega; sirf TARGET ya ⏹ STOP par band.')
-      : '⚠️ Never-stop OFF hai — safety stops batch band kar sakte hain (Settings → 🔁 Never-stop).',
-    telegram
-      ? '<b>Next:</b> START dabao — bot chuno, phir new number aayega'
-      : '<b>Next:</b> START dabao — live card par har step dikhega',
-  ]);
+    `🌍 <b>Engine:</b> ${engineWorld ? mono(`WORLD BOT @${worldBot.worldBotUsername()}`) : mono('CHROMIUM')}`,
+    `🎯 <b>Batch:</b> ${mono(`${target} fresh`)} · ${mono(`${maxMin} min`)} · never-stop ${mono(bs.getSetting('autoContinue') ? 'ON' : 'OFF')}`,
+    `🧭 <b>Flow:</b> ${mono(engineWorld
+      ? 'LOGIN › OTP › JSON'
+      : (telegram ? 'NEW › OTP › VERIFY › ADDR › FRESH' : 'POOL › OTP › INBOX › VERIFY › ADDR › FRESH'))}`,
+    ``,
+    '<b>Next:</b> START dabao → source chuno → batch chalu.',
+  ].filter(Boolean));
 }
 
 function runningCard(snap, stageText = '') {
@@ -366,83 +357,98 @@ const idleRows = () => [
 // ---------------------------------------------------------------------------
 function settingsCard() {
   const ps = proxyPool.proxySummary();
+  const engineWorld = bs.getSetting('accountEngine') === 'worldbot';
+  const proxyLine = ps.direct
+    ? 'DIRECT (no proxy)'
+    : (ps.enabled ? `${ps.enabledCount}/${ps.total} ON · ${ps.rotation}` : 'OFF — batch ruk sakta hai');
   return section('⚙️ Settings', [
-    activeSourceLine(),
-    field('🔀 Proxies', ps.direct
-      ? `${mono('DIRECT')} — bina proxy (PROXY_MODE=direct)`
-      : (ps.enabled ? `${ps.enabledCount}/${ps.total} ON — ${ps.rotation}` : 'OFF (rukna pad sakta hai)')),
+    field('Target', `${bs.getSetting('target')} fresh`),
+    field('Lanes', `${bs.getSetting('concurrency')} parallel`),
+    field('Time', `${bs.getSetting('maxMinutes')} min`),
+    field('Gap', bs.fmtSetting('gapMs')),
+    field('Never-stop', bs.getSetting('autoContinue') ? 'ON' : 'OFF'),
+    field('Offline', bs.getSetting('allowOffline') ? 'ON' : 'OFF'),
     ``,
-    field('🎯 Target', `${bs.getSetting('target')} fresh`),
-    field('⚡ Parallel lanes', `${bs.getSetting('concurrency')} numbers/IPs ek saath`),
-    field('⏱ Max time', `${bs.getSetting('maxMinutes')} min`),
-    field('🔁 Never-stop', bs.getSetting('autoContinue')
-      ? (bs.getSetting('accountEngine') === 'worldbot'
-        ? 'ON — fail/rate-limit/pool rukawat par batch khud aage badhta hai'
-        : 'ON — time cap/fail/WAF/pool rukawat par batch khud aage badhta hai')
-      : 'OFF — purana safety-stop behaviour'),
-    field('🚦 Gap', bs.fmtSetting('gapMs')),
-    field('⏳ OTP wait', bs.fmtSetting('otpWaitMs')),
-    field('📴 Offline devices', bs.getSetting('allowOffline') ? 'ON (try bhi karenge)' : 'OFF (sirf online)'),
+    field('Source', isTelegramNumberSource() ? `Telegram · ${activeOtpBotLabel()}` : 'Firebase'),
+    field('OTP bot', bs.fmtSetting('otpBotProfile')),
+    field('Engine', engineWorld ? `Swiggy World @${worldBot.worldBotUsername()}` : 'Chromium (direct)'),
+    engineWorld ? '' : field('Proxies', proxyLine),
+    field('OTP wait', isTelegramNumberSource()
+      ? `${bs.fmtSetting('telegramOtpTimeoutMs')} · refresh ${bs.fmtSetting('telegramOtpRefreshMs')}`
+      : bs.fmtSetting('otpWaitMs')),
     ``,
-    field('🌍 Account engine', bs.getSetting('accountEngine') === 'worldbot'
-      ? `OTP BOT + SWIGGY WORLD — number/OTP OTP bot se, account @${esc(worldBot.worldBotUsername())} ke buttons se`
-      : 'OTP BOT + CHROMIUM — number/OTP OTP bot se, account is bot ke apne Swiggy bridge se'),
-    field('📨 Telegram mode', bs.fmtSetting('telegramOtpMode')),
-    field('🤖 OTP bot', `${esc(bs.fmtSetting('otpBotProfile'))} — <code>@${esc(String(telegramProviderStatus().botUsername || ''))}</code>`),
-    numberSourceLine(),
-    isTelegramNumberSource()
-      ? field('⏳ OTP wait', `${bs.fmtSetting('telegramOtpTimeoutMs')} budget · har ${bs.fmtSetting('telegramOtpRefreshMs')}`)
-      : '',
-    ``,
-    sub(isTelegramNumberSource()
-      ? 'Number + OTP Telegram Hermes se aayenge; Firebase fallback OFF hai.'
-      : 'Sab kuch yahin se badlo — .env chhedni ki zaroorat nahi.'),
-  ].join('\n'));
+    details([
+      activeSourceLine(),
+      numberSourceLine(),
+      sub('Sab kuch yahin se badlo — .env chhedne ki zaroorat nahi.'),
+    ], { title: 'Source detail' }),
+  ].filter(Boolean).join('\n'));
 }
 
-const settingsRows = () => [
-  [{ text: `🔥 Firebase Sources${isTelegramNumberSource() ? ' · fallback OFF' : ''}`, callback_data: 'ap_sources', style: 'primary' }],
-  [{ text: `📨 Telegram mode: ${bs.fmtSetting('telegramOtpMode')}`, callback_data: 'ap_toggle_telegram', style: 'primary' }],
-  [{ text: `🤖 OTP bot: ${bs.fmtSetting('otpBotProfile')}`, callback_data: 'ap_pick_otp_bot', style: 'primary' }],
-  [{ text: '👤 Add Telegram Account', callback_data: 'ap_telegram_account', style: 'success' }],
-  [{ text: `🧪 Test ${activeOtpBotLabel()}`, callback_data: 'ap_test_hermes' }, { text: '🗑 Remove Telegram', callback_data: 'ap_remove_telegram', style: 'danger' }],
-  ...(isTelegramNumberSource() ? [[
-    { text: `⏳ OTP wait: ${bs.fmtSetting('telegramOtpTimeoutMs')}`, callback_data: 'ap_pick_telegram_wait' },
-    { text: `🔄 Refresh: ${bs.fmtSetting('telegramOtpRefreshMs')}`, callback_data: 'ap_pick_telegram_refresh' },
-  ]] : []),
-  // 🌍 World Bot mode me proxy ka koi button/wording nahi.
-  ...(bs.getSetting('accountEngine') === 'worldbot' ? [] : [[{
-    text: proxyPool.proxySummary().direct ? '🔀 Proxies: DIRECT' : `🔀 Proxies: ${proxyPool.proxySummary().enabledCount}`,
-    callback_data: 'ap_proxies',
-    style: 'primary',
-  }]]),
-  [{ text: `🎯 Target: ${bs.getSetting('target')}`, callback_data: 'ap_pick_target' }],
-  [{ text: `⚡ Parallel: ${bs.getSetting('concurrency')} lanes`, callback_data: 'ap_pick_parallel' }],
-  [{ text: `⏱ Max: ${bs.getSetting('maxMinutes')}m`, callback_data: 'ap_pick_time' }],
-  [{ text: `🚦 Gap: ${bs.fmtSetting('gapMs')}`, callback_data: 'ap_pick_gap' }],
-  [{ text: `📴 Offline: ${bs.getSetting('allowOffline') ? 'ON' : 'OFF'}`, callback_data: 'ap_toggle_offline' }],
-  [{ text: `🔁 Never-stop: ${bs.getSetting('autoContinue') ? 'ON' : 'OFF'}`, callback_data: 'ap_toggle_neverstop', style: 'success' }],
-  // 🧙‍♂️ Quick Setup wizard — ek tap me saara setup (engine + OTP bot + proxy + start)
-  [{ text: '🧙‍♂️ Quick Setup (Account + OTP Bot + Proxy)', callback_data: 'ap_setup_wizard', style: 'success' }],
-  // 👤 Owner: "otp bot + chromium" aur "otp bot + swiggy world" — dono options
-  // ek hi screen par, jo chalu hai us par ✓.
-  [
-    {
-      text: `${bs.getSetting('accountEngine') === 'worldbot' ? '' : '✓ '}🧩 OTP bot + Chromium`,
-      callback_data: 'ap_engine_chromium',
-      style: bs.getSetting('accountEngine') === 'worldbot' ? 'primary' : 'success',
-    },
-    {
-      text: `${bs.getSetting('accountEngine') === 'worldbot' ? '✓ ' : ''}🌍 OTP bot + Swiggy World`,
-      callback_data: 'ap_engine_worldbot',
-      style: 'primary',
-    },
-  ],
-  [{ text: '🔎 World Bot screen check', callback_data: 'ap_world_probe' }],
-  [{ text: '📦 Shop Bot Stock (@its_shop_bot)', callback_data: 'ap_shop_stock', style: 'success' }],
-  [{ text: '🩺 Diagnose (kya toota hai?)', callback_data: 'ap_diag' }],
-  [{ text: '↩️ Back', callback_data: 'ap_home', style: 'primary' }],
-];
+const settingsRows = () => {
+  const engineWorld = bs.getSetting('accountEngine') === 'worldbot';
+  const proxySummary = proxyPool.proxySummary();
+  return [
+    [
+      { text: `🎯 Target: ${bs.getSetting('target')}`, callback_data: 'ap_pick_target' },
+      { text: `⚡ Lanes: ${bs.getSetting('concurrency')}`, callback_data: 'ap_pick_parallel' },
+    ],
+    [
+      { text: `⏱ Max: ${bs.getSetting('maxMinutes')}m`, callback_data: 'ap_pick_time' },
+      { text: `🚦 Gap: ${bs.fmtSetting('gapMs')}`, callback_data: 'ap_pick_gap' },
+    ],
+    [
+      { text: `🔁 Never-stop: ${bs.getSetting('autoContinue') ? 'ON' : 'OFF'}`, callback_data: 'ap_toggle_neverstop', style: 'success' },
+      { text: `📴 Offline: ${bs.getSetting('allowOffline') ? 'ON' : 'OFF'}`, callback_data: 'ap_toggle_offline' },
+    ],
+    [
+      { text: `📨 Telegram: ${bs.fmtSetting('telegramOtpMode')}`, callback_data: 'ap_toggle_telegram', style: 'primary' },
+      { text: `🤖 ${bs.fmtSetting('otpBotProfile')}`, callback_data: 'ap_pick_otp_bot', style: 'primary' },
+    ],
+    [
+      { text: '🔥 Firebase Sources', callback_data: 'ap_sources', style: 'primary' },
+      // 🌍 World Bot mode me proxy ka koi button/wording nahi.
+      ...(bs.getSetting('accountEngine') === 'worldbot' ? [] : [[{
+        text: proxySummary.direct ? '🔀 Proxies: DIRECT' : `🔀 Proxies: ${proxySummary.enabledCount}`,
+        callback_data: 'ap_proxies',
+        style: 'primary',
+      }]]),
+    ],
+    // 👤 Owner: "otp bot + chromium" aur "otp bot + swiggy world" — dono options
+    // ek hi screen par, jo chalu hai us par ✓.
+    [
+      {
+        text: `${engineWorld ? '' : '✓ '}🧩 Chromium`,
+        callback_data: 'ap_engine_chromium',
+        style: engineWorld ? 'primary' : 'success',
+      },
+      {
+        text: `${engineWorld ? '✓ ' : ''}🌍 World Bot`,
+        callback_data: 'ap_engine_worldbot',
+        style: 'primary',
+      },
+    ],
+    ...(isTelegramNumberSource() ? [[
+      { text: `⏳ OTP wait: ${bs.fmtSetting('telegramOtpTimeoutMs')}`, callback_data: 'ap_pick_telegram_wait' },
+      { text: `🔄 Refresh: ${bs.fmtSetting('telegramOtpRefreshMs')}`, callback_data: 'ap_pick_telegram_refresh' },
+    ]] : []),
+    [
+      { text: '👤 Add Telegram Account', callback_data: 'ap_telegram_account', style: 'success' },
+      { text: `🧪 Test ${activeOtpBotLabel()}`, callback_data: 'ap_test_hermes' },
+    ],
+    [
+      { text: '📦 Shop Stock', callback_data: 'ap_shop_stock', style: 'success' },
+      { text: '🔎 World screen', callback_data: 'ap_world_probe' },
+    ],
+    [
+      { text: '🩺 Diagnose', callback_data: 'ap_diag' },
+      { text: '🗑 Remove Telegram', callback_data: 'ap_remove_telegram', style: 'danger' },
+    ],
+    // 🧙‍♂️ Quick Setup wizard — ek tap me saara setup (engine + OTP bot + proxy + start)
+    [{ text: '🧙‍♂️ Quick Setup', callback_data: 'ap_setup_wizard', style: 'success' }],
+    [{ text: '↩️ Back', callback_data: 'ap_home', style: 'primary' }],
+  ];
+};
 
 // ---------------------------------------------------------------------------
 // 🔀 PROXIES — "rukna hi na pare" ka tod. Multiple proxies = multiple IPs.
@@ -463,17 +469,18 @@ function proxiesCard() {
   rows.push([{ text: ps.enabled ? '⏸ Pause Rotation' : '▶️ Enable Rotation', callback_data: 'ap_px_rot' }]);
   rows.push([{ text: '↩️ Settings', callback_data: 'ap_settings', style: 'primary' }]);
   return {
-    text: section('🔀 Proxy Pool — IP Rotation', [
-      `Status: <b>${ps.enabled ? `ON (${ps.enabledCount}/${ps.total})` : 'OFF'}</b> — ${esc(ps.rotation)}`,
-      `🌐 Free auto-fetch: <b>${ps.autoFree ? 'ON' : 'OFF'}</b>${ps.autoCount ? ` · ${ps.autoCount} auto (${ps.autoClean || 0} clean${ps.autoChallenged ? ` · ${ps.autoChallenged} 🛡 WAF-ready` : ''})` : ''}`,
+    text: section('🔀 Proxies', [
+      field('Status', ps.enabled ? `ON (${ps.enabledCount}/${ps.total})` : 'OFF'),
+      field('Rotation', ps.rotation),
+      field('Free auto', `${ps.autoFree ? 'ON' : 'OFF'}${ps.autoCount ? ` · ${ps.autoCount} auto (${ps.autoClean || 0} clean${ps.autoChallenged ? ` · ${ps.autoChallenged} 🛡 WAF-ready` : ''})` : ''}`),
       ``,
       list.length
         ? list.map((p) =>
-            `${p.enabled ? (p.cooldownLeftMs > 0 ? `🟡 (${Math.ceil(p.cooldownLeftMs / 1000)}s)` : '▫️') : '🚫'} <b>${esc(p.label)}</b>${p.quality === 'challenged' ? ' 🛡' : ''}${p.tokenReady ? ' 🔑' : ''} · hits: ${p.hits || 0}`
+            `${p.enabled ? (p.cooldownLeftMs > 0 ? `🟡 ${Math.ceil(p.cooldownLeftMs / 1000)}s` : '▫️') : '🚫'} <b>${esc(p.label)}</b>${p.quality === 'challenged' ? ' 🛡' : ''}${p.tokenReady ? ' 🔑' : ''} · ${p.hits || 0} hits`
           ).join('\n')
-        : sub('Koi proxy nahi — abhi sab kuch EK IP se ja raha hai (rukne ka khatra).'),
+        : sub('Koi proxy nahi — sab kuch EK IP se ja raha hai (rukne ka khatra).'),
       ``,
-      sub('🌐 dabao — bot free proxy list se la kar sirf Swiggy par zinda wali rakhega. Batch start par bhi auto ho jata hai. Ek IP blocked → bot turant doosri IP (ZERO wait).'),
+      sub('🌐 Free Proxies dabao — sirf Swiggy par zinda proxies rakhega. Ek IP block → turant doosri IP.'),
     ].join('\n')),
     rows,
   };
@@ -536,23 +543,22 @@ function sourcesCard(requestedPage = 0) {
 
   return {
     text: section('🔥 Firebase Sources', [
-      `<b>Saare added Firebase hamesha ACTIVE hain</b> — disable/switch-off`,
-      `nahi hota. Koi source sirf <b>Delete</b> karne par hi hatega.`,
-      `Batch ek waqt me ek DB ko current rakhta hai taaki number ka OTP`,
-      `usi DB se mile; woh khali/error/exhaust ho to agli <b>ACTIVE</b> DB`,
-      `isi batch me auto-try hoti hai.`,
-      ``,
-      `Total: <b>${list.length} ACTIVE</b> sources · Page <b>${page + 1}/${totalPages}</b>`,
-      list.length ? '' : sub('Abhi koi Firebase add nahi — Delete All ke baad aisa hota hai. Add Firebase se naya DB daalo.'),
-      primary ? `⭐ First-try: <b>${esc(primary.name)}</b> (baaki sab bhi ACTIVE)` : '⭐ First-try: —',
-      health ? `🩺 Live <b>${health.live}</b> · untried <b>${health.neverTried}</b> · quarantine <b>${health.quarantined}</b> <i>(dead DB 30 min peeche)</i>` : '',
+      field('Total', `${list.length} ACTIVE · page ${page + 1}/${totalPages}`),
+      field('First try', primary ? primary.name : '—'),
+      health ? field('Health', `live ${health.live} · untried ${health.neverTried} · quarantine ${health.quarantined}`) : '',
+      list.length ? '' : sub('Abhi koi Firebase add nahi — Add Firebase se naya DB daalo.'),
       ``,
       ...pageItems.map((s, i) =>
-        `${start + i + 1}. ✅ <b>${esc(s.name)}</b> (ACTIVE)${s.primary ? ' ⭐' : ''} — <code>${esc(s.url.replace('https://', ''))}</code>${s.auth ? ' 🔑' : ''}`
+        `${start + i + 1}. ✅ <b>${esc(s.name)}</b>${s.primary ? ' ⭐' : ''} — <code>${esc(s.url.replace('https://', ''))}</code>${s.auth ? ' 🔑' : ''}`
       ),
       ``,
-      sub('Source tap karke: first-try / verify / delete. Disable option nahi — har added Firebase ACTIVE rehta hai.'),
-    ].join('\n')),
+      details([
+        'Saare added Firebase hamesha ACTIVE hain — disable/switch-off nahi hota; sirf Delete se hatt-ta hai.',
+        'Batch ek waqt me ek DB current rakhta hai taaki number ka OTP usi DB se mile; khali/error/exhaust ho to agli ACTIVE DB isi batch me auto-try hoti hai.',
+        'Dead DB 30 min ke liye quarantine ho jata hai.',
+        'Source tap karke: first-try / verify / delete.',
+      ], { title: 'Kaise kaam karta hai' }),
+    ].filter(Boolean).join('\n')),
     rows,
   };
 }
@@ -913,15 +919,17 @@ function startSourceCard() {
     ...preset.lines.map((line) => sub(line)),
     '',
   ]);
-  return section('🚀 Batch Kahan Se Chalega?', [
-    ...presetLines,
-    `${status.configured ? '✅' : '⚙️'} Telegram: ${status.configured ? 'spare account ready' : 'account add karo'} · 🔥 Firebase: ${fbCount} source`,
-    `📦 Shop Bot stock: <b>${shopStock.shopStockStatus().pending}/10</b> — 10 poore hone par JSON files @its_shop_bot ko (zip nahi)`,
-    '',
-    `⏱ OTP wait ${bs.fmtSetting('telegramOtpTimeoutMs')} · OTP na aaye to number skip`,
-    sub('Jo yahan chunoge wahi is batch ka source lock hoga. World Bot ke saare bots same hain — error aaye tab hi next bot.'),
-    sub('Swiggy World kaam na kare to 🧩 OTP BOT + CHROMIUM chuno — number + OTP wahi OTP bot se aayega, account Chromium se banega.'),
-  ].join('\n'));
+  const activePreset = active ? startPresets.getStartSourcePreset(active) : null;
+  return section('🚀 Batch Source', [
+    field('Selected', activePreset ? activePreset.shortLabel : 'Firebase only'),
+    field('Telegram', status.configured ? 'ready' : 'account add karo'),
+    field('Firebase', `${fbCount} source`),
+    field('OTP wait', `${bs.fmtSetting('telegramOtpTimeoutMs')} · na aaye to number skip`),
+    field('Shop stock', `${shopStock.shopStockStatus().pending}/10 — 10 par JSON files`),
+    ``,
+    sub('Neeche ek option chuno — wahi is batch ka source lock hoga.'),
+    details(presetLines, { title: 'Options detail' }),
+  ].filter(Boolean).join('\n'));
 }
 
 async function showStartSourcePicker(ctx) {
@@ -1103,7 +1111,15 @@ bot.start(async (ctx) => {
   await ctx.reply(startCard(), kb(isAutopilotRunning() ? stopRows() : startRows())).catch(() => {});
 });
 
-bot.help((ctx) => ctx.reply('/start — menu · /status — current batch · /diag — kya toota hai, check karo · /session <number> — saved session refresh karke latest JSON bhejo', { parse_mode: 'HTML' }).catch(() => {}));
+bot.help((ctx) => ctx.reply([
+  '<b>Commands</b>',
+  '/start — menu',
+  '/status — batch status',
+  '/diag — health check',
+  '/session &lt;number&gt; — fresh JSON',
+  '/world — World Bot screen check',
+  '/shopstock — shop bot stock',
+].join('\n'), { parse_mode: 'HTML' }).catch(() => {}));
 
 // ---------------------------------------------------------------------------
 // 🩺 /diag — "bot work nahi kar raha" ka jawab ek tap me.
@@ -1118,10 +1134,10 @@ async function diagCard() {
   {
     const shard = instanceShard.shardSummary();
     lines.push(field('🏷 Instance', shard.enabled
-      ? `${shard.label} · pool ka hissa ${shard.share}`
-      : `${shard.label} · akela (INSTANCE_COUNT set nahi)`));
+      ? `${shard.label} · shard ${shard.share}`
+      : `${shard.label} · akela (INSTANCE_COUNT nahi)`));
     if (shard.enabled) {
-      lines.push(field('🧩 Shard', `pool ${shard.count} hisson me · ye #${shard.index + 1} · proxies bhi isi hisse ki`));
+      lines.push(field('🧩 Shard', `${shard.count} shard · ye #${shard.index + 1}`));
     }
   }
   lines.push(field('⏰ Uptime', fmtDuration(Date.now() - runtimeHealth.bootAt)));
@@ -1131,8 +1147,8 @@ async function diagCard() {
       ? `${fmtDuration(Date.now() - ka.lastSuccessAt)} pehle OK`
       : 'abhi pehla ping baqi';
     lines.push(field('❤️ Keep-alive', ka.enabled
-      ? `✅ ON · har ${Math.round((ka.intervalMs || 300000) / 60000)} min · ${lastOk}${ka.lastError ? ` · last error: ${esc(String(ka.lastError).slice(0, 80))}` : ''}`
-      : `❌ OFF (${esc(ka.reason || 'unknown')}) — KEEP_ALIVE_URL=https://<service>.onrender.com/health set karo`));
+      ? `✅ ON · ${Math.round((ka.intervalMs || 300000) / 60000)} min · ${lastOk}${ka.lastError ? ` · err: ${esc(String(ka.lastError).slice(0, 60))}` : ''}`
+      : `❌ OFF — KEEP_ALIVE_URL set karo`));
   }
   lines.push(field('📡 FresBot Bot API', runtimeHealth.telegramReady
     ? `✅ ready${runtimeHealth.telegramUsername ? ` (@${esc(runtimeHealth.telegramUsername)})` : ''}`
@@ -1146,7 +1162,7 @@ async function diagCard() {
     try {
       wafPool.loadFromDb?.(); // db.json me saved token bhi dikhe (warna hamesha "nahi hai" lagega)
       const w = wafPool.getSummary();
-      lines.push(field('🛡 WAF token', w.hasToken ? `✅ hai (age ${w.tokenAgeMin}m, ${esc(w.source)})` : (w.stale ? '⚠️ purana/expired — batch start par naya banega (Chrome chahiye)' : '— abhi nahi (batch start par banega)')));
+      lines.push(field('🛡 WAF token', w.hasToken ? `✅ hai (${w.tokenAgeMin}m purana, ${esc(w.source)})` : (w.stale ? '⚠️ expired — start par naya banega' : '— start par banega')));
     } catch { lines.push(field('🛡 WAF token', '—')); }
   }
   const diagTelegramMode = isTelegramNumberSource();
@@ -1160,7 +1176,7 @@ async function diagCard() {
     const accounts = status.accounts || { count: 0, healthy: 0, accounts: [] };
     const tag = (() => { try { return telegramOtp.telegramSessionTag(); } catch { return ''; } })();
     if (tag && accounts.count <= 1) {
-      lines.push(field('🔑 Session tag', `${mono(tag)} <i>(do bots par same tag = ek hi account → conflict)</i>`));
+      lines.push(field('🔑 Session tag', `${mono(tag)} <i>(duplicate = conflict)</i>`));
     }
     if (accounts.count > 1) {
       lines.push(field('👥 Accounts', `${mono(`${accounts.healthy}/${accounts.count} READY`)} · active #${Number(status.accountSlot) + 1}`));
@@ -1169,40 +1185,40 @@ async function diagCard() {
       }
       lines.push(sub('Account flood/dead ho to bot khud agla account uthata hai — batch rukta nahi.'));
     } else {
-      lines.push(sub('Ek hi account hai. 4 accounts hain to TELEGRAM_SESSION, _2, _3, _4 env me daalo — ek kharab ho to baaki chalte rahenge.'));
+      lines.push(sub('Ek account. 4 ke liye TELEGRAM_SESSION, _2, _3, _4 env me daalo.'));
     }
     if (status.lastErrorCode && status.lastErrorCode !== 'UNKNOWN') {
       lines.push(field('🧯 Last account error', `${mono(status.lastErrorLabel || status.lastErrorCode)}${status.lastErrorHint ? `\n<i>${esc(status.lastErrorHint)}</i>` : ''}`));
     }
     lines.push(field('👤 Telegram account', status.configured
-      ? `✅ configured${status.me ? ` — ${esc(status.me)}` : ''} · API ${status.apiIdPresent && status.apiHashPresent ? '✅' : '❌'} · session ${status.sessionPresent ? '✅' : '❌'}`
-      : `❌ setup pending${status.missing?.length ? ` — missing ${esc(status.missing.join(', '))}` : ''} · Settings → Add Telegram Account`));
+      ? `✅ ${status.me ? `${esc(status.me)} · ` : ''}API ${status.apiIdPresent && status.apiHashPresent ? '✅' : '❌'} · session ${status.sessionPresent ? '✅' : '❌'}`
+      : `❌ pending${status.missing?.length ? ` — missing ${esc(status.missing.join(', '))}` : ''} · Settings → Add Telegram Account`));
     lines.push(field('⏳ Hermes timing', `OTP wait ${bs.fmtSetting('telegramOtpTimeoutMs')} · REFRESH har ${bs.fmtSetting('telegramOtpRefreshMs')}`));
 
     if (runSnap.running) {
-      lines.push(field('📨 Hermes', `● batch chal raha hai — ${esc(formatNumberSourceStatus(runSnap))}${status.currentPhone ? ` · current ${esc(status.currentPhone)}` : ''}`));
+      lines.push(field('📨 Hermes', `● running — ${esc(formatNumberSourceStatus(runSnap))}${status.currentPhone ? ` · ${esc(status.currentPhone)}` : ''}`));
       lines.push(field('📱 Number pool', esc(formatPoolStatus(runSnap))));
     } else if (telegramLoginFlow || status.loginInProgress) {
-      lines.push(field('📨 Hermes', `⏳ Telegram login chal raha hai${telegramLoginFlow ? ` — ${esc(telegramLoginStageLabel(telegramLoginFlow.stage))}` : ''}`));
-      lines.push(field('📱 Number pool', 'login complete hone ke baad FIND NUMBER available hoga'));
+      lines.push(field('📨 Hermes', `⏳ login — ${telegramLoginFlow ? esc(telegramLoginStageLabel(telegramLoginFlow.stage)) : 'chal raha hai'}`));
+      lines.push(field('📱 Number pool', 'login ke baad FIND NUMBER'));
     } else if (!status.configured) {
-      lines.push(field('📨 Hermes', '❌ pehle Add Telegram Account karo'));
-      lines.push(field('📱 Number pool', 'Telegram-only mode me Firebase pool use nahi hota'));
+      lines.push(field('📨 Hermes', '❌ Add Telegram Account pehle'));
+      lines.push(field('📱 Number pool', 'Telegram-only — Firebase pool use nahi hota'));
     } else {
       try {
         const t0 = Date.now();
         const v = await telegramOtp.verifyTelegramOtpConnection({ sendStartIfEmpty: true });
         lines.push(field('📨 Hermes', `✅ reachable ${Date.now() - t0}ms — @${esc(String(v.botUsername || botName).replace(/^@+/, ''))}${v.me ? ` · ${esc(v.me)}` : ''}`));
         lines.push(field('📱 Number pool', v.currentPhone
-          ? `current Hermes number <code>${esc(v.currentPhone)}</code>`
-          : 'koi current number card nahi — batch FIND NUMBER se shuru karega'));
+          ? `current ${mono(v.currentPhone)}`
+          : 'koi card nahi — batch FIND NUMBER se shuru'));
         lines.push(field('🔘 Hermes buttons', v.buttons?.length ? esc(v.buttons.slice(0, 10).join(' · ')) : 'koi button nahi mila'));
       } catch (e) {
         lines.push(field('📨 Hermes', `❌ ${esc(String(e?.message || e).slice(0, 140))}`));
-        lines.push(field('📱 Number pool', 'Settings → 🧪 Test Hermes se dobara check karo'));
+        lines.push(field('📱 Number pool', 'Settings → 🧪 Test se dobara'));
       }
     }
-    lines.push(field('📟 Device gate', 'Telegram mode me Firebase last-seen gate bypass — Hermes STATUS: ACTIVE card hi source hai'));
+    lines.push(field('📟 Device gate', 'bypass — Hermes STATUS: ACTIVE hi source'));
   } else {
     // Firebase (active source verify = shallow root read, halka test)
     try {
@@ -1230,8 +1246,8 @@ async function diagCard() {
         const deviceStates = _countDeviceOnlineStates(pool);
         const fallbackCount = Math.max(0, sources.listRunSources().length - 1);
         lines.push(field('📱 Number pool', pool.length
-          ? `✅ First-try ACTIVE source: ${pool.length} numbers · devices: ONLINE ${deviceStates.online} · status-unknown ${deviceStates.unknown} · offline ${deviceStates.offline}`
-          : `⚠️ First-try ACTIVE source: 0 numbers mile — clients/ node khali ya paths galat${fallbackCount ? `; batch me baaki ${fallbackCount} ACTIVE source(s) auto-try honge` : ''}`));
+          ? `✅ ${pool.length} numbers · online ${deviceStates.online} · unknown ${deviceStates.unknown} · offline ${deviceStates.offline}`
+          : `⚠️ 0 numbers — clients/paths check karo${fallbackCount ? ` · baaki ${fallbackCount} source auto-try` : ''}`));
       }
     } catch (e) {
       let fallbackNote = '';
@@ -1245,7 +1261,7 @@ async function diagCard() {
     {
       const w = Number(process.env.PREMIUM_DEVICE_ACTIVE_WINDOW_MS);
       const wMs = Number.isFinite(w) && w > 0 ? w : 60_000;
-      lines.push(field('📟 Device gate', `sirf wahi devices jinki last activity ≤${Math.round(wMs / 1000)}s purani ho (env PREMIUM_DEVICE_ACTIVE_WINDOW_MS se badal sakta hai)`));
+      lines.push(field('📟 Device gate', `last activity ≤${Math.round(wMs / 1000)}s (PREMIUM_DEVICE_ACTIVE_WINDOW_MS)`));
     }
   }
   // Proxies — sirf direct-API engine me (World Bot me proxy hoti hi nahi).
@@ -1253,8 +1269,7 @@ async function diagCard() {
     try {
       const ps = proxyPool.proxySummary();
       if (ps.direct) {
-        lines.push(field('🔀 Proxies', `🔀 ${mono('DIRECT MODE')} — koi proxy nahi, ek IP, 1 lane`));
-        lines.push(sub('Slow par predictable: proxy fetch/WAF-solve ka time bachta hai, par Swiggy ki per-IP rate-limit seedha lagti hai.'));
+        lines.push(field('🔀 Proxies', `${mono('DIRECT MODE')} — 1 IP · 1 lane`));
       } else {
         lines.push(field('🔀 Proxies', ps.enabled ? `✅ ${ps.enabledCount}/${ps.total} ON` : '⚠️ OFF (ek hi IP — rukna pad sakta hai)'));
       }
@@ -1263,7 +1278,7 @@ async function diagCard() {
   // Ek number = ek hi baar (owner rule): number park/queue nahi hota.
   try {
     const win = Math.round(numberDecisionWindowMs() / 1000);
-    lines.push(field('⛔ Number rule', `${mono('1 NUMBER = 1 BAAR')} — ${win}s me attempt start, warna chhod do; queue me park nahi`));
+    lines.push(field('⛔ Number rule', `${mono('1 NUMBER = 1 BAAR')} — ${win}s me attempt start, warna chhod do`));
   } catch { lines.push(field('⛔ Number rule', 'ek number = ek hi baar')); }
   // 🌍 Account engine — kaun Swiggy account bana raha hai.
   try {
@@ -1275,31 +1290,32 @@ async function diagCard() {
       ? ` · last phase: ${wbStatus.phase}${wbStatus.lastAction ? ` (${wbStatus.lastAction})` : ''}`
       : '';
     lines.push(field('🌍 Account engine', engine === 'worldbot'
-      ? `✅ ${mono('WORLD BOT')} @${esc(worldBot.worldBotUsername())} · spare TG ${tg.configured ? '✅' : '❌'}${esc(wbLine)}`
-      : `✅ ${mono('DIRECT API')} — bridge + proxy/WAF solver (Settings → 🌍 Account engine se World Bot chuno)`));
+      ? `${mono('WORLD BOT')} @${esc(worldBot.worldBotUsername())} · spare TG ${tg.configured ? '✅' : '❌'}${esc(wbLine)}`
+      : `${mono('DIRECT API')} — bridge + proxy/WAF solver`));
   } catch { lines.push(field('🌍 Account engine', '—')); }
   // 🔁 Never-stop + auto-resume — batch rukne na rukne ka sach.
   try {
     const resume = bs.getAutopilotResume();
     const ns = bs.getSetting('autoContinue') ? 'ON' : 'OFF';
     const resumeLine = resume?.wanted
-      ? `auto-resume armed (${String(resume.lastEndReason || 'restart')} ke baad wapas chalega)`
+      ? `auto-resume armed (${String(resume.lastEndReason || 'restart')})`
       : 'auto-resume idle';
     lines.push(field('🔁 Never-stop', bs.getSetting('autoContinue')
-      ? (diagWorld
-        ? `✅ ${mono(ns)} — fail-streak/rate-limit/pool khali par batch khud aage badhta hai; sirf TARGET/STOP end. ${esc(resumeLine)}`
-        : `✅ ${mono(ns)} — time cap/fail-streak/rate-limit/WAF-403/pool khali par batch khud aage badhta hai; sirf TARGET/STOP end. ${esc(resumeLine)}`)
-      : `⚠️ ${mono(ns)} — safety stops batch band kar sakte hain. ${esc(resumeLine)}`));
+      ? `${mono(ns)} — self-recover, sirf TARGET/STOP end · ${esc(resumeLine)}`
+      : `⚠️ ${mono(ns)} — safety stops batch band kar sakte hain · ${esc(resumeLine)}`));
   } catch { lines.push(field('🔁 Never-stop', '—')); }
   const snap = getAutopilotSnapshot();
   if (Number(snap.consumedNumbers)) {
-    lines.push(field('🔒 Consumed', `${mono(String(snap.consumedNumbers))} unique number(s) is run me lock — dobara try nahi`));
+    lines.push(field('🔒 Consumed', `${mono(String(snap.consumedNumbers))} number lock — dobara try nahi`));
   }
   lines.push(field('▶️ Batch', snap.running ? `● RUNNING — ${snap.fresh}/${snap.target} fresh` : (snap.finishedAt ? `⏹ last: ${snap.fresh} fresh · ${esc(snap.stopReason || 'done')}${snap.lastError ? ` · last error: ${esc(String(snap.lastError).slice(0, 100))}` : ''}` : 'ready')));
-  return section('🩺 Diagnose — kya toota hai?', [
+  return section('🩺 Diagnose', [
     ...lines,
     '',
-    sub('Jahan ❌ hai wahi problem hai. Sab ✅ ho aur phir bhi batch fail ho to console logs dekho — har number ka exact reason wahan likhta hai.'),
+    details([
+      'Jahan ❌ hai wahi problem hai. Sab ✅ ho aur batch phir bhi fail ho to console logs dekho — har number ka exact reason wahan hai.',
+      'DIRECT MODE: proxy fetch/WAF-solve ka time bachta hai, par Swiggy per-IP rate-limit seedha lagti hai.',
+    ], { title: 'Fix hints' }),
   ].join('\n'));
 }
 
@@ -1560,23 +1576,23 @@ function telegramLoginAbortError(message = 'Telegram account login cancel/timeou
 
 function telegramLoginStageLabel(stage) {
   return {
-    starting: 'login shuru ho raha hai',
-    api_id: 'Telegram API ID ka wait hai',
-    api_hash: 'Telegram API hash ka wait hai',
-    connecting: 'Telegram se connect ho raha hai',
-    phone: 'spare-account phone number ka wait hai',
-    code: 'Telegram login code ka wait hai',
-    password: '2FA password ka wait hai',
-    name: 'naaye Telegram account ke naam ka wait hai',
-    verifying: 'Hermes connection test ho raha hai',
+    starting: 'shuru ho raha hai',
+    api_id: 'API ID ka wait',
+    api_hash: 'API hash ka wait',
+    connecting: 'connect ho raha hai',
+    phone: 'phone ka wait',
+    code: 'login code ka wait',
+    password: '2FA password ka wait',
+    name: 'naam ka wait',
+    verifying: 'Hermes test',
   }[stage] || 'login chal raha hai';
 }
 
 function telegramLoginRows() {
-  return [
-    [{ text: '✖️ Login Cancel', callback_data: 'ap_telegram_login_cancel', style: 'danger' }],
-    [{ text: '⚙️ Settings', callback_data: 'ap_settings', style: 'primary' }],
-  ];
+  return [[
+    { text: '✖️ Cancel Login', callback_data: 'ap_telegram_login_cancel', style: 'danger' },
+    { text: '⚙️ Settings', callback_data: 'ap_settings', style: 'primary' },
+  ]];
 }
 
 function maskTelegramLoginPhone(phone = '') {
@@ -1672,10 +1688,10 @@ async function askTelegramLoginValue(flow, stage, prompt, validate) {
     const raw = await waitForTelegramLoginInput(flow, stage, prompt);
     const checked = validate(raw);
     if (checked?.ok) return checked.value;
-    await sendTelegramLoginMessage(flow, section('⚠️ Input sahi nahi hai', [
+    await sendTelegramLoginMessage(flow, section('⚠️ Input Sahi Nahi', [
       esc(checked?.error || 'Dobara sahi value bhejo.'),
       ``,
-      sub('Flow abhi chal raha hai — sahi value dubara bhejo, ya Cancel dabao.'),
+      sub('Sahi value dubara bhejo, ya Cancel dabao.'),
     ].join('\n')));
   }
 }
@@ -1684,16 +1700,18 @@ function telegramAccountCard() {
   const status = telegramProviderStatus();
   const botName = String(status.botUsername || 'HermeshuOTPROBOT').replace(/^@+/, '');
   const flow = telegramLoginFlow;
-  return section('👤 Telegram Spare Account', [
-    field('Hermes bot', `@${esc(botName)}`),
-    field('API ID', status.apiIdPresent ? '✅ saved hai' : '❌ missing'),
-    field('API hash', status.apiHashPresent ? '✅ saved hai' : '❌ missing'),
-    field('Account session', status.sessionPresent ? '✅ saved hai' : '❌ login nahi hai'),
-    status.me ? field('Account', esc(status.me)) : '',
-    flow ? field('Login', `⏳ ${esc(telegramLoginStageLabel(flow.stage))}`) : '',
-    status.loginInProgress && !flow ? field('Login', '⏳ provider me login chal raha hai') : '',
+  const ready = Boolean(status.apiIdPresent && status.apiHashPresent && status.sessionPresent);
+  return section('👤 Telegram Account', [
+    field('Status', (flow || status.loginInProgress) ? '⏳ LOGIN CHAL RAHA' : (ready ? 'READY' : 'SETUP PENDING')),
+    field('Bot', `@${botName}`),
+    field('API ID', status.apiIdPresent ? '✅ saved' : '❌ missing'),
+    field('API hash', status.apiHashPresent ? '✅ saved' : '❌ missing'),
+    field('Session', status.sessionPresent ? '✅ saved' : '❌ login nahi'),
+    status.me ? field('Account', status.me) : '',
+    flow ? field('Stage', telegramLoginStageLabel(flow.stage)) : '',
+    status.loginInProgress && !flow ? field('Stage', 'provider me login chal raha hai') : '',
     ``,
-    sub('Sirf spare/faltu Telegram account use karein. Session kabhi chat me nahi dikhegi.'),
+    sub('Sirf spare account. Session chat me kabhi nahi dikhegi.'),
   ].filter(Boolean).join('\n'));
 }
 
@@ -1710,12 +1728,13 @@ async function runTelegramLoginFlow(flow) {
       flow.apiId = await askTelegramLoginValue(
         flow,
         'api_id',
-        section('👤 Add Telegram Account — Step 1/2', [
-          `Render/env me <b>Telegram API ID</b> saved nahi hai.`,
+        section('👤 Telegram Setup · 1/2', [
+          field('Status', 'API ID saved nahi'),
+          field('Chahiye', 'numeric API ID'),
+          field('Kahan se', 'my.telegram.org → API development tools'),
           ``,
-          `<code>my.telegram.org</code> → <b>API development tools</b> se spare account ki API app ka <b>numeric API ID</b> yahan bhejo.`,
-          ``,
-          sub('Input milte hi message delete karne ki koshish hogi. Sirf spare account use karein.'),
+          '<b>Send:</b> API ID yahan bhejo (sirf digits).',
+          sub('Input delete hoga. Sirf spare account.'),
         ].join('\n')),
         (raw) => {
           const value = String(raw || '').trim();
@@ -1729,10 +1748,12 @@ async function runTelegramLoginFlow(flow) {
       flow.apiHash = await askTelegramLoginValue(
         flow,
         'api_hash',
-        section('👤 Add Telegram Account — Step 2/2', [
-          `Ab usi API app ka <b>API hash</b> bhejo.`,
+        section('👤 Telegram Setup · 2/2', [
+          field('Chahiye', 'API hash'),
+          field('App', 'wahi API app (my.telegram.org)'),
           ``,
-          sub('Hash ko chat me dobara nahi dikhaya jayega; input message delete karne ki koshish hogi.'),
+          '<b>Send:</b> API hash yahan bhejo.',
+          sub('Hash chat me dobara nahi dikhega; input delete hoga.'),
         ].join('\n')),
         (raw) => {
           const value = String(raw || '').trim().replace(/^['"]+|['"]+$/g, '');
@@ -1745,10 +1766,10 @@ async function runTelegramLoginFlow(flow) {
 
     flow.stage = 'connecting';
     await sendTelegramLoginMessage(flow, section('🔐 Telegram Login', [
-      `Spare account se Telegram connect kar raha hoon…`,
-      `Pehle phone number, phir Telegram ka login code lagega.`,
+      field('Flow', 'phone → login code'),
+      `Spare account se connect kar raha hoon…`,
       ``,
-      sub('Har code/password message milte hi delete karne ki koshish hogi.'),
+      sub('Code/password message milte hi delete hoga.'),
     ].join('\n')));
 
     const result = await telegramOtp.loginTelegramUserInteractive({
@@ -1757,8 +1778,10 @@ async function runTelegramLoginFlow(flow) {
           flow,
           'phone',
           section('📱 Spare Telegram Number', [
-            `Spare/faltu Telegram account ka phone number bhejo.`,
-            `India ke liye 10-digit chalega; dusre country ke liye <code>+countrycode number</code> bhejo.`,
+            field('Chahiye', 'spare account ka phone'),
+            field('Format', '+91XXXXXXXXXX ya 10-digit'),
+            ``,
+            '<b>Send:</b> phone number yahan bhejo.',
           ].join('\n')),
           (raw) => {
             const value = telegramOtp.normalizeTelegramLoginPhone?.(raw) || '';
@@ -1776,10 +1799,10 @@ async function runTelegramLoginFlow(flow) {
           flow,
           'code',
           section('🔑 Telegram Login Code', [
-            `Telegram ne code bhej diya hai (${esc(delivery)}).`,
-            `Woh code yahan bhejo — milte hi message delete karne ki koshish hogi.`,
+            field('Delivery', delivery),
             ``,
-            sub('Ye Hermeshu ka SMS OTP nahi hai; ye spare Telegram account ka login code hai.'),
+            '<b>Send:</b> Telegram ka login code yahan bhejo.',
+            sub('Ye Hermes OTP nahi — spare Telegram account ka login code hai.'),
           ].join('\n')),
           (raw) => {
             const value = String(raw || '').replace(/[\s-]+/g, '').trim();
@@ -1793,9 +1816,10 @@ async function runTelegramLoginFlow(flow) {
         flow,
         'password',
         section('🔐 Telegram 2FA Password', [
-          `Is spare account par <b>two-step verification</b> ON hai.`,
-          hint ? `Hint: <i>${esc(String(hint).slice(0, 80))}</i>` : '',
-          `2FA password yahan bhejo — milte hi message delete karne ki koshish hogi.`,
+          field('Status', 'two-step verification ON'),
+          hint ? field('Hint', String(hint).slice(0, 80)) : '',
+          ``,
+          '<b>Send:</b> 2FA password yahan bhejo.',
         ].filter(Boolean).join('\n')),
         (raw) => {
           const value = String(raw ?? '');
@@ -1808,10 +1832,10 @@ async function runTelegramLoginFlow(flow) {
         flow,
         'name',
         section('👤 Naya Telegram Account', [
-          `Is number par Telegram account registered nahi lagta.`,
-          `Naye spare account ke liye display name bhejo (jaise <code>Spare Account</code>).`,
+          field('Status', 'is number par account registered nahi'),
           ``,
-          sub('Agar naya account nahi banana, Login Cancel dabao.'),
+          '<b>Send:</b> display name bhejo (jaise Spare Account).',
+          sub('Naya account nahi banana? Cancel dabao.'),
         ].join('\n')),
         (raw) => {
           const value = String(raw || '').trim();
@@ -1864,7 +1888,7 @@ async function runTelegramLoginFlow(flow) {
       field('World Bot', `✅ isi account se @${esc(worldBot.worldBotUsername())} ke buttons click honge`),
       field('Shop Bot stock', `✅ isi account se @${esc(shopStock.shopBotConfig().username)} ko JSON files jayengi`),
       ``,
-      sub('Ek hi spare account kaafi hai (OTP bot + World Bot + shop stock — sab isi se). Ab START dabao.'),
+      sub('Ek spare account hi kaafi hai. Ab START dabao.'),
     ].join('\n')), settingsRows());
   } catch (error) {
     const aborted = flow.cancelled || error?.code === 'TELEGRAM_LOGIN_ABORTED' || /AUTH_USER_CANCEL|cancel\/timeout/i.test(String(error?.message || ''));
@@ -1924,11 +1948,11 @@ async function startTelegramLoginFlow(ctx) {
   telegramLoginFlow = flow;
   await ctx.answerCbQuery('👤 Telegram login shuru…').catch(() => {});
   await editOrSend(ctx, section('👤 Add Telegram Account', [
-    `Spare/faltu Telegram account ka login yahin private chat me hoga.`,
-    status.sessionPresent ? `⚠️ Ek saved account pehle se hai — naya login successful hone par wahi replace hoga.` : '',
-    `Session chat me kabhi nahi dikhegi; main account mat use karo.`,
+    field('Saved session', status.sessionPresent ? '⚠️ replace hoga' : '— koi nahi'),
+    field('Kahan', 'is private chat me'),
     ``,
-    sub('Agle prompt me jo manga jaye wahi bhejo. Beech me rokne ke liye Login Cancel dabao.'),
+    '<b>Next:</b> har prompt par value bhejo — rokne ke liye Cancel.',
+    sub('Session chat me kabhi nahi dikhegi; main account mat use karo.'),
   ].filter(Boolean).join('\n')), telegramLoginRows());
   runTelegramLoginFlow(flow).catch((e) => console.error('[FreshBot] telegram login runner:', e?.stack || e?.message || e));
 }
@@ -2781,9 +2805,14 @@ bot.action('ap_telegram_account', async (ctx) => {
   if (status.sessionPresent) {
     await ctx.answerCbQuery('👤 Telegram account saved hai.').catch(() => {});
     await editOrSend(ctx, telegramAccountCard(), [
-      [{ text: '🔁 Dusra Spare Account Login Karo', callback_data: 'ap_telegram_login_start', style: 'success' }],
-      [{ text: '🧪 Test Hermes', callback_data: 'ap_test_hermes' }, { text: '🗑 Remove Telegram', callback_data: 'ap_remove_telegram', style: 'danger' }],
-      [{ text: '↩️ Settings', callback_data: 'ap_settings', style: 'primary' }],
+      [
+        { text: '🔁 Dusra Account Login', callback_data: 'ap_telegram_login_start', style: 'success' },
+        { text: '🧪 Test', callback_data: 'ap_test_hermes' },
+      ],
+      [
+        { text: '🗑 Remove', callback_data: 'ap_remove_telegram', style: 'danger' },
+        { text: '↩️ Settings', callback_data: 'ap_settings', style: 'primary' },
+      ],
     ]);
     return;
   }
@@ -2858,13 +2887,13 @@ bot.action('ap_test_hermes', async (ctx) => {
       field('Buttons', r.buttons?.length ? esc(r.buttons.slice(0, 10).join(' · ')) : 'koi button nahi mila'),
       field('Time', `${Date.now() - t0}ms${r.sentStart ? ' · /start bheja gaya' : ''}`),
       ``,
-      sub('Ab START BATCH isi account se FIND NUMBER dabayega.'),
+      field('Next', 'START → FIND NUMBER'),
     ].filter(Boolean).join('\n')), settingsRows());
   } catch (e) {
     await editOrSend(ctx, section('❌ Hermes Test Fail', [
       esc(shortTelegramLoginError(e)),
       ``,
-      sub('Session expire ho to Add Telegram Account se dobara login karo; API ID/hash galat ho to setup check karo.'),
+      sub('Session expire? Add Telegram Account se dobara login. API galat? setup check karo.'),
     ].join('\n')), [
       [{ text: '👤 Add Telegram Account', callback_data: 'ap_telegram_account', style: 'success' }],
       [{ text: '↩️ Settings', callback_data: 'ap_settings', style: 'primary' }],
@@ -2888,10 +2917,10 @@ bot.action('ap_remove_telegram', async (ctx) => {
   await editOrSend(ctx, section('🗑 Remove Telegram Account?', [
     telegramAccountCard(),
     ``,
-    `Saved spare-account session is bot se hata di jayegi aur Hermes mode bhi OFF ho jayega.`,
-    `Telegram account khud delete nahi hoga.`,
+    field('Effect', 'saved session delete + Hermes mode OFF'),
+    field('Account', 'Telegram account khud delete nahi hoga'),
     ``,
-    sub('Agar session Render env TELEGRAM_SESSION me bhi rakhi hai, restart ke baad wahan se wapas aa sakti hai — env se bhi हटाना hoga.'),
+    sub('TELEGRAM_SESSION env me bhi ho to restart par wapas aa sakti hai — wahan se bhi hatao.'),
   ].join('\n')), [
     [{ text: '🗑 Haan, Remove Kar Do', callback_data: 'ap_remove_telegram_confirm', style: 'danger' }],
     [{ text: '↩️ Cancel', callback_data: 'ap_settings', style: 'primary' }],

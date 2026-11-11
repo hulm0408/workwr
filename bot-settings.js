@@ -6,6 +6,19 @@
 // Har set pehle validation + clamp — user galat value na daal paye.
 
 import { getDb, saveDb } from './store.js';
+import { getOtpBotProfile } from './otp-bot-profiles.js';
+
+// 🎓 Custom trained bots 'custom_<hex>' id rakhte hain — static enum ke saath
+// allowed hain (existence provider ke through getOtpBotProfile check se).
+const CUSTOM_ID_RE = /^custom_[a-z0-9]{6,24}$/;
+function isKnownOtpBotId(value = '') {
+  const key = String(value || '').trim().toLowerCase();
+  if (!key) return false;
+  if (['hermes', 'hathi', 'chauhan'].includes(key)) return true;
+  if (!CUSTOM_ID_RE.test(key)) return false;
+  // Provider se resolve ho raha hai ya nahi (delete ho gaya bot → false).
+  try { return getOtpBotProfile(key)?.id === key; } catch { return false; }
+}
 
 const SPECS = {
   target:            { min: 1,    max: 5000, dflt: 100,    label: '🎯 Target (fresh sessions)' },
@@ -34,11 +47,10 @@ const SPECS = {
   telegramOtpMode:   { bool: true, dflt: false, label: '📨 Telegram Hermes mode (number + OTP Telegram bot se)' },
   telegramOtpTimeoutMs: { min: 5000, max: 180000, dflt: 20000, label: 'Hermes OTP Refresh budget (ms)' },
   telegramOtpRefreshMs: { min: 1000, max: 15000, dflt: 2500, label: 'Hermes Refresh interval (ms)' },
-  // Kaunsa OTP bot — 'hermes' (@HermeshuOTPROBOT), 'hathi' (@Hathi_otp_bot)
-  // ya 'chauhan' (@HardXotp_Bot). START par owner jo chunta hai wahi yahan
-  // save ho jata hai.
-  otpBotProfile:     { dflt: 'hermes', label: '📨 OTP bot (hermes = @HermeshuOTPROBOT, hathi = @Hathi_otp_bot, chauhan = @HardXotp_Bot)',
-                       enum: ['hermes', 'hathi', 'chauhan'] },
+  // Kaunsa OTP bot — 'hermes' (@HermeshuOTPROBOT), 'hathi' (@Hathi_otp_bot),
+  // 'chauhan' (@HardXotp_Bot) ya 'custom_<hex>' (owner ka Train Custom Bot).
+  otpBotProfile:     { dflt: 'hermes', label: '📨 OTP bot (hermes = @HermeshuOTPROBOT, hathi = @Hathi_otp_bot, chauhan = @HardXotp_Bot, custom_* = aapka trained bot)',
+                       enum: ['hermes', 'hathi', 'chauhan'], allowKnownCustom: true },
 };
 
 const ENV_MAP = {
@@ -78,8 +90,10 @@ export function getSetting(key) {
   if (spec.enum) {
     const local = String(s[key] || '').trim().toLowerCase();
     if (spec.enum.includes(local)) return local;
+    if (spec.allowKnownCustom && isKnownOtpBotId(local)) return local;
     const envVal = String(process.env[ENV_MAP[key]] || '').trim().toLowerCase();
     if (spec.enum.includes(envVal)) return envVal;
+    if (spec.allowKnownCustom && isKnownOtpBotId(envVal)) return envVal;
     return spec.dflt;
   }
   if (Number.isFinite(s[key])) return s[key];
@@ -101,7 +115,8 @@ export function setSetting(key, value) {
     s[key] = value === true || value === 'true' || value === 1 || value === '1';
   } else if (spec.enum) {
     const v = String(value || '').trim().toLowerCase();
-    if (!spec.enum.includes(v)) return { ok: false, error: `${spec.label}: ${spec.enum.join(' / ')} me se chuno.` };
+    const allowed = spec.enum.includes(v) || (spec.allowKnownCustom && isKnownOtpBotId(v));
+    if (!allowed) return { ok: false, error: `${spec.label}: ${spec.enum.join(' / ')} me se chuno (ya custom trained bot).` };
     s[key] = v;
   } else {
     const n = Number(value);
@@ -132,7 +147,11 @@ export function settingsSpecs() {
 export function fmtSetting(key) {
   const v = getSetting(key);
   if (key === 'allowOffline' || key === 'telegramOtpMode' || key === 'autoContinue') return v ? 'ON' : 'OFF';
-  if (key === 'otpBotProfile') return { hermes: 'Hermes', hathi: 'Hathi', chauhan: 'HardXotp' }[v] || 'Hermes';
+  if (key === 'otpBotProfile') {
+    const fallback = { hermes: 'Hermes', hathi: 'Hathi', chauhan: 'HardXotp' }[v];
+    if (fallback) return fallback;
+    try { return getOtpBotProfile(v)?.label || 'Hermes'; } catch { return 'Hermes'; }
+  }
   if (key === 'accountEngine') {
     return v === 'worldbot' ? 'OTP bot + Swiggy World' : 'OTP bot + Chromium';
   }

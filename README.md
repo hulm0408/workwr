@@ -154,6 +154,85 @@ nahi aaya to wahi number chhod do (one-shot) — naya number lo.**
 
 Naya bot add karna ho to `otp-bot-profiles.js` me ek entry daal do — START
 picker, Settings list, live card aur pipeline text sab khud update ho jate hain.
+**Ya bina code chhue:** Settings → **🎓 Train Custom Bot** (niche dekho) — koi
+bhi bot UI se add + train karo.
+
+## 🎓 Custom Bot Training — apna koi bhi bot add aur train karo
+
+Settings → **🎓 Train Custom Bot**. Koi bhi OTP/SMS bot (naya/purana — jo bhi
+Telegram par maujood ho aur spare Telegram account se message/click-able ho)
+apne hisaab se train karo, bilkul Hermes/Hathi/HardXotp ki tarah — bas har
+cheez ka **BUTTON** hai, code chhedna nahi padta. Backend: `custom-bots.js`
+(steps save, pure) + `custom-bot-runner.js` (steps chalata hai).
+
+### Add karna (2 message)
+
+1. **➕ Naya bot add karo** → bot ka `username` bhejo (@ ke bina, jaise `MyOtpBot123`).
+2. **Naam** bhejo (blank/`-` = @username) → bot turant Train Bots / OTP bot
+   picker / START Advanced list me aa jata hai.
+
+### Do training flows — 📋 Claim aur 🔄 Refresh
+
+- 📋 **Claim** = number kaise lena hai (`/start` → `NEW NUMBER` click → …).
+- 🔄 **Refresh** = OTP kaise check karna hai (`REFRESH` / `VIEW MESSAGES` …).
+- Batch kaam karega sirf: claim → number, refresh → OTP check. Baaki sab tumhare
+  rules se.
+
+### Har cheez ka button — step types
+
+| Button | Kaam |
+|---|---|
+| ✉️ **Message bhejo** | Bot ko text (`/start`, `FIND NUMBER`…) |
+| 🖱 **Button dabao** | Newest message ke button ka text (click; na mile/click na chale to wahi text type — **click-then-type**, world-bot jaisa) |
+| ⏳ **Wait karo** | 100–30000 ms intezaar |
+| 🤖 **Doosre bot par jao** | Isi ke baad waale steps us bot se honge ("agar ye response mile to is bot par") |
+| 📱 **Number card pehchano** | Number card parse (claim yahin poori) |
+| 🔢 **OTP pehchano** | 6-digit OTP parse (test/log ke liye) |
+
+**Har step par OPTIONAL condition** — "jab LATEST response me ye text ho TABHI
+step chale" (blank = hamesha). Wajah: owner ka exact sawaal — "agar ye response
+mile to ye karo". `re:` prefix se regex bhi chalti hai. Step par ye buttons bhi:
+**Condition ⚙️ · fail par STOP/AAGE 🛑 · type-fallback ON/OFF 🔁 · text badlo ✏️ ·
+order ⬆️⬇️ · delete 🗑**.
+
+**Safety rule (Hermes jaisa):** click sirf **newest message ke buttons** par —
+purane screens ke buttons kabhi click nahi (stale number burn + claim-stuck se
+bachaav). Text match small-caps/emoji-insensitive (`𝗢𝗧𝗣 𝗦𝗲𝗻𝘁` = `otp sent`).
+
+### Ab tak coding kia hua training — ek button me copy karo
+
+Routing/claim/refresh ka jo kuch pehle se coded hai woh template ban gaya hai:
+
+- 📋 **Hermes/Hathi template** — claim: `NEW NUMBER` → `FIND NUMBER` → card; refresh: `REFRESH` (click ya `Refresh` type)
+- 🔐 **HardXotp template** — claim: `NEW NUMBER` → `GET NUMBERS` → card; refresh: `VIEW MESSAGES` (click ya `View Messages` type)
+
+Pehle template lagao, phir apne hisaab se edit — ek-ek step change karo.
+
+### 🧪 Test (live) aur ▶️ Batch banao
+
+- **🧪 Test claim / 🧪 Test refresh** — spare account se REAL bot ko training
+  ke mutabik message/click bhejo; har step ka result (✅/⏭️/❌ + detail) aur
+  mila hua card/OTP chat me dikhta hai. (Test real actions bhejta hai — claim
+  test naya number nikaal sakta hai.)
+- **▶️ Batch ka OTP bot banao** — ek tap: `otpBotProfile = aapka trained bot`
+  (telegram mode ON). START dabao — batch training ke mutabik chalega.
+  Claim/Refresh dono pipeline me kaam karte hain. Delete karne par Hermes wapas.
+- Training khali ho to force-use pehle roka jata hai (saaf warning).
+
+### Example — "agar OTP Sent aaye to …"
+
+```
+1. ADD: @MyOtpBot123 → naam "Mera FastBot"
+2. 📋 Claim → ➕ Step → "🖱 Button dabao" → "NEW NUMBER"
+     → condition: - (blank = hamesha)
+3. ➕ Step → "🖱 Button dabao" → "FIND NUMBER"   (NEW na ho to)
+4. ➕ Step → "📱 Number card pehchano"
+5. 🔄 Refresh → 📋 Hermes refresh template
+6. 🧪 Test claim — card aaya? ✅
+7. ▶️ Batch ka OTP bot banao → START
+```
+
+> Batch chal rahe ho to testing/use nahi — pehle STOP karo (spare account busy).
 
 
 ## Zaroori cheezein (warna bot "work nahi karega")
@@ -386,8 +465,11 @@ Chhota summary:
   me peeche aata hai). Isliye 400+ DBs ke pool me har run pehle **zinda**
   DBs try karta hai, dead URLs par 10-10 second nahi jalte — live card par
   `⚡ IDs/min · ETA` bhi isi liye dikhta hai.
-- **🤖 OTP bot** — Hermes / Hathi / HardXotp (sab same spare session; START par
+- **🤖 OTP bot** — Hermes / Hathi / HardXotp / **aapke trained custom bots** (sab same spare session; START par
   bhi chuna ja sakta hai aur choice save rehti hai)
+- **🎓 Train Custom Bot** — koi bhi bot add karke UI se poori training banao
+  (claim/refresh steps, conditions, templates, live test) — detail: neeche
+  **Custom Bot Training** section
 - **🗑 Delete All Firebase** — poori list ek tap me saaf; delete yaad rehti hai
   (restart/redeploy par seeding wapas nahi laati) aur Firebase tab tak OFF
   rehta hai jab tak naya DB add na karo
@@ -610,7 +692,9 @@ chalta rehta hai; temporary error par number failed nahi gina jata.
 | `firebase-numbers.js` | Firebase reader — pool + OTP inbox + **dynamic source override** |
 | `firebase-sources.js` | **Multiple Firebase sources** — bulk add (1000)/verify/health; sab Delete tak ACTIVE (db-backed + vault) |
 | `firebase-seed-urls.js` | Owner ki ROLEX VIP Firebase list (400+ DBs) — boot par permanently seed hoti hai |
-| `otp-bot-profiles.js` | **OTP bot profiles** — Hermes / Hathi / HardXotp ke buttons, card labels aur UI labels (pure, tested) |
+| `otp-bot-profiles.js` | **OTP bot profiles** — Hermes / Hathi / HardXotp ke buttons, card labels aur UI labels (pure, tested) + custom-bot provider hook |
+| `custom-bots.js` | **🎓 Custom bot training store** — add/CRUD/step validation/Hermes-HardXotp templates/profile bridge (pure, tested) |
+| `custom-bot-runner.js` | **🎓 Training runner** — claim/refresh steps execute karta hai (MTProto); `io` injection se network-free unit tests |
 | `instance-info.js` | **Doosra deployment label** — `INSTANCE_LABEL` se title/diag/health me `· bot2` (default `main` = purana look) |
 | `bot-settings.js` | **Batch knobs** — target/parallel lanes/time/gap (UI se, validated + clamped) |
 | `proxy-pool.js` | **Proxy pool** — lane reservations, IP rotation, per-proxy WAF token + cooldown |

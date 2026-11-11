@@ -326,6 +326,18 @@ export function telegramButtonRole(text = '', profileOrId = null) {
   return otpBotButtonRole(text, profile);
 }
 
+// Custom trained bots ke liye message helpers (custom-bot-runner.js).
+export function telegramMessageText(message) {
+  try { return String(message?.text || message?.message || message?.rawText || ''); } catch { return ''; }
+}
+
+export function telegramMessageId(message) {
+  const raw = message?.id;
+  if (typeof raw === 'bigint') return Number(raw);
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : 0;
+}
+
 function extractPhoneFromSegment(segment = '') {
   const normalized = normalizeTelegramFancyText(segment);
   const match = normalized.match(/(?:\+?91[\s-]*)?[6-9]\d{4}[\s-]?\d{5}(?!\d)/);
@@ -1006,6 +1018,35 @@ async function refreshHermesChatUnlocked({ phone = '', attempt = 0 } = {}) {
   const { client, config } = await ensureClientUnlocked();
   const wanted = String(phone || '').replace(/\D/g, '').slice(-10);
   const profile = getActiveOtpBotProfile();
+  // 🎓 Custom trained bot — owner ki refresh training hi chalti hai.
+  if (profile?.custom && customBotRefreshRunner) {
+    try {
+      const r = await customBotRefreshRunner({
+        client,
+        config,
+        botId: profile.botId || profile.id,
+        phone: wanted,
+        attempt,
+        timeoutMs: 12_000,
+      });
+      if (r?.ok) {
+        providerState.claimPhase = `refresh-training-${attempt || 1}`;
+        providerState.lastActionAt = Date.now();
+        providerState.lastError = '';
+        providerState.lastClickedButton = String(r.steps?.[r.steps.length - 1]?.detail || 'training').slice(0, 90);
+        console.log(`[CustomBot] 🔄 REFRESH #${attempt || 1} (training) — ${providerState.lastClickedButton}`);
+        return { ok: true, via: 'training', buttonText: providerState.lastClickedButton || 'training' };
+      }
+      providerState.claimPhase = 'refresh-training-failed';
+      providerState.lastError = String(r?.error || 'refresh training failed').slice(0, 180);
+      console.warn(`[CustomBot] REFRESH training fail: ${String(r?.error || 'unknown').slice(0, 140)}`);
+      return { ok: false, reason: `training: ${String(r?.error || 'refresh training failed').slice(0, 90)}` };
+    } catch (error) {
+      providerState.claimPhase = 'refresh-training-error';
+      providerState.lastError = String(error?.message || error).slice(0, 180);
+      return { ok: false, reason: `training-error: ${String(error?.message || error).slice(0, 80)}` };
+    }
+  }
   const allowed = profile.refreshRoles || ['refresh'];
   let lastReason = 'no-refresh-button';
   // 🟡 Card kisi aur number ka ho (world bot ka pichla number) tab pehle usko
@@ -1137,6 +1178,14 @@ async function waitForNumberCardUnlocked({
   return null;
 }
 
+// Custom trained bots (custom-bot-runner.js) in hooks se inject hote hain —
+// direct import se cycle banta, isliye set*Runner injection. fresh-bot.js boot
+// par inhe wire karta hai.
+let customBotClaimRunner = null;
+let customBotRefreshRunner = null;
+export function setCustomBotClaimRunner(fn) { customBotClaimRunner = typeof fn === 'function' ? fn : null; }
+export function setCustomBotRefreshRunner(fn) { customBotRefreshRunner = typeof fn === 'function' ? fn : null; }
+
 async function obtainCardUnlocked({
   forceNew = false,
   excludePhones = new Set(),
@@ -1149,6 +1198,33 @@ async function obtainCardUnlocked({
   const currentSignatures = async () => new Set(
     (await fetchIncomingUnlocked(20)).map(messageSignature)
   );
+
+  // 🎓 Custom trained bot — coding wala claim flow nahi, owner ki training chalegi.
+  if (customBotClaimRunner) {
+    const activeProfile = getActiveOtpBotProfile();
+    if (activeProfile?.custom) {
+      try {
+        const { client, config } = await ensureClientUnlocked();
+        const r = await customBotClaimRunner({
+          client,
+          config,
+          botId: activeProfile.botId || activeProfile.id,
+          timeoutMs: remainingMs(),
+          excludePhones: new Set([...excludePhones]),
+          shouldAbort,
+        });
+        if (r?.ok && r.card?.phone) return { card: r.card, message: r.message || null };
+        providerState.claimPhase = 'custom-claim-failed';
+        providerState.lastError = String(r?.error || 'custom claim training failed').slice(0, 180);
+        console.warn(`[CustomBot] Claim training fail: ${String(r?.error || 'unknown').slice(0, 140)}`);
+        return null;
+      } catch (error) {
+        providerState.claimPhase = 'custom-claim-error';
+        providerState.lastError = String(error?.message || error).slice(0, 180);
+        return null;
+      }
+    }
+  }
 
   if (!forceNew) {
     const existing = await latestNumberCardUnlocked(excludePhones);

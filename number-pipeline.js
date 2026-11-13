@@ -65,6 +65,7 @@ import {
   rotateWorldBot,
   shouldSwitchWorldBot,
 } from './swiggy-world-bot.js';
+import { processSingleNumberViaToingPro } from './toing-pro-engine.js';
 
 // ---------------------------------------------------------------------------
 // Ledger (db.json → premiumFlow.used) + fresh-selection helpers
@@ -413,6 +414,10 @@ export async function processSingleNumber({
   // hai (koi proxy/WAF/bridge nahi). Alag chhota pipeline.
   if (String(otpCfg?.accountEngine || '').toLowerCase() === 'worldbot') {
     return processSingleNumberViaWorldBot({ userId, entry, report, otpCfg, shouldAbort, shouldSkip, markUsed, sendSession });
+  }
+  // 🌐 Toing Pro Web mode — storelex.store/toing_web API
+  if (String(otpCfg?.accountEngine || '').toLowerCase() === 'toing_pro') {
+    return processSingleNumberViaToingPro({ userId, entry, report, otpCfg, shouldAbort, shouldSkip, markUsed, sendSession });
   }
   const phone = entry?.phone;
   if (!phone) return { ok: false, kind: 'failed_bad_entry', phone: '', reason: 'Entry me phone nahi hai' };

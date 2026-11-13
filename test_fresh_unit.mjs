@@ -4954,8 +4954,8 @@ Thanks`)),
 
   // --- START ke source buttons: OTP bot + Chromium / OTP bot + Swiggy World ---
   const presets = await import('./start-source-presets.js');
-  ok(presets.START_SOURCE_PRESET_IDS.join('|') === 'otp_chromium|otp_world|hathi|world',
-    'START: pehle do options — OTP bot + Chromium aur OTP bot + Swiggy World');
+  ok(presets.START_SOURCE_PRESET_IDS.includes('otp_chromium') && presets.START_SOURCE_PRESET_IDS.includes('toing_pro'),
+    'START: options me toing_pro, OTP bot + Chromium aur OTP bot + Swiggy World');
   ok(presets.getStartSourcePreset('otp_chromium')?.label === '🧩 OTP BOT + CHROMIUM'
     && presets.getStartSourcePreset('otp_world')?.label === '🌍 OTP BOT + SWIGGY WORLD',
   'START: owner wale naam — OTP BOT + CHROMIUM / OTP BOT + SWIGGY WORLD');
@@ -4984,6 +4984,11 @@ Thanks`)),
     && presets.canonicalStartSourcePresetId('hermes_world') === 'otp_world'
     && presets.getStartSourcePreset('hermes_world')?.accountEngine === 'worldbot',
   'START: purana HERMESHU + SWIGGYBYWORLD button bhi kaam karta hai (alias)');
+  ok(presets.isStartSourcePresetId('toing_pro')
+    && presets.getStartSourcePreset('toing_pro')?.accountEngine === 'toing_pro'
+    && presets.getStartSourcePreset('toing_hermes')?.otpBotProfile === 'hermes'
+    && presets.getStartSourcePreset('toing_hathi')?.otpBotProfile === 'hathi',
+  'START: TOING PRO preset maujood aur Hathi/Hermes profile sahi');
   ok(autoResumeSrc.includes("presetRow('otp_chromium')")
     && autoResumeSrc.includes("presetRow('otp_world')")
     && autoResumeSrc.includes("presetRow('hathi')")

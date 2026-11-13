@@ -21,11 +21,52 @@
 import { OTP_BOT_PROFILE_IDS } from './otp-bot-profiles.js';
 
 // Pickers par ye buttons dikhte hain (order yahi rehta hai).
-export const START_SOURCE_PRESET_IDS = ['otp_chromium', 'otp_world', 'hathi', 'world'];
+export const START_SOURCE_PRESET_IDS = ['toing_pro', 'otp_chromium', 'otp_world', 'hathi', 'world'];
 // Purane id bhi valid rehte hain (chat me pada purana button dab jaye to).
-export const LEGACY_START_SOURCE_PRESET_IDS = ['hermes_world'];
+export const LEGACY_START_SOURCE_PRESET_IDS = ['hermes_world', 'toing_hermes', 'toing_hathi'];
 
 export const START_SOURCE_PRESETS = {
+  // 0) 🌐 TOING PRO WEB SIGNUP — storelex.store/toing_web API flow
+  toing_pro: {
+    id: 'toing_pro',
+    label: '🌐 TOING PRO WEB SIGNUP',
+    shortLabel: 'Toing Pro Web',
+    sourceMode: 'telegram',
+    otpBotProfile: null,          // user can choose Hermes or Hathi
+    telegramOtpMode: true,
+    accountEngine: 'toing_pro',
+    lines: [
+      '🌐 Flow: <b>Toing Pro Web</b> (storelex.store API)',
+      '📨 Number + OTP: <b>Hathi 🐘 ya Hermes 📨 bot</b>',
+      '⚡ Auto new / old detection, OTP verify & session export',
+    ],
+  },
+  toing_hermes: {
+    id: 'toing_hermes',
+    label: '🌐 TOING PRO + HERMES',
+    shortLabel: 'Toing + Hermes',
+    sourceMode: 'telegram',
+    otpBotProfile: 'hermes',
+    telegramOtpMode: true,
+    accountEngine: 'toing_pro',
+    lines: [
+      '🌐 Flow: <b>Toing Pro Web</b> (storelex.store API)',
+      '📨 Number + OTP: <b>@HermeshuOTPROBOT</b>',
+    ],
+  },
+  toing_hathi: {
+    id: 'toing_hathi',
+    label: '🌐 TOING PRO + HATHI',
+    shortLabel: 'Toing + Hathi',
+    sourceMode: 'telegram',
+    otpBotProfile: 'hathi',
+    telegramOtpMode: true,
+    accountEngine: 'toing_pro',
+    lines: [
+      '🌐 Flow: <b>Toing Pro Web</b> (storelex.store API)',
+      '🐘 Number + OTP: <b>@Hathi_otp_bot</b>',
+    ],
+  },
   // 1) 🧩 OTP bot + CHROMIUM — number/OTP OTP bot se, account is bot ke apne
   //    Swiggy bridge (Chromium) se. Yehi fallback hai: World Bot na chale to
   //    batch isi se chalta rahega.
@@ -127,9 +168,12 @@ export function getStartSourcePreset(value = '') {
 // Preset → settings patch (bs.setSetting ko jo dena hai).
 export function startSourcePresetSettings(preset = null) {
   if (!preset) return null;
+  const engine = preset.accountEngine === 'worldbot'
+    ? 'worldbot'
+    : (preset.accountEngine === 'toing_pro' ? 'toing_pro' : 'direct');
   const patch = {
     telegramOtpMode: preset.telegramOtpMode === true,
-    accountEngine: preset.accountEngine === 'worldbot' ? 'worldbot' : 'direct',
+    accountEngine: engine,
   };
   if (preset.otpBotProfile && OTP_BOT_PROFILE_IDS.includes(preset.otpBotProfile)) {
     patch.otpBotProfile = preset.otpBotProfile;

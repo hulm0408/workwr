@@ -869,11 +869,16 @@ async function sendSessionFile(chatId, { jsonText = '', filename = 'session.json
 // Advanced (Firebase only / HardXotp) alag screen par, taaki main screen saaf
 // rahe aur galti se galat source na chale.
 function activeStartPresetId() {
-  const engine = bs.getSetting('accountEngine') === 'worldbot' ? 'worldbot' : 'direct';
+  const engine = bs.getSetting('accountEngine');
+  if (engine === 'toing_pro') {
+    const prof = bs.getSetting('otpBotProfile');
+    return prof === 'hathi' ? 'toing_hathi' : 'toing_hermes';
+  }
+  const normEngine = engine === 'worldbot' ? 'worldbot' : 'direct';
   const tgMode = telegramSettingEnabled();
-  // 👤 Owner ke do options: OTP bot + Chromium  ya  OTP bot + Swiggy World.
-  if (tgMode) return engine === 'worldbot' ? 'otp_world' : 'otp_chromium';
-  return engine === 'worldbot' ? 'world' : '';
+  // 👤 Owner ke options: OTP bot + Chromium ya OTP bot + Swiggy World ya Toing Pro.
+  if (tgMode) return normEngine === 'worldbot' ? 'otp_world' : 'otp_chromium';
+  return normEngine === 'worldbot' ? 'world' : '';
 }
 
 function otpBotChoiceRows() {
@@ -891,6 +896,7 @@ function otpBotChoiceRows() {
     }];
   };
   return [
+    [{ text: `🌐 TOING PRO WEB SIGNUP`, callback_data: 'ap_start_toing_pro', style: 'primary' }],
     // 👤 Owner: "otp bot + chromium" aur "otp bot + swiggy world" — do saaf option.
     presetRow('otp_chromium'),
     presetRow('otp_world'),
@@ -1428,7 +1434,33 @@ bot.command('session', async (ctx) => {
 bot.action('ap_start', showStartSourcePicker);
 // Engine ke rows premium callback names bhi bhejta hai — same kaam, same handler
 bot.action('prem_batch_start', showStartSourcePicker);
-bot.action(new RegExp(`^ap_start_go_(${[...startPresets.START_SOURCE_PRESET_IDS, ...otpBotProfiles.OTP_BOT_PROFILE_IDS, 'firebase'].join('|')}|custom_[a-z0-9]+)$`), async (ctx) => {
+
+// 🌐 Toing Pro Web flow: Ask user to choose OTP bot (🐘 Hathi or 📨 Hermes)
+bot.action('ap_start_toing_pro', async (ctx) => {
+  if (!(await gate(ctx))) return;
+  if (isAutopilotRunning()) {
+    await ctx.answerCbQuery('Pehle se chal raha hai!', { show_alert: true }).catch(() => {});
+    return;
+  }
+  await ctx.answerCbQuery().catch(() => {});
+  const text = section('🌐 TOING PRO WEB SIGNUP', [
+    'Toing Pro Web flow (storelex.store/toing_web API):',
+    '• Mobile check (New user vs Existing user)',
+    '• OTP Gateway trigger',
+    '• Auto OTP verify & Session export (.json)',
+    '',
+    sub('Neeche apna Telegram OTP bot chunein jahan se number aur OTP claim karna hai:'),
+  ].join('\n'));
+  const rows = [
+    [{ text: '🐘 Hathi OTP Bot (@Hathi_otp_bot)', callback_data: 'ap_start_go_toing_hathi', style: 'success' }],
+    [{ text: '📨 Hermeshu OTP Bot (@HermeshuOTPROBOT)', callback_data: 'ap_start_go_toing_hermes', style: 'primary' }],
+    [{ text: '↩️ Back', callback_data: 'ap_start' }],
+  ];
+  await ctx.editMessageText(text, kb(rows))
+    .catch(async () => { await ctx.reply(text, kb(rows)).catch(() => {}); });
+});
+
+bot.action(new RegExp(`^ap_start_go_(${[...startPresets.START_SOURCE_PRESET_IDS, ...startPresets.LEGACY_START_SOURCE_PRESET_IDS, ...otpBotProfiles.OTP_BOT_PROFILE_IDS, 'firebase'].join('|')}|custom_[a-z0-9]+)$`), async (ctx) => {
   await launchBatch(ctx, { source: ctx.match[1] });
 });
 

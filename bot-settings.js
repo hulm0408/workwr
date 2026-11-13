@@ -36,14 +36,11 @@ const SPECS = {
   // OFF: purana behaviour (safety stop cards wapas).
   autoContinue:      { bool: true, dflt: true, label: '🔁 Never-stop mode (batch khud na ruke)' },
   // 🌍 Account engine — Swiggy account kaise bane:
-  //   direct   = is bot ka apna Swiggy API/bridge flow (proxy + WAF solver)
-  //   worldbot = @SwiggyByWorldBot ke buttons click karke (koi proxy nahi;
-  //              wahi flow jo owner screenshot me dikhaya: Login → OTP Login
-  //              → number → OTP → JSON; purana account = delete → re-login)
-  // 👤 Owner ke do saaf options: 'OTP bot + Chromium' (direct) ya
-  // 'OTP bot + Swiggy World' (worldbot). Number/OTP dono me OTP bot se hi.
-  accountEngine:     { dflt: 'direct', label: '🌍 Account engine (OTP bot + Chromium ya OTP bot + Swiggy World)',
-                       enum: ['direct', 'worldbot'] },
+  //   direct    = is bot ka apna Swiggy API/bridge flow (proxy + WAF solver)
+  //   worldbot  = @SwiggyByWorldBot ke buttons click karke (koi proxy nahi)
+  //   toing_pro = Toing Pro Web flow (storelex.store/toing_web API: check_mobile -> send_otp -> verify_otp -> export)
+  accountEngine:     { dflt: 'direct', label: '🌍 Account engine (Chromium / Swiggy World / Toing Pro Web)',
+                       enum: ['direct', 'worldbot', 'toing_pro'] },
   telegramOtpMode:   { bool: true, dflt: false, label: '📨 Telegram Hermes mode (number + OTP Telegram bot se)' },
   telegramOtpTimeoutMs: { min: 5000, max: 180000, dflt: 20000, label: 'Hermes OTP Refresh budget (ms)' },
   telegramOtpRefreshMs: { min: 1000, max: 15000, dflt: 2500, label: 'Hermes Refresh interval (ms)' },

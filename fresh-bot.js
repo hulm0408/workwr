@@ -415,12 +415,12 @@ const settingsRows = () => {
     ],
     [
       { text: '🔥 Firebase Sources', callback_data: 'ap_sources', style: 'primary' },
-      // 🌍 World Bot mode me proxy ka koi button/wording nahi.
-      ...(bs.getSetting('accountEngine') === 'worldbot' ? [] : [[{
+      // 🌍 World Bot aur Toing Pro mode me proxy ka koi button/wording nahi.
+      ...(['worldbot', 'toing_pro'].includes(bs.getSetting('accountEngine')) ? [] : [{
         text: proxySummary.direct ? '🔀 Proxies: DIRECT' : `🔀 Proxies: ${proxySummary.enabledCount}`,
         callback_data: 'ap_proxies',
         style: 'primary',
-      }]]),
+      }]),
     ],
     // 👤 Owner: "otp bot + chromium" aur "otp bot + swiggy world" — dono options
     // ek hi screen par, jo chalu hai us par ✓.
@@ -1108,7 +1108,7 @@ async function launchBatch(ctx, opts = {}) {
     source: lockedSourceMode,
     otpBot: lockedOtpBot,
     // Engine choice isi batch ke liye lock — preset/Settings jo kehta hai wahi.
-    accountEngine: bs.getSetting('accountEngine') === 'worldbot' ? 'worldbot' : 'direct',
+    accountEngine: bs.getSetting('accountEngine') === 'worldbot' ? 'worldbot' : (bs.getSetting('accountEngine') === 'toing_pro' ? 'toing_pro' : 'direct'),
     ui,
   }).catch((e) => console.error('[FreshBot] autopilot:', e?.stack || e?.message));
 }

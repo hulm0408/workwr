@@ -118,7 +118,10 @@ export async function processSingleNumberViaToingPro({
   try {
     const checkRes = await fetch(`${baseUrl}/api/auth/check_mobile`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        'x-user-key': accessKey,
+      },
       body: JSON.stringify({ mobile: phone }),
     });
     if (checkRes.ok) {
@@ -145,7 +148,10 @@ export async function processSingleNumberViaToingPro({
   try {
     const sendRes = await fetch(`${baseUrl}/api/auth/send_otp`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        'x-user-key': accessKey,
+      },
       body: JSON.stringify({ mobile: phone }),
     });
     const sendData = await sendRes.json();

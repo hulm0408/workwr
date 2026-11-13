@@ -48,6 +48,7 @@ const SPECS = {
   // 'chauhan' (@HardXotp_Bot) ya 'custom_<hex>' (owner ka Train Custom Bot).
   otpBotProfile:     { dflt: 'hermes', label: '📨 OTP bot (hermes = @HermeshuOTPROBOT, hathi = @Hathi_otp_bot, chauhan = @HardXotp_Bot, custom_* = aapka trained bot)',
                        enum: ['hermes', 'hathi', 'chauhan'], allowKnownCustom: true },
+  toingAccessKey:    { string: true, dflt: 'TNG-M923-VR10-8SQF', label: '🔑 Toing Pro Access Key' },
 };
 
 const ENV_MAP = {
@@ -64,6 +65,7 @@ const ENV_MAP = {
   telegramOtpMode: 'PREMIUM_TELEGRAM_OTP_MODE',
   telegramOtpTimeoutMs: 'TELEGRAM_OTP_TIMEOUT_MS',
   telegramOtpRefreshMs: 'TELEGRAM_OTP_REFRESH_MS',
+  toingAccessKey: 'TOING_ACCESS_KEY',
 };
 
 function load() {
@@ -93,6 +95,11 @@ export function getSetting(key) {
     if (spec.allowKnownCustom && isKnownOtpBotId(envVal)) return envVal;
     return spec.dflt;
   }
+  if (spec.string) {
+    if (typeof s[key] === 'string' && s[key].trim()) return s[key].trim();
+    const envVal = String(process.env[ENV_MAP[key]] || '').trim();
+    return envVal || spec.dflt;
+  }
   if (Number.isFinite(s[key])) return s[key];
   const envVal = Number(process.env[ENV_MAP[key]]);
   return Number.isFinite(envVal) && envVal >= 0 ? envVal : spec.dflt;
@@ -110,6 +117,10 @@ export function setSetting(key, value) {
   const s = load();
   if (spec.bool) {
     s[key] = value === true || value === 'true' || value === 1 || value === '1';
+  } else if (spec.string) {
+    const v = String(value || '').trim();
+    if (!v) return { ok: false, error: `${spec.label}: Empty value allowed nahi hai.` };
+    s[key] = v;
   } else if (spec.enum) {
     const v = String(value || '').trim().toLowerCase();
     const allowed = spec.enum.includes(v) || (spec.allowKnownCustom && isKnownOtpBotId(v));
@@ -150,6 +161,7 @@ export function fmtSetting(key) {
     try { return getOtpBotProfile(v)?.label || 'Hermes'; } catch { return 'Hermes'; }
   }
   if (key === 'accountEngine') {
+    if (v === 'toing_pro') return 'Toing Pro Web';
     return v === 'worldbot' ? 'OTP bot + Swiggy World' : 'OTP bot + Chromium';
   }
   if (key === 'gapMs' || key === 'backoffMs' || key === 'otpWaitMs' || key === 'otpTimeoutMs' || key === 'telegramOtpTimeoutMs' || key === 'telegramOtpRefreshMs') {

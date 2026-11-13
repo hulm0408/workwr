@@ -997,6 +997,10 @@ function compactStepInfo(snap = {}, stageText = '') {
 }
 
 function compactSourceLine(snap = {}) {
+  if (snap.accountEngine === 'toing_pro' || snap.toingProMode) {
+    const botLabel = String(snap.otpBotLabel || getOtpBotProfile(snap.otpBotProfile || '').label || 'Hermes').toUpperCase();
+    return `🌐 ${mono('TOING PRO')} · 📨 ${mono(botLabel)}`;
+  }
   if (snap.accountEngine === 'worldbot' || snap.worldBotMode) {
     if (snap.sourceMode === 'telegram') {
       const botLabel = String(snap.otpBotLabel || getOtpBotProfile(snap.otpBotProfile || '').label || 'Hermes').toUpperCase();
@@ -1254,27 +1258,29 @@ export async function startAutopilot(opts = {}) {
     ? s('autoContinue', true) !== false
     : opts.neverStop !== false;
   // 🌍 Account engine: 'worldbot' = @SwiggyByWorldBot ke buttons click karke
-  // account banega (Swiggy API/proxy/WAF solver bilkul nahi). 'direct' =
-  // purana bridge flow. START op explicit opts jeetta hai.
-  const accountEngine = String(
+  // account banega. 'toing_pro' = Toing Pro Web flow (storelex.store API).
+  // 'direct' = Chromium bridge flow. START op explicit opts jeetta hai.
+  const rawEngine = String(
     opts.accountEngine || s('accountEngine', 'direct') || 'direct'
-  ).trim().toLowerCase() === 'worldbot' ? 'worldbot' : 'direct';
+  ).trim().toLowerCase();
+  const accountEngine = ['worldbot', 'toing_pro'].includes(rawEngine) ? rawEngine : 'direct';
   const worldBotMode = accountEngine === 'worldbot';
+  const toingProMode = accountEngine === 'toing_pro';
+  const bypassBridgeMode = worldBotMode || toingProMode;
   const allowOffline = s('allowOffline', String(process.env.PREMIUM_ALLOW_OFFLINE_DEVICES || '') === '1') === true;
   const telegramSetting = s('telegramOtpMode', false) === true;
   const resolvedSourceMode = resolveAutopilotNumberSource({
     ...opts,
     telegramSetting,
   });
-  // 🌍 World Bot mode me Swiggy ka kaam bot karta hai; number + OTP do jagah
-  // se aa sakte hain:
-  //   • Firebase pool (default) — START ka "🌍 SWIGGY BY WORLD"
-  //   • Hermes/Hathi OTP bot  — START ka "🤝 HERMESHU + SWIGGYBYWORLD"
-  // Baaki koi source ho to Firebase par lock kar do.
-  const sourceMode = worldBotMode
-    ? (resolvedSourceMode === 'telegram' ? 'telegram' : 'firebase')
+  // 🌍 World Bot aur Toing Pro mode me Swiggy ka kaam external server karta hai;
+  // number + OTP telegram OTP bot (Hermes/Hathi) ya Firebase pool se aate hain.
+  const sourceMode = bypassBridgeMode
+    ? (resolvedSourceMode === 'firebase' ? 'firebase' : 'telegram')
     : resolvedSourceMode;
-  if (worldBotMode) {
+  if (toingProMode) {
+    console.log(`[Autopilot] 🌐 Toing Pro mode — number/OTP ${sourceMode === 'telegram' ? 'Telegram OTP bot' : 'Firebase pool'} (Swiggy bridge/WAF OFF).`);
+  } else if (worldBotMode) {
     console.log(`[Autopilot] 🌍 World Bot mode — number source ${sourceMode === 'telegram' ? 'Telegram OTP bot' : 'Firebase pool'} (proxy/WAF OFF).`);
   }
   // Kaunsa OTP bot: START par owner ka selection > bot setting > Hermes.
@@ -1375,6 +1381,7 @@ export async function startAutopilot(opts = {}) {
     neverStop,
     accountEngine,
     worldBotMode,
+    toingProMode,
     timeExtensions: 0,
     infraPauses: 0,
     infraPauseUntil: 0,
@@ -1673,11 +1680,11 @@ export async function startAutopilot(opts = {}) {
     // behavior, koi rukawat nahi.
     const freePromise = (async () => {
       try {
-        // 🌍 World Bot mode: Swiggy ka kaam bot karta hai — proxy ki zaroorat
+        // 🌍 World Bot & Toing Pro mode: Swiggy ka kaam external server karta hai — proxy ki zaroorat
         // hi nahi, isliye fetch/solve bilkul band.
-        if (worldBotMode) {
-          console.log('[Autopilot] 🌍 Swiggy World Bot mode — koi proxy/WAF solve nahi.');
-          return { skipped: true, reason: 'worldbot-mode' };
+        if (worldBotMode || toingProMode) {
+          console.log(`[Autopilot] 🌐 ${toingProMode ? 'Toing Pro' : 'World Bot'} mode — koi proxy/WAF solve nahi.`);
+          return { skipped: true, reason: `${accountEngine}-mode` };
         }
         // Direct mode: proxy fetch/solve bilkul nahi — yahi wo cheez thi jo
         // free CPU par minute kha jati thi aur 4 bots me aapas me ladti thi.
@@ -1922,7 +1929,7 @@ export async function startAutopilot(opts = {}) {
         // PEHLE proxy final karo (free auto-fetch khatam hone do), PHIR token
         // solve karo — aws-waf-token IP-bound hai, galat IP ka token bekar hai.
         await freeStartPromise;
-        if (worldBotMode) return ''; // world bot ko WAF token chahiye hi nahi
+        if (worldBotMode || toingProMode) return ''; // world bot / toing pro ko WAF token chahiye hi nahi
         ps = proxyPool.proxySummary();
         if (ps.enabled) {
           const chosen = rotateProxy();
@@ -1953,8 +1960,8 @@ export async function startAutopilot(opts = {}) {
       // Chrome hi nahi mila aur saved token bhi nahi → har OTP par 403 pakki
       // hai. Pehle ye sirf console me chup chaap reh jata tha aur user ko
       // lagta tha "bot work nahi kar raha" — ab Telegram card par saaf btao.
-      // 🌍 World Bot mode me token/proxy ka concept hi nahi — kuch na dikhao.
-      if (!tok && !worldBotMode) {
+      // 🌍 World Bot & Toing Pro mode me token/proxy ka concept hi nahi — kuch na dikhao.
+      if (!tok && !worldBotMode && !toingProMode) {
         let chrome = null;
         try { chrome = getChromeStatus(); } catch {}
         if (chrome && !chrome.found) {
@@ -2912,6 +2919,7 @@ export async function startAutopilot(opts = {}) {
     // 🌍 World Bot ek hi Telegram chat par chalta hai — 2 lanes = do flows
     // ek hi screen par = gadbad. Isliye hamesha 1 lane, chahe setting kuch bhi.
     if (worldBotMode) laneCount = 1;
+    if (toingProMode) laneCount = 1;
     state.concurrency = laneCount;
     state.requestedConcurrency = requestedConcurrency;
     lanes = Array.from({ length: laneCount }, (_, i) => ({
@@ -2928,8 +2936,8 @@ export async function startAutopilot(opts = {}) {
       routePrepNoticeAt: 0,
       rawRouteOkKey: '',
     }));
-    // World Bot me route/proxy ka koi kaam nahi — allocator ko chhedo hi nahi.
-    if (!worldBotMode) {
+    // World Bot & Toing Pro me route/proxy ka koi kaam nahi — allocator ko chhedo hi nahi.
+    if (!worldBotMode && !toingProMode) {
       for (const lane of lanes) ensureLaneRoute(lane);
       syncRouteSummaryState();
     } else {
@@ -3036,15 +3044,15 @@ export async function startAutopilot(opts = {}) {
             continue;
           }
 
-          // 🌍 World Bot mode me IP/route ka koi matlab nahi (Swiggy call hi
+          // 🌍 World Bot & Toing Pro mode me IP/route ka koi matlab nahi (Swiggy call hi
           // hum nahi karte) — lane ko proxy/WAF token dene ki koshish skip.
-          if (!worldBotMode && !ensureLaneRoute(lane)) {
+          if (!worldBotMode && !toingProMode && !ensureLaneRoute(lane)) {
             await waitForRouteChange(1_000);
             continue;
           }
           // Hermes number claim karne se pehle is lane ki IP/WAF haalat
           // tayyar karo. Route ready na ho to FIND/NEW bilkul nahi chalega.
-          if (telegramMode && !(await prepareLaneRouteBeforeClaim(lane))) {
+          if (!worldBotMode && !toingProMode && telegramMode && !(await prepareLaneRouteBeforeClaim(lane))) {
             await waitForRouteChange(1_000);
             continue;
           }
@@ -3139,7 +3147,7 @@ export async function startAutopilot(opts = {}) {
 
       // WAF warm-up background me chal raha tha — pehla OTP iske baghair na jaye.
       // Owner ne isi beech SKIP kar diya ho to warm-up ka wait bhi mat karo.
-      if (!worldBotMode && !isAutopilotSkipRequested(entry.phone)) await ensureWarm();
+      if (!worldBotMode && !toingProMode && !isAutopilotSkipRequested(entry.phone)) await ensureWarm();
 
       // Scan se aaye number ka prechecked last-seen pipeline ko dedo — wahi
       // device dobara fetch nahi hoga. Agar ye device base window miss ke
@@ -3204,7 +3212,7 @@ export async function startAutopilot(opts = {}) {
         }, {
           owner: lane.owner,
           releaseOnExit: false,
-          wafTokenMode: !worldBotMode && laneCount > 1 && lane.proxy?.id ? 'defer-until-challenge' : '',
+          wafTokenMode: !worldBotMode && !toingProMode && laneCount > 1 && lane.proxy?.id ? 'defer-until-challenge' : '',
         });
       // SKIP kisi lambay bridge step ke bilkul aakhir me aaya ho tab bhi
       // tally se pehle manual outcome hi jeetega — ye number fresh count

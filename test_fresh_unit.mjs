@@ -5004,11 +5004,11 @@ Thanks`)),
   'START: Chromium option ka engine direct hai');
   ok(autoResumeSrc.includes('startSourcePresetSettings(preset)'),
     'START: preset dabate hi settings lock (engine + OTP bot)');
-  ok(autoResumeSrc.includes("accountEngine: bs.getSetting('accountEngine') === 'worldbot' ? 'worldbot' : 'direct'"),
+  ok(autoResumeSrc.includes("accountEngine: bs.getSetting('accountEngine') === 'worldbot' ? 'worldbot' : (bs.getSetting('accountEngine') === 'toing_pro' ? 'toing_pro' : 'direct')"),
     'START: engine choice batch ke saath lock hota hai');
 
   // World bot mode me Hermes source allowed hai (combined preset).
-  ok(src.includes("resolvedSourceMode === 'telegram' ? 'telegram' : 'firebase'"),
+  ok(src.includes("resolvedSourceMode === 'firebase' ? 'firebase' : 'telegram'"),
     'worldbot: combined preset me Hermes number-source allowed');
 
   // -------------------------------------------------------------------------
@@ -5327,7 +5327,7 @@ Thanks`)),
   ok(wbBotSrc.includes("const diagWorld = bs.getSetting('accountEngine') === 'worldbot'")
     && wbBotSrc.includes('if (!diagWorld) {'),
   'diag: World Bot mode me Chrome/WAF token/proxy fields chhupe rehte hain');
-  ok(wbBotSrc.includes("...(bs.getSetting('accountEngine') === 'worldbot' ? [] : [[{")
+  ok(wbBotSrc.includes("...(['worldbot', 'toing_pro'].includes(bs.getSetting('accountEngine')) ? [] : [{")
     && wbBotSrc.includes('🌍 World Bot ON'),
   'settings: World Bot mode me Proxies button nahi, purana button neutral card deta hai');
   ok(!/koi proxy\/WAF nahi/.test(wbBotSrc) && !/koi proxy\/WAF nahi/.test(wbPipelineSrc),

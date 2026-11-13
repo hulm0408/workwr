@@ -113,7 +113,7 @@ export async function processSingleNumberViaToingPro({
     `⏳ Checking number status on Toing Pro Web…`,
   ].join('\n'));
 
-  // 1. Check mobile registration status
+  // 1. Check mobile registration status (optional / quick check for is_new flag)
   let isNew = false;
   try {
     const checkRes = await fetch(`${baseUrl}/api/auth/check_mobile`, {
@@ -121,15 +121,15 @@ export async function processSingleNumberViaToingPro({
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ mobile: phone }),
     });
-    if (!checkRes.ok) {
-      const errText = await checkRes.text();
-      return { ok: false, kind: 'toing_check_fail', phone, reason: `check_mobile status ${checkRes.status}: ${errText.slice(0, 100)}` };
+    if (checkRes.ok) {
+      const checkData = await checkRes.json();
+      if (checkData && typeof checkData.registered === 'boolean') {
+        isNew = !checkData.registered;
+      }
     }
-    const checkData = await checkRes.json();
-    isNew = !checkData.registered;
-    console.log(`[ToingPro] check_mobile: ${phone} -> registered=${checkData.registered}, isNew=${isNew}`);
+    console.log(`[ToingPro] check_mobile for ${phone} -> isNew=${isNew}`);
   } catch (err) {
-    return { ok: false, kind: 'toing_check_error', phone, reason: `Toing check_mobile connection error: ${err.message}` };
+    console.log(`[ToingPro] check_mobile non-fatal error: ${err.message}, defaulting isNew=false`);
   }
 
   if (aborted()) return abortResult('after_check');
@@ -137,8 +137,7 @@ export async function processSingleNumberViaToingPro({
   await say([
     `🌐 <b>TOING PRO WEB SIGNUP</b>`,
     `📱 Mobile: <code>${phone}</code>`,
-    `ℹ️ Status: <b>${isNew ? '🆕 FRESH / NEW NUMBER' : '🔄 EXISTING / OLD NUMBER'}</b>`,
-    `🚀 Sending OTP via Swiggy gateway (${isNew ? 'New user signup' : 'Existing login'})…`,
+    `🚀 Sending OTP via Swiggy gateway…`,
   ].join('\n'));
 
   // 2. Send OTP

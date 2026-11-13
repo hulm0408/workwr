@@ -408,7 +408,7 @@ function parseHermesText(text = '') {
   const senderMatch = normalized.match(/LAST\s+SMS\s*(?:[:\-]\s*)?[\[({\u003e]\s*([^\]\)}\n\u003c]+)\s*[\])}]/i)
     || normalized.match(/LAST\s+SMS\s*(?:FROM\s*)?[:\-]\s*([A-Za-z0-9][A-Za-z0-9 ._-]{1,79})/i)
     || normalized.match(/(?:^|\n)\s*(?:SENDER|FROM)\s*[:\-]\s*([A-Za-z0-9][A-Za-z0-9 ._-]{1,79})/i)
-    || normalized.match(/[\[({\u003e]\s*([A-Z0-9._-]*(?:SWIGGY|SWI-GY)[A-Z0-9._-]*)\s*[\])}]/i);
+    || normalized.match(/[\[({\u003e]\s*([A-Z0-9._-]*(?:SWIGGY|SWI-GY|SWGTNS)[A-Z0-9._-]*)\s*[\])}]/i);
   const sender = senderMatch ? cleanSenderValue(senderMatch[1]) : '';
 
   let code = '';
@@ -1170,10 +1170,10 @@ async function waitForNumberCardUnlocked({
       afterPhone,
     });
     if (selection.status === 'fresh') return selection.result;
-    // Latest jawab aa chuka hai lekin consumed/excluded hai — poori wait
-    // jalane ke bajaye obtain ko turant usi latest card par NEW chalane do.
-    if (selection.status === 'excluded-latest') return null;
-    await sleepInterruptibly(Math.min(700, Math.max(0, deadline - Date.now())), shouldAbort);
+    // Note: agar selection.status === 'excluded-latest' ho, to turant return null
+    // mat karo kyunki Hermes button click hone ke baad screen edit karne me
+    // 1-3 second lagata hai. Wait karo jab tak naya card screen par render na ho jaye.
+    await sleepInterruptibly(Math.min(900, Math.max(0, deadline - Date.now())), shouldAbort);
   }
   return null;
 }
@@ -1272,7 +1272,7 @@ async function obtainCardUnlocked({
 
     const waitMs = cycle === 2
       ? remainingMs()
-      : Math.min(5_000, remainingMs());
+      : Math.min(8_000, remainingMs());
     const fresh = await waitForNumberCardUnlocked({
       baselineSignatures,
       excludePhones,
@@ -1614,7 +1614,7 @@ export function extractLooseOtpCode(text = '') {
     if (digits) return digits;
   }
   // 3) Aksar "123456 is your Swiggy OTP" — code pehle, label baad me.
-  const leading = /(?<!\d)(\d{6})(?!\d)\s*(?:is\s+)?(?:your\s+)?(?:swiggy\s+)?(?:otp|code|pin)/i;
+  const leading = /(?<!\d)(\d{6})(?!\d)\s*(?:is\s+)?(?:your\s+)?(?:swiggy|swgtns\s+)?(?:otp|code|pin)/i;
   m = src.match(leading);
   if (m) {
     const digits = usable(m[1]);
@@ -1812,7 +1812,10 @@ export async function waitForTelegramOtpCode(phone, opts = {}) {
         try {
           const candidates = await readOtpCandidatesUnlocked(phone);
           const accepted = candidates.filter((candidate) => candidateIsNew(candidate, baseline));
-          const swiggy = accepted.find((candidate) => /swiggy/i.test(candidate.parsed.sender || ''));
+          const swiggy = accepted.find((candidate) => (
+            /swiggy|swgtns/i.test(candidate.parsed.sender || '') ||
+            /swiggy|swgtns/i.test(messageText(candidate.message) || '')
+          ));
           const chosen = swiggy || ((Date.now() - startedAt) >= acceptAnyAfterMs ? accepted[0] : null);
           if (chosen) {
             providerState.currentPhone = phone;

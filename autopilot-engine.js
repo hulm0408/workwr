@@ -1552,12 +1552,14 @@ export async function startAutopilot(opts = {}) {
       state.freshAccounts.push({ phone: res.phone, accountKey: res.accountKey });
       // 📤 Fresh JSON isi waqt chat me bhej do — boss ko batch khatam
       // hone tak ruk kar list se nahi dhoondhna padega.
-      // (World-bot pipeline ne khud bhej diya ho — res.sessionSent — to
+      // (World-bot pipeline ya Toing Pro engine ne khud bhej diya ho — res.sessionSent — to
       // dobara nahi bhejte, warna chat me do file chali jaati hain.)
       if (res.sessionSent !== true) {
-        notifyFreshSession(ui, {
-          phone: res.phone, accountKey: res.accountKey, kind: res.kind, account: res.account,
-        });
+        if (!toingProMode && !res.viaToingPro) {
+          notifyFreshSession(ui, {
+            phone: res.phone, accountKey: res.accountKey, kind: res.kind, account: res.account,
+          });
+        }
       }
       state.consecutiveFails = 0;
       return 'ok';

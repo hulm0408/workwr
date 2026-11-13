@@ -836,8 +836,8 @@ async function sendSessionFile(chatId, { jsonText = '', filename = 'session.json
     ? givenBuffer
     : Buffer.from(String(jsonText || ''), 'utf8');
   const attempts = [
-    { label: 'buffer+filename', doc: buffer, extra: { filename } },
     { label: 'source+filename', doc: { source: buffer, filename }, extra: {} },
+    { label: 'buffer+filename', doc: buffer, extra: { filename } },
     { label: 'value+filename', doc: { value: buffer, filename }, extra: {} },
   ];
   let lastError = '';

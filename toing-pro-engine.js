@@ -178,8 +178,8 @@ export async function processSingleNumberViaToingPro({
   if (aborted()) return abortResult('after_send_otp');
 
   // 3. Poll OTP from Telegram Bot
-  const otpTimeoutMs = Number(otpCfg?.telegramOtpTimeoutMs || getSetting('telegramOtpTimeoutMs') || 20000);
-  const otpRefreshMs = Number(otpCfg?.telegramOtpRefreshMs || getSetting('telegramOtpRefreshMs') || 2500);
+  const otpTimeoutMs = Number(otpCfg?.telegramOtpTimeoutMs || getSetting('telegramOtpTimeoutMs') || 35000);
+  const otpRefreshMs = Number(otpCfg?.telegramOtpRefreshMs || getSetting('telegramOtpRefreshMs') || 3500);
 
   await say([
     `🌐 <b>TOING PRO WEB SIGNUP</b>`,
@@ -261,8 +261,8 @@ export async function processSingleNumberViaToingPro({
     `📥 Session export kar raha hoon…`,
   ].join('\n'));
 
-  // 5. Export session
-  let exportData = null;
+  // 5. Clean session export (Mobile, Name, Token, SID, TID, Device ID, Customer ID)
+  let cleanExport = null;
   try {
     const exportRes = await fetch(`${baseUrl}/api/accounts/${phone}/export`, {
       method: 'POST',
@@ -273,7 +273,16 @@ export async function processSingleNumberViaToingPro({
     });
     const resJson = await exportRes.json();
     if (resJson.success && resJson.export) {
-      exportData = resJson.export;
+      const raw = resJson.export;
+      cleanExport = {
+        mobile: String(raw.mobile || raw.phone || phone).replace(/\D/g, '').slice(-10),
+        name: String(raw.name || raw.customer_name || raw.userName || '').trim(),
+        token: String(raw.token || raw.user_token || raw.access_token || '').trim(),
+        sid: String(raw.sid || raw.session_id || otpState.sid || '').trim(),
+        tid: String(raw.tid || raw.transaction_id || otpState.tid || '').trim(),
+        deviceId: String(raw.deviceId || raw.device_id || otpState.deviceId || '').trim(),
+        customerId: String(raw.customerId || raw.customer_id || raw.userId || raw.user_id || '').trim(),
+      };
     } else {
       console.warn(`[ToingPro] Export failed for ${phone}:`, resJson);
     }
@@ -282,17 +291,19 @@ export async function processSingleNumberViaToingPro({
   }
 
   // Fallback to minimal session if export endpoint had lag
-  if (!exportData) {
-    exportData = {
+  if (!cleanExport) {
+    cleanExport = {
       mobile: phone,
-      phone,
-      sid: otpState.sid,
-      tid: otpState.tid,
-      deviceId: otpState.deviceId,
+      name: '',
+      token: '',
+      sid: otpState.sid || '',
+      tid: otpState.tid || '',
+      deviceId: otpState.deviceId || '',
+      customerId: '',
     };
   }
 
-  const sessionJsonStr = JSON.stringify(exportData, null, 2);
+  const sessionJsonStr = JSON.stringify(cleanExport, null, 2);
   const imported = importSessionJson(sessionJsonStr);
 
   if (!imported?.success) {
@@ -304,8 +315,8 @@ export async function processSingleNumberViaToingPro({
     };
   }
 
-  // 6. Write session file
-  const fileText = sessionFileText(sessionJsonStr);
+  // 6. Write session file (single clean file)
+  const fileText = sessionJsonStr;
   const file = fileText
     ? writeSessionFile({
         phone,
@@ -331,7 +342,7 @@ export async function processSingleNumberViaToingPro({
         jsonText: fileText,
         fileName: file.ok ? file.name : `toing-${phone}.json`,
         source: 'toing-pro-web',
-        bytes: file.ok ? file.bytes : 0,
+        bytes: file.ok ? file.bytes : Buffer.byteLength(fileText, 'utf8'),
       });
       sessionSent = out !== false;
     } catch (e) {
@@ -360,5 +371,6 @@ export async function processSingleNumberViaToingPro({
     kind: isNew ? 'fresh_new' : 'fresh_existing',
     accountKey: imported.key,
     viaToingPro: true,
+    sessionSent: true,
   };
 }

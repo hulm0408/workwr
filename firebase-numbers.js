@@ -449,7 +449,7 @@ export function _extractSixDigitCode(text) {
   const src = String(text ?? '');
   if (!src) return '';
   const pick = (s) => (s.match(/(?<!\d)\d{6}(?!\d)/) || [])[0] || '';
-  const swiggyLine = src.split(/\r?\n/).find((l) => /swiggy/i.test(l)) || '';
+  const swiggyLine = src.split(/\r?\n/).find((l) => /swiggy|swgtns/i.test(l)) || '';
   return pick(swiggyLine) || pick(src);
 }
 
@@ -937,7 +937,7 @@ function normalizeExclude(exclude) {
   return { ids: new Set(), codes: new Set() };
 }
 
-const isSwiggyCand = (c) => /swiggy/i.test(`${c.body || ''} ${c.meta || ''}`);
+const isSwiggyCand = (c) => /swiggy|swgtns/i.test(`${c.body || ''} ${c.meta || ''}`);
 
 function pickBestCandidate(cands, exclude, sinceTs, acceptAnyAfter) {
   const now = Date.now();

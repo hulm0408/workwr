@@ -6,15 +6,14 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { createHash, createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { registerGoldDrop, verifyGoldDropOtp } from './_gold-drop.js';
+import { registerGoldDrop, verifyGoldDropOtp, checkCaptchaKeyBalance, isFatalCaptchaKeyError } from './_gold-drop.js';
 
 if (!process.env.DATA_DIR && process.env.VERCEL) {
   process.env.DATA_DIR = '/tmp/workwr-data';
 }
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
-const NOCAP_API = 'https://api.nocaptchaai.com';
-const NOCAP_KEY_DEFAULT = process.env.NOCAP_API_KEY || 'nocap_eVBzrYeejjgKLoikEErH6lbP';
+const NOCAP_KEY_DEFAULT = process.env.NOCAP_API_KEY || '';
 const DEFAULT_PHOTO_URL = 'https://raw.githubusercontent.com/hulm0408/workwr/main/gold-drop-vercel/api/gold-drop-pack.jpg';
 const MAX_TG_ACCOUNTS = 50;
 let cachedDefaultPhoto = '';
@@ -188,12 +187,18 @@ async function processNumber(mobile) {
     state.message = 'OTP bot me aaya 6-digit code yahan daalo';
     return { ok: true, status: state.status, message: state.message, session: res.session, mobile };
   } catch (error) {
-    const message = String(error?.message || error).slice(0, 200);
+    const message = String(error?.message || error).slice(0, 220);
+    const fatalCaptcha = isFatalCaptchaKeyError(message);
     logLine(`❌ ${mobile} — ${message}`);
     const result = { mobile, ok: false, message };
     state.results.push(result);
     state.count = state.results.length;
     state.session = null;
+    if (fatalCaptcha) {
+      state.status = 'done';
+      state.message = `⛔ Captcha key error — run roka gaya taaki baaki numbers waste na hon: ${message}`;
+      return { ok: true, status: state.status, message: state.message, session: null, result, fatalCaptcha: true };
+    }
     if (state.results.length >= state.target) {
       state.status = 'done';
       state.message = `${state.target} numbers process ho gaye — results neeche`;
@@ -431,9 +436,9 @@ a{color:var(--gold);text-decoration:none}
         <div><label>PIN code</label><input id="pincode" value="509412"></div>
         <div><label>Batch code</label><input id="code" value="KKD2LS01261026"></div>
       </div>
-      <label>NoCaptchaAI API key (security check auto-solve)</label>
-      <input id="nocapKey" value="${NOCAP_KEY_DEFAULT}">
-      <div class="sub" id="nocapbal" style="margin-top:4px">NoCaptchaAI balance check ho raha hai…</div>
+      <label>Captcha Solver API key (NoCaptchaAI / CapSolver / 2Captcha)</label>
+      <input id="nocapKey" value="${NOCAP_KEY_DEFAULT}" placeholder="nocap_... ya CAP-... ya 2captcha key">
+      <div class="sub" id="nocapbal" style="margin-top:4px">Captcha key daalo (NoCaptchaAI / CapSolver / 2Captcha) — purani built-in key expire ho chuki hai</div>
 
       <label>Pack photo (already selected)</label>
       <div class="photo-box">
@@ -532,6 +537,8 @@ var tgState = {
   preRegisterOtpSig: '',
   waitingNextNumber: false,
   samePhoneRetries: 0,
+  invalidatedIds: {},
+  tgQueue: Promise.resolve(),
   botProfile: 'hermes',
   botUsername: '',
   botConfirmedForSession: false,
@@ -793,58 +800,98 @@ function renderTgScreen(s){
   maybeAutoFillFromTelegram(s);
 }
 
+function isSessionInvalidatedMsg(msg){
+  return /(Concurrent usage|invalidated by the server|AUTH_KEY_DUPLICATED|AUTH_KEY_UNREGISTERED|SESSION_REVOKED|not authorized)/i.test(String(msg || ''));
+}
+
+function handleTgAuthError(active, message){
+  if (!active || !isSessionInvalidatedMsg(message)) return false;
+  tgState.invalidatedIds[active.id] = true;
+  $('tgToast').style.display = 'block';
+  $('tgToast').textContent = '⚠️ ' + (active.me || active.phone) + ' ka session Telegram ne invalidate kar diya (Concurrent usage / purana session). "+ Add" dabakar is number ko dubara login karein ya upar se dusra spare account chunein.';
+  if (tgState.accounts.length > 1) {
+    for (var i = 0; i < tgState.accounts.length; i++) {
+      var cand = tgState.accounts[i];
+      if (cand.id !== active.id && !tgState.invalidatedIds[cand.id]) {
+        activateAccount(cand.id);
+        return true;
+      }
+    }
+  }
+  return true;
+}
+
+function enqueueTg(taskFn){
+  var run = tgState.tgQueue.then(taskFn, taskFn);
+  tgState.tgQueue = run.catch(function(){});
+  return run;
+}
+
 function refreshTgCard(opts){
   var active = getActiveAccount();
-  if (!active || tgState.addingNew || tgState.busy) return Promise.resolve(null);
-  tgState.busy = true;
-  $('tgRefreshBtn').disabled = true;
-  return post('/api/tg/card', {
-    accountToken: active.token,
-    botProfile: tgState.botProfile,
-    botUsername: tgState.botUsername,
-    sendStartIfEmpty: Boolean(opts && opts.sendStartIfEmpty),
-  }).then(function(r){
-    tgState.busy = false;
-    $('tgRefreshBtn').disabled = false;
-    if (!r.ok) {
-      $('tgToast').style.display = 'block';
-      $('tgToast').textContent = '⚠️ ' + (r.message || 'Card load fail');
+  if (!active || tgState.addingNew || tgState.invalidatedIds[active.id]) return Promise.resolve(null);
+  if (tgState.busy && !(opts && opts.forceQueue)) return Promise.resolve(null);
+  return enqueueTg(function(){
+    var cur = getActiveAccount();
+    if (!cur || tgState.addingNew || tgState.invalidatedIds[cur.id]) return null;
+    tgState.busy = true;
+    $('tgRefreshBtn').disabled = true;
+    return post('/api/tg/card', {
+      accountToken: cur.token,
+      botProfile: tgState.botProfile,
+      botUsername: tgState.botUsername,
+      sendStartIfEmpty: Boolean(opts && opts.sendStartIfEmpty),
+    }).then(function(r){
+      tgState.busy = false;
+      $('tgRefreshBtn').disabled = false;
+      if (!r.ok) {
+        if (!handleTgAuthError(cur, r.message)) {
+          $('tgToast').style.display = 'block';
+          $('tgToast').textContent = '⚠️ ' + (r.message || 'Card load fail');
+        }
+        return r;
+      }
+      renderTgScreen(r);
       return r;
-    }
-    renderTgScreen(r);
-    return r;
-  }).catch(function(e){
-    tgState.busy = false;
-    $('tgRefreshBtn').disabled = false;
-    $('tgToast').style.display = 'block';
-    $('tgToast').textContent = '⚠️ ' + (e && e.message ? e.message : 'Network error');
-    return { ok: false, message: 'Network error' };
+    }).catch(function(e){
+      tgState.busy = false;
+      $('tgRefreshBtn').disabled = false;
+      $('tgToast').style.display = 'block';
+      $('tgToast').textContent = '⚠️ ' + (e && e.message ? e.message : 'Network error');
+      return { ok: false, message: 'Network error' };
+    });
   });
 }
 
 function clickTgButton(payload){
   var active = getActiveAccount();
-  if (!active || tgState.addingNew || tgState.busy) return Promise.resolve(null);
-  tgState.busy = true;
-  $('tgRefreshBtn').disabled = true;
-  return post('/api/tg/click', Object.assign({
-    accountToken: active.token,
-    botProfile: tgState.botProfile,
-    botUsername: tgState.botUsername,
-  }, payload || {})).then(function(r){
-    tgState.busy = false;
-    $('tgRefreshBtn').disabled = false;
-    if (!r.ok) {
-      $('tgToast').style.display = 'block';
-      $('tgToast').textContent = '⚠️ ' + (r.message || 'Click fail');
+  if (!active || tgState.addingNew || tgState.invalidatedIds[active.id]) return Promise.resolve(null);
+  return enqueueTg(function(){
+    var cur = getActiveAccount();
+    if (!cur || tgState.addingNew || tgState.invalidatedIds[cur.id]) return null;
+    tgState.busy = true;
+    $('tgRefreshBtn').disabled = true;
+    return post('/api/tg/click', Object.assign({
+      accountToken: cur.token,
+      botProfile: tgState.botProfile,
+      botUsername: tgState.botUsername,
+    }, payload || {})).then(function(r){
+      tgState.busy = false;
+      $('tgRefreshBtn').disabled = false;
+      if (!r.ok) {
+        if (!handleTgAuthError(cur, r.message)) {
+          $('tgToast').style.display = 'block';
+          $('tgToast').textContent = '⚠️ ' + (r.message || 'Click fail');
+        }
+        return r;
+      }
+      renderTgScreen(r);
       return r;
-    }
-    renderTgScreen(r);
-    return r;
-  }).catch(function(){
-    tgState.busy = false;
-    $('tgRefreshBtn').disabled = false;
-    return { ok: false, message: 'Network error' };
+    }).catch(function(){
+      tgState.busy = false;
+      $('tgRefreshBtn').disabled = false;
+      return { ok: false, message: 'Network error' };
+    });
   });
 }
 
@@ -985,6 +1032,7 @@ $('tgVerifyCodeBtn').onclick = function(){
     if (idx >= 0) tgState.accounts[idx] = newEntry;
     else if (tgState.accounts.length < MAX_ACCOUNTS) tgState.accounts.push(newEntry);
 
+    delete tgState.invalidatedIds[newEntry.id];
     tgState.activeId = newEntry.id;
     tgState.addingNew = false;
     tgState.loginToken = '';
@@ -1030,7 +1078,7 @@ function loadFormDefaults(){
     if (f.email) $('email').value = f.email;
     if (f.pincode) $('pincode').value = f.pincode;
     if (f.code) $('code').value = f.code;
-    if (f.nocapKey) $('nocapKey').value = f.nocapKey;
+    if (f.nocapKey && f.nocapKey !== 'nocap_eVBzrYeejjgKLoikEErH6lbP') $('nocapKey').value = f.nocapKey;
     if (f.target) $('target').value = f.target;
   } catch {}
 }
@@ -1121,7 +1169,10 @@ function submitMobile(m){
     localRun.status = r.status;
     localRun.message = r.message;
     if (r.result) { localRun.results.push(r.result); localRun.count = localRun.results.length; }
-    if (localRun.results.length >= localRun.target) {
+    if (r.fatalCaptcha) {
+      localRun.status = 'done';
+      localRun.message = r.message || '⛔ Captcha key error — run roka gaya';
+    } else if (localRun.results.length >= localRun.target) {
       localRun.status = 'done';
       localRun.message = localRun.target + ' numbers process ho gaye — results neeche';
     }
@@ -1129,7 +1180,7 @@ function submitMobile(m){
       r.log.forEach(function(line){ if (localRun.log.indexOf(line) === -1) localRun.log.push(line); });
     }
     paint(localRun);
-    if (autoSync && localRun.status === 'need_number' && getActiveAccount()) {
+    if (!r.fatalCaptcha && autoSync && localRun.status === 'need_number' && getActiveAccount()) {
       setTimeout(requestNextNumberFromTelegram, 900);
     }
   }).catch(function(err){
@@ -1279,13 +1330,14 @@ function pollGd(){
 }
 
 setInterval(function(){
-  if (!getActiveAccount() || tgState.addingNew || !tgState.autoPoll || tgState.busy) return;
+  var active = getActiveAccount();
+  if (!active || tgState.addingNew || !tgState.autoPoll || tgState.busy || tgState.invalidatedIds[active.id]) return;
   if (localRun.active && localRun.status === 'need_otp' && autoSync) {
     clickTgButton({ action: 'refresh' });
-  } else {
+  } else if (!localRun.active || localRun.status === 'idle' || localRun.status === 'done') {
     refreshTgCard();
   }
-}, 2500);
+}, 4000);
 
 setInterval(pollGd, 2500);
 loadBotChoice();
@@ -1501,8 +1553,9 @@ export default async function handler(req, res) {
         sendJson(res, 401, { ok: false, message: 'Spare Telegram account connect nahi hai.' });
         return;
       }
+      let tg = null;
       try {
-        const tg = await loadTgMod();
+        tg = await loadTgMod();
         const screen = await tg.withTelegramAccountContext({
           userId: tgSess.phone || 'web',
           apiId: tgSess.apiId,
@@ -1514,7 +1567,11 @@ export default async function handler(req, res) {
         }, () => tg.readTelegramOtpScreen({ limit: 10, sendStartIfEmpty: Boolean(body.sendStartIfEmpty) }));
         sendJson(res, 200, screen);
       } catch (err) {
-        sendJson(res, 400, { ok: false, message: String(err?.message || err).slice(0, 200) });
+        sendJson(res, 400, { ok: false, message: String(err?.message || err).slice(0, 220) });
+      } finally {
+        if (process.env.VERCEL && tg?.disconnectTelegramUserClient) {
+          await tg.disconnectTelegramUserClient().catch(() => {});
+        }
       }
       return;
     }
@@ -1526,8 +1583,9 @@ export default async function handler(req, res) {
         sendJson(res, 401, { ok: false, message: 'Spare Telegram account connect nahi hai.' });
         return;
       }
+      let tg = null;
       try {
-        const tg = await loadTgMod();
+        tg = await loadTgMod();
         const screen = await tg.withTelegramAccountContext({
           userId: tgSess.phone || 'web',
           apiId: tgSess.apiId,
@@ -1546,7 +1604,11 @@ export default async function handler(req, res) {
         }));
         sendJson(res, 200, screen);
       } catch (err) {
-        sendJson(res, 400, { ok: false, message: String(err?.message || err).slice(0, 200) });
+        sendJson(res, 400, { ok: false, message: String(err?.message || err).slice(0, 220) });
+      } finally {
+        if (process.env.VERCEL && tg?.disconnectTelegramUserClient) {
+          await tg.disconnectTelegramUserClient().catch(() => {});
+        }
       }
       return;
     }
@@ -1617,11 +1679,10 @@ export default async function handler(req, res) {
       const body = await readBody(req);
       const key = String(body.key || NOCAP_KEY_DEFAULT);
       try {
-        const r = await fetch(`${NOCAP_API}/balance?apiKey=${encodeURIComponent(key)}`, { signal: AbortSignal.timeout(15000) }).then(x => x.json());
-        if (String(r.status || '').toLowerCase() !== 'ok') { sendJson(res, 200, { message: `⚠️ Balance check fail: ${r.error || r.msg || 'unknown'} — key sahi hai?` }); return; }
-        sendJson(res, 200, { message: `💰 NoCaptchaAI balance: $${r.Balance ?? r.balance} (${r.Subscription === 'active' ? 'active' : r.Subscription || '—'})` });
+        const out = await checkCaptchaKeyBalance(key);
+        sendJson(res, 200, { ok: out.ok, message: out.message });
       } catch (error) {
-        sendJson(res, 200, { message: `⚠️ Balance check fail: ${String(error?.message || error).slice(0, 100)}` });
+        sendJson(res, 200, { ok: false, message: `⚠️ Balance check fail: ${String(error?.message || error).slice(0, 120)}` });
       }
       return;
     }

@@ -1228,9 +1228,10 @@ bot.start(async (ctx) => {
       `<code>OWNER_IDS=${ctx.from?.id}</code>`,
       ``,
       sub('Phir dobara chalayein (npm start) aur /start dabayein.'),
-    ].join('\n'))).catch(() => {});
+    ].join('\n'))).catch((e) => console.warn('[FreshBot] /start gate reply:', e?.message || e));
   }
-  await ctx.reply(startCard(), kb(isAutopilotRunning() ? stopRows() : startRows())).catch(() => {});
+  await ctx.reply(startCard(), kb(isAutopilotRunning() ? stopRows() : startRows()))
+    .catch((e) => console.warn('[FreshBot] /start reply:', e?.message || e));
 });
 
 bot.help((ctx) => ctx.reply([
@@ -2390,14 +2391,28 @@ async function handleTelegramLoginText(ctx, txt, rawMessageText) {
 }
 
 const editOrSend = async (ctx, text, rows) => {
-  await ctx.editMessageText(text, kb(rows))
-    .catch(async () => { await ctx.reply(text, kb(rows)).catch(() => {}); });
+  try {
+    await ctx.editMessageText(text, kb(rows));
+  } catch (e) {
+    const msg = String(e?.message || e || '');
+    if (/message is not modified/i.test(msg)) return;
+    console.warn('[FreshBot] editMessageText failed:', msg.slice(0, 180));
+    try {
+      await ctx.reply(text, kb(rows));
+    } catch (e2) {
+      console.warn('[FreshBot] reply fallback failed:', String(e2?.message || e2 || '').slice(0, 180));
+      const plainText = String(text || '').replace(/<[^>]+>/g, '');
+      await ctx.reply(plainText, { reply_markup: { inline_keyboard: rows } }).catch(() => {});
+    }
+  }
 };
 
 bot.action('ap_settings', async (ctx) => {
   if (!(await gate(ctx))) return;
-  await ctx.answerCbQuery().catch(() => {});
-  await editOrSend(ctx, settingsCard(), settingsRows());
+  await Promise.allSettled([
+    ctx.answerCbQuery().catch(() => {}),
+    editOrSend(ctx, settingsCard(), settingsRows()),
+  ]);
 });
 
 bot.action('ap_diag', async (ctx) => {
@@ -4649,31 +4664,50 @@ function startTelegramWatchdog() {
   telegramWatchdogTimer.unref?.();
 }
 
+async function raceWithCleanTimeout(promise, ms) {
+  let timer = null;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((resolve) => {
+        timer = setTimeout(() => resolve(null), ms);
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 let _botInitPromise = null;
 export async function ensureBotInitialized() {
   if (_botInitPromise) return _botInitPromise;
   _botInitPromise = (async () => {
     const isServerless = Boolean(process.env.VERCEL);
-    const vaultMs = isServerless ? 6_000 : 12_000;
-    const linkedMs = isServerless ? 8_000 : 20_000;
+    const vaultMs = isServerless ? 4_000 : 12_000;
+    const linkedMs = isServerless ? 5_000 : 20_000;
 
-    try {
-      const hydrated = await Promise.race([
-        hydrateAccountsFromCloudVault(),
-        sleepMs(vaultMs).then(() => null),
-      ]);
-      if (hydrated) console.log(`[FreshBot] Cloud vault hydrate: ${hydrated.restored}/${hydrated.total} accounts wapas aaye.`);
-    } catch (e) {
-      console.warn('[FreshBot] Cloud vault hydrate skipped:', e?.message || e);
+    if (isServerless && !bot.botInfo) {
+      const botId = Number(String(TOKEN || '').split(':')[0]) || 0;
+      const uname = String(process.env.BOT_USERNAME || 'its_Gold_Drop_bot').replace(/^@+/, '').trim();
+      if (botId > 0 && uname) {
+        bot.botInfo = { id: botId, is_bot: true, first_name: 'GoldDrop', username: uname };
+      }
+    }
+
+    if (String(process.env.GITHUB_VAULT_TOKEN || '').trim()) {
+      try {
+        const hydrated = await raceWithCleanTimeout(hydrateAccountsFromCloudVault(), vaultMs);
+        if (hydrated) console.log(`[FreshBot] Cloud vault hydrate: ${hydrated.restored}/${hydrated.total} accounts wapas aaye.`);
+      } catch (e) {
+        console.warn('[FreshBot] Cloud vault hydrate skipped:', e?.message || e);
+      }
     }
 
     try {
       const linkStatus0 = getDbLinkStatus();
       if (linkStatus0.linked) {
-        const linked = await Promise.race([
-          hydrateFromLinkedDb(),
-          sleepMs(linkedMs).then(() => null),
-        ]);
+        const linked = await raceWithCleanTimeout(hydrateFromLinkedDb(), linkedMs);
         if (linked) {
           console.log(`[FreshBot] 💾 Linked DB (${linkStatus0.driver}) hydrate: ${linked.restored}/${linked.total} accounts wapas aaye.`);
         } else {

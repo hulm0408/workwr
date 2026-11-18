@@ -138,18 +138,55 @@ export function bullet(text) {
 }
 
 // Bordered section block (Telegram <blockquote> renders as a card with a left border).
-// Title ab in bots jaisa:  —[ ⚡ TITLE ]—  + niche patli line.
-// `body` is trusted internal HTML already built with esc()/field()/table()/heading()/sub().
+// Telegram Bot API rejects nested <blockquote> tags ("Nested blockquote tags are
+// not allowed"). When `body` already contains a <blockquote ...>...</blockquote>
+// (for example `details()` or an error quote), split around it so every
+// blockquote stays top-level.
+function wrapSection(header, body) {
+  const rawBody = String(body ?? '');
+  const innerBlockRe = /(<blockquote(?:\s+expandable)?>[\s\S]*?<\/blockquote>)/gi;
+  if (!innerBlockRe.test(rawBody)) {
+    return `<blockquote>${header}${rawBody}</blockquote>\n`;
+  }
+  innerBlockRe.lastIndex = 0;
+  const parts = rawBody.split(innerBlockRe);
+  const out = [];
+  let headerEmitted = false;
+  for (const part of parts) {
+    if (!part) continue;
+    if (/^<blockquote(?:\s+expandable)?>[\s\S]*<\/blockquote>$/i.test(part)) {
+      if (!headerEmitted && header) {
+        out.push(`<blockquote>${header.trimEnd()}</blockquote>`);
+        headerEmitted = true;
+      }
+      out.push(part);
+      continue;
+    }
+    const trimmed = part.replace(/^\n+|\n+$/g, '');
+    if (!trimmed) continue;
+    if (!headerEmitted) {
+      out.push(`<blockquote>${header}${trimmed}</blockquote>`);
+      headerEmitted = true;
+    } else {
+      out.push(`<blockquote>${trimmed}</blockquote>`);
+    }
+  }
+  if (!headerEmitted && header) {
+    out.unshift(`<blockquote>${header.trimEnd()}</blockquote>`);
+  }
+  return `${out.join('\n')}\n`;
+}
+
 export function section(title, body) {
   const t = title ? `${bracketHeader(title)}\n${headerRule()}\n` : '';
-  return `<blockquote>${t}${body}</blockquote>\n`;
+  return wrapSection(t, body);
 }
 
 // Same card, par header ke saath time chip (in bots ka right-side timestamp).
 export function sectionStamp(title, body, date = new Date()) {
   const time = stamp(date);
   const t = title ? `${bracketHeader(title, { time })}\n${headerRule()}\n` : '';
-  return `<blockquote>${t}${body}</blockquote>\n`;
+  return wrapSection(t, body);
 }
 
 // Bordered card: title + multiple body lines joined by newline

@@ -11,7 +11,21 @@ import { registerGoldDrop, verifyGoldDropOtp } from './_gold-drop.js';
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const NOCAP_API = 'https://api.nocaptchaai.com';
 const NOCAP_KEY_DEFAULT = process.env.NOCAP_API_KEY || 'nocap_eVBzrYeejjgKLoikEErH6lbP';
-const DEFAULT_PHOTO = readFileSync(path.join(ROOT, 'gold-drop-pack.jpg')).toString('base64');
+const DEFAULT_PHOTO_URL = 'https://raw.githubusercontent.com/hulm0408/workwr/main/gold-drop-vercel/api/gold-drop-pack.jpg';
+let cachedDefaultPhoto = '';
+
+async function getDefaultPhoto() {
+  if (cachedDefaultPhoto) return cachedDefaultPhoto;
+  try {
+    cachedDefaultPhoto = readFileSync(path.join(ROOT, 'gold-drop-pack.jpg')).toString('base64');
+    return cachedDefaultPhoto;
+  } catch {
+    const res = await fetch(DEFAULT_PHOTO_URL, { signal: AbortSignal.timeout(15000) });
+    if (!res.ok) throw new Error(`Default photo fetch failed: HTTP ${res.status}`);
+    cachedDefaultPhoto = Buffer.from(await res.arrayBuffer()).toString('base64');
+    return cachedDefaultPhoto;
+  }
+}
 
 // ─── LOGIN (public Vercel URL hai — password ke bina koi use na kar paye) ───
 const APP_PASSWORD = process.env.APP_PASSWORD || 'rahul@123';
@@ -88,10 +102,13 @@ async function processNumber(mobile) {
     logLine(`✅ Register ho gaya — ${res.message}. OTP ka wait…`);
     state.status = 'need_otp';
     state.message = 'OTP bot me aaya 6-digit code yahan daalo';
+    return { ok: true, status: state.status, message: state.message, session: res.session, mobile };
   } catch (error) {
     const message = String(error?.message || error).slice(0, 200);
     logLine(`❌ ${mobile} — ${message}`);
-    state.results.push({ mobile, ok: false, message });
+    const result = { mobile, ok: false, message };
+    state.results.push(result);
+    state.count = state.results.length;
     state.session = null;
     if (state.results.length >= state.target) {
       state.status = 'done';
@@ -100,25 +117,31 @@ async function processNumber(mobile) {
       state.status = 'need_number';
       state.message = 'Agla number daalo';
     }
+    return { ok: true, status: state.status, message: state.message, session: null, result };
   }
 }
 
 async function processOtp(otp) {
   state.status = 'working';
   state.message = 'OTP verify ho raha hai…';
-  logLine(`🔐 ${state.mobile} — OTP verify…`);
+  const mobile = state.mobile;
+  logLine(`🔐 ${mobile} — OTP verify…`);
+  let result;
   try {
     const res = await verifyGoldDropOtp({ session: state.session, otp });
     const rewardText = res.reward?.name ? ` 🎁 ${res.reward.name} (${res.reward.faceValue})` : '';
-    logLine(`✅ ${state.mobile} verified — ${res.message}${rewardText}. Reward SMS ab phone par aayega.`);
-    state.results.push({ mobile: state.mobile, ok: true, message: `${res.message}${rewardText}` });
+    logLine(`✅ ${mobile} verified — ${res.message}${rewardText}. Reward SMS ab phone par aayega.`);
+    result = { mobile, ok: true, message: `${res.message}${rewardText}` };
+    state.results.push(result);
   } catch (error) {
     const message = String(error?.message || error).slice(0, 200);
-    logLine(`❌ ${state.mobile} — ${message}`);
-    state.results.push({ mobile: state.mobile, ok: false, message });
+    logLine(`❌ ${mobile} — ${message}`);
+    result = { mobile, ok: false, message };
+    state.results.push(result);
   }
   state.session = null;
   state.mobile = '';
+  state.count = state.results.length;
   if (state.results.length >= state.target) {
     state.status = 'done';
     state.message = `${state.target} numbers process ho gaye — results neeche`;
@@ -126,6 +149,7 @@ async function processOtp(otp) {
     state.status = 'need_number';
     state.message = 'Agla number daalo';
   }
+  return { ok: true, status: state.status, message: state.message, result };
 }
 
 // ─── UI ───
@@ -171,6 +195,7 @@ button.secondary{background:#232845;color:#e8eaf2}
 </div>
 <script>
 var pollTimer = null;
+var localRun = { active: false, status: 'idle', message: '', target: 1, count: 0, mobile: '', details: null, session: null, results: [], log: [] };
 function $(id){return document.getElementById(id)}
 function post(url, body){return fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})}).then(function(r){return r.json()})}
 function show(id,on){$(id).style.display=on?'block':'none'}
@@ -185,14 +210,28 @@ function paint(s){
   var r = $('results');
   if (s.results.length){ r.style.display='block'; r.textContent = s.results.map(function(x){return (x.ok?'✅':'❌')+' '+x.mobile+' — '+x.message}).join('\\n'); }
 }
-function poll(){ fetch('/state').then(function(r){return r.json()}).then(paint).catch(function(){}) }
+function poll(){
+  fetch('/state').then(function(r){return r.json()}).then(function(s){
+    if (localRun.active && s.status === 'idle') return;
+    if (s.log && s.log.length >= localRun.log.length && s.results && s.results.length >= localRun.results.length) {
+      localRun.status = s.status;
+      localRun.message = s.message;
+      localRun.count = s.count;
+      localRun.target = s.target;
+      localRun.results = s.results;
+      localRun.log = s.log;
+    }
+    paint(localRun.active ? localRun : s);
+  }).catch(function(){})
+}
 $('start').onclick = function(){
   var file = $('photo').files[0];
   var body = { name:$('name').value.trim(), email:$('email').value, pincode:$('pincode').value, code:$('code').value, target:Number($('target').value)||1, nocapKey:$('nocapKey').value.trim() };
   var go = function(){
     post('/start', body).then(function(r){
       if(!r.ok){ alert(r.message||'Error'); return }
-      show('setup',false); show('run',true); poll();
+      localRun = { active:true, status:'need_number', message:'Pehla mobile number daalo', target:body.target, count:0, mobile:'', details:body, session:null, results:[], log:['▶ START — target '+body.target+' numbers'] };
+      show('setup',false); show('run',true); paint(localRun);
     });
   };
   if (file){
@@ -201,10 +240,48 @@ $('start').onclick = function(){
     rd.readAsDataURL(file);
   } else go();
 };
-$('sendNumber').onclick = function(){ var m=$('mobile').value.replace(/\\D/g,'').slice(-10); if(m.length!==10){alert('10-digit mobile daalo');return} $('mobile').value=''; post('/number',{mobile:m}).then(poll) };
-$('sendOtp').onclick = function(){ var o=$('otp').value.replace(/\\D/g,''); if(o.length!==6){alert('6-digit OTP daalo');return} $('otp').value=''; post('/otp',{otp:o}).then(poll) };
-$('reset').onclick = function(){ post('/reset').then(function(){ location.reload() }) };
-pollTimer = setInterval(poll, 1200); poll();
+$('sendNumber').onclick = function(){
+  var m=$('mobile').value.replace(/\\D/g,'').slice(-10);
+  if(m.length!==10){alert('10-digit mobile daalo');return}
+  $('mobile').value='';
+  $('sendNumber').disabled = true;
+  localRun.status = 'working';
+  localRun.mobile = m;
+  localRun.message = 'Register ho raha hai (NoCaptchaAI check ke saath 15-45s lag sakta hai)…';
+  paint(localRun);
+  post('/number',{mobile:m, details:localRun.details, target:localRun.target}).then(function(r){
+    $('sendNumber').disabled = false;
+    if(!r.ok){ alert(r.message||'Error'); localRun.status='need_number'; paint(localRun); return; }
+    localRun.session = r.session || null;
+    localRun.status = r.status;
+    localRun.message = r.message;
+    if (r.result){ localRun.results.push(r.result); localRun.count = localRun.results.length; }
+    if (r.log && r.log.length) localRun.log = r.log;
+    paint(localRun);
+  }).catch(function(){ $('sendNumber').disabled = false; localRun.status='need_number'; paint(localRun); });
+};
+$('sendOtp').onclick = function(){
+  var o=$('otp').value.replace(/\\D/g,'');
+  if(o.length!==6){alert('6-digit OTP daalo');return}
+  $('otp').value='';
+  $('sendOtp').disabled = true;
+  localRun.status = 'working';
+  localRun.message = 'OTP verify ho raha hai…';
+  paint(localRun);
+  post('/otp',{otp:o, session:localRun.session, mobile:localRun.mobile, target:localRun.target}).then(function(r){
+    $('sendOtp').disabled = false;
+    if(!r.ok){ alert(r.message||'Error'); localRun.status='need_otp'; paint(localRun); return; }
+    localRun.session = null;
+    localRun.mobile = '';
+    localRun.status = r.status;
+    localRun.message = r.message;
+    if (r.result){ localRun.results.push(r.result); localRun.count = localRun.results.length; }
+    if (r.log && r.log.length) localRun.log = r.log;
+    paint(localRun);
+  }).catch(function(){ $('sendOtp').disabled = false; localRun.status='need_otp'; paint(localRun); });
+};
+$('reset').onclick = function(){ localRun.active = false; post('/reset').then(function(){ location.reload() }) };
+pollTimer = setInterval(poll, 3000); poll();
 post('/nocap-balance',{key:$('nocapKey').value.trim()}).then(function(r){ $('nocapbal').textContent = r.message || ''; }).catch(function(){ $('nocapbal').textContent=''; });
 </script></body></html>`;
 
@@ -274,7 +351,8 @@ export default async function handler(req, res) {
     if (req.method === 'POST' && url.pathname === '/start') {
       const body = await readBody(req);
       if (state.status !== 'idle' && state.status !== 'done') { sendJson(res, 400, { ok: false, message: 'Pehle run chal raha hai — Stop/Reset karo' }); return; }
-      state.details = { name: body.name, email: body.email, pincode: body.pincode, code: body.code, photo: body.photo || DEFAULT_PHOTO, nocapKey: body.nocapKey };
+      const photo = body.photo || await getDefaultPhoto();
+      state.details = { name: body.name, email: body.email, pincode: body.pincode, code: body.code, photo, nocapKey: body.nocapKey };
       state.target = Math.max(1, Math.min(100, Number(body.target) || 1));
       state.count = 0;
       state.results = [];
@@ -289,20 +367,32 @@ export default async function handler(req, res) {
     }
     if (req.method === 'POST' && url.pathname === '/number') {
       const body = await readBody(req);
-      if (state.status !== 'need_number') { sendJson(res, 400, { ok: false, message: 'Abhi number nahi chahiye' }); return; }
+      if (body.details && (!state.details || state.status !== 'need_number')) {
+        const photo = body.details.photo || await getDefaultPhoto();
+        state.details = { ...body.details, photo };
+        state.target = Math.max(1, Math.min(100, Number(body.target) || state.target || 1));
+        state.status = 'need_number';
+      }
+      if (state.status !== 'need_number' || !state.details) { sendJson(res, 400, { ok: false, message: 'Abhi number nahi chahiye' }); return; }
       const mobile = String(body.mobile || '').replace(/\D/g, '').slice(-10);
       if (!/^[6789]\d{9}$/.test(mobile)) { sendJson(res, 400, { ok: false, message: 'Valid 10-digit Indian mobile daalo' }); return; }
-      sendJson(res, 200, { ok: true });
-      processNumber(mobile); // background — UI /state se poll karta hai
+      const out = await processNumber(mobile);
+      sendJson(res, 200, { ...out, log: state.log.slice(-40) });
       return;
     }
     if (req.method === 'POST' && url.pathname === '/otp') {
       const body = await readBody(req);
+      if (body.session) {
+        state.session = body.session;
+        state.mobile = String(body.mobile || state.mobile || '');
+        state.target = Math.max(1, Math.min(100, Number(body.target) || state.target || 1));
+        state.status = 'need_otp';
+      }
       if (state.status !== 'need_otp' || !state.session) { sendJson(res, 400, { ok: false, message: 'Abhi OTP nahi chahiye' }); return; }
       const otp = String(body.otp || '').replace(/\D/g, '');
       if (!/^\d{6}$/.test(otp)) { sendJson(res, 400, { ok: false, message: '6-digit OTP daalo' }); return; }
-      sendJson(res, 200, { ok: true });
-      processOtp(otp); // background
+      const out = await processOtp(otp);
+      sendJson(res, 200, { ...out, log: state.log.slice(-40) });
       return;
     }
     if (req.method === 'POST' && url.pathname === '/reset') {

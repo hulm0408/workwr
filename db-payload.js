@@ -90,6 +90,7 @@ export function emptyDbPayload() {
     orders: {},
     firebaseSources: null,
     freshSettings: {},
+    userStates: {},
     waf: null,
   };
 }
@@ -245,6 +246,22 @@ export function mergeDbSnapshots(local = {}, remote = {}) {
     if (v !== undefined && v !== null) freshSettings[k] = v;
   }
 
+  // 7b) Per-user states (spare Telegram accounts, per-user pending/login state) — newest updatedAt wins per uid.
+  const userStates = {};
+  const rUsers = R.userStates && typeof R.userStates === 'object' ? R.userStates : {};
+  const lUsers = L.userStates && typeof L.userStates === 'object' ? L.userStates : {};
+  for (const [uid, st] of Object.entries(rUsers)) {
+    if (st && typeof st === 'object') userStates[uid] = { ...st };
+  }
+  for (const [uid, st] of Object.entries(lUsers)) {
+    if (!st || typeof st !== 'object') continue;
+    const prev = userStates[uid];
+    if (!prev) { userStates[uid] = { ...st }; continue; }
+    const lTs = Number(st.updatedAt) || 0;
+    const rTs = Number(prev.updatedAt) || 0;
+    userStates[uid] = lTs >= rTs ? { ...prev, ...st } : { ...st, ...prev };
+  }
+
   // 8) WAF token — naya acquiredAt jeeta.
   let waf = R.waf && typeof R.waf === 'object' ? { ...R.waf } : null;
   if (L.waf && typeof L.waf === 'object') {
@@ -268,6 +285,7 @@ export function mergeDbSnapshots(local = {}, remote = {}) {
       orders,
       firebaseSources: sources,
       freshSettings,
+      userStates,
       waf,
     },
     stats,

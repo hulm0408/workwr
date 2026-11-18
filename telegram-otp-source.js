@@ -81,7 +81,8 @@ function firstEnv(env, keys) {
 export function getTelegramSessionFilePath(env = process.env) {
   const explicit = firstEnv(env, ['TELEGRAM_SESSION_FILE', 'TG_SESSION_FILE']);
   if (explicit) return explicit;
-  const dataDir = String(env?.DATA_DIR || 'data').trim() || 'data';
+  const fallbackDir = env?.VERCEL ? '/tmp/workwr-data' : 'data';
+  const dataDir = String(env?.DATA_DIR || fallbackDir).trim() || fallbackDir;
   return `${dataDir.replace(/\/+$/, '')}/telegram.session`;
 }
 
@@ -102,7 +103,8 @@ export function telegramSessionTag(env = process.env) {
 export function getTelegramApiCredentialsFilePath(env = process.env) {
   const explicit = firstEnv(env, ['TELEGRAM_API_CREDENTIALS_FILE', 'TG_API_CREDENTIALS_FILE']);
   if (explicit) return explicit;
-  const dataDir = String(env?.DATA_DIR || 'data').trim() || 'data';
+  const fallbackDir = env?.VERCEL ? '/tmp/workwr-data' : 'data';
+  const dataDir = String(env?.DATA_DIR || fallbackDir).trim() || fallbackDir;
   return `${dataDir.replace(/\/+$/, '')}/telegram-api.json`;
 }
 
@@ -158,15 +160,36 @@ export function saveTelegramSessionString(
   return { ok: true, sessionFile: filePath, sessionSource: persisted ? 'file' : 'memory', persisted };
 }
 
+const telegramAccountCtx = new AsyncLocalStorage();
+let activeClientSessionTag = '';
+
+export function withTelegramAccountContext(account = {}, fn) {
+  if (typeof fn !== 'function') throw new Error('withTelegramAccountContext expects a callback');
+  const clean = {
+    userId: String(account?.userId || '').trim(),
+    apiId: Number(account?.apiId) || 0,
+    apiHash: String(account?.apiHash || '').trim(),
+    session: String(account?.session || '').trim(),
+    requireOwnAccount: Boolean(account?.requireOwnAccount),
+    botProfile: String(account?.botProfile || '').trim(),
+  };
+  return telegramAccountCtx.run(clean, fn);
+}
+
+export function getScopedTelegramAccount() {
+  return telegramAccountCtx.getStore() || null;
+}
+
 export function getTelegramOtpConfig(env = process.env) {
+  const scoped = env === process.env ? telegramAccountCtx.getStore() : null;
   const apiIdRaw = firstEnv(env, ['TELEGRAM_API_ID', 'TG_API_ID', 'TELEGRAM_APP_ID']);
   const envApiId = /^\d+$/.test(apiIdRaw) ? Number(apiIdRaw) : 0;
   const envApiHash = firstEnv(env, ['TELEGRAM_API_HASH', 'TG_API_HASH', 'TELEGRAM_APP_HASH']);
   const apiCredentialsFile = firstEnv(env, ['TELEGRAM_API_CREDENTIALS_FILE', 'TG_API_CREDENTIALS_FILE'])
     || (env === process.env ? getTelegramApiCredentialsFilePath(env) : '');
   const storedApi = readStoredTelegramApiCredentials(apiCredentialsFile);
-  const apiId = envApiId || storedApi.apiId || 0;
-  const apiHash = envApiHash || storedApi.apiHash || '';
+  let apiId = envApiId || storedApi.apiId || 0;
+  let apiHash = envApiHash || storedApi.apiHash || '';
   const apiCredentialsSource = (envApiId || envApiHash)
     ? ((storedApi.apiId || storedApi.apiHash) ? 'env+file' : 'env')
     : ((storedApi.apiId || storedApi.apiHash) ? 'file' : '');
@@ -182,6 +205,18 @@ export function getTelegramOtpConfig(env = process.env) {
         if (session) sessionSource = 'file';
       }
     } catch {}
+  }
+
+  if (scoped) {
+    if (scoped.apiId > 0) apiId = scoped.apiId;
+    if (scoped.apiHash) apiHash = scoped.apiHash;
+    if (scoped.session) {
+      session = scoped.session;
+      sessionSource = 'user-account';
+    } else if (scoped.requireOwnAccount) {
+      session = '';
+      sessionSource = '';
+    }
   }
 
   // Bot ka faisla: owner ka START selection > env ka custom bot > Hermes.
@@ -208,11 +243,14 @@ export function getTelegramOtpConfig(env = process.env) {
 
   // Multi-account: TELEGRAM_SESSION_2.._8 ho to healthy account chuno.
   // Ek hi session ho to roster single-slot hai — behaviour bilkul purana.
-  const accounts = roster.buildRoster(env, {
-    fallbackSession: session,
-    fallbackApiId: apiId,
-    fallbackApiHash: apiHash,
-  });
+  // Per-user scoped account par owner ka global roster apply nahi karte.
+  const accounts = (scoped && (scoped.session || scoped.requireOwnAccount))
+    ? (session ? [{ slot: 0, envKey: 'USER_ACCOUNT', tag: createHash('sha1').update(session).digest('hex').slice(0, 10), session, apiId, apiHash }] : [])
+    : roster.buildRoster(env, {
+        fallbackSession: session,
+        fallbackApiId: apiId,
+        fallbackApiHash: apiHash,
+      });
   let accountSlot = 0;
   let accountTag = accounts[0]?.tag || '';
   let accountCount = accounts.length;
@@ -642,6 +680,7 @@ async function loadTeleproto() {
       import('teleproto/sessions'),
     ]).then(([main, sessions]) => ({
       TelegramClient: main.TelegramClient,
+      Api: main.Api,
       StringSession: sessions.StringSession,
     }));
   }
@@ -705,6 +744,17 @@ async function ensureClientUnlocked() {
   if (!config.configured) {
     throw new Error(`Telegram Hermes setup missing hai: ${config.missing.join(', ')}`);
   }
+  const desiredTag = config.accountTag || (config.session ? createHash('sha1').update(String(config.session)).digest('hex').slice(0, 10) : '');
+  if (clientRef && activeClientSessionTag && desiredTag && activeClientSessionTag !== desiredTag) {
+    try { await clientRef.disconnect?.(); } catch {}
+    clientRef = null;
+    clientPromise = null;
+    entityRef = null;
+    entityCacheKey = '';
+    activeClientSessionTag = '';
+    providerState.connected = false;
+    providerState.authorized = false;
+  }
   if (clientRef && providerState.connected && telegramClientLooksConnected(clientRef)) return { client: clientRef, config };
   if (clientRef && !telegramClientLooksConnected(clientRef)) {
     // Render/network jhatke ke baad Teleproto socket mar sakta hai lekin
@@ -714,6 +764,7 @@ async function ensureClientUnlocked() {
     clientPromise = null;
     entityRef = null;
     entityCacheKey = '';
+    activeClientSessionTag = '';
     providerState.connected = false;
     providerState.authorized = false;
   }
@@ -735,6 +786,7 @@ async function ensureClientUnlocked() {
       meLabel = me?.username ? `@${me.username}` : [me?.firstName, me?.lastName].filter(Boolean).join(' ');
     } catch {}
     clientRef = client;
+    activeClientSessionTag = desiredTag;
     roster.markAccountHealthy(config.accountSlot, { me: meLabel });
     Object.assign(providerState, {
       connected: true,
@@ -751,6 +803,7 @@ async function ensureClientUnlocked() {
     clientRef = null;
     entityRef = null;
     entityCacheKey = '';
+    activeClientSessionTag = '';
     providerState.connected = false;
     providerState.authorized = false;
     setLastError(error);
@@ -2293,9 +2346,152 @@ export async function disconnectTelegramUserClient() {
   clientPromise = null;
   entityRef = null;
   entityCacheKey = '';
+  activeClientSessionTag = '';
   providerState.connected = false;
   providerState.authorized = false;
   try { await client?.disconnect?.(); } catch {}
+}
+
+// ---------------------------------------------------------------------------
+// Stateless multi-step MTProto login (for Vercel serverless webhooks where each
+// user message arrives in a separate HTTP invocation).
+// ---------------------------------------------------------------------------
+export async function startStatelessTelegramLogin({ apiId, apiHash, phoneNumber } = {}) {
+  const cleanId = Number(apiId) || getTelegramOtpConfig().apiId;
+  const cleanHash = String(apiHash || getTelegramOtpConfig().apiHash || '').trim();
+  const normalizedPhone = normalizeTelegramLoginPhone(phoneNumber);
+  if (!cleanId || !cleanHash) {
+    throw new Error('TELEGRAM_API_ID / TELEGRAM_API_HASH missing hai.');
+  }
+  if (!normalizedPhone) {
+    throw new Error('Valid phone number bhejo — Indian 10-digit ya +country code ke saath.');
+  }
+
+  const { TelegramClient, StringSession } = await loadTeleproto();
+  const client = new TelegramClient(new StringSession(''), cleanId, cleanHash, {
+    connectionRetries: 3,
+    requestRetries: 2,
+    autoReconnect: false,
+    floodSleepThreshold: 20,
+    deviceModel: 'Swiggy Fresh Hermes Client',
+    systemVersion: process.version,
+    appVersion: '1.0.0',
+    langCode: 'en',
+    systemLangCode: 'en',
+  });
+  try {
+    await client.connect();
+    const sent = await client.sendCode({ apiId: cleanId, apiHash: cleanHash }, normalizedPhone);
+    const tempSession = String(client.session?.save?.() || '').trim();
+    if (!sent?.phoneCodeHash || !tempSession) {
+      throw new Error('Telegram login code request incomplete rahi — dobara try karo.');
+    }
+    return {
+      ok: true,
+      apiId: cleanId,
+      apiHash: cleanHash,
+      phoneNumber: normalizedPhone,
+      phoneCodeHash: String(sent.phoneCodeHash),
+      isCodeViaApp: Boolean(sent.isCodeViaApp),
+      tempSession,
+    };
+  } finally {
+    try { await client.disconnect(); } catch {}
+  }
+}
+
+export async function completeStatelessTelegramLogin({
+  apiId,
+  apiHash,
+  phoneNumber,
+  phoneCodeHash,
+  phoneCode = '',
+  tempSession = '',
+  password = '',
+} = {}) {
+  const cleanId = Number(apiId) || getTelegramOtpConfig().apiId;
+  const cleanHash = String(apiHash || getTelegramOtpConfig().apiHash || '').trim();
+  const normalizedPhone = normalizeTelegramLoginPhone(phoneNumber);
+  const cleanSession = String(tempSession || '').trim();
+  if (!cleanId || !cleanHash || !normalizedPhone || !cleanSession) {
+    throw new Error('Login session expire ho gayi hai — Add Telegram Account dobara start karo.');
+  }
+
+  const { TelegramClient, Api, StringSession } = await loadTeleproto();
+  const client = new TelegramClient(new StringSession(cleanSession), cleanId, cleanHash, {
+    connectionRetries: 3,
+    requestRetries: 2,
+    autoReconnect: false,
+    floodSleepThreshold: 20,
+    deviceModel: 'Swiggy Fresh Hermes Client',
+    systemVersion: process.version,
+    appVersion: '1.0.0',
+    langCode: 'en',
+    systemLangCode: 'en',
+  });
+
+  try {
+    await client.connect();
+    if (password) {
+      let pwError = null;
+      await client.signInWithPassword(
+        { apiId: cleanId, apiHash: cleanHash },
+        {
+          password: async () => String(password),
+          onError: async (err) => {
+            pwError = err;
+            return true;
+          },
+        }
+      );
+      if (pwError) throw pwError;
+    } else {
+      const cleanCode = String(phoneCode || '').replace(/[\s-]+/g, '').trim();
+      if (!cleanCode) throw new Error('Telegram login code khali hai.');
+      try {
+        const res = await client.invoke(new Api.auth.SignIn({
+          phoneNumber: normalizedPhone,
+          phoneCodeHash: String(phoneCodeHash || ''),
+          phoneCode: cleanCode,
+        }));
+        if (res instanceof Api.auth.AuthorizationSignUpRequired) {
+          throw new Error('Is number par Telegram account bana nahi hai — pehle official Telegram app par spare account register karo.');
+        }
+      } catch (err) {
+        if (err?.errorMessage === 'SESSION_PASSWORD_NEEDED' || /SESSION_PASSWORD_NEEDED/i.test(String(err?.message || ''))) {
+          let hint = '';
+          try {
+            const pwInfo = await client.invoke(new Api.account.GetPassword());
+            hint = String(pwInfo?.hint || '').trim();
+          } catch {}
+          const nextTemp = String(client.session?.save?.() || cleanSession).trim();
+          return {
+            ok: false,
+            needsPassword: true,
+            hint,
+            tempSession: nextTemp,
+          };
+        }
+        throw err;
+      }
+    }
+
+    const finalSession = String(client.session?.save?.() || '').trim();
+    if (!finalSession) throw new Error('Login ke baad Telegram session khali mili.');
+    let me = '';
+    try { me = telegramAccountLabel(await client.getMe()); } catch {}
+    return {
+      ok: true,
+      needsPassword: false,
+      apiId: cleanId,
+      apiHash: cleanHash,
+      phoneNumber: normalizedPhone,
+      session: finalSession,
+      me,
+    };
+  } finally {
+    try { await client.disconnect(); } catch {}
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -2358,6 +2554,7 @@ export function _resetTelegramOtpSourceForTests() {
   clientPromise = null;
   entityRef = null;
   entityCacheKey = '';
+  activeClientSessionTag = '';
   Object.assign(providerState, {
     connected: false,
     authorized: false,

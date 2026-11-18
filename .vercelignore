@@ -1,0 +1,8 @@
+node_modules
+.git
+data
+scratch
+Unselected files
+Dockerfile
+gold-drop-vercel
+vercel-monitor

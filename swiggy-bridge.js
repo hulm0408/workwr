@@ -203,8 +203,10 @@ const HEADLESS_MODE = resolveHeadless();
 
 // Bot startup + /diag ke liye — Chrome mila ya nahi, saaf-saaf.
 export function getChromeStatus() {
+  const wsEndpoint = String(process.env.BROWSER_WS_ENDPOINT || '').trim();
   return {
-    found: Boolean(CHROME_PATH && _exists(CHROME_PATH)),
+    found: Boolean(wsEndpoint || (CHROME_PATH && _exists(CHROME_PATH))),
+    remote: Boolean(wsEndpoint),
     path: CHROME_PATH || '',
     headless: HEADLESS_MODE,
     platform: process.platform,
@@ -3019,36 +3021,44 @@ export async function claimSwiggyBreakfastAndLateNightOffers(account, { force = 
 }
 
 async function launchStealthSwiggyBrowser(routeProxy = getBridgeProxy()) {
-  if (!CHROME_PATH || !_exists(CHROME_PATH)) {
-    throw new Error(
-      'Chrome/Chromium nahi mila is machine par. Google Chrome install karo, ' +
-      'ya .env me PUPPETEER_EXECUTABLE_PATH=<chrome.exe ka full path> set karo. ' +
-      '(puppeteer-core ke saath browser bundled NAHI aata.)'
-    );
+  const wsEndpoint = String(process.env.BROWSER_WS_ENDPOINT || '').trim();
+  let browser;
+  if (wsEndpoint) {
+    browser = await puppeteer.connect({
+      browserWSEndpoint: wsEndpoint,
+      protocolTimeout: 60000,
+    });
+  } else {
+    if (!CHROME_PATH || !_exists(CHROME_PATH)) {
+      throw new Error(
+        'Chrome/Chromium nahi mila is machine par. Vercel/serverless par BROWSER_WS_ENDPOINT set karo ' +
+        'ya World Bot / Gold Drop mode use karo. (Local: Chrome install karke PUPPETEER_EXECUTABLE_PATH lagao.)'
+      );
+    }
+    browser = await puppeteer.launch({
+      executablePath: CHROME_PATH,
+      headless: HEADLESS_MODE,
+      protocolTimeout: 60000,
+      ignoreDefaultArgs: ['--enable-automation'],
+      args: [
+        '--disable-blink-features=AutomationControlled',
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-gpu',
+        '--disable-dev-shm-usage',
+        '--no-first-run',
+        '--no-default-browser-check',
+        '--disable-background-timer-throttling',
+        '--disable-backgrounding-occluded-windows',
+        '--disable-renderer-backgrounding',
+        '--window-size=1366,768',
+        '--lang=en-IN,en-US,en',
+        // 🔀 Browser bhi active proxy (nayi IP) se chale — warna WAF IP ko
+        // proxy-wala aur browser-wala traffic alag-alag dekh lega.
+        ...proxyPool.puppeteerProxyArgs(routeProxy)
+      ]
+    });
   }
-  const browser = await puppeteer.launch({
-    executablePath: CHROME_PATH,
-    headless: HEADLESS_MODE,
-    protocolTimeout: 60000,
-    ignoreDefaultArgs: ['--enable-automation'],
-    args: [
-      '--disable-blink-features=AutomationControlled',
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-gpu',
-      '--disable-dev-shm-usage',
-      '--no-first-run',
-      '--no-default-browser-check',
-      '--disable-background-timer-throttling',
-      '--disable-backgrounding-occluded-windows',
-      '--disable-renderer-backgrounding',
-      '--window-size=1366,768',
-      '--lang=en-IN,en-US,en',
-      // 🔀 Browser bhi active proxy (nayi IP) se chale — warna WAF IP ko
-      // proxy-wala aur browser-wala traffic alag-alag dekh lega.
-      ...proxyPool.puppeteerProxyArgs(routeProxy)
-    ]
-  });
 
   const page = await browser.newPage();
   // Proxy auth (user:pass wale proxies) — page par pehle se authenticate
@@ -3105,6 +3115,7 @@ async function launchStealthSwiggyBrowser(routeProxy = getBridgeProxy()) {
 
 function canUseStealthBrowser() {
   try {
+    if (String(process.env.BROWSER_WS_ENDPOINT || '').trim()) return true;
     return Boolean(CHROME_PATH && fs.existsSync(CHROME_PATH));
   } catch {
     return false;

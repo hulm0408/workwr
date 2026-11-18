@@ -43,7 +43,8 @@ import {
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const DATA_DIR = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : path.join(__dirname, 'data');
+const DEFAULT_DATA_DIR = process.env.VERCEL ? '/tmp/workwr-data' : path.join(__dirname, 'data');
+const DATA_DIR = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : DEFAULT_DATA_DIR;
 const OUTBOX_FILE = path.join(DATA_DIR, 'db-outbox.json');
 
 // Runtime status — /diag, startup log aur doctor CLI isse padhte hain.

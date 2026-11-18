@@ -22,10 +22,13 @@ const __dirname = path.dirname(__filename);
 
 // DATA_DIR env se override ho sakta hai — tests isse alag folder point karke
 // production data/db.json KO KABHI touch nahi karte (warna mock URLs persist
-// karke bot ko toddete the). Default = production data/.
-const DATA_DIR = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : path.join(__dirname, 'data');
+// karke bot ko toddete the). Default = production data/, ya Vercel par /tmp.
+const DEFAULT_DATA_DIR = process.env.VERCEL ? '/tmp/workwr-data' : path.join(__dirname, 'data');
+const DATA_DIR = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : DEFAULT_DATA_DIR;
 const DB_FILE = path.join(DATA_DIR, 'db.json');
-const ACCOUNTS_JSON_FILE = path.join(__dirname, 'accounts.json');
+const ACCOUNTS_JSON_FILE = process.env.VERCEL
+  ? path.join(DATA_DIR, 'accounts.json')
+  : path.join(__dirname, 'accounts.json');
 
 const defaultData = {
   config: {
@@ -804,6 +807,20 @@ export function mergeVaultFirebaseState(db, remote = {}) {
     }
   }
 
+  if (remote?.userStates && typeof remote.userStates === 'object') {
+    if (!db.userStates || typeof db.userStates !== 'object') db.userStates = {};
+    for (const [uid, rState] of Object.entries(remote.userStates)) {
+      if (!rState || typeof rState !== 'object') continue;
+      const cur = db.userStates[uid];
+      const rTs = Number(rState.updatedAt) || 0;
+      const lTs = Number(cur?.updatedAt) || 0;
+      if (!cur || rTs > lTs) {
+        db.userStates[uid] = { ...(cur || {}), ...rState };
+        mutated = true;
+      }
+    }
+  }
+
   if (restoredSources > 0) {
     console.log(`[CloudVault] Restored ${restoredSources} Firebase source(s) from vault — total ${db.firebaseSources?.list?.length || 0}.`);
   }
@@ -865,6 +882,9 @@ export function buildCloudVaultSnapshot(data = null) {
     firebaseSources: buildVaultFirebaseSources(src),
     freshSettings: (src?.freshSettings && typeof src.freshSettings === 'object')
       ? { ...src.freshSettings }
+      : {},
+    userStates: (src?.userStates && typeof src.userStates === 'object')
+      ? { ...src.userStates }
       : {},
     // Shared WAF token (encrypted at rest by the vault transport) so a fresh
     // Render deploy starts WARM — no cold-start challenge storm on scans.
@@ -2471,5 +2491,126 @@ export function appendAuditEvent(action, meta = {}) {
     }
     saveDb(db);
   } catch {}
+}
+
+// ── Per-user spare Telegram account & stateless multi-step state ───────────
+function cleanUid(userId) {
+  const s = String(userId ?? '').trim();
+  if (!s || UNSAFE_ORDER_KEYS.has(s) || s.startsWith('__')) return '';
+  return s;
+}
+
+export function getUserTelegramAccount(userId) {
+  const uid = cleanUid(userId);
+  if (!uid) return null;
+  const db = getDb();
+  const acc = db?.userStates?.[uid]?.tgAccount;
+  if (!acc || typeof acc !== 'object' || !String(acc.session || '').trim()) return null;
+  return { ...acc };
+}
+
+export function setUserTelegramAccount(userId, account = {}) {
+  const uid = cleanUid(userId);
+  if (!uid) return null;
+  ensureDb();
+  const db = getDb();
+  if (!db.userStates || typeof db.userStates !== 'object') db.userStates = {};
+  const prev = db.userStates[uid] && typeof db.userStates[uid] === 'object' ? db.userStates[uid] : {};
+  const nextAcc = {
+    apiId: Number(account.apiId) || 0,
+    apiHash: String(account.apiHash || '').trim(),
+    session: String(account.session || '').trim(),
+    phone: String(account.phone || '').trim(),
+    me: String(account.me || '').trim(),
+    updatedAt: Date.now(),
+  };
+  db.userStates[uid] = {
+    ...prev,
+    tgAccount: nextAcc,
+    tgLogin: null,
+    updatedAt: Date.now(),
+  };
+  saveDb(db);
+  return { ...nextAcc };
+}
+
+export function clearUserTelegramAccount(userId) {
+  const uid = cleanUid(userId);
+  if (!uid) return false;
+  ensureDb();
+  const db = getDb();
+  if (!db.userStates || typeof db.userStates !== 'object') db.userStates = {};
+  const prev = db.userStates[uid] && typeof db.userStates[uid] === 'object' ? db.userStates[uid] : {};
+  const had = Boolean(prev.tgAccount?.session);
+  db.userStates[uid] = {
+    ...prev,
+    tgAccount: null,
+    tgLogin: null,
+    updatedAt: Date.now(),
+  };
+  saveDb(db);
+  return had;
+}
+
+export function getUserTelegramLoginState(userId) {
+  const uid = cleanUid(userId);
+  if (!uid) return null;
+  const db = getDb();
+  const st = db?.userStates?.[uid]?.tgLogin;
+  if (!st || typeof st !== 'object') return null;
+  if (st.expiresAt && Date.now() > Number(st.expiresAt)) return null;
+  return { ...st };
+}
+
+export function setUserTelegramLoginState(userId, state = null) {
+  const uid = cleanUid(userId);
+  if (!uid) return null;
+  ensureDb();
+  const db = getDb();
+  if (!db.userStates || typeof db.userStates !== 'object') db.userStates = {};
+  const prev = db.userStates[uid] && typeof db.userStates[uid] === 'object' ? db.userStates[uid] : {};
+  const next = state ? { ...state, updatedAt: Date.now(), expiresAt: state.expiresAt || (Date.now() + 15 * 60 * 1000) } : null;
+  db.userStates[uid] = {
+    ...prev,
+    tgLogin: next,
+    updatedAt: Date.now(),
+  };
+  saveDb(db);
+  return next;
+}
+
+export function clearUserTelegramLoginState(userId) {
+  return setUserTelegramLoginState(userId, null);
+}
+
+export function getUserPendingState(userId) {
+  const uid = cleanUid(userId);
+  if (!uid) return null;
+  const db = getDb();
+  const st = db?.userStates?.[uid]?.pending;
+  if (!st || typeof st !== 'object') return null;
+  if (st.expiresAt && Date.now() > Number(st.expiresAt)) return null;
+  return { ...st };
+}
+
+export function setUserPendingState(userId, state = null) {
+  const uid = cleanUid(userId);
+  if (!uid) return null;
+  ensureDb();
+  const db = getDb();
+  if (!db.userStates || typeof db.userStates !== 'object') db.userStates = {};
+  const prev = db.userStates[uid] && typeof db.userStates[uid] === 'object' ? db.userStates[uid] : {};
+  const next = state ? { ...state, updatedAt: Date.now(), expiresAt: state.expiresAt || (Date.now() + 15 * 60 * 1000) } : null;
+  db.userStates[uid] = {
+    ...prev,
+    pending: next,
+    updatedAt: Date.now(),
+  };
+  saveDb(db);
+  return next;
+}
+
+export function clearUserPendingState(userId) {
+  return setUserPendingState(userId, null);
 }
 

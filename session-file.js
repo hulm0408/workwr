@@ -19,8 +19,14 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
+const DEFAULT_SESSION_FILE_DIR = process.env.DATA_DIR
+  ? path.join(path.resolve(process.env.DATA_DIR), 'session-files')
+  : (process.env.VERCEL
+    ? path.join('/tmp/workwr-data', 'session-files')
+    : path.join(process.cwd(), 'data', 'session-files'));
+
 export const SESSION_FILE_DIR = process.env.SESSION_FILE_DIR
-  || path.join(process.cwd(), 'data', 'session-files');
+  || DEFAULT_SESSION_FILE_DIR;
 
 // JSON ka asli tukda: pehla `{`/`[` se aakhri `}`/`]` tak.
 // Invalid JSON / braces hi na ho → khali string (caller fallback lagata hai).

@@ -27,8 +27,16 @@
 import dotenv from 'dotenv';
 dotenv.config();
 
+// Vercel serverless par /var/task read-only hota hai — store/session files /tmp me rakho.
+if (process.env.VERCEL && !process.env.DATA_DIR) {
+  process.env.DATA_DIR = '/tmp/workwr-data';
+}
+
 // OTP + numbers dono ISI Firebase se aate hain (premium/firebase koi third source nahi)
 process.env.FIREBASE_DB_URL ||= 'https://vuvhbjbi-default-rtdb.firebaseio.com/';
+
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 // Dynamic import — defaults set karne KE BAAD hi modules load ho, warna
 // firebase-numbers.js env ko call-time par hi padhta hai, phir bhi safe side.
@@ -45,6 +53,15 @@ const {
   getSessionExportJson,
   getDb,
   findAccountKeyByPhone,
+  getUserTelegramAccount,
+  setUserTelegramAccount,
+  clearUserTelegramAccount,
+  getUserTelegramLoginState,
+  setUserTelegramLoginState,
+  clearUserTelegramLoginState,
+  getUserPendingState,
+  setUserPendingState,
+  clearUserPendingState,
 } = await import('./store.js');
 const {
   startAutopilot,
@@ -215,7 +232,7 @@ function startHealthServer() {
 }
 
 // ---------------------------------------------------------------------------
-// Config + owner gate
+// Config + owner / public-user gate
 // ---------------------------------------------------------------------------
 const TOKEN = String(process.env.BOT_TOKEN || process.env.AUTOPILOT_BOT_TOKEN || '').trim();
 
@@ -228,13 +245,34 @@ function ownerIds() {
   return null; // fallback: store bossIds + known owner
 }
 
-function isOwner(userId) {
+function isAdminOwner(userId) {
   const ids = ownerIds();
-  const uid = String(userId);
+  const uid = String(userId ?? '').trim();
+  if (!uid) return false;
   if (ids) return ids.has(uid);
   try { if (isBoss(Number(userId))) return true; } catch {}
   try { if (isBoss(uid)) return true; } catch {}
-  return uid === '5393396812';
+  return uid === '6484999726' || uid === '5393396812';
+}
+
+function isPublicBotMode() {
+  return String(process.env.PUBLIC_BOT_MODE ?? '1').trim() !== '0';
+}
+
+function isOwner(userId) {
+  if (!userId) return false;
+  if (isPublicBotMode()) return true;
+  return isAdminOwner(userId);
+}
+
+function vercelWaitUntil(promise) {
+  try {
+    const fn = globalThis[Symbol.for('@vercel/request-context')]?.get?.()?.waitUntil;
+    if (typeof fn === 'function' && promise && typeof promise.then === 'function') {
+      fn(Promise.resolve(promise).catch(() => {}));
+    }
+  } catch {}
+  return promise;
 }
 
 // ---------------------------------------------------------------------------
@@ -686,13 +724,26 @@ bot.use(async (ctx, next) => {
     await ctx.answerCbQuery('Gold Drop chal raha hai; result ka wait karein.', { show_alert: true }).catch(() => {});
     return;
   }
-  return next();
+  const uid = ctx.from?.id ? String(ctx.from.id) : '';
+  if (!uid) return next();
+  const admin = isAdminOwner(uid);
+  const userAcc = getUserTelegramAccount(uid);
+  return telegramOtp.withTelegramAccountContext({
+    userId: uid,
+    apiId: userAcc?.apiId || 0,
+    apiHash: userAcc?.apiHash || '',
+    session: userAcc?.session || '',
+    requireOwnAccount: !admin,
+  }, next);
 });
 
-// Render Web Service par port sab se pehle kholo. Pehle health server
-// cloud-vault hydrate ke baad banta tha; ab deploy/cold-start par Render
-// aur bahar wale cron ko foran /health mil jayega.
-startHealthServer();
+const isDirectCliEntry = Boolean(process.argv[1])
+  && path.resolve(fileURLToPath(import.meta.url)) === path.resolve(process.argv[1]);
+
+// Render Web Service par port sab se pehle kholo (Vercel serverless par nahi).
+if (isDirectCliEntry && !process.env.VERCEL) {
+  startHealthServer();
+}
 
 const gate = async (ctx) => {
   const uid = ctx.from?.id;
@@ -703,6 +754,20 @@ const gate = async (ctx) => {
       ``,
       sub('Is ID ko .env me OWNER_IDS me daalein aur bot restart karein:'),
       `<code>OWNER_IDS=${uid}</code>`,
+    ].join('\n'))).catch(() => {});
+    return false;
+  }
+  return true;
+};
+
+const adminGate = async (ctx) => {
+  const uid = ctx.from?.id;
+  if (!isAdminOwner(uid)) {
+    await ctx.answerCbQuery?.('⛔ Ye global admin setting sirf bot owner ke liye hai.', { show_alert: true }).catch(() => {});
+    await ctx.reply(section('🔒 Owner-Only Setting', [
+      `Ye global setting sirf bot owner (<code>${uid}</code> nahi) badal sakta hai.`,
+      ``,
+      sub('Aap Settings → 👤 Add Telegram Account se apna spare Telegram account connect karke bot use kar sakte ho.'),
     ].join('\n'))).catch(() => {});
     return false;
   }
@@ -1042,9 +1107,10 @@ async function launchBatch(ctx, opts = {}) {
     // baad bhi START "spare Telegram account chahiye" bolta reh jata tha.
     let tg = {};
     try { tg = await telegramOtp.telegramUserClientStatus(); } catch {}
-    if (telegramLoginFlow || tg.loginInProgress) {
+    const activeLogin = getActiveTelegramLogin(ctx.from?.id);
+    if (activeLogin || tg.loginInProgress) {
       await ctx.answerCbQuery('⏳ Telegram login chal raha hai — pehle complete karo.', { show_alert: true }).catch(() => {});
-      await ctx.reply(telegramAccountCard(), kb(telegramLoginRows())).catch(() => {});
+      await ctx.reply(telegramAccountCard(ctx.from?.id), kb(telegramLoginRows())).catch(() => {});
       return;
     }
     if (!tg.configured) {
@@ -1066,9 +1132,10 @@ async function launchBatch(ctx, opts = {}) {
 
   if (!worldBotEngine && isTelegramNumberSource()) {
     const status = telegramProviderStatus();
-    if (telegramLoginFlow || status.loginInProgress) {
+    const activeLogin = getActiveTelegramLogin(ctx.from?.id);
+    if (activeLogin || status.loginInProgress) {
       await ctx.answerCbQuery('⏳ Telegram login chal raha hai — pehle Add Telegram Account complete karo.', { show_alert: true }).catch(() => {});
-      await ctx.reply(telegramAccountCard(), kb(telegramLoginRows())).catch(() => {});
+      await ctx.reply(telegramAccountCard(ctx.from?.id), kb(telegramLoginRows())).catch(() => {});
       return;
     }
     if (!status.configured) {
@@ -1134,7 +1201,7 @@ async function launchBatch(ctx, opts = {}) {
   const lockedOtpBot = lockedSourceMode === 'telegram'
     ? otpBotProfiles.normalizeOtpBotProfileId(chosen || bs.getSetting('otpBotProfile'))
     : '';
-  startAutopilot({
+  vercelWaitUntil(startAutopilot({
     userId: String(ctx.from.id),
     telegramSetting: telegramSettingEnabled(),
     // Is run ka source yahin lock kar do. Hermes/HardXotp ON ho to stale env
@@ -1146,7 +1213,7 @@ async function launchBatch(ctx, opts = {}) {
     // Engine choice isi batch ke liye lock — preset/Settings jo kehta hai wahi.
     accountEngine: bs.getSetting('accountEngine') === 'worldbot' ? 'worldbot' : (bs.getSetting('accountEngine') === 'toing_pro' ? 'toing_pro' : 'direct'),
     ui,
-  }).catch((e) => console.error('[FreshBot] autopilot:', e?.stack || e?.message));
+  }).catch((e) => console.error('[FreshBot] autopilot:', e?.stack || e?.message)));
 }
 
 bot.start(async (ctx) => {
@@ -1796,7 +1863,7 @@ bot.action(/^gold_drop_go_(hermes|hathi|chauhan)_(\d+)$/, async (ctx) => {
   const source = ctx.match[1];
   const cardId = ctx.callbackQuery.message.message_id;
   // startGoldDropRun sets the running flag synchronously, before the callback is acknowledged.
-  const task = startGoldDropRun(ctx, source, target, cardId);
+  const task = vercelWaitUntil(startGoldDropRun(ctx, source, target, cardId));
   await ctx.answerCbQuery('Gold Drop shuru').catch(() => {});
   task.catch(error => console.error('[GoldDrop] start:', error?.message || error));
 });
@@ -1970,21 +2037,46 @@ bot.action(['boss_panel_home', 'prem_get_number'], async (ctx) => {
 
 // ---------------------------------------------------------------------------
 // ⚙️ Settings handlers — sources + knobs (kuch bhi text-input wait-state me)
+// PersistentPendingMap mirrors wait-states to store.js so multi-step flows
+// survive across separate Vercel serverless webhook invocations.
 // ---------------------------------------------------------------------------
-const pending = new Map(); // uid → { action, srcId? } — text input ka wait-state
+class PersistentPendingMap extends Map {
+  get(key) {
+    const uid = String(key ?? '');
+    let val = super.get(uid);
+    if (!val && uid) {
+      try {
+        val = getUserPendingState(uid);
+        if (val) super.set(uid, val);
+      } catch {}
+    }
+    return val;
+  }
+  set(key, val) {
+    const uid = String(key ?? '');
+    super.set(uid, val);
+    try { if (uid) setUserPendingState(uid, val); } catch {}
+    return this;
+  }
+  delete(key) {
+    const uid = String(key ?? '');
+    const res = super.delete(uid);
+    try { if (uid) clearUserPendingState(uid); } catch {}
+    return res;
+  }
+}
+const pending = new PersistentPendingMap(); // uid → { action, srcId? } — text input ka wait-state
 
 // ---------------------------------------------------------------------------
-// 👤 Add Telegram Account — owner ki private chat ke andar spare-account login
-// Ek waqt me sirf ek flow. Har input promise Teleproto ke auth callbacks ko
-// jata hai; session/API hash/code/password chat me kabhi echo nahi hote.
+// 👤 Add Telegram Account — per-user stateless multi-step spare account login
+// Works identically in Vercel webhooks AND polling mode. Each user has their own
+// isolated login state & saved spare Telegram session in store.js.
 // ---------------------------------------------------------------------------
-const TELEGRAM_LOGIN_INPUT_TIMEOUT_MS = 10 * 60_000;
 let telegramLoginFlow = null;
 
-function telegramLoginAbortError(message = 'Telegram account login cancel/timeout ho gaya.') {
-  const err = new Error(message);
-  err.code = 'TELEGRAM_LOGIN_ABORTED';
-  return err;
+function getActiveTelegramLogin(uid) {
+  if (!uid) return null;
+  try { return getUserTelegramLoginState(String(uid)); } catch { return null; }
 }
 
 function telegramLoginStageLabel(stage) {
@@ -2021,98 +2113,18 @@ function shortTelegramLoginError(error) {
     .slice(0, 220);
 }
 
-function clearTelegramLoginWait(flow) {
-  if (flow?.timer) clearTimeout(flow.timer);
-  if (flow) {
-    flow.timer = null;
-    flow.resolveInput = null;
-    flow.rejectInput = null;
-    const st = pending.get(flow.ownerId);
-    if (st?.action === 'telegram_login' && st.flowId === flow.id) pending.delete(flow.ownerId);
-  }
+function clearUserLoginFlowState(uid) {
+  const clean = String(uid ?? '');
+  if (!clean) return;
+  try { clearUserTelegramLoginState(clean); } catch {}
+  const st = pending.get(clean);
+  if (st?.action === 'telegram_login') pending.delete(clean);
 }
 
-function finishTelegramLoginFlow(flow) {
-  if (!flow) return;
-  clearTelegramLoginWait(flow);
-  flow.apiHash = '';
-  flow.done = true;
-  if (telegramLoginFlow === flow) telegramLoginFlow = null;
-}
-
-function cancelTelegramLoginFlow(reason = 'cancel') {
-  const flow = telegramLoginFlow;
-  if (!flow) return false;
-  flow.cancelled = true;
-  flow.cancelReason = reason;
-  const reject = flow.rejectInput;
-  clearTelegramLoginWait(flow);
-  if (reject) {
-    reject(telegramLoginAbortError(
-      reason === 'timeout'
-        ? 'Telegram login input ka time khatam ho gaya.'
-        : 'Telegram account login cancel ho gaya.'
-    ));
-  }
-  return true;
-}
-
-async function sendTelegramLoginMessage(flow, text, rows = telegramLoginRows()) {
-  if (!flow?.chatId) return null;
-  return bot.telegram.sendMessage(flow.chatId, text, kb(rows)).catch((e) => {
-    console.warn('[FreshBot] Telegram login prompt send:', e?.message || e);
-    return null;
-  });
-}
-
-async function waitForTelegramLoginInput(flow, stage, prompt) {
-  if (!flow || flow.cancelled || telegramLoginFlow !== flow) throw telegramLoginAbortError();
-  if (flow.resolveInput) throw new Error('Telegram login input pehle se pending hai.');
-
-  flow.stage = stage;
-  let resolveInput;
-  let rejectInput;
-  const inputPromise = new Promise((resolve, reject) => {
-    resolveInput = resolve;
-    rejectInput = reject;
-  });
-  flow.resolveInput = resolveInput;
-  flow.rejectInput = rejectInput;
-  pending.set(flow.ownerId, { action: 'telegram_login', flowId: flow.id, stage });
-  flow.timer = setTimeout(() => {
-    const reject = flow.rejectInput;
-    flow.cancelled = true;
-    flow.cancelReason = 'timeout';
-    clearTelegramLoginWait(flow);
-    reject?.(telegramLoginAbortError('Telegram login input ka time khatam ho gaya.'));
-  }, TELEGRAM_LOGIN_INPUT_TIMEOUT_MS);
-  flow.timer.unref?.();
-
-  const sent = await sendTelegramLoginMessage(flow, prompt);
-  if (!sent && flow.resolveInput === resolveInput) {
-    clearTelegramLoginWait(flow);
-    throw new Error('Telegram login prompt nahi bhej paya — bot chat check karke dobara try karo.');
-  }
-  return inputPromise;
-}
-
-async function askTelegramLoginValue(flow, stage, prompt, validate) {
-  for (;;) {
-    const raw = await waitForTelegramLoginInput(flow, stage, prompt);
-    const checked = validate(raw);
-    if (checked?.ok) return checked.value;
-    await sendTelegramLoginMessage(flow, section('⚠️ Input Sahi Nahi', [
-      esc(checked?.error || 'Dobara sahi value bhejo.'),
-      ``,
-      sub('Sahi value dubara bhejo, ya Cancel dabao.'),
-    ].join('\n')));
-  }
-}
-
-function telegramAccountCard() {
+function telegramAccountCard(uid = '') {
   const status = telegramProviderStatus();
   const botName = String(status.botUsername || 'HermeshuOTPROBOT').replace(/^@+/, '');
-  const flow = telegramLoginFlow;
+  const flow = getActiveTelegramLogin(uid);
   const ready = Boolean(status.apiIdPresent && status.apiHashPresent && status.sessionPresent);
   return section('👤 Telegram Account', [
     field('Status', (flow || status.loginInProgress) ? '⏳ LOGIN CHAL RAHA' : (ready ? 'READY' : 'SETUP PENDING')),
@@ -2134,240 +2146,243 @@ async function requirePrivateTelegramChat(ctx, actionLabel = 'Telegram account a
   return false;
 }
 
-async function runTelegramLoginFlow(flow) {
-  try {
-    const initialStatus = telegramProviderStatus();
-    if (!initialStatus.apiIdPresent) {
-      flow.apiId = await askTelegramLoginValue(
-        flow,
-        'api_id',
-        section('👤 Telegram Setup · 1/2', [
-          field('Status', 'API ID saved nahi'),
-          field('Chahiye', 'numeric API ID'),
-          field('Kahan se', 'my.telegram.org → API development tools'),
-          ``,
-          '<b>Send:</b> API ID yahan bhejo (sirf digits).',
-          sub('Input delete hoga. Sirf spare account.'),
-        ].join('\n')),
-        (raw) => {
-          const value = String(raw || '').trim();
-          return /^\d{3,15}$/.test(value)
-            ? { ok: true, value }
-            : { ok: false, error: 'API ID sirf digits me bhejo (my.telegram.org wali numeric ID).' };
-        }
-      );
-    }
-    if (!initialStatus.apiHashPresent) {
-      flow.apiHash = await askTelegramLoginValue(
-        flow,
-        'api_hash',
-        section('👤 Telegram Setup · 2/2', [
-          field('Chahiye', 'API hash'),
-          field('App', 'wahi API app (my.telegram.org)'),
-          ``,
-          '<b>Send:</b> API hash yahan bhejo.',
-          sub('Hash chat me dobara nahi dikhega; input delete hoga.'),
-        ].join('\n')),
-        (raw) => {
-          const value = String(raw || '').trim().replace(/^['"]+|['"]+$/g, '');
-          return value.length >= 16 && !/\s/.test(value)
-            ? { ok: true, value }
-            : { ok: false, error: 'API hash sahi nahi laga — spaces ke bina poora hash bhejo.' };
-        }
-      );
-    }
+async function startTelegramLoginFlow(ctx) {
+  if (!(await requirePrivateTelegramChat(ctx, 'Add Telegram Account'))) return;
+  const uid = String(ctx.from.id);
+  const status = telegramProviderStatus();
+  const existing = getActiveTelegramLogin(uid);
+  if (existing) {
+    await ctx.answerCbQuery(`⏳ Login pehle se chal raha hai: ${telegramLoginStageLabel(existing.stage)}`, { show_alert: true }).catch(() => {});
+    await editOrSend(ctx, telegramAccountCard(uid), telegramLoginRows());
+    return;
+  }
 
-    flow.stage = 'connecting';
-    await sendTelegramLoginMessage(flow, section('🔐 Telegram Login', [
-      field('Flow', 'phone → login code'),
-      `Spare account se connect kar raha hoon…`,
+  const baseConfig = telegramOtp.getTelegramOtpConfig();
+  const hasServerApi = Boolean(baseConfig.apiId && baseConfig.apiHash);
+  const stage = hasServerApi ? 'phone' : 'api_id';
+
+  setUserTelegramLoginState(uid, {
+    stage,
+    chatId: String(ctx.chat.id),
+    apiId: hasServerApi ? baseConfig.apiId : 0,
+    apiHash: hasServerApi ? baseConfig.apiHash : '',
+    phone: '',
+    phoneCodeHash: '',
+    tempSession: '',
+  });
+  pending.set(uid, { action: 'telegram_login', stage });
+
+  await ctx.answerCbQuery('👤 Telegram login shuru…').catch(() => {});
+  if (stage === 'phone') {
+    await editOrSend(ctx, section('📱 Spare Telegram Number', [
+      field('Saved session', status.sessionPresent ? '⚠️ replace hoga' : '— koi nahi'),
+      field('API App', '✅ server configured'),
+      field('Format', '+880XXXXXXXXXX, +91XXXXXXXXXX, ya 10-digit'),
       ``,
-      sub('Code/password message milte hi delete hoga.'),
-    ].join('\n')));
-
-    const result = await telegramOtp.loginTelegramUserInteractive({
-      phoneNumber: async () => {
-        const phone = await askTelegramLoginValue(
-          flow,
-          'phone',
-          section('📱 Spare Telegram Number', [
-            field('Chahiye', 'spare account ka phone'),
-            field('Format', '+91XXXXXXXXXX ya 10-digit'),
-            ``,
-            '<b>Send:</b> phone number yahan bhejo.',
-          ].join('\n')),
-          (raw) => {
-            const value = telegramOtp.normalizeTelegramLoginPhone?.(raw) || '';
-            return value
-              ? { ok: true, value }
-              : { ok: false, error: 'Valid phone bhejo — Indian 10-digit ya country code ke saath.' };
-          }
-        );
-        flow.phone = phone;
-        return phone;
-      },
-      phoneCode: async (isCodeViaApp, info) => {
-        const delivery = String(info?.type || (isCodeViaApp ? 'Telegram app' : 'SMS/call'));
-        return askTelegramLoginValue(
-          flow,
-          'code',
-          section('🔑 Telegram Login Code', [
-            field('Delivery', delivery),
-            ``,
-            '<b>Send:</b> Telegram ka login code yahan bhejo.',
-            sub('Ye Hermes OTP nahi — spare Telegram account ka login code hai.'),
-          ].join('\n')),
-          (raw) => {
-            const value = String(raw || '').replace(/[\s-]+/g, '').trim();
-            return value && value.length <= 20
-              ? { ok: true, value }
-              : { ok: false, error: 'Login code khali ya bahut lamba hai — sahi code dobara bhejo.' };
-          }
-        );
-      },
-      password: async (hint) => askTelegramLoginValue(
-        flow,
-        'password',
-        section('🔐 Telegram 2FA Password', [
-          field('Status', 'two-step verification ON'),
-          hint ? field('Hint', String(hint).slice(0, 80)) : '',
-          ``,
-          '<b>Send:</b> 2FA password yahan bhejo.',
-        ].filter(Boolean).join('\n')),
-        (raw) => {
-          const value = String(raw ?? '');
-          return value.length > 0
-            ? { ok: true, value }
-            : { ok: false, error: '2FA password khali hai — password dobara bhejo.' };
-        }
-      ),
-      firstAndLastNames: async () => askTelegramLoginValue(
-        flow,
-        'name',
-        section('👤 Naya Telegram Account', [
-          field('Status', 'is number par account registered nahi'),
-          ``,
-          '<b>Send:</b> display name bhejo (jaise Spare Account).',
-          sub('Naya account nahi banana? Cancel dabao.'),
-        ].join('\n')),
-        (raw) => {
-          const value = String(raw || '').trim();
-          return value
-            ? { ok: true, value }
-            : { ok: false, error: 'Display name khali hai — naam dobara bhejo.' };
-        }
-      ),
-      onError: async (error) => {
-        if (flow.cancelled) return true;
-        const message = shortTelegramLoginError(error);
-        const unrecoverable = /API_ID_INVALID|API_HASH_INVALID|PHONE_NUMBER_BANNED|FLOOD_WAIT|AUTH_KEY_(UNREGISTERED|DUPLICATED)|USER_DEACTIVATED|PHONE_NUMBER_INVALID/i.test(message);
-        await sendTelegramLoginMessage(flow, section(
-          unrecoverable ? '❌ Telegram Login Ruk Gaya' : '⚠️ Telegram Ne Retry Manga',
-          [
-            esc(message),
-            ``,
-            sub(unrecoverable
-              ? 'Details check karke Add Telegram Account dobara start karo.'
-              : 'Galat code/password ho to agla prompt aayega — sahi value wahan bhejo.'),
-          ].join('\n')
-        )).catch(() => {});
-        return unrecoverable;
-      },
-    }, {
-      apiId: flow.apiId || undefined,
-      apiHash: flow.apiHash || undefined,
-      shouldAbort: () => Boolean(flow.cancelled || telegramLoginFlow !== flow),
-    });
-
-    if (flow.cancelled) throw telegramLoginAbortError();
-    flow.apiHash = '';
-    try { bs.setSetting('telegramOtpMode', true); } catch {}
-
-    flow.stage = 'verifying';
-    let verifyLine = 'Hermes test baaki hai — Settings → 🧪 Test Hermes dabao.';
-    try {
-      const verify = await telegramOtp.verifyTelegramOtpConnection({ sendStartIfEmpty: true });
-      const verifyBot = String(verify.botUsername || result.botUsername || 'HermeshuOTPROBOT').replace(/^@+/, '');
-      verifyLine = `@${verifyBot} connect ho gaya${verify.currentPhone ? ` · current number ${verify.currentPhone}` : ''}${verify.buttons?.length ? ` · buttons mile: ${verify.buttons.slice(0, 6).join(' · ')}` : ''}`;
-    } catch (e) {
-      verifyLine = `Login saved hai, lekin Hermes test abhi fail: ${shortTelegramLoginError(e)} — Settings → 🧪 Test Hermes se dobara check karo.`;
-    }
-
-    await sendTelegramLoginMessage(flow, section('✅ Telegram Account Add Ho Gaya', [
-      field('Account', esc(result.me || result.accountLabel || maskTelegramLoginPhone(result.phone || flow.phone) || 'saved')),
-      field('Hermes mode', '📨 ON (Telegram only)'),
-      field('Hermes test', esc(verifyLine)),
-      field('Session', '🔐 secure saved — chat me kabhi nahi dikhegi'),
-      field('World Bot', `✅ isi account se @${esc(worldBot.worldBotUsername())} ke buttons click honge`),
-      field('Shop Bot stock', `✅ isi account se @${esc(shopStock.shopBotConfig().username)} ko JSON files jayengi`),
+      '<b>Send:</b> apna spare Telegram phone number yahan bhejo.',
+      sub('Main account mat use karo. Input delete hoga.'),
+    ].join('\n')), telegramLoginRows());
+  } else {
+    await editOrSend(ctx, section('👤 Telegram Setup · 1/3', [
+      field('Saved session', status.sessionPresent ? '⚠️ replace hoga' : '— koi nahi'),
+      field('Chahiye', 'numeric API ID (my.telegram.org → API development tools)'),
       ``,
-      sub('Ek spare account hi kaafi hai. Ab START dabao.'),
-    ].join('\n')), settingsRows());
-  } catch (error) {
-    const aborted = flow.cancelled || error?.code === 'TELEGRAM_LOGIN_ABORTED' || /AUTH_USER_CANCEL|cancel\/timeout/i.test(String(error?.message || ''));
-    if (!flow.done) {
-      await sendTelegramLoginMessage(flow, section(
-        aborted ? '✖️ Telegram Login Cancel' : '❌ Telegram Login Fail',
-        [
-          esc(aborted
-            ? 'Login flow band kar diya gaya hai. Partial session save nahi hui.'
-            : shortTelegramLoginError(error)),
-          ``,
-          sub('Settings → Add Telegram Account se dobara try kar sakte ho.'),
-        ].join('\n')
-      ), settingsRows()).catch(() => {});
-    }
-    if (!aborted) console.warn('[FreshBot] Telegram account login fail:', shortTelegramLoginError(error));
-  } finally {
-    finishTelegramLoginFlow(flow);
+      '<b>Send:</b> API ID yahan bhejo (sirf digits).',
+      sub('Input delete hoga. Sirf spare account.'),
+    ].join('\n')), telegramLoginRows());
   }
 }
 
-async function startTelegramLoginFlow(ctx) {
-  if (!(await requirePrivateTelegramChat(ctx, 'Add Telegram Account'))) return;
-  if (isAutopilotRunning()) {
-    await ctx.answerCbQuery('⏳ Batch chal raha hai — pehle STOP karo, phir Telegram account add karo.', { show_alert: true }).catch(() => {});
+async function handleTelegramLoginText(ctx, txt, rawMessageText) {
+  const uid = String(ctx.from.id);
+  let deleted = false;
+  try {
+    if (ctx.chat?.id && ctx.message?.message_id) {
+      await bot.telegram.deleteMessage(ctx.chat.id, ctx.message.message_id);
+      deleted = true;
+    }
+  } catch {}
+
+  const flow = getActiveTelegramLogin(uid);
+  if (!flow) {
+    pending.delete(uid);
+    await ctx.reply('⌛ Ye Telegram login step khatam ho gaya hai. Settings → Add Telegram Account se dobara shuru karo.', kb(settingsRows())).catch(() => {});
     return;
   }
-  if (telegramLoginFlow) {
-    await ctx.answerCbQuery(`⏳ Login pehle se chal raha hai: ${telegramLoginStageLabel(telegramLoginFlow.stage)}`, { show_alert: true }).catch(() => {});
-    await editOrSend(ctx, telegramAccountCard(), telegramLoginRows());
+  if (ctx.chat?.type !== 'private' || String(ctx.chat.id) !== String(flow.chatId)) {
+    await ctx.reply('🔒 Telegram login input sirf usi private chat se bhejo jahan Add Telegram Account start kiya tha.').catch(() => {});
     return;
   }
-  const status = telegramProviderStatus();
-  if (status.loginInProgress) {
-    await ctx.answerCbQuery('⏳ Telegram login provider me pehle se chal raha hai.', { show_alert: true }).catch(() => {});
-    await editOrSend(ctx, telegramAccountCard(), telegramLoginRows());
+  if (/^\/cancel(?:@\w+)?$/i.test(txt)) {
+    clearUserLoginFlowState(uid);
+    await ctx.reply('✖️ Telegram login cancel kar diya.', kb(settingsRows())).catch(() => {});
     return;
   }
 
-  const flow = {
-    id: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
-    ownerId: String(ctx.from.id),
-    chatId: ctx.chat.id,
-    stage: 'starting',
-    startedAt: Date.now(),
-    cancelled: false,
-    cancelReason: '',
-    done: false,
-    deleteWarned: false,
-    apiId: '',
-    apiHash: '',
-    phone: '',
-    resolveInput: null,
-    rejectInput: null,
-    timer: null,
-  };
-  telegramLoginFlow = flow;
-  await ctx.answerCbQuery('👤 Telegram login shuru…').catch(() => {});
-  await editOrSend(ctx, section('👤 Add Telegram Account', [
-    field('Saved session', status.sessionPresent ? '⚠️ replace hoga' : '— koi nahi'),
-    field('Kahan', 'is private chat me'),
-    ``,
-    '<b>Next:</b> har prompt par value bhejo — rokne ke liye Cancel.',
-    sub('Session chat me kabhi nahi dikhegi; main account mat use karo.'),
-  ].filter(Boolean).join('\n')), telegramLoginRows());
-  runTelegramLoginFlow(flow).catch((e) => console.error('[FreshBot] telegram login runner:', e?.stack || e?.message || e));
+  try {
+    if (flow.stage === 'api_id') {
+      const value = String(txt || '').trim();
+      if (!/^\d{3,15}$/.test(value)) {
+        await ctx.reply(section('⚠️ Input Sahi Nahi', ['API ID sirf digits me bhejo (my.telegram.org wali numeric ID).'].join('\n')), kb(telegramLoginRows())).catch(() => {});
+        return;
+      }
+      flow.apiId = Number(value);
+      flow.stage = 'api_hash';
+      setUserTelegramLoginState(uid, flow);
+      pending.set(uid, { action: 'telegram_login', stage: 'api_hash' });
+      await ctx.reply(section('👤 Telegram Setup · 2/3', [
+        field('API ID', '✅ saved'),
+        field('Chahiye', 'API hash (my.telegram.org)'),
+        ``,
+        '<b>Send:</b> API hash yahan bhejo.',
+      ].join('\n')), kb(telegramLoginRows())).catch(() => {});
+      return;
+    }
+
+    if (flow.stage === 'api_hash') {
+      const value = String(txt || '').trim().replace(/^['"]+|['"]+$/g, '');
+      if (value.length < 16 || /\s/.test(value)) {
+        await ctx.reply(section('⚠️ Input Sahi Nahi', ['API hash sahi nahi laga — spaces ke bina poora hash bhejo.'].join('\n')), kb(telegramLoginRows())).catch(() => {});
+        return;
+      }
+      flow.apiHash = value;
+      flow.stage = 'phone';
+      setUserTelegramLoginState(uid, flow);
+      pending.set(uid, { action: 'telegram_login', stage: 'phone' });
+      await ctx.reply(section('📱 Spare Telegram Number', [
+        field('API App', '✅ saved'),
+        field('Format', '+880XXXXXXXXXX, +91XXXXXXXXXX, ya 10-digit'),
+        ``,
+        '<b>Send:</b> spare account ka phone number yahan bhejo.',
+      ].join('\n')), kb(telegramLoginRows())).catch(() => {});
+      return;
+    }
+
+    if (flow.stage === 'phone') {
+      const phone = telegramOtp.normalizeTelegramLoginPhone?.(txt) || '';
+      if (!phone) {
+        await ctx.reply(section('⚠️ Phone Sahi Nahi', ['Valid phone bhejo — Indian 10-digit ya +country code ke saath (jaise +8801322367848).'].join('\n')), kb(telegramLoginRows())).catch(() => {});
+        return;
+      }
+      await ctx.reply('🔐 Telegram ko login code request bhej raha hoon…').catch(() => {});
+      const sent = await telegramOtp.startStatelessTelegramLogin({
+        apiId: flow.apiId,
+        apiHash: flow.apiHash,
+        phoneNumber: phone,
+      });
+      flow.apiId = sent.apiId;
+      flow.apiHash = sent.apiHash;
+      flow.phone = sent.phoneNumber;
+      flow.phoneCodeHash = sent.phoneCodeHash;
+      flow.tempSession = sent.tempSession;
+      flow.stage = 'code';
+      setUserTelegramLoginState(uid, flow);
+      pending.set(uid, { action: 'telegram_login', stage: 'code' });
+      await ctx.reply(section('🔑 Telegram Login Code', [
+        field('Number', maskTelegramLoginPhone(sent.phoneNumber)),
+        field('Delivery', sent.isCodeViaApp ? 'Telegram app' : 'SMS / Telegram'),
+        ``,
+        '<b>Send:</b> Telegram ka login code yahan bhejo.',
+        sub('Ye Hermes OTP nahi — spare Telegram account ka login code hai.'),
+      ].join('\n')), kb(telegramLoginRows())).catch(() => {});
+      return;
+    }
+
+    if (flow.stage === 'code' || flow.stage === 'password') {
+      const isPw = flow.stage === 'password';
+      const cleanCode = isPw ? '' : String(txt || '').replace(/[\s-]+/g, '').trim();
+      if (!isPw && (!cleanCode || cleanCode.length > 20)) {
+        await ctx.reply(section('⚠️ Code Sahi Nahi', ['Login code khali ya bahut lamba hai — sahi code dobara bhejo.'].join('\n')), kb(telegramLoginRows())).catch(() => {});
+        return;
+      }
+      if (isPw && !String(rawMessageText ?? '')) {
+        await ctx.reply(section('⚠️ Password Khali', ['2FA password dobara bhejo.'].join('\n')), kb(telegramLoginRows())).catch(() => {});
+        return;
+      }
+
+      const res = await telegramOtp.completeStatelessTelegramLogin({
+        apiId: flow.apiId,
+        apiHash: flow.apiHash,
+        phoneNumber: flow.phone,
+        phoneCodeHash: flow.phoneCodeHash,
+        phoneCode: cleanCode,
+        tempSession: flow.tempSession,
+        password: isPw ? String(rawMessageText ?? '') : '',
+      });
+
+      if (res.needsPassword) {
+        flow.tempSession = res.tempSession || flow.tempSession;
+        flow.stage = 'password';
+        setUserTelegramLoginState(uid, flow);
+        pending.set(uid, { action: 'telegram_login', stage: 'password' });
+        await ctx.reply(section('🔐 Telegram 2FA Password', [
+          field('Status', 'two-step verification ON'),
+          res.hint ? field('Hint', esc(res.hint.slice(0, 80))) : '',
+          ``,
+          '<b>Send:</b> 2FA password yahan bhejo.',
+        ].filter(Boolean).join('\n')), kb(telegramLoginRows())).catch(() => {});
+        return;
+      }
+
+      // Login complete! Save per-user spare Telegram account in store.js
+      setUserTelegramAccount(uid, {
+        apiId: res.apiId,
+        apiHash: res.apiHash,
+        session: res.session,
+        phone: res.phoneNumber,
+        me: res.me,
+      });
+      if (isAdminOwner(uid)) {
+        try {
+          telegramOtp.saveTelegramApiCredentials({ apiId: res.apiId, apiHash: res.apiHash }, { persist: true, updateProcessEnv: true });
+          telegramOtp.saveTelegramSessionString(res.session, { persist: true, updateProcessEnv: true });
+          bs.setSetting('telegramOtpMode', true);
+        } catch {}
+      }
+      clearUserLoginFlowState(uid);
+
+      let verifyLine = 'Settings → 🧪 Test dabakar check kar sakte ho.';
+      try {
+        const verify = await telegramOtp.withTelegramAccountContext({
+          userId: uid,
+          apiId: res.apiId,
+          apiHash: res.apiHash,
+          session: res.session,
+          requireOwnAccount: !isAdminOwner(uid),
+        }, () => telegramOtp.verifyTelegramOtpConnection({ sendStartIfEmpty: true }));
+        const verifyBot = String(verify.botUsername || 'HermeshuOTPROBOT').replace(/^@+/, '');
+        verifyLine = `@${verifyBot} connect ho gaya${verify.currentPhone ? ` · current number ${verify.currentPhone}` : ''}${verify.buttons?.length ? ` · buttons: ${verify.buttons.slice(0, 5).join(' · ')}` : ''}`;
+      } catch (e) {
+        verifyLine = `Account saved hai, lekin bot test abhi fail: ${shortTelegramLoginError(e)}`;
+      }
+
+      await ctx.reply(section('✅ Telegram Account Add Ho Gaya', [
+        field('Account', esc(res.me || maskTelegramLoginPhone(res.phoneNumber) || 'saved')),
+        field('Hermes test', esc(verifyLine)),
+        field('Session', '🔐 secure saved — chat me kabhi nahi dikhegi'),
+        !deleted ? sub('⚠️ Security ke liye apna code/password message chat se khud delete kar do.') : '',
+        ``,
+        sub('Ab aap apna spare account use karke START ya Gold Drop chala sakte ho.'),
+      ].filter(Boolean).join('\n')), kb(settingsRows())).catch(() => {});
+    }
+  } catch (error) {
+    const msg = shortTelegramLoginError(error);
+    const unrecoverable = /API_ID_INVALID|API_HASH_INVALID|PHONE_NUMBER_BANNED|FLOOD_WAIT|AUTH_KEY_(UNREGISTERED|DUPLICATED)|USER_DEACTIVATED|PHONE_NUMBER_INVALID|PHONE_CODE_EXPIRED|expire/i.test(msg);
+    if (unrecoverable) {
+      clearUserLoginFlowState(uid);
+      await ctx.reply(section('❌ Telegram Login Fail', [
+        esc(msg),
+        ``,
+        sub('Settings → Add Telegram Account se dobara try karo.'),
+      ].join('\n')), kb(settingsRows())).catch(() => {});
+    } else {
+      await ctx.reply(section('⚠️ Dobara Bhejo', [
+        esc(msg),
+        ``,
+        sub('Sahi value dobara bhejo, ya Cancel dabao.'),
+      ].join('\n')), kb(telegramLoginRows())).catch(() => {});
+    }
+  }
 }
 
 const editOrSend = async (ctx, text, rows) => {
@@ -2390,14 +2405,14 @@ bot.action('ap_diag', async (ctx) => {
 });
 
 bot.action('ap_sources', async (ctx) => {
-  if (!(await gate(ctx))) return;
+  if (!(await adminGate(ctx))) return;
   await ctx.answerCbQuery().catch(() => {});
   const { text, rows } = sourcesCard();
   await editOrSend(ctx, text, rows);
 });
 
 bot.action(/^ap_sources_p(\d+)$/, async (ctx) => {
-  if (!(await gate(ctx))) return;
+  if (!(await adminGate(ctx))) return;
   await ctx.answerCbQuery().catch(() => {});
   const { text, rows } = sourcesCard(Number(ctx.match[1]));
   await editOrSend(ctx, text, rows);
@@ -2405,7 +2420,7 @@ bot.action(/^ap_sources_p(\d+)$/, async (ctx) => {
 
 // Source detail — regex har naye source id tak match karega
 bot.action(/^ap_src_(?!add$)([a-f0-9-]{1,10})$/, async (ctx) => {
-  if (!(await gate(ctx))) return;
+  if (!(await adminGate(ctx))) return;
   await ctx.answerCbQuery().catch(() => {});
   const { text, rows } = sourceDetailCard(ctx.match[1]);
   await editOrSend(ctx, text, rows);
@@ -2421,7 +2436,7 @@ async function blockSourceChangeWhileRunning(ctx) {
 }
 
 bot.action(/^ap_src_use_([a-f0-9-]{1,10})$/, async (ctx) => {
-  if (!(await gate(ctx))) return;
+  if (!(await adminGate(ctx))) return;
   if (await blockSourceChangeWhileRunning(ctx)) return;
   const r = sources.setActiveSource(ctx.match[1]);
   await ctx.answerCbQuery(
@@ -2435,7 +2450,7 @@ bot.action(/^ap_src_use_([a-f0-9-]{1,10})$/, async (ctx) => {
 // Purane keyboards me Disable button ho sakta hai. Naye rule me ye kabhi
 // source ko off nahi karega — hatana ho to sirf Delete.
 bot.action(/^ap_src_toggle_([a-f0-9-]{1,10})$/, async (ctx) => {
-  if (!(await gate(ctx))) return;
+  if (!(await adminGate(ctx))) return;
   const r = sources.toggleSource(ctx.match[1]);
   await ctx.answerCbQuery(
     r.ok ? '✅ Ye Firebase hamesha ACTIVE rahega — hatana ho to Delete karein.' : `❌ ${r.error}`,
@@ -2446,7 +2461,7 @@ bot.action(/^ap_src_toggle_([a-f0-9-]{1,10})$/, async (ctx) => {
 });
 
 bot.action(/^ap_src_verify_(.{1,10})$/, async (ctx) => {
-  if (!(await gate(ctx))) return;
+  if (!(await adminGate(ctx))) return;
   await ctx.answerCbQuery('🧪 Testing…').catch(() => {});
   const id = ctx.match[1];
   const r = await sources.verifySource(id);
@@ -2467,7 +2482,7 @@ bot.action(/^ap_src_verify_(.{1,10})$/, async (ctx) => {
 });
 
 bot.action(/^ap_src_del_(.{1,10})$/, async (ctx) => {
-  if (!(await gate(ctx))) return;
+  if (!(await adminGate(ctx))) return;
   if (await blockSourceChangeWhileRunning(ctx)) return;
   const r = sources.removeSource(ctx.match[1]);
   await ctx.answerCbQuery(r.ok ? '🗑 Delete ho gaya.' : `❌ ${r.error}`, !r.ok && { show_alert: true }).catch(() => {});
@@ -2503,7 +2518,7 @@ bot.action('ap_src_add', async (ctx) => {
 // 🔀 Proxy handlers — add (text input) / toggle / delete / rotation on-off
 // ---------------------------------------------------------------------------
 bot.action('ap_proxies', async (ctx) => {
-  if (!(await gate(ctx))) return;
+  if (!(await adminGate(ctx))) return;
   await ctx.answerCbQuery().catch(() => {});
   // 🌍 World Bot mode: proxy pool ka concept nahi — sirf saaf jawab.
   if (bs.getSetting('accountEngine') === 'worldbot') {
@@ -2519,14 +2534,14 @@ bot.action('ap_proxies', async (ctx) => {
 });
 
 bot.action(/^ap_px_(?!add$|rot$|free$|autotoggle$)([a-f0-9-]{1,10})$/, async (ctx) => {
-  if (!(await gate(ctx))) return;
+  if (!(await adminGate(ctx))) return;
   await ctx.answerCbQuery().catch(() => {});
   const { text, rows } = proxyDetailCard(ctx.match[1]);
   await editOrSend(ctx, text, rows);
 });
 
 bot.action(/^ap_px_toggle_([a-f0-9-]{1,10})$/, async (ctx) => {
-  if (!(await gate(ctx))) return;
+  if (!(await adminGate(ctx))) return;
   const r = proxyPool.toggleProxy(ctx.match[1]);
   await ctx.answerCbQuery(r.ok ? (r.enabled ? '▫️ Enabled' : '🚫 Disabled') : `❌ ${r.error}`, !r.ok && { show_alert: true }).catch(() => {});
   const { text, rows } = proxiesCard();
@@ -2534,7 +2549,7 @@ bot.action(/^ap_px_toggle_([a-f0-9-]{1,10})$/, async (ctx) => {
 });
 
 bot.action(/^ap_px_del_([a-f0-9-]{1,10})$/, async (ctx) => {
-  if (!(await gate(ctx))) return;
+  if (!(await adminGate(ctx))) return;
   const r = proxyPool.removeProxy(ctx.match[1]);
   await ctx.answerCbQuery(r.ok ? '🗑 Delete ho gaya.' : `❌ ${r.error}`, !r.ok && { show_alert: true }).catch(() => {});
   const { text, rows } = proxiesCard();
@@ -3076,20 +3091,20 @@ async function showShopStock(ctx) {
 }
 
 bot.command(['shopstock', 'shopbot', 'stock'], async (ctx) => {
-  if (!isOwner(ctx.from?.id)) return;
+  if (!isAdminOwner(ctx.from?.id)) return;
   const text = shopStockCard();
   const rows = shopStockRows();
   await ctx.reply(text, kb(rows)).catch(() => {});
 });
 
 bot.action('ap_shop_stock', async (ctx) => {
-  if (!(await gate(ctx))) return;
+  if (!(await adminGate(ctx))) return;
   await ctx.answerCbQuery().catch(() => {});
   await showShopStock(ctx);
 });
 
 bot.action('ap_shop_flush', async (ctx) => {
-  if (!(await gate(ctx))) return;
+  if (!(await adminGate(ctx))) return;
   const st = shopStock.shopStockStatus();
   if (!st.pending) {
     await ctx.answerCbQuery('Queue khali hai — pehle 10 fresh aane do.', { show_alert: true }).catch(() => {});
@@ -3246,15 +3261,17 @@ bot.action(/^ap_set_telegram_refresh_(\d+)$/, async (ctx) => {
 bot.action('ap_telegram_account', async (ctx) => {
   if (!(await gate(ctx))) return;
   if (!(await requirePrivateTelegramChat(ctx, 'Add Telegram Account'))) return;
+  const uid = String(ctx.from.id);
   const status = telegramProviderStatus();
-  if (telegramLoginFlow || status.loginInProgress) {
+  const activeLogin = getActiveTelegramLogin(uid);
+  if (activeLogin || status.loginInProgress) {
     await ctx.answerCbQuery('⏳ Telegram login pehle se chal raha hai.').catch(() => {});
-    await editOrSend(ctx, telegramAccountCard(), telegramLoginRows());
+    await editOrSend(ctx, telegramAccountCard(uid), telegramLoginRows());
     return;
   }
   if (status.sessionPresent) {
     await ctx.answerCbQuery('👤 Telegram account saved hai.').catch(() => {});
-    await editOrSend(ctx, telegramAccountCard(), [
+    await editOrSend(ctx, telegramAccountCard(uid), [
       [
         { text: '🔁 Dusra Account Login', callback_data: 'ap_telegram_login_start', style: 'success' },
         { text: '🧪 Test', callback_data: 'ap_test_hermes' },
@@ -3271,22 +3288,24 @@ bot.action('ap_telegram_account', async (ctx) => {
 
 bot.action('ap_telegram_login_start', async (ctx) => {
   if (!(await gate(ctx))) return;
+  const uid = String(ctx.from.id);
+  clearUserLoginFlowState(uid);
   await startTelegramLoginFlow(ctx);
 });
 
 bot.action('ap_telegram_login_cancel', async (ctx) => {
   if (!(await gate(ctx))) return;
-  const flow = telegramLoginFlow;
-  if (!flow || flow.ownerId !== String(ctx.from.id)) {
+  const uid = String(ctx.from.id);
+  const flow = getActiveTelegramLogin(uid);
+  if (!flow) {
     await ctx.answerCbQuery('Koi Telegram login flow chal nahi raha.').catch(() => {});
     await editOrSend(ctx, settingsCard(), settingsRows());
     return;
   }
-  const wasWaiting = Boolean(flow.rejectInput);
-  cancelTelegramLoginFlow('cancel');
-  await ctx.answerCbQuery(wasWaiting ? '✖️ Telegram login cancel kar diya.' : '✖️ Cancel request bhej di — current step rukte hi flow band hoga.').catch(() => {});
+  clearUserLoginFlowState(uid);
+  await ctx.answerCbQuery('✖️ Telegram login cancel kar diya.').catch(() => {});
   await editOrSend(ctx, section('✖️ Telegram Login Cancel', [
-    `Login flow band ho raha hai. Partial session save nahi hogi.`,
+    `Login flow band kar diya gaya hai. Partial session save nahi hui.`,
     ``,
     sub('Dobara start karne ke liye Settings → Add Telegram Account dabao.'),
   ].join('\n')), settingsRows());
@@ -3295,13 +3314,14 @@ bot.action('ap_telegram_login_cancel', async (ctx) => {
 bot.action('ap_test_hermes', async (ctx) => {
   if (!(await gate(ctx))) return;
   if (!(await requirePrivateTelegramChat(ctx, 'Test Hermes'))) return;
+  const uid = String(ctx.from.id);
   if (isAutopilotRunning()) {
     await ctx.answerCbQuery('⏳ Batch chal raha hai — Hermes chat batch ke paas hai; test baad me karo.', { show_alert: true }).catch(() => {});
     return;
   }
-  if (telegramLoginFlow || telegramProviderStatus().loginInProgress) {
+  if (getActiveTelegramLogin(uid) || telegramProviderStatus().loginInProgress) {
     await ctx.answerCbQuery('⏳ Telegram login chal raha hai — pehle use complete ya cancel karo.', { show_alert: true }).catch(() => {});
-    await editOrSend(ctx, telegramAccountCard(), telegramLoginRows());
+    await editOrSend(ctx, telegramAccountCard(uid), telegramLoginRows());
     return;
   }
 
@@ -3354,23 +3374,22 @@ bot.action('ap_test_hermes', async (ctx) => {
 bot.action('ap_remove_telegram', async (ctx) => {
   if (!(await gate(ctx))) return;
   if (!(await requirePrivateTelegramChat(ctx, 'Remove Telegram Account'))) return;
+  const uid = String(ctx.from.id);
   if (isAutopilotRunning()) {
     await ctx.answerCbQuery('⏳ Batch chal raha hai — pehle STOP karo.', { show_alert: true }).catch(() => {});
     return;
   }
-  if (telegramLoginFlow || telegramProviderStatus().loginInProgress) {
+  if (getActiveTelegramLogin(uid) || telegramProviderStatus().loginInProgress) {
     await ctx.answerCbQuery('⏳ Telegram login chal raha hai — pehle use cancel karo.', { show_alert: true }).catch(() => {});
-    await editOrSend(ctx, telegramAccountCard(), telegramLoginRows());
+    await editOrSend(ctx, telegramAccountCard(uid), telegramLoginRows());
     return;
   }
   await ctx.answerCbQuery().catch(() => {});
   await editOrSend(ctx, section('🗑 Remove Telegram Account?', [
-    telegramAccountCard(),
+    telegramAccountCard(uid),
     ``,
-    field('Effect', 'saved session delete + Hermes mode OFF'),
+    field('Effect', 'aapka saved spare session delete hoga'),
     field('Account', 'Telegram account khud delete nahi hoga'),
-    ``,
-    sub('TELEGRAM_SESSION env me bhi ho to restart par wapas aa sakti hai — wahan se bhi hatao.'),
   ].join('\n')), [
     [{ text: '🗑 Haan, Remove Kar Do', callback_data: 'ap_remove_telegram_confirm', style: 'danger' }],
     [{ text: '↩️ Cancel', callback_data: 'ap_settings', style: 'primary' }],
@@ -3380,24 +3399,28 @@ bot.action('ap_remove_telegram', async (ctx) => {
 bot.action('ap_remove_telegram_confirm', async (ctx) => {
   if (!(await gate(ctx))) return;
   if (!(await requirePrivateTelegramChat(ctx, 'Remove Telegram Account'))) return;
+  const uid = String(ctx.from.id);
   if (isAutopilotRunning()) {
     await ctx.answerCbQuery('⏳ Batch chal raha hai — pehle STOP karo.', { show_alert: true }).catch(() => {});
     return;
   }
-  if (telegramLoginFlow || telegramProviderStatus().loginInProgress) {
+  if (getActiveTelegramLogin(uid) || telegramProviderStatus().loginInProgress) {
     await ctx.answerCbQuery('⏳ Telegram login chal raha hai — pehle use cancel karo.', { show_alert: true }).catch(() => {});
     return;
   }
   try {
-    const r = await telegramOtp.clearTelegramSessionString();
-    try { bs.setSetting('telegramOtpMode', false); } catch {}
+    const hadPerUser = clearUserTelegramAccount(uid);
+    let r = { removedFile: false, removedEnv: false, envSessionMayReturnAfterRestart: false };
+    if (isAdminOwner(uid)) {
+      r = await telegramOtp.clearTelegramSessionString();
+      try { bs.setSetting('telegramOtpMode', false); } catch {}
+    }
     await ctx.answerCbQuery('🗑 Telegram account remove ho gaya.').catch(() => {});
     await editOrSend(ctx, section('🗑 Telegram Account Removed', [
-      field('Saved session file', r.removedFile ? '✅ delete ho gaya' : 'file nahi mili / already clear'),
-      field('Process env', r.removedEnv ? '✅ current process se clear' : 'env session current process me nahi thi'),
-      field('Hermes mode', 'OFF'),
-      r.envSessionMayReturnAfterRestart
-        ? `⚠️ Session pehle env source se aayi thi — restart ke baad wapas na aaye, Render env <code>TELEGRAM_SESSION</code> bhi remove karo.`
+      field('Per-user session', hadPerUser ? '✅ remove ho gayi' : 'already clear'),
+      isAdminOwner(uid) ? field('Saved session file', r.removedFile ? '✅ delete ho gaya' : 'file nahi mili / already clear') : '',
+      isAdminOwner(uid) && r.envSessionMayReturnAfterRestart
+        ? `⚠️ Session env source se aayi thi — restart ke baad wapas na aaye, env <code>TELEGRAM_SESSION</code> bhi remove karo.`
         : '',
       ``,
       sub('Dobara use karna ho to Settings → Add Telegram Account se spare account login karo.'),
@@ -4347,9 +4370,9 @@ bot.on('text', async (ctx) => {
     }
     pending.delete(uid);
     const card = await ctx.reply('🟡 Gold Drop shuru ho raha hai…');
-    startGoldDropRun(ctx, st.source, Number(txt), card.message_id).catch(error => {
+    vercelWaitUntil(startGoldDropRun(ctx, st.source, Number(txt), card.message_id).catch(error => {
       ctx.telegram.editMessageText(ctx.chat.id, card.message_id, undefined, `⚠️ ${String(error?.message || 'Run start failed')}`).catch(() => {});
-    });
+    }));
     return;
   }
 
@@ -4359,44 +4382,7 @@ bot.on('text', async (ctx) => {
   }
 
   if (st.action === 'telegram_login') {
-    const flow = telegramLoginFlow;
-    // Sensitive login inputs sabse pehle chat se delete karne ki koshish karo.
-    let deleted = false;
-    try {
-      if (ctx.chat?.id && ctx.message?.message_id) {
-        await bot.telegram.deleteMessage(ctx.chat.id, ctx.message.message_id);
-        deleted = true;
-      }
-    } catch {}
-
-    if (!flow || flow.id !== st.flowId || flow.ownerId !== uid || flow.stage !== st.stage) {
-      pending.delete(uid);
-      await ctx.reply('⌛ Ye Telegram login step khatam ho gaya hai. Settings → Add Telegram Account se dobara shuru karo.', kb(settingsRows())).catch(() => {});
-      return;
-    }
-    if (ctx.chat?.type !== 'private' || String(ctx.chat.id) !== String(flow.chatId)) {
-      await ctx.reply('🔒 Telegram login input sirf usi private chat se bhejo jahan Add Telegram Account start kiya tha.').catch(() => {});
-      return;
-    }
-    if (!deleted && !flow.deleteWarned) {
-      flow.deleteWarned = true;
-      await ctx.reply('⚠️ Input message auto-delete nahi ho paya — security ke liye use khud delete kar do.').catch(() => {});
-    }
-    if (/^\/cancel(?:@\w+)?$/i.test(txt)) {
-      cancelTelegramLoginFlow('cancel');
-      await ctx.reply('✖️ Telegram login cancel request mil gayi.', kb(settingsRows())).catch(() => {});
-      return;
-    }
-
-    const resolve = flow.resolveInput;
-    clearTelegramLoginWait(flow);
-    if (!resolve) {
-      await ctx.reply('⏳ Login processor abhi ready nahi hai — agla prompt aaye tab dobara bhejo.').catch(() => {});
-      return;
-    }
-    // Password me leading/trailing spaces bhi ho sakte hain; baaki stages apne
-    // validators me normalization karte hain. Isliye raw value resolve hoti hai.
-    resolve(st.stage === 'password' ? rawMessageText : txt);
+    await handleTelegramLoginText(ctx, txt, rawMessageText);
     return;
   }
 
@@ -4548,53 +4534,18 @@ const shutdown = (signal) => {
   try { healthServer?.close?.(); } catch {}
   setTimeout(() => process.exit(0), 1500).unref?.();
 };
-process.once('SIGINT', () => shutdown('SIGINT'));
-process.once('SIGTERM', () => shutdown('SIGTERM'));
-
-// Startup self-check — console me pehli nazar me sab dikh jaye
-{
-  const nodeMajor = Number(String(process.versions.node).split('.')[0]) || 0;
-  console.log(`[FreshBot] 🏷 Instance: ${instanceInfo.getInstanceLabel()}${instanceInfo.isSecondaryInstance() ? ' (doosra bot — INSTANCE_LABEL env se)' : ''}`);
-  {
-    const shard = instanceShard.shardSummary();
-    if (shard.enabled) {
-      console.log(`[FreshBot] 🧩 Shard: pool/proxies ko ${shard.count} hisson me baanta — ye hissa ${shard.share} (INSTANCE_COUNT=${shard.count}, INSTANCE_INDEX=${shard.index})`);
-    } else if (instanceInfo.isSecondaryInstance()) {
-      console.warn('[FreshBot] ⚠️ INSTANCE_LABEL set hai par INSTANCE_COUNT nahi — agar kai bots ek hi Firebase pool/proxy par chal rahe hain to wo ek doosre se ladenge (same numbers, same IPs, same OTP). Fix: har instance me INSTANCE_COUNT=<kul bots> daalo (e.g. 4).');
-    }
-  }
-  {
-    try {
-      const tag = telegramOtp.telegramSessionTag();
-      if (tag) console.log(`[FreshBot] 🔑 Telegram session tag: ${tag} — DOOSRE bot par bhi yahi tag dikhe to wo ek hi spare account hai (OTP races + session conflict). Har bot ka apna account chahiye.`);
-    } catch {}
-  }
-  console.log(`[FreshBot] Node ${process.version}${nodeMajor < 20 ? '  ⚠️ Node 20+ chahiye — nodejs.org se update karo, warna kuch bhi kabhi bhi toot sakta hai!' : ''}`);
-  try {
-    const c = getChromeStatus();
-    console.log(c.found
-      ? `[FreshBot] Chrome ✅ ${c.path}${c.headless ? ' (headless)' : ''}`
-      : '[FreshBot] Chrome ❌ nahi mila — WAF solver nahi chalega. Chrome install karo ya .env me PUPPETEER_EXECUTABLE_PATH do. (Bot phir bhi chalega, /diag dekho.)');
-  } catch {}
-  console.log(`[FreshBot] Firebase ${isFirebaseConfigured() ? '✅ configured' : '❌ config nahi — FIREBASE_DB_URL / Settings → Firebase Sources'}`);
-  console.log(`[FreshBot] Owner gate: ${ownerIds() ? 'OWNER_IDS (.env)' : 'store bossIds + default (OWNER_IDS khali hai)'}`);
+if (isDirectCliEntry && !process.env.VERCEL) {
+  process.once('SIGINT', () => shutdown('SIGINT'));
+  process.once('SIGTERM', () => shutdown('SIGTERM'));
 }
 
 const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
 const tgCode = (e) => Number(e?.code ?? e?.response?.error_code ?? 0) || 0;
 const isNetErr = (e) => /fetch|network|socket|TLS|ECONN|ETIMEDOUT|EAI_AGAIN|timed? ?out|disconnected/i.test(`${e?.name || ''} ${e?.message || ''}`);
 
-// ---------------------------------------------------------------------------
-// 🔒 Ek hi instance — dobara "409: Conflict: terminated by other getUpdates
-// request" wala crash rokne ke liye. Ek lock file (data/bot.lock) batati hai
-// ki isi machine par pehle se ek copy chal rahi hai. Purani copy band ho chuki
-// hai to stale lock khud hata kar aage badh jaate hain.
-// ---------------------------------------------------------------------------
 async function acquireInstanceLock() {
   try {
     const fs = await import('node:fs');
-    const path = await import('node:path');
-    const { fileURLToPath } = await import('node:url');
     const dir = process.env.DATA_DIR
       ? path.resolve(process.env.DATA_DIR)
       : path.join(path.dirname(fileURLToPath(import.meta.url)), 'data');
@@ -4607,7 +4558,7 @@ async function acquireInstanceLock() {
         try { process.kill(pid, 0); } catch (e) { alive = e?.code === 'EPERM'; }
         if (alive) return { ok: false, pid, lock };
       }
-      fs.unlinkSync(lock); // stale lock (purani copy mar chuki hai)
+      fs.unlinkSync(lock);
     }
     fs.writeFileSync(lock, String(process.pid));
     const mine = String(process.pid);
@@ -4618,25 +4569,10 @@ async function acquireInstanceLock() {
     });
     return { ok: true, lock };
   } catch {
-    return { ok: true }; // lock na bane to bot band mat karo
+    return { ok: true };
   }
 }
 
-const lockState = await acquireInstanceLock();
-if (!lockState.ok) {
-  console.error(`❌ Isi machine par bot ALREADY chal raha hai (PID ${lockState.pid}).`);
-  console.error('   Ek token = ek copy. Purani copy band karo (Ctrl+C wale terminal ya us service ko),');
-  console.error('   phir npm start. Do copy ek saath = Telegram 409 Conflict.');
-  process.exit(1);
-}
-
-// Token + internet pehle test karo (getMe) — network par retry, token galat
-// ho to turant saaf wajah. Bina is test ke bot chup-chaap "launch failed"
-// bolkar mar jata tha.
-// getMe ka HARD timeout. Telegraf/undici kabhi kabhi reply ke intezaar me
-// latak jate hain (Render par dekha gaya: /health par 200, ready:false, aur
-// process na aage badha na restart hua). Isliye har network call khud band
-// karo — hang = fail, phir normal retry.
 const TELEGRAM_CALL_TIMEOUT_MS = Number(process.env.TELEGRAM_CALL_TIMEOUT_MS) || 20_000;
 function withTelegramTimeout(promise, label = 'telegram call', ms = TELEGRAM_CALL_TIMEOUT_MS) {
   let timer = null;
@@ -4656,9 +4592,6 @@ async function preflight() {
       runtimeHealth.telegramApiFailures = 0;
       runtimeHealth.lastTelegramError = '';
       console.log(`[FreshBot] Telegram ✅ @${me.username} (id ${me.id})`);
-      // Agar is token par kahin webhook laga ho (purana server, ya token
-      // leak hone par kisi aur ne lagaya ho) to polling 409 marega aur bot
-      // kabhi chalega hi nahi — isliye shuru me webhook saaf kar do.
       await withTelegramTimeout(bot.telegram.deleteWebhook({ drop_pending_updates: true }), 'deleteWebhook')
         .catch((e) => console.warn('[FreshBot] deleteWebhook skip:', e?.message || e));
       return me;
@@ -4668,28 +4601,20 @@ async function preflight() {
       const code = tgCode(e);
       if (code === 401) {
         console.error('❌ BOT_TOKEN galat hai ya revoke ho chuka hai (Telegram 401).');
-        console.error('   Fix: Telegram me @BotFather → /mybots → apna bot → API Token → naya token lo,');
-        console.error('   .env ki BOT_TOKEN= wali line me naya token daalo, phir npm start.');
         process.exit(1);
       }
       const waitSec = Math.min(3 * 2 ** (attempt - 1), 30);
       const retryable = isNetErr(e) || code === 429 || code >= 500 || code === 0;
       console.error(`[FreshBot] Telegram se connect nahi hua (try ${attempt}/6): ${e?.message || e}`);
       if (!retryable || attempt === 6) {
-        console.error('❌ Internet/Telegram tak pahunch hi nahi paya. Net check karo (VPN/firewall?), phir npm start.');
+        console.error('❌ Internet/Telegram tak pahunch hi nahi paya.');
         process.exit(1);
       }
-      console.log(`[FreshBot] ${waitSec}s ruk kar dobara try…`);
       await sleepMs(waitSec * 1000);
     }
   }
 }
 
-// Telegram API/polling atak jaye to health server akele 200 deta rahega
-// aur user ko lagega cron kaam kar raha hai lekin bot jawab nahi de raha.
-// Watchdog har 2 minute me halka getMe check karta hai; lagatar 3 fail
-// par process exit kar deta hai taaki Render fresh instance/polling start
-// kare. Ek-aadh network jhatke par restart nahi hota.
 function startTelegramWatchdog() {
   if (telegramWatchdogTimer) return;
   telegramWatchdogTimer = setInterval(async () => {
@@ -4707,14 +4632,11 @@ function startTelegramWatchdog() {
       console.warn(`[FreshBot] Telegram watchdog fail ${runtimeHealth.telegramApiFailures}/3: ${runtimeHealth.lastTelegramError}`);
       if (code === 401 || runtimeHealth.telegramApiFailures >= 3) {
         if (isAutopilotRunning()) {
-          // Active batch ko Telegram UI/API ke jhatke par force-stop mat
-          // karo. Hermes/Swiggy ka kaam process ke andar jaari reh sakta
-          // hai; restart sirf batch khatam honay ke baad watchdog karega.
           runtimeHealth.telegramApiFailures = 2;
           console.error('[FreshBot] Telegram API fail hai, lekin batch chal raha hai — restart batch ke baad tak deferred.');
           return;
         }
-        console.error('[FreshBot] Telegram API lagatar fail hai — Render restart ke liye process exit kar raha hoon.');
+        console.error('[FreshBot] Telegram API lagatar fail hai — restart ke liye process exit kar raha hoon.');
         try { requestAutopilotStop('telegram-watchdog'); } catch {}
         process.exit(1);
       }
@@ -4723,148 +4645,85 @@ function startTelegramWatchdog() {
   telegramWatchdogTimer.unref?.();
 }
 
-// ---------------------------------------------------------------------------
-// ☁️ Cloud-vault hydrate (Render ke liye khaas zaroori) — bina persistent
-// disk ke har deploy/restart par data/db.json fresh banta hai aur saare
-// saved accounts chale jate. Vault configured ho (GITHUB_VAULT_TOKEN +
-// VAULT_ENCRYPTION_KEY) to accounts GitHub vault se wapas aa jate hain.
-// Pehle ye function store me tha lekin bot ise KABHI bulata hi nahi tha.
-// 12s timeout: vault slow/fail ho to bot startup atke nahi.
-// ---------------------------------------------------------------------------
-try {
-  const hydrated = await Promise.race([
-    hydrateAccountsFromCloudVault(),
-    sleepMs(12_000).then(() => null),
-  ]);
-  if (hydrated) console.log(`[FreshBot] Cloud vault hydrate: ${hydrated.restored}/${hydrated.total} accounts wapas aaye.`);
-} catch (e) {
-  console.warn('[FreshBot] Cloud vault hydrate skipped:', e?.message || e);
-}
+let _botInitPromise = null;
+export async function ensureBotInitialized() {
+  if (_botInitPromise) return _botInitPromise;
+  _botInitPromise = (async () => {
+    const isServerless = Boolean(process.env.VERCEL);
+    const vaultMs = isServerless ? 6_000 : 12_000;
+    const linkedMs = isServerless ? 8_000 : 20_000;
 
-// ---------------------------------------------------------------------------
-// 💾 LINKED DATABASE hydrate — DB ko durable store se bind karo.
-//
-// Render free disk / GitHub Actions runner par `data/db.json` har restart
-// par mit jata hai (accounts, settings, number-ledger, Firebase source list).
-// Isi liye DB ka linked store (GitHub vault / Vercel KV / DB_STORE) se boot
-// par sab kuch wapas aata hai.
-//
-// ⚠️ 12s timeout ke baad bhi local db ko khaali chhodkar aage nahi badhte —
-// pehle ka behaviour me timeout par bot khali db par chalta tha aur pehli
-// push se remote DB WIPE ho jata tha (asli data loss).
-// ---------------------------------------------------------------------------
-try {
-  const linkStatus0 = getDbLinkStatus();
-  if (linkStatus0.linked) {
-    const linked = await Promise.race([
-      hydrateFromLinkedDb(),
-      sleepMs(20_000).then(() => null),
-    ]);
-    if (linked) {
-      console.log(`[FreshBot] 💾 Linked DB (${linkStatus0.driver}) hydrate: ${linked.restored}/${linked.total} accounts wapas aaye.`);
-    } else {
-      console.warn(`[FreshBot] 💾 Linked DB (${linkStatus0.driver}) hydrate timeout — remote data merge push se protect rahega.`);
+    try {
+      const hydrated = await Promise.race([
+        hydrateAccountsFromCloudVault(),
+        sleepMs(vaultMs).then(() => null),
+      ]);
+      if (hydrated) console.log(`[FreshBot] Cloud vault hydrate: ${hydrated.restored}/${hydrated.total} accounts wapas aaye.`);
+    } catch (e) {
+      console.warn('[FreshBot] Cloud vault hydrate skipped:', e?.message || e);
     }
-  } else {
-    console.warn('[FreshBot] ⚠️ DB LINKED nahi hai — accounts/settings sirf local file me hain (restart = data loss). `npm run doctor` dekho.');
-  }
-} catch (e) {
-  console.warn('[FreshBot] Linked DB hydrate skipped:', e?.message || e);
+
+    try {
+      const linkStatus0 = getDbLinkStatus();
+      if (linkStatus0.linked) {
+        const linked = await Promise.race([
+          hydrateFromLinkedDb(),
+          sleepMs(linkedMs).then(() => null),
+        ]);
+        if (linked) {
+          console.log(`[FreshBot] 💾 Linked DB (${linkStatus0.driver}) hydrate: ${linked.restored}/${linked.total} accounts wapas aaye.`);
+        } else {
+          console.warn(`[FreshBot] 💾 Linked DB (${linkStatus0.driver}) hydrate timeout.`);
+        }
+      }
+    } catch (e) {
+      console.warn('[FreshBot] Linked DB hydrate skipped:', e?.message || e);
+    }
+
+    if (!isServerless) {
+      try { startLinkedDbRetry(); } catch {}
+    }
+
+    try {
+      seedUsedNumbersFromSeedFile();
+    } catch (e) {
+      console.warn('[FreshBot] Used-numbers seed skipped:', e?.message || e);
+    }
+
+    try {
+      trimExpiredUsedNumbers();
+    } catch (e) {
+      console.warn('[FreshBot] Ledger trim skipped:', e?.message || e);
+    }
+
+    try {
+      const savedOtpBot = bs.getSetting('otpBotProfile');
+      telegramOtp.setActiveOtpBotProfile(savedOtpBot || 'hermes');
+    } catch (e) {
+      console.warn('[FreshBot] OTP bot apply skipped:', e?.message || e);
+    }
+
+    try {
+      sources.applyActiveSource();
+    } catch (e) {
+      console.warn('[FreshBot] Firebase sources apply skipped:', e?.message || e);
+    }
+
+    if (isServerless) {
+      runtimeHealth.telegramReady = true;
+      runtimeHealth.telegramReadyAt ||= Date.now();
+    }
+  })();
+  return _botInitPromise;
 }
 
-// Failed push ko retry (outbox + 60s tick) — network jhatke me data mat lo.
-try { startLinkedDbRetry(); } catch {}
-
-// ---------------------------------------------------------------------------
-// 📋 Used-numbers seed — owner ki list (seed/used-numbers.json) ka import.
-//
-// Ye numbers cooldown window tak block hote hain (OTP dobara nahi lena).
-// Har instance par boot par lagta hai, taaki Render/GH Actions dono par
-// wahi list ho. 30 din baad unlock ho jate hain (seed window expire).
-// ---------------------------------------------------------------------------
-try {
-  const seeded = seedUsedNumbersFromSeedFile();
-  if (seeded?.present) {
-    console.log(
-      `[FreshBot] 📋 Used-numbers seed: ${seeded.added} naye block, ${seeded.kept} pehle se block, ` +
-      `${seeded.skipped} skip · ledger ${seeded.total} numbers${seeded.seedActive ? '' : ' (seed window expire — naye add nahi hue)'}`
-    );
-  } else {
-    console.warn(`[FreshBot] 📋 Used-numbers seed: file nahi mili (${seeded?.file || 'seed/used-numbers.json'})`);
-  }
-} catch (e) {
-  console.warn('[FreshBot] Used-numbers seed skipped:', e?.message || e);
+export async function handleTelegramUpdate(update) {
+  await ensureBotInitialized();
+  return bot.handleUpdate(update);
 }
 
-// Expire ho chuke ledger entries hata do (ledger bounded rahe, vault file
-// chhoti rahe — warna 10k+ numbers par GitHub ka 1MB limit toot jata).
-try {
-  const trimmed = trimExpiredUsedNumbers();
-  if (trimmed.removed > 0) {
-    console.log(`[FreshBot] 🧹 Ledger trim: ${trimmed.removed} expire entries hataye (ab ${trimmed.remaining}).`);
-  }
-} catch (e) {
-  console.warn('[FreshBot] Ledger trim skipped:', e?.message || e);
-}
+export { bot, buildHealthPayload, isOwner, isAdminOwner };
 
-// Saved OTP bot (Hermes / HardXotp) boot par hi apply karo — taaki /diag,
-// Test Hermes aur batch — teeno ek hi bot dikhayen/chalayen.
-try {
-  const savedOtpBot = bs.getSetting('otpBotProfile');
-  if (savedOtpBot && savedOtpBot !== 'hermes') telegramOtp.setActiveOtpBotProfile(savedOtpBot);
-  else telegramOtp.setActiveOtpBotProfile(savedOtpBot || 'hermes');
-  console.log(`[FreshBot] 🤖 OTP bot: ${otpBotProfiles.getOtpBotProfile(savedOtpBot).username}`);
-} catch (e) {
-  console.warn('[FreshBot] OTP bot apply skipped:', e?.message || e);
-}
-
-// Vault se owner ki Firebase list wapas aayi ho to reader par turant lagao —
-// warna first-try purani env DB reh jati hai aur 400+ saved sources bekaar.
-try {
-  const applied = sources.applyActiveSource();
-  const all = sources.listSources();
-  console.log(`[FreshBot] 🔥 Firebase sources ready: ${all.length} ACTIVE · first-try ${applied?.name || 'env'}`);
-} catch (e) {
-  console.warn('[FreshBot] Firebase sources apply skipped:', e?.message || e);
-}
-
-// Health server upar bot bante hi start ho chuka hai (Render ko port
-// foran chahiye hota hai) — yahan dobara start nahi karna.
-await preflight();
-
-// 409 = doosri copy chal rahi hai. Kabhi kabhi wo copy abhi mar rahi/Restart
-// ho rahi hoti hai — aise me 1-2 try me yehi instance aage aa jata hai.
-// Persistent conflict ho to saaf wajah ke saath band (retry se fayda nahi).
-//
-// ⚠️ Loop ka control `await bot.launch()` se hi — kabhi onLaunch callback se
-// nahi. Telegraf me wo callback getMe ke BAAD aur polling se PEHLE chalta hai,
-// to usse flag set karne par pehle hi 409 aane par bhi loop soch kar band ho
-// jata tha (process chup-chaap exit 0, koi message nahi).
-//
-// "Live" ka confirmation bhi asal me hi: 409 aam taur par 1-2s me aa jata
-// hai, isliye har attempt ke 6s baad bina ruke = polling stable. Health
-// readiness/watchdog bhi isi stable point par ON hoti hai.
-let liveTimer = null;
-const armLiveConfirm = (attempt) => {
-  if (liveTimer) clearTimeout(liveTimer);
-  liveTimer = setTimeout(() => {
-    runtimeHealth.telegramReady = true;
-    runtimeHealth.telegramReadyAt = Date.now();
-    startTelegramWatchdog();
-    console.log('✅ Bot LIVE — Telegram polling stable (koi conflict nahi).');
-    console.log('🆕 Swiggy Fresh Bot chal raha hai — START dabao, phone chhod ke aa jao. (/diag = health check)');
-  }, 6_000);
-  liveTimer.unref?.();
-};
-const disarmLiveConfirm = () => { if (liveTimer) { clearTimeout(liveTimer); liveTimer = null; } };
-
-// ---------------------------------------------------------------------------
-// 🔁 AUTO-RESUME — Render deploy/restart, GitHub-Actions runner badalna ya
-// process crash ke baad WAHI batch khud wapas shuru ho. Flag db (data/db.json)
-// aur cloud vault dono me hota hai; manual STOP aur target pura hone par
-// engine khud flag clear kar deta hai, isliye ye kabhi apne aap repeat nahi
-// hota. Ye hi us "batch ruk gaya" ka tod hai jo restart par hota tha.
-// ---------------------------------------------------------------------------
 function createHeadlessUi(chatId) {
   let msgId = 0;
   let lastAt = 0;
@@ -4873,8 +4732,6 @@ function createHeadlessUi(chatId) {
     async update(text, rows) {
       const now = Date.now();
       if (!text || text === lastText) return;
-      // Flood se bachao: live card sirf ~15s me ek baar; final summary
-      // ("BATCH KHATAM") hamesha jaati hai.
       const isFinal = /BATCH KHATAM/.test(text);
       if (!isFinal && now - lastAt < 15_000) return;
       lastAt = now;
@@ -4897,7 +4754,7 @@ function createHeadlessUi(chatId) {
 async function maybeAutoResumeBatch() {
   try {
     if (shuttingDown || isAutopilotRunning()) return;
-    if (bs.getSetting('autoContinue') === false) return; // Never-stop OFF = koi auto start nahi
+    if (bs.getSetting('autoContinue') === false) return;
     const resume = bs.getAutopilotResume();
     if (!resume?.wanted) return;
     const savedAt = Number(resume.savedAt || resume.startedAt || 0);
@@ -4906,7 +4763,7 @@ async function maybeAutoResumeBatch() {
       return;
     }
     const ids = ownerIds();
-    const chatId = ids ? [...ids][0] : '5393396812';
+    const chatId = ids ? [...ids][0] : '6484999726';
     if (!chatId) return;
     const ui = createHeadlessUi(chatId);
     const mins = Math.max(1, Math.round((Date.now() - savedAt) / 60_000));
@@ -4934,65 +4791,88 @@ async function maybeAutoResumeBatch() {
   }
 }
 
-// Telegram ready hone ke ~25s baad ek hi baar check (polling ke saath parallel).
-setTimeout(() => { void maybeAutoResumeBatch(); }, 25_000).unref?.();
-
-let conflictAttempts = 0;
-let transientLaunchAttempts = 0;
-for (let attempt = 1; ; attempt++) {
-  armLiveConfirm(attempt);
+async function startCliBot() {
+  const nodeMajor = Number(String(process.versions.node).split('.')[0]) || 0;
+  console.log(`[FreshBot] 🏷 Instance: ${instanceInfo.getInstanceLabel()}${instanceInfo.isSecondaryInstance() ? ' (doosra bot — INSTANCE_LABEL env se)' : ''}`);
+  console.log(`[FreshBot] Node ${process.version}${nodeMajor < 20 ? '  ⚠️ Node 20+ chahiye' : ''}`);
   try {
-    await bot.launch({ dropPendingUpdates: true }, () => {
-      console.log(`🔄 Telegram connect ho raha hai (attempt ${attempt})…`);
-    });
-    // Yahan tab aate hain jab launch resolve ho (yaani polling stop ho chuki —
-    // shutdown already chal raha hoga). Dobara launch ki zaroorat nahi.
-    disarmLiveConfirm();
-    runtimeHealth.telegramReady = false;
-    break;
-  } catch (e) {
-    disarmLiveConfirm();
-    runtimeHealth.telegramReady = false;
-    runtimeHealth.telegramApiFailures++;
-    runtimeHealth.lastTelegramError = String(e?.message || e || '').slice(0, 180);
-    const code = tgCode(e);
-    if (shuttingDown) break;
-    const batchRunning = (() => { try { return isAutopilotRunning(); } catch { return false; } })();
-    if (code === 409) {
-      conflictAttempts += 1;
-      if (conflictAttempts < 4 || batchRunning) {
-        console.error(`[FreshBot] 409 Conflict (try ${conflictAttempts}) — doosri copy abhi band ho rahi hogi; webhook saaf karke 15s baad dobara…`);
+    const c = getChromeStatus();
+    console.log(c.found
+      ? `[FreshBot] Chrome ✅ ${c.remote ? 'remote WS' : c.path}${c.headless ? ' (headless)' : ''}`
+      : '[FreshBot] Chrome ❌ nahi mila — World Bot / Gold Drop mode bina Chrome chalega.');
+  } catch {}
+  console.log(`[FreshBot] Firebase ${isFirebaseConfigured() ? '✅ configured' : '❌ config nahi'}`);
+  console.log(`[FreshBot] Mode: ${isPublicBotMode() ? 'Public multi-user (apna spare account)' : 'Owner-only'}`);
+
+  const lockState = await acquireInstanceLock();
+  if (!lockState.ok) {
+    console.error(`❌ Isi machine par bot ALREADY chal raha hai (PID ${lockState.pid}).`);
+    process.exit(1);
+  }
+
+  await ensureBotInitialized();
+  await preflight();
+
+  let liveTimer = null;
+  const armLiveConfirm = () => {
+    if (liveTimer) clearTimeout(liveTimer);
+    liveTimer = setTimeout(() => {
+      runtimeHealth.telegramReady = true;
+      runtimeHealth.telegramReadyAt = Date.now();
+      startTelegramWatchdog();
+      console.log('✅ Bot LIVE — Telegram polling stable (koi conflict nahi).');
+    }, 6_000);
+    liveTimer.unref?.();
+  };
+  const disarmLiveConfirm = () => { if (liveTimer) { clearTimeout(liveTimer); liveTimer = null; } };
+
+  setTimeout(() => { void maybeAutoResumeBatch(); }, 25_000).unref?.();
+
+  let conflictAttempts = 0;
+  let transientLaunchAttempts = 0;
+  for (let attempt = 1; ; attempt++) {
+    armLiveConfirm();
+    try {
+      await bot.launch({ dropPendingUpdates: true }, () => {
+        console.log(`🔄 Telegram connect ho raha hai (attempt ${attempt})…`);
+      });
+      disarmLiveConfirm();
+      runtimeHealth.telegramReady = false;
+      break;
+    } catch (e) {
+      disarmLiveConfirm();
+      runtimeHealth.telegramReady = false;
+      runtimeHealth.telegramApiFailures++;
+      runtimeHealth.lastTelegramError = String(e?.message || e || '').slice(0, 180);
+      const code = tgCode(e);
+      if (shuttingDown) break;
+      const batchRunning = (() => { try { return isAutopilotRunning(); } catch { return false; } })();
+      if (code === 409 && (conflictAttempts < 4 || batchRunning)) {
+        conflictAttempts += 1;
         try { bot.stop('retry-409'); } catch {}
         await bot.telegram.deleteWebhook({ drop_pending_updates: true }).catch(() => {});
         await sleepMs(15_000);
         continue;
       }
-    }
-    if (code === 401 && batchRunning) {
-      console.error('[FreshBot] Telegram 401 aaya, lekin batch chal raha hai — process ko force-stop nahi kar raha; 30s baad polling retry.');
-      await sleepMs(30_000);
-      continue;
-    }
-    if (code !== 401 && code !== 409) {
-      transientLaunchAttempts += 1;
-      if (batchRunning || transientLaunchAttempts <= 12) {
-        const waitMs = Math.min(30_000, 5_000 * (2 ** Math.min(3, transientLaunchAttempts - 1)));
-        console.error(`[FreshBot] Telegram launch temporary fail (try ${transientLaunchAttempts}) — ${Math.round(waitMs / 1000)}s baad retry. Batch force-stop nahi hoga.`);
-        try { bot.stop('retry-launch'); } catch {}
-        await sleepMs(waitMs);
+      if (code === 401 && batchRunning) {
+        await sleepMs(30_000);
         continue;
       }
-    }
-    if (code === 409) {
-      console.error('❌ Telegram 409 Conflict — isi BOT_TOKEN se bot ki DOOSRI copy pehle se chal rahi hai.');
-      console.error('   Fix: purani copy band karo (doosra terminal/server/PC jahan bot chal raha ho),');
-      console.error('   phir yahan npm start. Ek token = ek hi copy ek waqt par.');
-      console.error('   (Agar bot Render par bhi chalta hai to wahan aur yahan se EK HI jagah chalao.)');
-    } else if (code === 401) {
-      console.error('❌ Telegram 401 — BOT_TOKEN revoke/galat. @BotFather se naya token lekar .env me daalo.');
-    } else {
+      if (code !== 401 && code !== 409) {
+        transientLaunchAttempts += 1;
+        if (batchRunning || transientLaunchAttempts <= 12) {
+          const waitMs = Math.min(30_000, 5_000 * (2 ** Math.min(3, transientLaunchAttempts - 1)));
+          try { bot.stop('retry-launch'); } catch {}
+          await sleepMs(waitMs);
+          continue;
+        }
+      }
       console.error('[FreshBot] launch failed:', e?.stack || e?.message || e);
+      process.exit(1);
     }
-    process.exit(1);
   }
+}
+
+if (isDirectCliEntry && !process.env.VERCEL) {
+  await startCliBot();
 }

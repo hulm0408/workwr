@@ -929,11 +929,8 @@ function buttonText(button) {
   try { return String(button?.text || button?.button?.text || ''); } catch { return ''; }
 }
 
-async function getMessageButtons(message) {
+async function getMessageButtonRows(message) {
   let rows;
-  // Teleproto ke sync `buttons` getter se pehle dekho. Har purani message
-  // par async getButtons()/reload ghumana claim ko bekaar slow karta tha;
-  // asal action bhi sirf latest screen par hi lena hai.
   try { rows = message?.buttons; } catch {}
   if (!rows) {
     try {
@@ -944,7 +941,14 @@ async function getMessageButtons(message) {
   }
   if (!rows) rows = message?._buttons || (message?._buttonsFlat ? [message._buttonsFlat] : []);
   if (!Array.isArray(rows)) return [];
-  return rows.flatMap((row) => (Array.isArray(row) ? row : [row])).filter(Boolean);
+  return rows
+    .map((row) => (Array.isArray(row) ? row : [row]).filter(Boolean))
+    .filter((row) => row.length > 0);
+}
+
+async function getMessageButtons(message) {
+  const rows = await getMessageButtonRows(message);
+  return rows.flatMap((row) => row);
 }
 
 function buttonMatchesRole(button, role, config) {
@@ -2547,6 +2551,171 @@ export async function auditTelegramAccounts() {
   }
   roster.unpinSlot();
   return results;
+}
+
+async function readTelegramScreenUnlocked({ limit = 10, sendStartIfEmpty = false } = {}) {
+  const { config } = await ensureClientUnlocked();
+  let messages = await fetchIncomingUnlocked(Math.max(4, Math.min(20, Number(limit) || 10)));
+  if (sendStartIfEmpty && !messages.length) {
+    await sendStartUnlocked();
+    await sleep(900);
+    messages = await fetchIncomingUnlocked(Math.max(4, Math.min(20, Number(limit) || 10)));
+  }
+
+  const serialized = [];
+  for (const msg of messages.slice(0, 8)) {
+    const text = messageText(msg);
+    const rawRows = await getMessageButtonRows(msg);
+    const buttonRows = rawRows.map((rowArr, rIdx) =>
+      rowArr
+        .map((btn, cIdx) => {
+          const label = buttonText(btn);
+          if (!label) return null;
+          return {
+            text: label,
+            row: rIdx,
+            col: cIdx,
+            role: roleForHermesButton(btn, config) || '',
+          };
+        })
+        .filter(Boolean)
+    ).filter((r) => r.length > 0);
+    const card = parseTelegramNumberCard(text);
+    const strictOtp = parseTelegramOtpText(text);
+    const looseOtp = strictOtp?.code ? null : extractLooseOtpCode(`${text}\n${messageButtonsText(msg)}`);
+    const otpCode = strictOtp?.code || looseOtp?.code || '';
+    serialized.push({
+      messageId: messageId(msg),
+      text,
+      dateMs: messageDateMs(msg),
+      editMs: messageEditMs(msg),
+      buttonRows,
+      parsedPhone: card?.phone || strictOtp?.phone || '',
+      parsedOtp: otpCode,
+      parsedService: strictOtp?.service || '',
+      parsedRawSms: strictOtp?.rawSms || '',
+    });
+  }
+
+  const primary = serialized.find((m) => m.buttonRows.length > 0) || serialized[0] || null;
+  let currentPhone = primary?.parsedPhone || '';
+  if (!currentPhone) {
+    for (const m of serialized) {
+      if (m.parsedPhone) { currentPhone = m.parsedPhone; break; }
+    }
+  }
+  let currentOtp = '';
+  let currentOtpMessageId = 0;
+  for (const m of serialized) {
+    if (!m.parsedOtp) continue;
+    if (!currentPhone || !m.parsedPhone || m.parsedPhone === currentPhone) {
+      currentOtp = m.parsedOtp;
+      currentOtpMessageId = m.messageId;
+      break;
+    }
+  }
+
+  return {
+    ok: true,
+    botUsername: config.botUsername,
+    botTitle: config.otpBotTitle || config.botUsername,
+    otpBotProfile: config.otpBotProfile || '',
+    me: providerState.meLabel || '',
+    fetchedAt: Date.now(),
+    currentPhone,
+    currentOtp,
+    currentOtpMessageId,
+    primary,
+    messages: serialized.slice(0, 5),
+  };
+}
+
+export async function readTelegramOtpScreen(opts = {}) {
+  return withTelegramLock(() => readTelegramScreenUnlocked(opts));
+}
+
+export async function interactTelegramOtpScreen({
+  action = 'button',
+  buttonText: wantedText = '',
+  row = -1,
+  col = -1,
+  messageId: targetMsgId = 0,
+  sendText = '',
+} = {}) {
+  return withTelegramLock(async () => {
+    const { client, config } = await ensureClientUnlocked();
+    const act = String(action || 'button').toLowerCase();
+
+    if (act === 'start' || sendText) {
+      const entity = await ensureEntityUnlocked(client, config);
+      const txt = act === 'start' ? '/start' : String(sendText || '').trim();
+      if (!txt) throw new Error('Empty command/text');
+      await client.sendMessage(entity, { message: txt });
+      await sleep(1_100);
+      const screen = await readTelegramScreenUnlocked({ limit: 10 });
+      return { ...screen, clicked: txt, callbackMessage: '' };
+    }
+
+    const messages = await fetchIncomingUnlocked(10);
+    let targetMsg = null;
+    if (Number(targetMsgId) > 0) {
+      targetMsg = messages.find((m) => messageId(m) === Number(targetMsgId)) || null;
+    }
+    if (!targetMsg) {
+      for (const m of messages) {
+        const rows = await getMessageButtonRows(m);
+        if (rows.length) { targetMsg = m; break; }
+      }
+    }
+    if (!targetMsg) {
+      throw new Error(`@${config.botUsername} chat me koi button card nahi mili — pehle /start bhejein.`);
+    }
+
+    const rows = await getMessageButtonRows(targetMsg);
+    let chosenBtn = null;
+    if (row >= 0 && col >= 0 && rows[row]?.[col]) {
+      chosenBtn = rows[row][col];
+    }
+    if (!chosenBtn && wantedText) {
+      const targetNorm = searchText(wantedText);
+      for (const r of rows) {
+        for (const b of r) {
+          const bt = searchText(buttonText(b));
+          if (bt && (bt === targetNorm || bt.includes(targetNorm) || targetNorm.includes(bt))) {
+            chosenBtn = b;
+            break;
+          }
+        }
+        if (chosenBtn) break;
+      }
+    }
+    if (!chosenBtn && (act === 'refresh' || act === 'find' || act === 'new' || act === 'view')) {
+      for (const r of rows) {
+        for (const b of r) {
+          if (buttonMatchesRole(b, act, config)) { chosenBtn = b; break; }
+        }
+        if (chosenBtn) break;
+      }
+    }
+    if (!chosenBtn) {
+      throw new Error('Selected button card par nahi mila — Refresh Card dabao.');
+    }
+
+    const clickedLabel = buttonText(chosenBtn);
+    const answer = await chosenBtn.click({});
+    const callbackMessage = String(answer?.message || '').trim().slice(0, 200);
+    providerState.lastActionAt = Date.now();
+    providerState.lastClickedButton = clickedLabel;
+    providerState.lastCallbackMessage = callbackMessage;
+    await sleep(900);
+    const screen = await readTelegramScreenUnlocked({ limit: 10 });
+    return {
+      ...screen,
+      clicked: clickedLabel,
+      callbackMessage,
+      callbackAlert: Boolean(answer?.alert),
+    };
+  });
 }
 
 export function _resetTelegramOtpSourceForTests() {

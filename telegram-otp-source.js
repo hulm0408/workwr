@@ -2591,8 +2591,8 @@ async function readTelegramScreenUnlocked({ limit = 10, sendStartIfEmpty = false
     ).filter((r) => r.length > 0);
     const card = parseTelegramNumberCard(text);
     const strictOtp = parseTelegramOtpText(text);
-    const looseOtp = strictOtp?.code ? null : extractLooseOtpCode(`${text}\n${messageButtonsText(msg)}`);
-    const otpCode = strictOtp?.code || looseOtp?.code || '';
+    const looseOtp = strictOtp?.code ? '' : extractLooseOtpCode(`${text}\n${messageButtonsText(msg)}`);
+    const otpCode = strictOtp?.code || (/^\d{6}$/.test(String(looseOtp || '')) ? String(looseOtp) : '');
     serialized.push({
       messageId: messageId(msg),
       text,
@@ -2720,14 +2720,29 @@ export async function interactTelegramOtpScreen({
       throw new Error('Selected button card par nahi mila — Refresh Card dabao.');
     }
 
+    const beforeMsgId = messageId(targetMsg);
+    const beforeText = messageText(targetMsg);
+    const beforePhone = parseTelegramNumberCard(beforeText)?.phone || '';
     const clickedLabel = buttonText(chosenBtn);
     const answer = await chosenBtn.click({});
     const callbackMessage = String(answer?.message || '').trim().slice(0, 200);
     providerState.lastActionAt = Date.now();
     providerState.lastClickedButton = clickedLabel;
     providerState.lastCallbackMessage = callbackMessage;
-    await sleep(900);
-    const screen = await readTelegramScreenUnlocked({ limit: 10 });
+    const isNumberClaim = (act === 'next' || act === 'claim' || act === 'find' || act === 'new');
+    let screen = null;
+    if (isNumberClaim) {
+      for (let attempt = 0; attempt < 6; attempt++) {
+        await sleep(attempt === 0 ? 1100 : 750);
+        screen = await readTelegramScreenUnlocked({ limit: 10 });
+        const changedPhone = screen?.currentPhone && screen.currentPhone !== beforePhone;
+        const changedCard = screen?.primary && (screen.primary.messageId !== beforeMsgId || screen.primary.text !== beforeText);
+        if (changedPhone || (changedCard && screen?.currentPhone)) break;
+      }
+    } else {
+      await sleep(900);
+      screen = await readTelegramScreenUnlocked({ limit: 10 });
+    }
     return {
       ...screen,
       clicked: clickedLabel,

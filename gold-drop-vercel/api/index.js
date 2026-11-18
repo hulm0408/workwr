@@ -529,6 +529,7 @@ var tgState = {
   lastScreen: null,
   lastConsumedPhone: '',
   lastConsumedOtpKey: '',
+  preRegisterOtpSig: '',
   waitingNextNumber: false,
   samePhoneRetries: 0,
   botProfile: 'hermes',
@@ -536,7 +537,7 @@ var tgState = {
   botConfirmedForSession: false,
   onBotPicked: null,
 };
-var localRun = { active: false, status: 'idle', message: '', target: 1, count: 0, mobile: '', details: null, session: null, results: [], log: [] };
+var localRun = { active: false, inFlight: false, status: 'idle', message: '', target: 1, count: 0, mobile: '', details: null, session: null, results: [], log: [] };
 var autoSync = true;
 var customPhotoBase64 = '';
 
@@ -853,7 +854,7 @@ function requestNextNumberFromTelegram(){
   if (!active) return;
   if (tgState.busy) { setTimeout(requestNextNumberFromTelegram, 700); return; }
   tgState.waitingNextNumber = true;
-  localRun.message = '🔄 Telegram card se agla number fetch ho raha hai…';
+  localRun.message = '🔄 Telegram card (' + currentBotLabel() + ') se agla number fetch ho raha hai…';
   paint(localRun);
   clickTgButton({ action: 'next' }).then(function(r){
     if (!localRun.active || localRun.status !== 'need_number') return;
@@ -862,16 +863,30 @@ function requestNextNumberFromTelegram(){
     }
     tgState.samePhoneRetries += 1;
     if (tgState.samePhoneRetries === 1 && (!r || !r.ok)) {
-      // Card par button nahi mila to /start bhej kar fresh card kholo
+      localRun.log.push('↪️ Button card missing — /start bhej kar fresh card khol rahe hain');
+      paint(localRun);
       clickTgButton({ action: 'start' }).then(function(){
         if (localRun.active && localRun.status === 'need_number') {
-          setTimeout(function(){ clickTgButton({ action: 'next' }); }, 900);
+          setTimeout(requestNextNumberFromTelegram, 1000);
         }
       });
       return;
     }
-    if (tgState.samePhoneRetries >= 2 && tgState.accounts.length > 1) {
-      // Current spare account ne naya number nahi diya → agle spare account par switch karo
+    if (tgState.samePhoneRetries <= 2) {
+      localRun.log.push('⏳ Naya number update ka intezar — dubara check (' + tgState.samePhoneRetries + '/2)…');
+      paint(localRun);
+      setTimeout(function(){
+        if (!localRun.active || localRun.status !== 'need_number') return;
+        refreshTgCard().then(function(scr){
+          if (!localRun.active || localRun.status !== 'need_number') return;
+          if (!scr || !scr.currentPhone || scr.currentPhone === tgState.lastConsumedPhone) {
+            requestNextNumberFromTelegram();
+          }
+        });
+      }, 1400);
+      return;
+    }
+    if (tgState.accounts.length > 1) {
       tgState.samePhoneRetries = 0;
       var idx = -1;
       for (var i = 0; i < tgState.accounts.length; i++) {
@@ -880,12 +895,14 @@ function requestNextNumberFromTelegram(){
       var next = tgState.accounts[(idx + 1) % tgState.accounts.length];
       if (next && next.id !== tgState.activeId) {
         localRun.log.push('↪️ Spare account switch: ' + (next.me || next.phone));
+        paint(localRun);
         activateAccount(next.id);
-        setTimeout(function(){
-          if (localRun.active && localRun.status === 'need_number') clickTgButton({ action: 'next' });
-        }, 1200);
+        setTimeout(requestNextNumberFromTelegram, 1200);
+        return;
       }
     }
+    localRun.log.push('⚠️ Bot ne naya number abhi nahi diya — Refresh ya New Number click karein');
+    paint(localRun);
   });
 }
 
@@ -1081,15 +1098,21 @@ function submitMobile(m){
   tgState.lastConsumedPhone = m;
   tgState.waitingNextNumber = false;
   tgState.samePhoneRetries = 0;
+  var scr = tgState.lastScreen;
+  tgState.preRegisterOtpSig = scr && scr.currentOtp ? (scr.currentOtp + '|' + (scr.primary && scr.primary.text ? scr.primary.text : '')) : '';
+  localRun.inFlight = true;
   localRun.status = 'working';
   localRun.mobile = m;
   localRun.message = 'Register ho raha hai (NoCaptchaAI check ho to 15-45s lag sakta hai)…';
+  localRun.log.push('📱 Mobile try: ' + m);
   paint(localRun);
   post('/number', { mobile: m, details: localRun.details, target: localRun.target }).then(function(r){
+    localRun.inFlight = false;
     $('sendNumber').disabled = false;
     if (!r.ok) {
       localRun.status = 'need_number';
       localRun.message = r.message || 'Error — agla number try ho raha hai…';
+      localRun.log.push('❌ ' + m + ' — ' + (r.message || 'Error'));
       paint(localRun);
       if (autoSync && getActiveAccount()) setTimeout(requestNextNumberFromTelegram, 900);
       return;
@@ -1098,14 +1121,22 @@ function submitMobile(m){
     localRun.status = r.status;
     localRun.message = r.message;
     if (r.result) { localRun.results.push(r.result); localRun.count = localRun.results.length; }
-    if (r.log && r.log.length) localRun.log = r.log;
+    if (localRun.results.length >= localRun.target) {
+      localRun.status = 'done';
+      localRun.message = localRun.target + ' numbers process ho gaye — results neeche';
+    }
+    if (r.log && r.log.length) {
+      r.log.forEach(function(line){ if (localRun.log.indexOf(line) === -1) localRun.log.push(line); });
+    }
     paint(localRun);
     if (autoSync && localRun.status === 'need_number' && getActiveAccount()) {
       setTimeout(requestNextNumberFromTelegram, 900);
     }
-  }).catch(function(){
+  }).catch(function(err){
+    localRun.inFlight = false;
     $('sendNumber').disabled = false;
     localRun.status = 'need_number';
+    localRun.log.push('❌ ' + m + ' — ' + (err && err.message ? err.message : 'Network error'));
     paint(localRun);
     if (autoSync && getActiveAccount()) setTimeout(requestNextNumberFromTelegram, 1200);
   });
@@ -1116,37 +1147,58 @@ function submitOtp(o){
   if (o.length !== 6) { alert('6-digit OTP daalo'); return; }
   $('otp').value = '';
   $('sendOtp').disabled = true;
+  localRun.inFlight = true;
   localRun.status = 'working';
   localRun.message = 'OTP verify ho raha hai…';
+  localRun.log.push('🔐 OTP submit: ' + o + ' (' + localRun.mobile + ')');
   paint(localRun);
   post('/otp', { otp: o, session: localRun.session, mobile: localRun.mobile, target: localRun.target }).then(function(r){
+    localRun.inFlight = false;
     $('sendOtp').disabled = false;
-    if (!r.ok) { alert(r.message || 'Error'); localRun.status = 'need_otp'; paint(localRun); return; }
+    if (!r.ok) {
+      localRun.status = 'need_otp';
+      localRun.message = r.message || 'OTP error';
+      localRun.log.push('❌ OTP error: ' + (r.message || 'Error'));
+      paint(localRun);
+      return;
+    }
     localRun.session = null;
     localRun.mobile = '';
     localRun.status = r.status;
     localRun.message = r.message;
     if (r.result) { localRun.results.push(r.result); localRun.count = localRun.results.length; }
-    if (r.log && r.log.length) localRun.log = r.log;
+    if (localRun.results.length >= localRun.target) {
+      localRun.status = 'done';
+      localRun.message = localRun.target + ' numbers process ho gaye — results neeche';
+    }
+    if (r.log && r.log.length) {
+      r.log.forEach(function(line){ if (localRun.log.indexOf(line) === -1) localRun.log.push(line); });
+    }
     paint(localRun);
     if (autoSync && localRun.status === 'need_number' && getActiveAccount()) {
       setTimeout(requestNextNumberFromTelegram, 900);
     }
-  }).catch(function(){
+  }).catch(function(err){
+    localRun.inFlight = false;
     $('sendOtp').disabled = false;
     localRun.status = 'need_otp';
+    localRun.log.push('❌ OTP network error: ' + (err && err.message ? err.message : 'Network error'));
     paint(localRun);
   });
 }
 
 function maybeAutoFillFromTelegram(s){
-  if (!autoSync || !localRun.active) return;
+  if (!autoSync || !localRun.active || localRun.inFlight) return;
   if (localRun.status === 'need_number' && s.currentPhone && s.currentPhone !== tgState.lastConsumedPhone) {
     $('mobile').value = s.currentPhone;
     submitMobile(s.currentPhone);
     return;
   }
   if (localRun.status === 'need_otp' && s.currentOtp) {
+    var curOtpSig = s.currentOtp + '|' + (s.primary && s.primary.text ? s.primary.text : '');
+    if (tgState.preRegisterOtpSig && curOtpSig === tgState.preRegisterOtpSig) {
+      return; // Purana pre-register SMS hai — naye Gold Drop OTP ka wait karo
+    }
     var otpKey = (localRun.mobile || s.currentPhone || '') + ':' + s.currentOtp + ':' + (s.currentOtpMessageId || '');
     if (otpKey !== tgState.lastConsumedOtpKey) {
       tgState.lastConsumedOtpKey = otpKey;
@@ -1211,8 +1263,9 @@ $('sendOtp').onclick = function(){ submitOtp($('otp').value); };
 $('reset').onclick = function(){ localRun.active = false; post('/reset').then(function(){ location.reload(); }); };
 
 function pollGd(){
+  if (localRun.active || localRun.inFlight) return;
   fetch('/state').then(function(r){ return r.json(); }).then(function(s){
-    if (localRun.active && s.status === 'idle') return;
+    if (localRun.active || localRun.inFlight) return;
     if (s.log && s.log.length >= localRun.log.length && s.results && s.results.length >= localRun.results.length) {
       localRun.status = s.status;
       localRun.message = s.message;
@@ -1221,7 +1274,7 @@ function pollGd(){
       localRun.results = s.results;
       localRun.log = s.log;
     }
-    paint(localRun.active ? localRun : s);
+    paint(s);
   }).catch(function(){});
 }
 
@@ -1250,7 +1303,12 @@ function sendJson(res, code, data, extraHeaders = {}) {
 }
 
 function readBody(req) {
+  if (req.body && typeof req.body === 'object') return Promise.resolve(req.body);
+  if (typeof req.body === 'string') {
+    try { return Promise.resolve(req.body ? JSON.parse(req.body) : {}); } catch (e) { return Promise.reject(e); }
+  }
   return new Promise((resolve, reject) => {
+    if (req.readableEnded) return resolve({});
     let raw = '';
     req.on('data', chunk => { raw += chunk; if (raw.length > 15e6) req.destroy(); });
     req.on('end', () => { try { resolve(raw ? JSON.parse(raw) : {}); } catch (e) { reject(e); } });
@@ -1505,7 +1563,6 @@ export default async function handler(req, res) {
     }
     if (req.method === 'POST' && url.pathname === '/start') {
       const body = await readBody(req);
-      if (state.status !== 'idle' && state.status !== 'done') { sendJson(res, 400, { ok: false, message: 'Pehle run chal raha hai — Stop/Reset karo' }); return; }
       const photo = body.photo || await getDefaultPhoto();
       state.details = { name: body.name, email: body.email, pincode: body.pincode, code: body.code, photo, nocapKey: body.nocapKey };
       state.target = Math.max(1, Math.min(100, Number(body.target) || 1));

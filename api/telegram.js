@@ -1,8 +1,17 @@
-if (!process.env.DATA_DIR) {
-  process.env.DATA_DIR = '/tmp/workwr-data';
-}
+let _botPromise = null;
 
-const { handleTelegramUpdate } = await import('../fresh-bot.js');
+async function loadBot() {
+  if (!process.env.DATA_DIR) {
+    process.env.DATA_DIR = '/tmp/workwr-data';
+  }
+  if (!_botPromise) {
+    _botPromise = import('../fresh-bot.js').catch((err) => {
+      _botPromise = null;
+      throw err;
+    });
+  }
+  return _botPromise;
+}
 
 async function readJsonBody(req) {
   if (req.body && typeof req.body === 'object') return req.body;
@@ -45,6 +54,7 @@ export default async function handler(req, res) {
   }
 
   try {
+    const { handleTelegramUpdate } = await loadBot();
     await handleTelegramUpdate(update);
   } catch (err) {
     console.error('[api/telegram] update error:', err?.stack || err?.message || err);

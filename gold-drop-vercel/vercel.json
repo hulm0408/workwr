@@ -1,7 +1,6 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "framework": null,
-  "installCommand": "cd .. && npm install --omit=dev --no-audit --no-fund",
   "functions": {
     "api/telegram.js": { "maxDuration": 300 },
     "api/health.js": { "maxDuration": 60 },

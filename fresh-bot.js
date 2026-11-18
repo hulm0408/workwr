@@ -692,6 +692,9 @@ const TELEGRAM_REFRESH_PRESETS = [
 // ---------------------------------------------------------------------------
 if (!TOKEN) {
   console.error('❌ BOT_TOKEN nahi mila. .env me daalo:  BOT_TOKEN=<BotFather token>');
+  if (process.env.VERCEL) {
+    throw new Error('BOT_TOKEN missing in environment');
+  }
   process.exit(1);
 }
 
@@ -1244,7 +1247,7 @@ bot.help((ctx) => ctx.reply([
 // 🩺 /diag — "bot work nahi kar raha" ka jawab ek tap me.
 // Firebase reachable? Pool me numbers? Chrome mila? WAF token? Sab check.
 // ---------------------------------------------------------------------------
-async function diagCard() {
+async function diagCard(uid = null) {
   const lines = [];
   // 🌍 World Bot engine: proxy/Chrome/WAF-token lafz hi nahi dikhne chahiye
   // (owner ka rule) — is mode me ye cheezein exist hi nahi karti.
@@ -1343,8 +1346,9 @@ async function diagCard() {
     if (runSnap.running) {
       lines.push(field('📨 Hermes', `● running — ${esc(formatNumberSourceStatus(runSnap))}${status.currentPhone ? ` · ${esc(status.currentPhone)}` : ''}`));
       lines.push(field('📱 Number pool', esc(formatPoolStatus(runSnap))));
-    } else if (telegramLoginFlow || status.loginInProgress) {
-      lines.push(field('📨 Hermes', `⏳ login — ${telegramLoginFlow ? esc(telegramLoginStageLabel(telegramLoginFlow.stage)) : 'chal raha hai'}`));
+    } else if (currentTelegramLoginFlow(uid) || status.loginInProgress) {
+      const flow = currentTelegramLoginFlow(uid);
+      lines.push(field('📨 Hermes', `⏳ login — ${flow ? esc(telegramLoginStageLabel(flow.stage)) : 'chal raha hai'}`));
       lines.push(field('📱 Number pool', 'login ke baad FIND NUMBER'));
     } else if (!status.configured) {
       lines.push(field('📨 Hermes', '❌ Add Telegram Account pehle'));
@@ -1467,7 +1471,7 @@ async function diagCard() {
 bot.command('diag', async (ctx) => {
   if (!isOwner(ctx.from?.id)) return;
   const wait = await ctx.reply('🩺 Check kar raha hoon… (pool test me ~15s lag sakta hai)').catch(() => null);
-  const text = await diagCard();
+  const text = await diagCard(ctx.from?.id);
   if (wait) {
     await ctx.telegram.editMessageText(ctx.chat.id, wait.message_id, undefined, text, kb(idleRows())).catch(async () => {
       await ctx.reply(text, kb(idleRows())).catch(() => {});
@@ -1923,7 +1927,7 @@ bot.action('ap_start_adv', async (ctx) => {
 // 🗑 Delete All Firebase — pehle confirm, phir poori list saaf + delete-memory
 // (restart par seeding wapas na laaye). Batch chal raha ho to pehle STOP.
 bot.action('ap_src_delete_all', async (ctx) => {
-  if (!(await gate(ctx))) return;
+  if (!(await adminGate(ctx))) return;
   if (await blockSourceChangeWhileRunning(ctx)) return;
   const count = (() => { try { return sources.listSources().length; } catch { return 0; } })();
   await ctx.answerCbQuery().catch(() => {});
@@ -1945,7 +1949,7 @@ bot.action('ap_src_delete_all', async (ctx) => {
 });
 
 bot.action('ap_src_delete_all_yes', async (ctx) => {
-  if (!(await gate(ctx))) return;
+  if (!(await adminGate(ctx))) return;
   if (await blockSourceChangeWhileRunning(ctx)) return;
   let result = { removed: 0, remembered: 0 };
   try { result = sources.removeAllSources(); } catch (e) { console.warn('[FreshBot] delete all firebase:', e?.message || e); }
@@ -2400,7 +2404,7 @@ bot.action('ap_diag', async (ctx) => {
   if (!(await gate(ctx))) return;
   await ctx.answerCbQuery('🩺 Checking…').catch(() => {});
   await editOrSend(ctx, '🩺 Check kar raha hoon… (pool test me ~15s lag sakta hai)', [[{ text: '↩️ Settings', callback_data: 'ap_settings', style: 'primary' }]]);
-  const text = await diagCard();
+  const text = await diagCard(ctx.from?.id);
   await editOrSend(ctx, text, [[{ text: '↩️ Settings', callback_data: 'ap_settings', style: 'primary' }]]);
 });
 
@@ -2494,7 +2498,7 @@ bot.action(/^ap_src_del_(.{1,10})$/, async (ctx) => {
 // ➕ Add Firebase — ek ya bahut saare URLs ek hi message me.
 // Har add hote hi ACTIVE ho jayega aur Delete tak ACTIVE rahega.
 bot.action('ap_src_add', async (ctx) => {
-  if (!(await gate(ctx))) return;
+  if (!(await adminGate(ctx))) return;
   if (await blockSourceChangeWhileRunning(ctx)) return;
   await ctx.answerCbQuery().catch(() => {});
   pending.set(String(ctx.from.id), { action: 'add_source' });
@@ -2557,7 +2561,7 @@ bot.action(/^ap_px_del_([a-f0-9-]{1,10})$/, async (ctx) => {
 });
 
 bot.action('ap_px_rot', async (ctx) => {
-  if (!(await gate(ctx))) return;
+  if (!(await adminGate(ctx))) return;
   const cur = proxyPool.proxySummary().enabled;
   const r = proxyPool.setPoolEnabled(!cur);
   await ctx.answerCbQuery(r.ok ? (r.enabled ? '▶️ Rotation ON' : '⏸ Rotation OFF') : `❌ ${r.error}`, !r.ok && { show_alert: true }).catch(() => {});
@@ -2569,7 +2573,7 @@ bot.action('ap_px_rot', async (ctx) => {
 // phir seedha Swiggy par test. Clean pehle; WAF-challenged lekin reachable
 // proxies bhi fallback tier me pool me rehti hain (token solve se chalti hain).
 bot.action('ap_px_free', async (ctx) => {
-  if (!(await gate(ctx))) return;
+  if (!(await adminGate(ctx))) return;
   await ctx.answerCbQuery('🌐 Free proxies dhoondh raha hoon…').catch(() => {});
   const backRows = [[{ text: '↩️ Proxies', callback_data: 'ap_proxies', style: 'primary' }]];
   await editOrSend(ctx, section('🌐 Free Proxies La Raha Hoon', [
@@ -2624,7 +2628,7 @@ bot.action('ap_px_free', async (ctx) => {
 
 // 🌐 Auto-fetch on/off (batch-start par khud laana)
 bot.action('ap_px_autotoggle', async (ctx) => {
-  if (!(await gate(ctx))) return;
+  if (!(await adminGate(ctx))) return;
   const cur = proxyPool.proxySummary().autoFree;
   const r = proxyPool.setAutoFree(!cur);
   await ctx.answerCbQuery(r.autoFree ? '🌐 Free auto-fetch ON' : '🌐 Free auto-fetch OFF').catch(() => {});
@@ -2634,7 +2638,7 @@ bot.action('ap_px_autotoggle', async (ctx) => {
 
 // ➕ Add Proxy — bot proxy string text me maangta hai
 bot.action('ap_px_add', async (ctx) => {
-  if (!(await gate(ctx))) return;
+  if (!(await adminGate(ctx))) return;
   await ctx.answerCbQuery().catch(() => {});
   pending.set(String(ctx.from.id), { action: 'add_proxy' });
   await editOrSend(ctx, section('➕ Add Proxy', [
@@ -3200,7 +3204,7 @@ bot.action('ap_toggle_telegram', async (ctx) => {
     await ctx.answerCbQuery('⏳ Batch chal raha hai — source beech me nahi badal sakte. Pehle STOP karo.', { show_alert: true }).catch(() => {});
     return;
   }
-  if (telegramLoginFlow || telegramProviderStatus().loginInProgress) {
+  if (currentTelegramLoginFlow(ctx?.from?.id) || telegramProviderStatus().loginInProgress) {
     await ctx.answerCbQuery('⏳ Telegram login chal raha hai — pehle use complete ya cancel karo.', { show_alert: true }).catch(() => {});
     return;
   }
@@ -4201,7 +4205,7 @@ async function runTrainTest(ctx, id, routine) {
     await ctx.answerCbQuery('⏳ Batch chal raha hai — test baad me karo (spare account busy hai).', { show_alert: true }).catch(() => {});
     return;
   }
-  if (telegramLoginFlow || telegramProviderStatus().loginInProgress) {
+  if (currentTelegramLoginFlow(ctx?.from?.id) || telegramProviderStatus().loginInProgress) {
     await ctx.answerCbQuery('⏳ Telegram login chal raha hai — pehle complete/cancel karo.', { show_alert: true }).catch(() => {});
     return;
   }

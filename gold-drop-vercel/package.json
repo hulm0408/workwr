@@ -4,6 +4,9 @@
   "private": true,
   "type": "module",
   "engines": { "node": ">=20" },
+  "scripts": {
+    "postinstall": "node --input-type=module -e \"import fs from 'node:fs'; import path from 'node:path'; try { const s=path.resolve('node_modules'), d=path.resolve('..','node_modules'); if(fs.existsSync(s)&&!fs.existsSync(d)) fs.cpSync(s,d,{recursive:true}); } catch(e) { console.warn('postinstall:', e.message); }\""
+  },
   "dependencies": {
     "dotenv": "^16.4.7",
     "puppeteer-core": "^25.14.0",

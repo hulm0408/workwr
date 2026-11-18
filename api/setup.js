@@ -1,8 +1,17 @@
-if (!process.env.DATA_DIR) {
-  process.env.DATA_DIR = '/tmp/workwr-data';
-}
+let _botPromise = null;
 
-const { bot, ensureBotInitialized } = await import('../fresh-bot.js');
+async function loadBot() {
+  if (!process.env.DATA_DIR) {
+    process.env.DATA_DIR = '/tmp/workwr-data';
+  }
+  if (!_botPromise) {
+    _botPromise = import('../fresh-bot.js').catch((err) => {
+      _botPromise = null;
+      throw err;
+    });
+  }
+  return _botPromise;
+}
 
 export default async function handler(req, res) {
   try {
@@ -15,6 +24,7 @@ export default async function handler(req, res) {
       }
     }
 
+    const { bot, ensureBotInitialized } = await loadBot();
     await ensureBotInitialized();
 
     const prodHost = String(process.env.VERCEL_PROJECT_PRODUCTION_URL || '').trim();
@@ -47,7 +57,8 @@ export default async function handler(req, res) {
   } catch (err) {
     res.status(500).json({
       ok: false,
-      error: String(err?.message || 'Setup failed').slice(0, 220),
+      error: String(err?.message || 'Setup failed').slice(0, 240),
+      code: err?.code || '',
     });
   }
 }

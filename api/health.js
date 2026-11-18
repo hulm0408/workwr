@@ -1,17 +1,29 @@
-if (!process.env.DATA_DIR) {
-  process.env.DATA_DIR = '/tmp/workwr-data';
-}
+let _depsPromise = null;
 
-const { ensureBotInitialized, buildHealthPayload } = await import('../fresh-bot.js');
-const { getDbLinkStatus } = await import('../store.js');
-const { getTelegramOtpConfig } = await import('../telegram-otp-source.js');
+async function loadDeps() {
+  if (!process.env.DATA_DIR) {
+    process.env.DATA_DIR = '/tmp/workwr-data';
+  }
+  if (!_depsPromise) {
+    _depsPromise = Promise.all([
+      import('../fresh-bot.js'),
+      import('../store.js'),
+      import('../telegram-otp-source.js'),
+    ]).catch((err) => {
+      _depsPromise = null;
+      throw err;
+    });
+  }
+  return _depsPromise;
+}
 
 export default async function handler(req, res) {
   try {
-    await ensureBotInitialized();
-    const payload = buildHealthPayload();
-    const dbLink = getDbLinkStatus();
-    const tg = getTelegramOtpConfig();
+    const [freshBot, store, tgMod] = await loadDeps();
+    await freshBot.ensureBotInitialized();
+    const payload = freshBot.buildHealthPayload();
+    const dbLink = store.getDbLinkStatus();
+    const tg = tgMod.getTelegramOtpConfig();
     res.setHeader('Cache-Control', 'no-store');
     res.status(200).json({
       ...payload,
@@ -29,7 +41,8 @@ export default async function handler(req, res) {
   } catch (err) {
     res.status(500).json({
       ok: false,
-      error: String(err?.message || 'Health check error').slice(0, 180),
+      error: String(err?.message || 'Health check error').slice(0, 240),
+      code: err?.code || '',
     });
   }
 }

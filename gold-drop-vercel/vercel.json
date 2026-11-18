@@ -1,6 +1,19 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "framework": null,
-  "rewrites": [{ "source": "/(.*)", "destination": "/api/index" }],
-  "functions": { "api/index.js": { "maxDuration": 60 } }
+  "installCommand": "cd .. && npm install --omit=dev --no-audit --no-fund",
+  "functions": {
+    "api/telegram.js": { "maxDuration": 300 },
+    "api/health.js": { "maxDuration": 60 },
+    "api/setup.js": { "maxDuration": 60 },
+    "api/index.js": { "maxDuration": 60 }
+  },
+  "rewrites": [
+    { "source": "/api/telegram", "destination": "/api/telegram" },
+    { "source": "/api/health", "destination": "/api/health" },
+    { "source": "/api/setup", "destination": "/api/setup" },
+    { "source": "/health", "destination": "/api/health" },
+    { "source": "/setup", "destination": "/api/setup" },
+    { "source": "/(.*)", "destination": "/api/index" }
+  ]
 }

@@ -234,10 +234,12 @@ export function getTelegramOtpConfig(env = process.env) {
   // Owner ne UI se koi bot chuna (explicit) → wahi final. Warna env ka bot:
   // agar woh Hermes/HardXotp hai to uski profile, warna custom-bot mode me
   // selected profile ke buttons + env ka username.
-  const profile = (activeOtpBotExplicit && live)
-    ? getOtpBotProfile(activeOtpBotProfileId)
-    : (knownEnvProfile || getActiveOtpBotProfile());
-  const botUsername = ((activeOtpBotExplicit && live) || !envBotUsername
+  const profile = (scoped?.botProfile)
+    ? getOtpBotProfile(scoped.botProfile)
+    : ((activeOtpBotExplicit && live)
+      ? getOtpBotProfile(activeOtpBotProfileId)
+      : (knownEnvProfile || getActiveOtpBotProfile()));
+  const botUsername = (scoped?.botProfile || (activeOtpBotExplicit && live) || !envBotUsername
     ? profile.username
     : envBotUsername).replace(/^@+/, '').trim();
 

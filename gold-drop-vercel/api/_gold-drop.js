@@ -106,6 +106,25 @@ async function nocapSolveTurnstile(apiKey, sitekey, pageUrl) {
       : ['AntiTurnstileTask', 'AntiTurnstileTaskProxyLess', 'CloudflareTurnstileTaskProxyLess', 'TurnstileTaskProxyLess'];
 
   let lastError = '';
+  if (provider === 'nocaptchaai') {
+    try {
+      const syncRes = await fetch(`${NOCAP_API}/solve`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', apikey: key },
+        body: JSON.stringify({ sitekey, url: pageUrl, type: 'turnstile' }),
+        signal: AbortSignal.timeout(30000),
+      }).then(x => x.json()).catch(() => ({}));
+      const syncToken = syncRes?.token || syncRes?.solution?.token || '';
+      if (syncToken) return syncToken;
+      const syncErr = String(syncRes?.errorDescription || syncRes?.errorCode || syncRes?.error || syncRes?.message || syncRes?.msg || '').slice(0, 140);
+      if (syncErr && isFatalCaptchaKeyError(syncErr)) {
+        throw new Error(`nocaptchaai key error: ${syncErr}`);
+      }
+      if (syncErr) lastError = syncErr;
+    } catch (error) {
+      if (isFatalCaptchaKeyError(error?.message)) throw error;
+    }
+  }
   for (const type of taskTypes) {
     let created;
     try {

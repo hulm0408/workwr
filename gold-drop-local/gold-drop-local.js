@@ -24,7 +24,7 @@ const MOCK = process.env.GOLD_DROP_LOCAL_NO_BROWSER === '1'; // sirf testing
 
 // ─── NoCaptchaAI (Cloudflare Turnstile solver API) ───
 const NOCAP_API = 'https://api.nocaptchaai.com';
-const NOCAP_KEY_DEFAULT = process.env.NOCAP_API_KEY || 'nocap_eVBzrYeejjgKLoikEErH6lbP';
+const NOCAP_KEY_DEFAULT = process.env.NOCAP_API_KEY || '';
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -72,16 +72,33 @@ async function nocapPost(pathname, apiKey, body, timeoutMs = 30000) {
   }
 }
 
-// createTask → getTaskResult poll → token (NoCaptchaAI async flow, docs v2)
+// /solve sync + createTask → getTaskResult poll → token (NoCaptchaAI v2)
 async function nocapSolveTurnstile(apiKey, sitekey, pageUrl) {
   let lastError = '';
-  for (const type of ['CloudflareTurnstileTaskProxyLess', 'TurnstileTaskProxyLess']) {
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 30000);
+    const syncRes = await fetch(`${NOCAP_API}/solve`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', apikey: apiKey },
+      body: JSON.stringify({ sitekey, url: pageUrl, type: 'turnstile' }),
+      signal: controller.signal,
+    }).finally(() => clearTimeout(timer));
+    const syncJson = await syncRes.json().catch(() => ({}));
+    const tok = syncJson?.token || syncJson?.solution?.token || '';
+    if (tok) return { token: tok };
+    if (syncJson?.error || syncJson?.errorDescription || syncJson?.errorCode) {
+      lastError = String(syncJson.errorDescription || syncJson.errorCode || syncJson.error).slice(0, 140);
+    }
+  } catch {}
+
+  for (const type of ['AntiTurnstileTask', 'AntiTurnstileTaskProxyLess', 'CloudflareTurnstileTaskProxyLess', 'TurnstileTaskProxyLess']) {
     let created;
     try {
       created = await nocapPost('/createTask', apiKey, { task: { type, websiteURL: pageUrl, websiteKey: sitekey } });
     } catch (error) { lastError = String(error?.message || error).slice(0, 120); continue; }
     if ((created.errorId ?? 0) !== 0 || !created.taskId) {
-      lastError = String(created.errorDescription || created.msg || 'createTask fail').slice(0, 120);
+      lastError = String(created.errorDescription || created.errorCode || created.error || created.msg || 'createTask fail').slice(0, 140);
       continue;
     }
     const deadline = Date.now() + 50000;

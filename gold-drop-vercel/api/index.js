@@ -299,6 +299,12 @@ button.sm{padding:6px 10px;font-size:12px;border-radius:8px}
 .photo-box img{width:46px;height:46px;object-fit:cover;border-radius:7px;border:1px solid var(--border);background:#1b2238}
 .status{background:#10142a;border:1px solid var(--border);border-radius:10px;padding:12px;margin-top:12px;font-size:14px;white-space:pre-wrap}
 .log{background:#0a0c18;border:1px solid #1d2440;border-radius:10px;padding:10px;font:12px/1.5 ui-monospace,monospace;color:#8b94b8;max-height:210px;overflow:auto;margin-top:12px;white-space:pre-wrap}
+.modal-bg{position:fixed;inset:0;background:rgba(6,8,16,.78);backdrop-filter:blur(4px);display:none;align-items:center;justify-content:center;padding:16px;z-index:50}
+.modal-card{width:100%;max-width:440px;background:var(--card);border:1px solid #35416e;border-radius:16px;padding:18px;box-shadow:0 20px 50px rgba(0,0,0,.55)}
+.bot-choice{width:100%;text-align:left;padding:11px 13px;border-radius:10px;background:#10162b;border:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:8px}
+.bot-choice:hover{border-color:var(--tg);background:#15203b}
+.bot-choice.active{border-color:var(--gold);background:rgba(247,181,0,.1)}
+.tg-bubble code{background:rgba(46,166,255,.15);padding:1px 5px;border-radius:5px;font-family:ui-monospace,monospace;color:#9ed4ff}
 a{color:var(--gold);text-decoration:none}
 </style></head><body>
 
@@ -319,11 +325,7 @@ a{color:var(--gold);text-decoration:none}
     <div class="card-head">
       <div class="card-title">📱 Telegram OTP Card <span class="badge" id="tgConnPill">0 / 50</span></div>
       <div class="btn-strip">
-        <select id="tgBotProfile" style="width:auto;padding:5px 8px;font-size:12px">
-          <option value="hermes">@HermeshuOTPROBOT</option>
-          <option value="hathi">@Hathi_otp_bot</option>
-          <option value="chauhan">@HardXotp_Bot</option>
-        </select>
+        <button class="sm tg" id="openBotPickerBtn" type="button">🤖 Bot: @HermeshuOTPROBOT</button>
       </div>
     </div>
 
@@ -378,6 +380,19 @@ a{color:var(--gold);text-decoration:none}
         <button class="sm" id="tgAutoPollBtn">⏱ Poll: ON</button>
       </div>
 
+      <div class="extract-bar">
+        <div class="extract-box">
+          <div class="k">📱 Card Number</div>
+          <div class="v" id="tgFoundPhone">—</div>
+          <button class="gold sm" id="fillPhoneBtn" style="width:100%" disabled>➡ Fill Number</button>
+        </div>
+        <div class="extract-box">
+          <div class="k">🔐 Card OTP</div>
+          <div class="v" id="tgFoundOtp">—</div>
+          <button class="green sm" id="fillOtpBtn" style="width:100%" disabled>➡ Fill OTP</button>
+        </div>
+      </div>
+
       <div class="tg-chat">
         <div class="tg-chat-bar">
           <span id="tgBotTitle">@HermeshuOTPROBOT</span>
@@ -390,19 +405,6 @@ a{color:var(--gold);text-decoration:none}
         </div>
         <div class="tg-toast" id="tgToast" style="display:none"></div>
         <div class="tg-kb" id="tgButtons"></div>
-      </div>
-
-      <div class="extract-bar">
-        <div class="extract-box">
-          <div class="k">📱 Card Number</div>
-          <div class="v" id="tgFoundPhone">—</div>
-          <button class="gold sm" id="fillPhoneBtn" style="width:100%" disabled>➡ Fill Number</button>
-        </div>
-        <div class="extract-box">
-          <div class="k">🔐 Card OTP</div>
-          <div class="v" id="tgFoundOtp">—</div>
-          <button class="green sm" id="fillOtpBtn" style="width:100%" disabled>➡ Fill OTP</button>
-        </div>
       </div>
 
       <label style="margin-top:10px">Recent Messages</label>
@@ -478,11 +480,44 @@ a{color:var(--gold);text-decoration:none}
   </div>
 </div>
 
+<!-- OTP BOT PICKER MODAL (Explicitly asks user which OTP bot to use) -->
+<div class="modal-bg" id="botModal">
+  <div class="modal-card">
+    <div style="display:flex;justify-content:space-between;align-items:center;gap:8px">
+      <div style="font-size:16px;font-weight:700">🤖 Kaunsa OTP Bot use karna hai?</div>
+      <button class="sm secondary" id="closeBotModalBtn" type="button">✕</button>
+    </div>
+    <div class="sub" style="margin-top:4px">Apna OTP bot chuno — left card aur auto-fetch usi bot se chalega.</div>
+
+    <button class="bot-choice" id="pickHermesBtn" type="button">
+      <span><b>📨 @HermeshuOTPROBOT</b><br><span class="sub">Hermes · FIND / NEW NUMBER → REFRESH</span></span>
+      <span class="badge tg">Select</span>
+    </button>
+    <button class="bot-choice" id="pickHathiBtn" type="button">
+      <span><b>🐘 @Hathi_otp_bot</b><br><span class="sub">Hathi OTP · FIND / NEW NUMBER → REFRESH</span></span>
+      <span class="badge tg">Select</span>
+    </button>
+    <button class="bot-choice" id="pickChauhanBtn" type="button">
+      <span><b>🔐 @HardXotp_Bot</b><br><span class="sub">HardXotp (Chauhan) · GET NUMBERS → VIEW MESSAGES</span></span>
+      <span class="badge tg">Select</span>
+    </button>
+
+    <div style="margin-top:12px;padding-top:10px;border-top:1px solid var(--border)">
+      <label style="margin-top:0">➕ Ya koi Custom OTP Bot (@username)</label>
+      <div class="row">
+        <input id="customBotInput" placeholder="@MyOtpBot">
+        <button class="gold" id="pickCustomBotBtn" type="button" style="flex:0 0 auto">Use Bot</button>
+      </div>
+    </div>
+  </div>
+</div>
+
 <script>
 var MAX_ACCOUNTS = ${MAX_TG_ACCOUNTS};
 var LS_ACCOUNTS = 'gd_tg_accounts_v1';
 var LS_ACTIVE = 'gd_tg_active_v1';
 var LS_FORM = 'gd_form_v1';
+var LS_BOT = 'gd_tg_bot_v1';
 
 var tgState = {
   accounts: [], // [{ id, phone, me, token }]
@@ -494,6 +529,12 @@ var tgState = {
   lastScreen: null,
   lastConsumedPhone: '',
   lastConsumedOtpKey: '',
+  waitingNextNumber: false,
+  samePhoneRetries: 0,
+  botProfile: 'hermes',
+  botUsername: '',
+  botConfirmedForSession: false,
+  onBotPicked: null,
 };
 var localRun = { active: false, status: 'idle', message: '', target: 1, count: 0, mobile: '', details: null, session: null, results: [], log: [] };
 var autoSync = true;
@@ -627,20 +668,83 @@ $('tgDelAcctBtn').onclick = function(){
   renderAccountsUI();
 };
 
+function currentBotLabel(){
+  if (tgState.botUsername) return '@' + tgState.botUsername.replace(/^@+/, '');
+  if (tgState.botProfile === 'hathi') return '@Hathi_otp_bot';
+  if (tgState.botProfile === 'chauhan') return '@HardXotp_Bot';
+  return '@HermeshuOTPROBOT';
+}
+function updateBotPickerUI(){
+  $('openBotPickerBtn').textContent = '🤖 Bot: ' + currentBotLabel();
+  $('tgBotTitle').textContent = currentBotLabel();
+  $('pickHermesBtn').className = 'bot-choice' + (!tgState.botUsername && tgState.botProfile === 'hermes' ? ' active' : '');
+  $('pickHathiBtn').className = 'bot-choice' + (!tgState.botUsername && tgState.botProfile === 'hathi' ? ' active' : '');
+  $('pickChauhanBtn').className = 'bot-choice' + (!tgState.botUsername && tgState.botProfile === 'chauhan' ? ' active' : '');
+}
+function loadBotChoice(){
+  try {
+    var b = JSON.parse(localStorage.getItem(LS_BOT) || 'null');
+    if (b && (b.botProfile || b.botUsername)) {
+      tgState.botProfile = b.botProfile || 'hermes';
+      tgState.botUsername = b.botUsername || '';
+    }
+  } catch {}
+  updateBotPickerUI();
+}
+function applyBotChoice(profile, customUser){
+  tgState.botProfile = profile || 'hermes';
+  tgState.botUsername = String(customUser || '').replace(/^@+/, '').trim();
+  tgState.botConfirmedForSession = true;
+  tgState.lastScreen = null;
+  try { localStorage.setItem(LS_BOT, JSON.stringify({ botProfile: tgState.botProfile, botUsername: tgState.botUsername })); } catch {}
+  updateBotPickerUI();
+  $('botModal').style.display = 'none';
+  var cb = tgState.onBotPicked;
+  tgState.onBotPicked = null;
+  if (typeof cb === 'function') cb();
+  else if (getActiveAccount()) refreshTgCard({ sendStartIfEmpty: true });
+}
+function openBotPickerModal(onPicked){
+  tgState.onBotPicked = typeof onPicked === 'function' ? onPicked : null;
+  $('customBotInput').value = tgState.botUsername ? ('@' + tgState.botUsername) : '';
+  updateBotPickerUI();
+  $('botModal').style.display = 'flex';
+}
+$('openBotPickerBtn').onclick = function(){ openBotPickerModal(null); };
+$('closeBotModalBtn').onclick = function(){ tgState.onBotPicked = null; $('botModal').style.display = 'none'; };
+$('pickHermesBtn').onclick = function(){ applyBotChoice('hermes', ''); };
+$('pickHathiBtn').onclick = function(){ applyBotChoice('hathi', ''); };
+$('pickChauhanBtn').onclick = function(){ applyBotChoice('chauhan', ''); };
+$('pickCustomBotBtn').onclick = function(){
+  var u = $('customBotInput').value.replace(/^@+/, '').trim();
+  if (!u) { alert('Custom bot ka @username daalo'); return; }
+  applyBotChoice('', u);
+};
+
 // ─── LEFT: TELEGRAM OTP CARD ───
 function updateAutoSyncUI(){
   $('autoFillBtn').textContent = '⚡ Auto-Fill: ' + (autoSync ? 'ON' : 'OFF');
   $('autoFillBtn').className = 'sm ' + (autoSync ? 'green' : 'secondary');
 }
 
+function escapeHtml(s){
+  return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+function formatTgBubbleHtml(txt){
+  var h = escapeHtml(txt || '');
+  h = h.replace(new RegExp('\\\\*\\\\*([^\\\\*\\\\n]+)\\\\*\\\\*', 'g'), '<b>$1</b>');
+  h = h.replace(new RegExp('\`([^\`\\\\n]+)\`', 'g'), '<code>$1</code>');
+  return h;
+}
+
 function renderTgScreen(s){
   if (!s || !s.ok) return;
   tgState.lastScreen = s;
-  $('tgBotTitle').textContent = '@' + (s.botUsername || 'HermeshuOTPROBOT');
+  $('tgBotTitle').textContent = '@' + (s.botUsername || currentBotLabel().replace(/^@+/, ''));
   $('tgUpdatedAt').textContent = 'updated ' + fmtTime(s.fetchedAt);
   $('tgMeLabel').textContent = s.me ? ('spare: ' + s.me) : 'connected';
   if (s.primary) {
-    $('tgCardText').textContent = s.primary.text || '(empty message)';
+    $('tgCardText').innerHTML = s.primary.text ? formatTgBubbleHtml(s.primary.text) : '(empty message)';
     $('tgCardMsgId').textContent = 'msg #' + (s.primary.messageId || '—');
   } else {
     $('tgCardText').textContent = 'Chat khali hai — ▶ /start dabao.';
@@ -690,12 +794,13 @@ function renderTgScreen(s){
 
 function refreshTgCard(opts){
   var active = getActiveAccount();
-  if (!active || tgState.addingNew || tgState.busy) return Promise.resolve();
+  if (!active || tgState.addingNew || tgState.busy) return Promise.resolve(null);
   tgState.busy = true;
   $('tgRefreshBtn').disabled = true;
   return post('/api/tg/card', {
     accountToken: active.token,
-    botProfile: $('tgBotProfile').value,
+    botProfile: tgState.botProfile,
+    botUsername: tgState.botUsername,
     sendStartIfEmpty: Boolean(opts && opts.sendStartIfEmpty),
   }).then(function(r){
     tgState.busy = false;
@@ -703,37 +808,84 @@ function refreshTgCard(opts){
     if (!r.ok) {
       $('tgToast').style.display = 'block';
       $('tgToast').textContent = '⚠️ ' + (r.message || 'Card load fail');
-      return;
+      return r;
     }
     renderTgScreen(r);
+    return r;
   }).catch(function(e){
     tgState.busy = false;
     $('tgRefreshBtn').disabled = false;
     $('tgToast').style.display = 'block';
     $('tgToast').textContent = '⚠️ ' + (e && e.message ? e.message : 'Network error');
+    return { ok: false, message: 'Network error' };
   });
 }
 
 function clickTgButton(payload){
   var active = getActiveAccount();
-  if (!active || tgState.addingNew || tgState.busy) return Promise.resolve();
+  if (!active || tgState.addingNew || tgState.busy) return Promise.resolve(null);
   tgState.busy = true;
   $('tgRefreshBtn').disabled = true;
   return post('/api/tg/click', Object.assign({
     accountToken: active.token,
-    botProfile: $('tgBotProfile').value,
+    botProfile: tgState.botProfile,
+    botUsername: tgState.botUsername,
   }, payload || {})).then(function(r){
     tgState.busy = false;
     $('tgRefreshBtn').disabled = false;
     if (!r.ok) {
       $('tgToast').style.display = 'block';
       $('tgToast').textContent = '⚠️ ' + (r.message || 'Click fail');
-      return;
+      return r;
     }
     renderTgScreen(r);
+    return r;
   }).catch(function(){
     tgState.busy = false;
     $('tgRefreshBtn').disabled = false;
+    return { ok: false, message: 'Network error' };
+  });
+}
+
+function requestNextNumberFromTelegram(){
+  if (!autoSync || !localRun.active || localRun.status !== 'need_number') return;
+  var active = getActiveAccount();
+  if (!active) return;
+  if (tgState.busy) { setTimeout(requestNextNumberFromTelegram, 700); return; }
+  tgState.waitingNextNumber = true;
+  localRun.message = '🔄 Telegram card se agla number fetch ho raha hai…';
+  paint(localRun);
+  clickTgButton({ action: 'next' }).then(function(r){
+    if (!localRun.active || localRun.status !== 'need_number') return;
+    if (r && r.ok && r.currentPhone && r.currentPhone !== tgState.lastConsumedPhone) {
+      return; // renderTgScreen -> maybeAutoFillFromTelegram ne submit kar diya
+    }
+    tgState.samePhoneRetries += 1;
+    if (tgState.samePhoneRetries === 1 && (!r || !r.ok)) {
+      // Card par button nahi mila to /start bhej kar fresh card kholo
+      clickTgButton({ action: 'start' }).then(function(){
+        if (localRun.active && localRun.status === 'need_number') {
+          setTimeout(function(){ clickTgButton({ action: 'next' }); }, 900);
+        }
+      });
+      return;
+    }
+    if (tgState.samePhoneRetries >= 2 && tgState.accounts.length > 1) {
+      // Current spare account ne naya number nahi diya → agle spare account par switch karo
+      tgState.samePhoneRetries = 0;
+      var idx = -1;
+      for (var i = 0; i < tgState.accounts.length; i++) {
+        if (tgState.accounts[i].id === tgState.activeId) { idx = i; break; }
+      }
+      var next = tgState.accounts[(idx + 1) % tgState.accounts.length];
+      if (next && next.id !== tgState.activeId) {
+        localRun.log.push('↪️ Spare account switch: ' + (next.me || next.phone));
+        activateAccount(next.id);
+        setTimeout(function(){
+          if (localRun.active && localRun.status === 'need_number') clickTgButton({ action: 'next' });
+        }, 1200);
+      }
+    }
   });
 }
 
@@ -826,7 +978,11 @@ $('tgVerifyCodeBtn').onclick = function(){
     $('tgLoginMsg').textContent = '';
     saveStoredAccounts();
     renderAccountsUI();
-    refreshTgCard({ sendStartIfEmpty: true });
+    if (!tgState.botConfirmedForSession) {
+      openBotPickerModal(function(){ refreshTgCard({ sendStartIfEmpty: true }); });
+    } else {
+      refreshTgCard({ sendStartIfEmpty: true });
+    }
   }).catch(function(){
     $('tgVerifyCodeBtn').disabled = false;
     $('tgLoginMsg').textContent = '❌ Network error';
@@ -835,7 +991,6 @@ $('tgVerifyCodeBtn').onclick = function(){
 
 $('tgRefreshBtn').onclick = function(){ refreshTgCard(); };
 $('tgSendStartBtn').onclick = function(){ clickTgButton({ action: 'start' }); };
-$('tgBotProfile').onchange = function(){ if (getActiveAccount()) refreshTgCard({ sendStartIfEmpty: true }); };
 $('tgAutoPollBtn').onclick = function(){
   tgState.autoPoll = !tgState.autoPoll;
   $('tgAutoPollBtn').textContent = '⏱ Poll: ' + (tgState.autoPoll ? 'ON' : 'OFF');
@@ -924,23 +1079,35 @@ function submitMobile(m){
   $('mobile').value = '';
   $('sendNumber').disabled = true;
   tgState.lastConsumedPhone = m;
+  tgState.waitingNextNumber = false;
+  tgState.samePhoneRetries = 0;
   localRun.status = 'working';
   localRun.mobile = m;
   localRun.message = 'Register ho raha hai (NoCaptchaAI check ho to 15-45s lag sakta hai)…';
   paint(localRun);
   post('/number', { mobile: m, details: localRun.details, target: localRun.target }).then(function(r){
     $('sendNumber').disabled = false;
-    if (!r.ok) { alert(r.message || 'Error'); localRun.status = 'need_number'; paint(localRun); return; }
+    if (!r.ok) {
+      localRun.status = 'need_number';
+      localRun.message = r.message || 'Error — agla number try ho raha hai…';
+      paint(localRun);
+      if (autoSync && getActiveAccount()) setTimeout(requestNextNumberFromTelegram, 900);
+      return;
+    }
     localRun.session = r.session || null;
     localRun.status = r.status;
     localRun.message = r.message;
     if (r.result) { localRun.results.push(r.result); localRun.count = localRun.results.length; }
     if (r.log && r.log.length) localRun.log = r.log;
     paint(localRun);
+    if (autoSync && localRun.status === 'need_number' && getActiveAccount()) {
+      setTimeout(requestNextNumberFromTelegram, 900);
+    }
   }).catch(function(){
     $('sendNumber').disabled = false;
     localRun.status = 'need_number';
     paint(localRun);
+    if (autoSync && getActiveAccount()) setTimeout(requestNextNumberFromTelegram, 1200);
   });
 }
 
@@ -963,7 +1130,7 @@ function submitOtp(o){
     if (r.log && r.log.length) localRun.log = r.log;
     paint(localRun);
     if (autoSync && localRun.status === 'need_number' && getActiveAccount()) {
-      setTimeout(function(){ clickTgButton({ action: 'find' }); }, 900);
+      setTimeout(requestNextNumberFromTelegram, 900);
     }
   }).catch(function(){
     $('sendOtp').disabled = false;
@@ -1003,7 +1170,7 @@ $('fillOtpBtn').onclick = function(){
 };
 $('autoFillBtn').onclick = function(){ autoSync = !autoSync; updateAutoSyncUI(); };
 
-$('start').onclick = function(){
+function launchGoldDropRun(){
   saveFormDefaults();
   var body = {
     name: $('name').value.trim(),
@@ -1018,13 +1185,25 @@ $('start').onclick = function(){
     if (!r.ok) { alert(r.message || 'Error'); return; }
     tgState.lastConsumedPhone = '';
     tgState.lastConsumedOtpKey = '';
-    localRun = { active:true, status:'need_number', message:'Pehla mobile number daalo (ya Telegram card se fetch hoga)', target:body.target, count:0, mobile:'', details:body, session:null, results:[], log:['▶ START — target '+body.target+' numbers'] };
+    tgState.waitingNextNumber = false;
+    tgState.samePhoneRetries = 0;
+    localRun = { active:true, status:'need_number', message:'Telegram card (' + currentBotLabel() + ') se number fetch ho raha hai…', target:body.target, count:0, mobile:'', details:body, session:null, results:[], log:['▶ START — target '+body.target+' numbers · Bot: '+currentBotLabel()] };
     show('setup', false); show('run', true); paint(localRun);
     if (autoSync && getActiveAccount()) {
-      if (tgState.lastScreen && tgState.lastScreen.currentPhone) maybeAutoFillFromTelegram(tgState.lastScreen);
-      else clickTgButton({ action: 'find' });
+      refreshTgCard({ sendStartIfEmpty: true }).then(function(scr){
+        if (!localRun.active || localRun.status !== 'need_number') return;
+        if (!scr || !scr.currentPhone) requestNextNumberFromTelegram();
+      });
     }
   });
+}
+
+$('start').onclick = function(){
+  if (getActiveAccount() && autoSync && !tgState.botConfirmedForSession) {
+    openBotPickerModal(launchGoldDropRun);
+    return;
+  }
+  launchGoldDropRun();
 };
 
 $('sendNumber').onclick = function(){ submitMobile($('mobile').value); };
@@ -1056,6 +1235,7 @@ setInterval(function(){
 }, 2500);
 
 setInterval(pollGd, 2500);
+loadBotChoice();
 loadFormDefaults();
 pollGd();
 initTgAccounts();
@@ -1270,7 +1450,8 @@ export default async function handler(req, res) {
           apiId: tgSess.apiId,
           apiHash: tgSess.apiHash,
           session: tgSess.session,
-          botProfile: String(body.botProfile || 'hermes'),
+          botProfile: String(body.botProfile || ''),
+          botUsername: String(body.botUsername || ''),
           requireOwnAccount: true,
         }, () => tg.readTelegramOtpScreen({ limit: 10, sendStartIfEmpty: Boolean(body.sendStartIfEmpty) }));
         sendJson(res, 200, screen);
@@ -1294,7 +1475,8 @@ export default async function handler(req, res) {
           apiId: tgSess.apiId,
           apiHash: tgSess.apiHash,
           session: tgSess.session,
-          botProfile: String(body.botProfile || 'hermes'),
+          botProfile: String(body.botProfile || ''),
+          botUsername: String(body.botUsername || ''),
           requireOwnAccount: true,
         }, () => tg.interactTelegramOtpScreen({
           action: String(body.action || 'button'),

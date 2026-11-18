@@ -2,7 +2,7 @@
 // Koi browser nahi: POST /api/users {} → HMAC signed token → multipart
 // register (data+img) → verify-otp. Security check aaye to NoCaptchaAI se
 // Turnstile solve → cf-turnstile-response ke saath 1 retry.
-import { randomBytes, createHmac } from 'node:crypto';
+import { randomBytes, randomInt, createHmac } from 'node:crypto';
 
 const BASE = 'https://golddropgolddhamaka.com/api';
 const GOLD_DROP_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
@@ -11,16 +11,30 @@ const NOCAP_KEY_DEFAULT = process.env.NOCAP_API_KEY || 'nocap_eVBzrYeejjgKLoikEE
 const ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
 const b64 = value => Buffer.from(value, 'utf8').toString('base64');
 
-// ─── Signing (drop.py ke signer ke exactly same) ───
+// ─── Signing (gold-drop-client.js / drop.py exact signer) ───
 function signPayload(payload, dataKey, userKey, t) {
   const ts = b64(String(t));
-  const json = JSON.stringify({ ...payload, userKey, t: String(t) });
-  const digest = createHmac('sha256', String(dataKey).slice(4, 18)).update(`${ts}.${b64(json)}`).digest('hex');
-  const p = 1 + (digest.length % 6); // 1..6
-  const m = 2 + (digest.charCodeAt(0) % 7); // 2..8
+  const json = JSON.stringify({ ...payload, userKey: String(userKey), t: String(t) });
+  const digest = b64(createHmac('sha256', String(dataKey).slice(4, 18)).update(`${ts}.${b64(json)}`).digest('hex'));
+  const p = randomInt(1, 7); // 1..6
+  const m = randomInt(2, 9); // 2..8
   let nonce = '';
-  for (let i = 0; i < m; i++) nonce += ALPHABET[Math.floor(Math.random() * ALPHABET.length)];
+  for (let i = 0; i < m; i++) nonce += ALPHABET[randomInt(ALPHABET.length)];
   return `${ts}.${b64(json)}.${m}${p}${digest.slice(0, p)}${nonce}${digest.slice(p)}`;
+}
+
+function mergeCookies(setCookies = [], userKey = '') {
+  const map = new Map();
+  for (const raw of Array.isArray(setCookies) ? setCookies : []) {
+    const first = String(raw || '').split(';')[0];
+    const idx = first.indexOf('=');
+    if (idx <= 0) continue;
+    const name = first.slice(0, idx).trim();
+    const val = first.slice(idx + 1).trim();
+    if (name) map.set(name, val);
+  }
+  if (userKey) map.set('gold-drop-id', String(userKey));
+  return Array.from(map.entries()).map(([k, v]) => `${k}=${v}`).join('; ');
 }
 
 function unwrapResponse(data) {
@@ -126,7 +140,7 @@ export async function registerGoldDrop({ name, mobile, email, pincode, code, ima
   if (!boot.data?.userKey || !boot.data?.dataKey) throw new Error(String(boot.data?.message || 'Session keys nahi mile'));
   const userKey = String(boot.data.userKey);
   const dataKey = String(boot.data.dataKey);
-  const cookies = `gold-drop-id=${userKey}`;
+  const cookies = mergeCookies(boot.setCookie, userKey);
 
   const doRegister = async captchaToken => {
     const t = String(Date.now());
@@ -136,15 +150,16 @@ export async function registerGoldDrop({ name, mobile, email, pincode, code, ima
       ? `\r\n--${boundary}\r\nContent-Disposition: form-data; name="cf-turnstile-response"\r\n\r\n${captchaToken}`
       : '';
     const chunks = [Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="data"\r\n\r\n${signed}${captchaPart}\r\n--${boundary}\r\nContent-Disposition: form-data; name="img"; filename="sample.jpg"\r\nContent-Type: image/jpeg\r\n\r\n`), image, Buffer.from(`\r\n--${boundary}--\r\n`)];
-    const { data: result } = await gdRequest(`/users/register/${encodeURIComponent(userKey)}?t=${t}`, Buffer.concat(chunks), `multipart/form-data; boundary=${boundary}`, cookies);
+    const reg = await gdRequest(`/users/register/${encodeURIComponent(userKey)}?t=${t}`, Buffer.concat(chunks), `multipart/form-data; boundary=${boundary}`, cookies);
+    const result = reg.data;
     if (result?.statusCode !== 200) throw new Error(String(result?.message || 'Registration failed'));
-    return result;
+    return { result, setCookie: reg.setCookie };
   };
 
-  let registerResult;
+  let registerOut;
   let securitySolved = false;
   try {
-    registerResult = await doRegister('');
+    registerOut = await doRegister('');
   } catch (error) {
     if (!isSecurityCheck(error)) throw error;
     const key = String(nocapApiKey || '').trim();
@@ -152,22 +167,23 @@ export async function registerGoldDrop({ name, mobile, email, pincode, code, ima
     const sitekey = await fetchSitekey().catch(() => '');
     if (!sitekey) throw new Error('Site par Turnstile sitekey nahi mili — site ka structure badla hai.');
     const token = await nocapSolveTurnstile(key || NOCAP_KEY_DEFAULT, sitekey, 'https://golddropgolddhamaka.com/register');
-    registerResult = await doRegister(token);
+    registerOut = await doRegister(token);
     securitySolved = true;
   }
 
-  // session verify ke liye wapas chahiye (stateless serverless)
+  const mergedSessionCookies = mergeCookies([...(boot.setCookie || []), ...(registerOut.setCookie || [])], userKey);
   return {
     ok: true,
     securitySolved,
-    message: String(registerResult?.message || 'OTP sent'),
-    session: { userKey, dataKey },
+    message: String(registerOut.result?.message || 'OTP sent'),
+    session: { userKey, dataKey, cookies: mergedSessionCookies },
   };
 }
 
 export async function verifyGoldDropOtp({ session, otp }) {
   const userKey = String(session?.userKey || '');
   const dataKey = String(session?.dataKey || '');
+  const cookies = String(session?.cookies || `gold-drop-id=${userKey}`);
   if (!userKey || !dataKey) throw new Error('Session expire ho gaya — number dobara bhejo');
   if (!/^\d{6}$/.test(String(otp))) throw new Error('OTP 6 digits ka hota hai');
   const t = String(Date.now());
@@ -176,7 +192,7 @@ export async function verifyGoldDropOtp({ session, otp }) {
     `/users/verify-otp/${encodeURIComponent(userKey)}?t=${t}`,
     JSON.stringify({ data }),
     'application/json',
-    `gold-drop-id=${userKey}`,
+    cookies,
     'https://golddropgolddhamaka.com/otp',
   );
   if (result?.statusCode !== 200) throw new Error(String(result?.message || 'OTP verification failed'));

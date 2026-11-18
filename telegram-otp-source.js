@@ -172,6 +172,7 @@ export function withTelegramAccountContext(account = {}, fn) {
     session: String(account?.session || '').trim(),
     requireOwnAccount: Boolean(account?.requireOwnAccount),
     botProfile: String(account?.botProfile || '').trim(),
+    botUsername: String(account?.botUsername || '').replace(/^@+/, '').trim(),
   };
   return telegramAccountCtx.run(clean, fn);
 }
@@ -234,14 +235,20 @@ export function getTelegramOtpConfig(env = process.env) {
   // Owner ne UI se koi bot chuna (explicit) → wahi final. Warna env ka bot:
   // agar woh Hermes/HardXotp hai to uski profile, warna custom-bot mode me
   // selected profile ke buttons + env ka username.
+  const scopedBotUser = String(scoped?.botUsername || '').replace(/^@+/, '').trim();
+  const knownScopedProfile = scopedBotUser ? otpBotProfileForUsername(scopedBotUser) : null;
   const profile = (scoped?.botProfile)
     ? getOtpBotProfile(scoped.botProfile)
-    : ((activeOtpBotExplicit && live)
-      ? getOtpBotProfile(activeOtpBotProfileId)
-      : (knownEnvProfile || getActiveOtpBotProfile()));
-  const botUsername = (scoped?.botProfile || (activeOtpBotExplicit && live) || !envBotUsername
-    ? profile.username
-    : envBotUsername).replace(/^@+/, '').trim();
+    : (knownScopedProfile
+      ? knownScopedProfile
+      : ((activeOtpBotExplicit && live)
+        ? getOtpBotProfile(activeOtpBotProfileId)
+        : (knownEnvProfile || getActiveOtpBotProfile())));
+  const botUsername = (scopedBotUser
+    ? scopedBotUser
+    : (scoped?.botProfile || (activeOtpBotExplicit && live) || !envBotUsername
+      ? profile.username
+      : envBotUsername)).replace(/^@+/, '').trim();
 
   // Multi-account: TELEGRAM_SESSION_2.._8 ho to healthy account chuno.
   // Ek hi session ho to roster single-slot hai — behaviour bilkul purana.
@@ -2691,10 +2698,20 @@ export async function interactTelegramOtpScreen({
         if (chosenBtn) break;
       }
     }
-    if (!chosenBtn && (act === 'refresh' || act === 'find' || act === 'new' || act === 'view')) {
-      for (const r of rows) {
-        for (const b of r) {
-          if (buttonMatchesRole(b, act, config)) { chosenBtn = b; break; }
+    if (!chosenBtn && (act === 'next' || act === 'claim' || act === 'refresh' || act === 'find' || act === 'new' || act === 'view')) {
+      const roleOrder = (act === 'next' || act === 'claim')
+        ? ['new', 'find']
+        : act === 'find'
+          ? ['find', 'new']
+          : act === 'refresh'
+            ? ['refresh', 'view']
+            : [act];
+      for (const wantedRole of roleOrder) {
+        for (const r of rows) {
+          for (const b of r) {
+            if (buttonMatchesRole(b, wantedRole, config)) { chosenBtn = b; break; }
+          }
+          if (chosenBtn) break;
         }
         if (chosenBtn) break;
       }

@@ -506,7 +506,23 @@ API se** — koi browser, proxy ya WAF solve nahi.
 - ZZBOT par `check_mobile` endpoint nahi hai — naya/purana account OTP verify
   ke jawab se pata chalta hai.
 
-### 🖥 Browser se (Vercel) — `zzbot-vercel/`
+### 🖥 Ek hi hub — pehle card, phir spare, phir bot, phir START (`bot-hub-vercel/`)
+
+Sabse aasan rasta: `bot-hub-vercel/` (Root Directory `bot-hub-vercel`).
+Page kholte hi **service card** aata hai:
+
+| Card | Flow |
+|---|---|
+| 🟡 Gold Drop | number → register (NoCaptchaAI) → OTP → reward |
+| 🌐 Toing Pro | number → `send_otp` → OTP → `verify_otp` → session JSON |
+| 🟣 ZZBOT (Zepto) | number → `login/otp` → OTP → `login/verify` → session JSON |
+| 🧩 Custom | apni site ke send/verify endpoints |
+
+Uske baad **2️⃣ spare account** (kaun Telegram spare OTP bot padhega,
+`TELEGRAM_SESSION` / `_2.._9`), **3️⃣ OTP bot** (Hermes / Hathi / HardXotp /
+custom), **4️⃣ START**. OTP **manual** ya **🤖 auto** (spare se khud uthata hai).
+
+### 🖥 Sirf ZZBOT ke liye — `zzbot-vercel/`
 
 Bot ki zaroorat nahi: `zzbot-vercel/` ek chhota Vercel project hai (Gold Drop
 jaisa) — page kholo, number daalo, OTP (manual ya Telegram bot se auto),
@@ -845,6 +861,7 @@ chalta rehta hai; temporary error par number failed nahi gina jata.
 | `seed/used-numbers.json` | 📋 Blocklist — jinka OTP dobara nahi lena (30-din cooldown). Sirf mobile numbers |
 | `scripts/seed-used-numbers.mjs` | 📋 List import/apply — `npm run seed:used-numbers -- <file.json>` |
 | `zzbot-vercel/` | 🖥 **ZZBOT web signup (Vercel)** — browser se Zepto session JSON (root dir `zzbot-vercel`) |
+| `bot-hub-vercel/` | 🌐 **Service Hub (Vercel)** — pehle card (Gold/Toing/ZZBOT/Custom) → spare → bot → START |
 | `test_fresh_unit.mjs` | Unit tests (mocked fetch) — `npm test` |
 | `test_db_link.mjs` | Linked-DB tests (merge rules + KV round-trip) — `npm test` |
 | `test_used_numbers.mjs` | Blocklist tests (30-din unlock, idempotency) — `npm test` |

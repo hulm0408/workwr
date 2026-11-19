@@ -8,7 +8,8 @@ import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { registerGoldDrop, verifyGoldDropOtp, goldDropCaptchaDiagnose, goldDropDeadEnd, resetGoldDropDeadEnd } from './_gold-drop.js';
 import { goldDropBrowserAvailable, findStealthWorker } from './_gold-drop-browser.js';
-import { readOtpBotMirror, telegramConfigured } from './_otp-mirror.js';
+import { readOtpBotMirror, telegramConfigured, setMirrorSession } from './_otp-mirror.js';
+import { startTelegramLogin, submitTelegramCode, submitTelegramPassword, loginConfigured } from './_telegram-login.js';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const NOCAP_API = 'https://api.nocaptchaai.com';
@@ -181,6 +182,28 @@ button.secondary{background:#232845;color:#e8eaf2}
       <button class="secondary" id="mRefresh" style="margin-top:8px">🔄 Refresh mirror</button>
       <button class="secondary" id="mNext" style="margin-top:6px">📱 Naya number lo</button>
       <div class="sub" id="mHint" style="margin:6px 0 0"></div>
+      <!-- Spare account login (sirf tab dikhta hai jab session nahi hai) -->
+      <div id="tgLogin" style="display:none;margin-top:12px;border-top:1px solid #2a3050;padding-top:10px">
+        <div style="font-size:12.5px;font-weight:700;margin-bottom:6px">🔐 Spare account se mirror jodo</div>
+        <div class="sub" id="tgNote" style="margin:0 0 6px"></div>
+        <div id="tgPhoneRow">
+          <input id="tgPhone" placeholder="+9198xxxxxxxx" inputmode="tel">
+          <button class="secondary" id="tgSendCode" style="margin-top:6px">Code bhejo</button>
+        </div>
+        <div id="tgCodeRow" style="display:none">
+          <input id="tgCode" placeholder="Telegram login code" inputmode="numeric">
+          <button class="secondary" id="tgSignIn" style="margin-top:6px">Sign in</button>
+          <button class="secondary" id="tgResend" style="margin-top:6px">Code dobara bhejo</button>
+        </div>
+        <div id="tgPassRow" style="display:none">
+          <input id="tgPass" type="password" placeholder="2FA password">
+          <button class="secondary" id="tgPassOk" style="margin-top:6px">Unlock</button>
+        </div>
+        <div id="tgApplyRow" style="display:none">
+          <button class="secondary" id="tgApply" style="margin-top:6px">✅ Mirror me lagao</button>
+        </div>
+        <div class="sub" id="tgOut" style="margin:6px 0 0"></div>
+      </div>
     </div>
   </div>
 </div>
@@ -247,7 +270,6 @@ $('sendNumber').onclick = function(){ var m=$('mobile').value.replace(/\\D/g,'')
 $('sendOtp').onclick = function(){ var o=$('otp').value.replace(/\\D/g,''); if(o.length!==6){alert('6-digit OTP daalo');return} $('otp').value=''; post('/otp',{otp:o}).then(poll) };
 $('reset').onclick = function(){ post('/reset').then(function(){ location.reload() }) };
 pollTimer = setInterval(poll, 1200); poll();
-loadMirror(); M.timer = setInterval(loadMirror, 5000);
 // ─── OTP bot mirror (left pane) ───
 var M = { timer: null, last: null, lastOtp: '' };
 function esc(t){ return String(t==null?'':t).replace(/[&<>"']/g, function(c){ return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c] }) }
@@ -260,8 +282,11 @@ function paintMirror(m){
   $('mBot').textContent = m.bot ? ('@' + m.bot) : '—';
   $('mDot').className = 'dot' + (m.ok ? ' live' : '');
   var chat = $('mChat');
-  if (!m.ok){
-    chat.innerHTML = '<div class="empty">' + esc(m.error || 'Mirror band hai') + '</div>';
+  if (!m.ok && !(m.messages||[]).length){
+    // Load error — mirror se link nahi bana. Error ke saath seedha fix batao.
+    chat.innerHTML = '<div class="empty">' + esc(m.error || 'Mirror band hai')
+      + '<br><br>Fix: Vercel → Settings → Environment Variables me TELEGRAM_SESSION daalo'
+      + ' (TELEGRAM_API_ID/HASH pehle se hain), phir Redeploy.</div>';
   } else if (!(m.messages||[]).length){
     chat.innerHTML = '<div class="empty">Bot me abhi koi message nahi — NEW NUMBER dabao</div>';
   } else {
@@ -280,11 +305,53 @@ function paintMirror(m){
     var f = $('otp');
     if (f && !f.value){ f.value = m.otp; $('mHint').textContent = 'OTP mirror se bhar diya — verify dabao'; }
   }
-  $('mHint').textContent = m.ok ? ((m.messages||[]).length + ' messages') : '';
+  $('mHint').textContent = (m.messages||[]).length + ' messages'
+    + (!m.ok ? ' · purana data (' + (m.error || '') + ')' : '');
 }
+var TG = { loginId: '', step: 'phone', session: '' };
+function tgShow(step, out){
+  $('tgPhoneRow').style.display = step === 'phone' ? 'block' : 'none';
+  $('tgCodeRow').style.display = step === 'code' ? 'block' : 'none';
+  $('tgPassRow').style.display = step === 'password' ? 'block' : 'none';
+  $('tgApplyRow').style.display = step === 'done' ? 'block' : 'none';
+  if (out) $('tgOut').textContent = out;
+  TG.step = step;
+}
+function tgPaint(res){
+  if (!res) return;
+  if (res.loginId) TG.loginId = res.loginId;
+  if (res.session) TG.session = res.session;
+  tgShow(res.step || TG.step, (res.ok ? '✅ ' : '❌ ') + (res.message || res.error || ''));
+  if (res.step === 'done') loadMirror();
+}
+function tgPost(url, body){
+  return fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) })
+    .then(function(r){ return r.json() }).then(function(res){ tgPaint(res); return res; })
+    .catch(function(e){ $('tgOut').textContent = '❌ ' + e; });
+}
+$('tgSendCode').onclick = function(){ tgPost('/tg-login/start', { phone: $('tgPhone').value.trim() }); };
+$('tgSignIn').onclick = function(){ tgPost('/tg-login/code', { loginId: TG.loginId, code: $('tgCode').value.trim() }); };
+$('tgResend').onclick = function(){ TG.loginId = ''; tgPost('/tg-login/start', { phone: $('tgPhone').value.trim() }); };
+$('tgPassOk').onclick = function(){ tgPost('/tg-login/password', { loginId: TG.loginId, password: $('tgPass').value }); };
+$('tgApply').onclick = function(){
+  tgPost('/tg-login/apply', { loginId: TG.loginId, session: TG.session }).then(function(res){
+    if (res && res.ok){ $('tgLogin').style.display = 'none'; loadMirror(); }
+  });
+};
 function loadMirror(){
-  fetch('/otp-mirror?slot=0').then(function(r){ return r.json() }).then(paintMirror).catch(function(){});
+  fetch('/otp-mirror?slot=0').then(function(r){ return r.json() }).then(function(m){
+    paintMirror(m);
+    // Mirror ne session nahi maanga? Login panel dikhao, warna chhupao.
+    var need = !m.ok && /configured nahi|SESSION/i.test(m.error || '');
+    $('tgLogin').style.display = need ? 'block' : 'none';
+    $('tgNote').textContent = need ? '' : '';
+  }).catch(function(){});
 }
+fetch('/tg-login/status').then(function(r){ return r.json() }).then(function(st){
+  $('tgNote').textContent = st.configured
+    ? ''
+    : (st.apiReady ? 'API ID/HASH mil gaya — spare account ka number daalo.' : 'TELEGRAM_API_ID/HASH env missing hai — login nahi ho payega.');
+}).catch(function(){});
 $('mRefresh').onclick = loadMirror;
 $('mNext').onclick = function(){
   loadMirror();
@@ -311,6 +378,8 @@ function captchaTest(){
   }).catch(function(){ btn.disabled = false; btn.textContent = old; });
 }
 $('captchaTest').onclick = captchaTest;
+// Mirror boot — sab function/var define hone ke BAAD hi chalta hai.
+loadMirror(); M.timer = setInterval(loadMirror, 5000);
 fetch('/browser-mode').then(function(r){return r.json()}).then(function(b){
   var el = $('browsermode');
   if (b.available) {
@@ -448,6 +517,45 @@ export default async function handler(req, res) {
         botUsername: url.searchParams.get('bot') || '',
       });
       sendJson(res, 200, mirror);
+      return;
+    }
+    // ── Spare Telegram account login (mirror ke liye session) ──
+    if (req.method === 'GET' && url.pathname === '/tg-login/status') {
+      sendJson(res, 200, {
+        ok: true,
+        apiReady: loginConfigured(),
+        configured: telegramConfigured(),
+        mirrorReady: telegramConfigured(),
+      });
+      return;
+    }
+    if (req.method === 'POST' && url.pathname === '/tg-login/start') {
+      const body = await readBody(req);
+      sendJson(res, 200, await startTelegramLogin({ phone: body.phone }));
+      return;
+    }
+    if (req.method === 'POST' && url.pathname === '/tg-login/code') {
+      const body = await readBody(req);
+      sendJson(res, 200, await submitTelegramCode({ loginId: body.loginId, code: body.code }));
+      return;
+    }
+    if (req.method === 'POST' && url.pathname === '/tg-login/password') {
+      const body = await readBody(req);
+      sendJson(res, 200, await submitTelegramPassword({ loginId: body.loginId, password: body.password }));
+      return;
+    }
+    if (req.method === 'POST' && url.pathname === '/tg-login/apply') {
+      const body = await readBody(req);
+      if (!body.session) { sendJson(res, 400, { ok: false, error: 'Session nahi mila — pehle login poora karo' }); return; }
+      try {
+        await setMirrorSession(String(body.session), { slot: 0 });
+        sendJson(res, 200, {
+          ok: true,
+          message: 'Mirror chalu — permanent rakhne ke liye ye session Vercel env TELEGRAM_SESSION me daal do.',
+        });
+      } catch (error) {
+        sendJson(res, 400, { ok: false, error: String(error?.message || error) });
+      }
       return;
     }
     if (req.method === 'GET' && url.pathname === '/browser-mode') {

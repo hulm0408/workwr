@@ -45,11 +45,15 @@ ENV NODE_ENV=production \
 WORKDIR /app
 
 COPY package.json ./
+# Mirror ke liye teleproto (spare account se OTP bot padhna). Bina iske
+# /otp-mirror har baar "Cannot find package 'teleproto'" deta hai.
+RUN npm install --omit=dev --no-audit --no-fund
+
 COPY api ./api
 COPY gold_drop_stealth.py ./gold_drop_stealth.py
 
 # Build par hi verify — deploy se pehle pata chale ki app aur worker theek hain
-RUN node -e "import('./api/index.js').then(m => { if (typeof m.default !== 'function') throw new Error('handler missing'); console.log('gold-drop handler OK') })" \
+RUN node -e "Promise.all([import('./api/index.js'), import('./api/_otp-mirror.js'), import('./api/_telegram-login.js')]).then(([h]) => { if (typeof h.default !== 'function') throw new Error('handler missing'); console.log('gold-drop handler + mirror + tg-login OK') })" \
     && /opt/golddrop-venv/bin/python -m py_compile gold_drop_stealth.py \
     && /opt/golddrop-venv/bin/python gold_drop_stealth.py --selftest
 

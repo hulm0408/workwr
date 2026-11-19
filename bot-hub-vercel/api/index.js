@@ -965,25 +965,25 @@ function chatOf(list, empty){
 }
 function tgCard(slot, c){
   c = c || {};
-  // Simple card: status + ek button. Button dabane par hi code ka text box khulta hai.
-  return '<div style="background:#10142a;border:1px solid ' + (c.ok?'#1f6b3a':'#232845') + ';border-radius:12px;padding:10px">'
+  // Card static — refresh par sirf spans badalte hain (khola box/typed code safe).
+  return '<div id="tgc'+slot+'" style="background:#10142a;border:1px solid ' + (c.ok?'#1f6b3a':'#232845') + ';border-radius:12px;padding:10px">'
     + '<div style="display:flex;justify-content:space-between;font:700 12.5px system-ui">Account #' + (slot+1)
     + ' · <b>' + esc2(c.phoneMasked||'number set nahi') + '</b>'
-    + '<span class="badge">' + (c.ready?'live':'login baaki') + '</span></div>'
+    + '<span class="badge" id="tgPill'+slot+'">' + (c.ready?'live':'login baaki') + '</span></div>'
     + '<button class="ghost" id="tgCode'+slot+'" style="width:100%;margin-top:6px">📩 OTP bhejo</button>'
     + '<div id="tgBox'+slot+'" style="display:none">'
-    + '<input id="tgLogin'+slot+'" placeholder="Telegram par aaya code" inputmode="numeric">'
+    + '<input id="tgLogin'+slot+'" placeholder="Telegram par aaya code (6 digit)" inputmode="numeric">'
     + '<input id="tgOtp'+slot+'" placeholder="2FA password (sirf agar ho)" type="password">'
     + '<button id="tgApply'+slot+'" style="width:100%">✅ Code daalo</button>'
     + '</div>'
     + '<div class="hint" id="tgOut'+slot+'"></div>'
-    + '<div class="hint">Number <b>' + (c.number||'—') + '</b> · OTP <b>' + (c.otp||'—') + '</b></div>'
-    + '<div style="display:grid;gap:6px;max-height:150px;overflow:auto;margin-top:6px">' + chatOf(c.messages, c.error||'OTP bot se abhi kuch nahi mila') + '</div>'
+    + '<div class="hint">Number <b id="tgNum'+slot+'">' + (c.number||'—') + '</b> · OTP <b id="tgOtpVal'+slot+'">' + (c.otp||'—') + '</b></div>'
+    + '<div id="tgChat'+slot+'" style="display:grid;gap:6px;max-height:150px;overflow:auto;margin-top:6px">' + chatOf(c.messages, c.error||'OTP bot se abhi kuch nahi mila') + '</div>'
     + '</div>';
 }
 function claimCard(slot, r){
   r = r || {};
-  return '<div style="background:#10142a;border:1px solid ' + (r.running?'#1f6b3a':'#232845') + ';border-radius:12px;padding:10px">'
+  return '<div id="clc'+slot+'" style="background:#10142a;border:1px solid ' + (r.running?'#1f6b3a':'#232845') + ';border-radius:12px;padding:10px">'
     + '<div style="display:flex;justify-content:space-between;font:700 12.5px system-ui">Claim #' + (slot+1)
     + '<span class="badge">' + esc2(r.phase||'idle') + '</span></div>'
     + '<input id="clBot'+slot+'" value="' + esc2((CR&&CR['bot'+slot])||r.bot||'rajafuckbot') + '">'
@@ -994,14 +994,11 @@ function claimCard(slot, r){
     + '<input id="clOtp'+slot+'" placeholder="OTP bhejo" inputmode="numeric">'
     + '<button class="ghost" id="clOtpBtn'+slot+'">🔑 OTP bhejo</button>'
     + '<div class="hint" id="clMsg'+slot+'">' + esc2(r.message||'START dabao — /start → Manual Claim → number → OTP ×3') + '</div>'
-    + '<div class="hint">' + (r.done||0) + '/' + (r.target||1) + ' · step ' + (r.step||0) + '/3</div>'
-    + '<div style="display:grid;gap:6px;max-height:150px;overflow:auto;margin-top:6px">' + chatOf(r.transcript, 'kuch nahi hua abhi') + '</div>'
+    + '<div class="hint" id="clCount'+slot+'">' + (r.done||0) + '/' + (r.target||1) + ' · step ' + (r.step||0) + '/3</div>'
+    + '<div id="clChat'+slot+'" style="display:grid;gap:6px;max-height:150px;overflow:auto;margin-top:6px">' + chatOf(r.transcript, 'kuch nahi hua abhi') + '</div>'
     + '</div>';
 }
-function renderCards(){
-  $('tgCards').innerHTML = [0,1,2].map(function(s){ return tgCard(s, TC[s]) }).join('');
-  $('claimCards').innerHTML = [0,1,2].map(function(s){ return claimCard(s, CR[s]) }).join('');
-  [0,1,2].forEach(function(s){
+function bindTgCard(s){
     var cb = $('tgCode'+s); if (cb) cb.onclick = function(){
       var box = $('tgBox'+s); if (box) box.style.display = 'block';
       $('tgOut'+s).textContent = 'OTP bhej raha hoon…';
@@ -1021,6 +1018,8 @@ function renderCards(){
         else $('tgOut'+s).textContent = '❌ ' + (r.error||r.message||'fail');
       });
     };
+}
+function bindClaimCard(s){
     var bi = $('clBot'+s); if (bi) bi.oninput = function(){ CR['bot'+s] = bi.value.trim() };
     var ti = $('clTarget'+s); if (ti) ti.oninput = function(){ CR['target'+s] = Number(ti.value)||1 };
     var sb = $('clStart'+s); if (sb) sb.onclick = function(){
@@ -1047,6 +1046,43 @@ function renderCards(){
         if (r.ok) $('clOtp'+s).value = '';
       });
     };
+}
+function renderCards(){
+  // ---- Telegram cards: pehli baar markup, uske baad sirf status/chat update ----
+  [0,1,2].forEach(function(s){
+    var card = $('tgc'+s), c = TC[s] || {};
+    if (!card){
+      $('tgCards').insertAdjacentHTML('beforeend', tgCard(s, c));
+      bindTgCard(s);
+      return;
+    }
+    var pill = $('tgPill'+s);
+    if (pill) pill.textContent = c.ready ? 'live' : 'login baaki';
+    var n = $('tgNum'+s); if (n) n.textContent = c.number || '—';
+    var o = $('tgOtpVal'+s); if (o) o.textContent = c.otp || '—';
+    var ch = $('tgChat'+s);
+    if (ch && c.ok){
+      var html = chatOf(c.messages, '');
+      if (ch.getAttribute('data-stamp') !== html){ ch.setAttribute('data-stamp', html); ch.innerHTML = html; }
+    }
+  });
+  // ---- Claim cards: pehli baar markup, baad me sirf message/count/transcript ----
+  [0,1,2].forEach(function(s){
+    var card = $('clc'+s), r = CR[s] || {};
+    if (!card){
+      $('claimCards').insertAdjacentHTML('beforeend', claimCard(s, r));
+      bindClaimCard(s);
+      return;
+    }
+    var msg = $('clMsg'+s); if (msg && r.message) msg.textContent = r.message;
+    var cnt = $('clCount'+s); if (cnt) cnt.textContent = (r.done||0) + '/' + (r.target||1) + ' · step ' + (r.step||0) + '/3';
+    var ch = $('clChat'+s);
+    if (ch){
+      var html = chatOf(r.transcript, 'kuch nahi hua abhi');
+      if (ch.getAttribute('data-stamp') !== html){ ch.setAttribute('data-stamp', html); ch.innerHTML = html; }
+    }
+    var pill = card.firstChild && card.firstChild.lastChild; // badge
+    if (pill && r.phase && pill.textContent !== r.phase) pill.textContent = r.phase;
   });
 }
 function refreshCards(){

@@ -270,18 +270,19 @@ function tgCardHtml(slot, c){
   c = c || {};
   var ready = !!c.ready, live = !!c.ok;
   var num = c.number || '', otp = c.otp || '';
-  // Simple card: status + ek button. Button dabane par hi code ka text box khulta hai.
+  // Card static rehta hai — 5s refresh par sirf neeche wale spans badalte hain.
+  // Isse jo box aapne khola hai (aur usme typed code) kabhi nahi udta.
   return '<div class="cardbox' + (live ? ' live' : '') + '" id="tgc' + slot + '">'
     + '<div class="top"><span>Account #' + (slot+1) + ' · <b>' + esc(c.phoneMasked || 'number set nahi') + '</b></span>'
-    + '<span class="pill ' + (ready ? 'ok' : 'bad') + '">' + (ready ? 'live' : 'login baaki') + '</span></div>'
+    + '<span class="pill ' + (ready ? 'ok' : 'bad') + '" id="tgPill' + slot + '">' + (ready ? 'live' : 'login baaki') + '</span></div>'
     + '<button class="secondary" id="tgCode' + slot + '" style="width:100%">📩 OTP bhejo</button>'
     + '<div id="tgBox' + slot + '" style="display:none">'
-    + '<input id="tgLogin' + slot + '" placeholder="Telegram par aaya code" inputmode="numeric" autocomplete="one-time-code">'
+    + '<input id="tgLogin' + slot + '" placeholder="Telegram par aaya code (6 digit)" inputmode="numeric" autocomplete="one-time-code">'
     + '<input id="tgOtp' + slot + '" placeholder="2FA password (sirf agar ho)" type="password">'
     + '<button class="secondary" id="tgApply' + slot + '" style="width:100%">✅ Code daalo</button>'
     + '</div>'
     + '<div class="mini" id="tgOut' + slot + '"></div>'
-    + '<div class="mini" id="tgNum' + slot + '">Number <b>' + (num || '—') + '</b> · OTP <b>' + (otp || '—') + '</b></div>'
+    + '<div class="mini">Number <b id="tgNum' + slot + '">' + (num || '—') + '</b> · OTP <b id="tgOtpVal' + slot + '">' + (otp || '—') + '</b></div>'
     + '<div class="chat" id="tgChat' + slot + '">' + (live ? messagesHtml(c.messages) : '<div class="empty">' + esc(c.error || 'OTP bot se abhi kuch nahi mila') + '</div>') + '</div>'
     + '</div>';
 }
@@ -301,7 +302,7 @@ function claimCardHtml(slot, r){
   var bot = (CR && CR['bot'+slot]) || r.bot || 'rajafuckbot';
   var target = (CR && CR['target'+slot]) || r.target || 1;
   return '<div class="cardbox' + (running ? ' live' : '') + '" id="clc' + slot + '">'
-    + '<div class="top"><span>Claim bot #' + (slot+1) + '</span><span class="pill ' + (running ? 'ok' : '') + '">' + (r.phase || 'idle') + '</span></div>'
+    + '<div class="top"><span>Claim bot #' + (slot+1) + '</span><span class="pill ' + (running ? 'ok' : '') + '" id="clPill' + slot + '">' + (r.phase || 'idle') + '</span></div>'
     + '<input id="clBot' + slot + '" placeholder="@rajafuckbot" value="' + esc(bot) + '">'
     + '<div class="two"><input id="clTarget' + slot + '" type="number" min="1" max="50" value="' + target + '" placeholder="kitne claims">'
     + '<input id="clNumber' + slot + '" placeholder="number bhejo" inputmode="numeric"></div>'
@@ -314,12 +315,56 @@ function claimCardHtml(slot, r){
 }
 
 function renderTg(){
-  $('tgCards').innerHTML = [0,1,2].map(function(slot){ return tgCardHtml(slot, TC[slot]) }).join('');
-  [0,1,2].forEach(bindTg);
+  [0,1,2].forEach(function(slot){
+    var card = $('tgc' + slot);
+    var c = TC[slot] || {};
+    if (!card) {   // pehli baar — poora card
+      $('tgCards').insertAdjacentHTML('beforeend', tgCardHtml(slot, c));
+      bindTg(slot);
+      return;
+    }
+    // Refresh: sirf status/text badlo — input, khola hua box, focus, cursor sab intact.
+    var pill = $('tgPill' + slot);
+    if (pill) {
+      var isReady = !!c.ready;
+      pill.className = 'pill ' + (isReady ? 'ok' : 'bad');
+      pill.textContent = isReady ? 'live' : 'login baaki';
+      card.className = 'cardbox' + (c.ok ? ' live' : '');
+    }
+    var numEl = $('tgNum' + slot); if (numEl) numEl.textContent = c.number || '—';
+    var otpEl = $('tgOtpVal' + slot); if (otpEl) otpEl.textContent = c.otp || '—';
+    var chat = $('tgChat' + slot);
+    if (chat && c.ok) {
+      var newHtml = messagesHtml(c.messages);
+      if (chat.dataset.stamp !== newHtml) { chat.dataset.stamp = newHtml; chat.innerHTML = newHtml; }
+    }
+  });
 }
 function renderClaim(){
-  $('claimCards').innerHTML = [0,1,2].map(function(slot){ return claimCardHtml(slot, CR[slot]) }).join('');
-  [0,1,2].forEach(bindClaim);
+  [0,1,2].forEach(function(slot){
+    var card = $('clc' + slot), r = CR[slot] || {};
+    if (!card) {   // pehli baar — poora card
+      $('claimCards').insertAdjacentHTML('beforeend', claimCardHtml(slot, r));
+      bindClaim(slot);
+      return;
+    }
+    // Refresh par input fields ko chhedte hi nahi (typed number/OTP safe rehta hai).
+    var pill = $('clPill' + slot);
+    if (pill) {
+      pill.textContent = r.phase || 'idle';
+      pill.className = 'pill ' + (r.running ? 'ok' : '');
+    }
+    card.className = 'cardbox' + (r.running ? ' live' : '');
+    var msg = $('clMsg' + slot);
+    if (msg && r.message) msg.textContent = r.message;
+    var cnt = $('clCount' + slot);
+    if (cnt) cnt.textContent = (r.done || 0) + '/' + (r.target || 1) + ' · step ' + (r.step || 0) + '/3';
+    var chat = $('clChat' + slot);
+    if (chat) {
+      var html = chatHtml(r.transcript, 'kuch nahi hua abhi');
+      if (chat.dataset.stamp !== html) { chat.dataset.stamp = html; chat.innerHTML = html; }
+    }
+  });
 }
 
 function bindTg(slot){

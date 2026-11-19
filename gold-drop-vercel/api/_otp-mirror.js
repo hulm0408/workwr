@@ -34,9 +34,7 @@ export async function setMirrorSession(session, { slot = 0 } = {}) {
   const clean = String(session || '').trim();
   if (!clean) throw new Error('Session khali hai');
   runtimeSessions.set(slot, clean);
-  await dropClient(slot);
-  clients.delete(slot); // naya client naye session se bane
-  for (const k of [...clients.keys()]) if (k === slot) clients.delete(k);
+  await dropClient(slot); // naya client naye session se banega
   return { slot, configured: telegramConfigured() };
 }
 

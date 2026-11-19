@@ -200,7 +200,10 @@ button.secondary{background:#232845;color:#e8eaf2}
           <button class="secondary" id="tgPassOk" style="margin-top:6px">Unlock</button>
         </div>
         <div id="tgApplyRow" style="display:none">
-          <button class="secondary" id="tgApply" style="margin-top:6px">✅ Mirror me lagao</button>
+          <div class="sub" style="margin:0 0 4px">Session mil gaya. Ise <b>Vercel → Settings → Environment Variables → TELEGRAM_SESSION</b> me daalo, phir <b>Redeploy</b> — tab har naye instance par bhi mirror chalega. (Neeche wala button sirf isi instance par chalta hai.)</div>
+          <textarea id="tgSession" rows="3" readonly style="width:100%;font:11px ui-monospace,monospace;background:#0b0e18;color:#7ee2a8;border:1px solid #2a3050;border-radius:8px;padding:8px"></textarea>
+          <button class="secondary" id="tgCopy" style="margin-top:6px">📋 Session copy karo</button>
+          <button class="secondary" id="tgApply" style="margin-top:6px">✅ Isi instance par abhi chalao</button>
         </div>
         <div class="sub" id="tgOut" style="margin:6px 0 0"></div>
       </div>
@@ -320,7 +323,7 @@ function tgShow(step, out){
 function tgPaint(res){
   if (!res) return;
   if (res.loginId) TG.loginId = res.loginId;
-  if (res.session) TG.session = res.session;
+  if (res.session) { TG.session = res.session; $('tgSession').value = res.session; }
   tgShow(res.step || TG.step, (res.ok ? '✅ ' : '❌ ') + (res.message || res.error || ''));
   if (res.step === 'done') loadMirror();
 }
@@ -333,6 +336,13 @@ $('tgSendCode').onclick = function(){ tgPost('/tg-login/start', { phone: $('tgPh
 $('tgSignIn').onclick = function(){ tgPost('/tg-login/code', { loginId: TG.loginId, code: $('tgCode').value.trim() }); };
 $('tgResend').onclick = function(){ TG.loginId = ''; tgPost('/tg-login/start', { phone: $('tgPhone').value.trim() }); };
 $('tgPassOk').onclick = function(){ tgPost('/tg-login/password', { loginId: TG.loginId, password: $('tgPass').value }); };
+$('tgCopy').onclick = function(){
+  var t = $('tgSession');
+  if (!t.value) { $('tgOut').textContent = '❌ Session abhi nahi mila'; return; }
+  t.select();
+  try { document.execCommand('copy'); $('tgOut').textContent = '📋 Copy ho gaya — Vercel env me paste karo'; }
+  catch (e) { $('tgOut').textContent = 'Copy nahi hua — text select karke copy karo'; }
+};
 $('tgApply').onclick = function(){
   tgPost('/tg-login/apply', { loginId: TG.loginId, session: TG.session }).then(function(res){
     if (res && res.ok){ $('tgLogin').style.display = 'none'; loadMirror(); }
@@ -344,7 +354,6 @@ function loadMirror(){
     // Mirror ne session nahi maanga? Login panel dikhao, warna chhupao.
     var need = !m.ok && /configured nahi|SESSION/i.test(m.error || '');
     $('tgLogin').style.display = need ? 'block' : 'none';
-    $('tgNote').textContent = need ? '' : '';
   }).catch(function(){});
 }
 fetch('/tg-login/status').then(function(r){ return r.json() }).then(function(st){

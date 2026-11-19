@@ -270,22 +270,19 @@ function tgCardHtml(slot, c){
   c = c || {};
   var ready = !!c.ready, live = !!c.ok;
   var num = c.number || '', otp = c.otp || '';
+  // Simple card: status + ek button. Button dabane par hi code ka text box khulta hai.
   return '<div class="cardbox' + (live ? ' live' : '') + '" id="tgc' + slot + '">'
-    + '<div class="top"><span><span class="dot' + (live ? ' live' : '') + '" style="display:inline-block;width:8px;height:8px;border-radius:99px;background:' + (live ? '#28c76f' : '#4a5070') + ';margin-right:6px"></span>Account #' + (slot+1) + '</span>'
-    + '<span class="pill ' + (ready ? 'ok' : 'bad') + '">' + (ready ? 'ready' : 'adhoora') + '</span></div>'
-    + '<div class="mini">API ID: <b>' + (c.apiIdSet ? (c.apiIdMasked || 'set') : '—') + '</b> · hash: <b>' + (c.apiHashSet ? 'set' : '—') + '</b> · session: <b>' + (c.sessionSet ? 'set' : '—') + '</b></div>'
-    + '<div class="mini">Number: <b>' + esc(c.phoneMasked || '—') + '</b> · Bot: <b>@' + esc(c.bot || 'Hathi_otp_bot') + '</b></div>'
-    + '<div class="two"><input id="tgApi' + slot + '" placeholder="API ID' + (c.apiIdSet ? ' (set — badalna ho tab bharo)' : '') + '">'
-    + '<input id="tgHash' + slot + '" placeholder="API hash' + (c.apiHashSet ? ' (set)' : '') + '"></div>'
-    + '<input id="tgPhone' + slot + '" placeholder="' + esc(c.phoneMasked || '+91xxxxxxxxxx (spare account)') + '" inputmode="tel">'
-    + '<div class="two"><button class="secondary" id="tgCode' + slot + '">Code bhejo</button>'
-    + '<button class="secondary" id="tgApply' + slot + '">Save session</button></div>'
-    + '<button class="secondary" id="tgSave' + slot + '" style="width:100%;margin-top:4px">💾 API ID / hash / number card me save</button>'
-    + '<input id="tgLogin' + slot + '" placeholder="Telegram login code">'
-    + '<input id="tgOtp' + slot + '" placeholder="2FA password (agar ho)">'
+    + '<div class="top"><span>Account #' + (slot+1) + ' · <b>' + esc(c.phoneMasked || 'number set nahi') + '</b></span>'
+    + '<span class="pill ' + (ready ? 'ok' : 'bad') + '">' + (ready ? 'live' : 'login baaki') + '</span></div>'
+    + '<button class="secondary" id="tgCode' + slot + '" style="width:100%">📩 OTP bhejo</button>'
+    + '<div id="tgBox' + slot + '" style="display:none">'
+    + '<input id="tgLogin' + slot + '" placeholder="Telegram par aaya code" inputmode="numeric" autocomplete="one-time-code">'
+    + '<input id="tgOtp' + slot + '" placeholder="2FA password (sirf agar ho)" type="password">'
+    + '<button class="secondary" id="tgApply' + slot + '" style="width:100%">✅ Code daalo</button>'
+    + '</div>'
     + '<div class="mini" id="tgOut' + slot + '"></div>'
-    + '<div class="mini" id="tgNum' + slot + '">Number: <b>' + (num || '—') + '</b> · OTP: <b>' + (otp || '—') + '</b></div>'
-    + '<div class="chat" id="tgChat' + slot + '">' + (live ? messagesHtml(c.messages) : '<div class="empty">' + esc(c.error || 'session chahiye — code bhejo') + '</div>') + '</div>'
+    + '<div class="mini" id="tgNum' + slot + '">Number <b>' + (num || '—') + '</b> · OTP <b>' + (otp || '—') + '</b></div>'
+    + '<div class="chat" id="tgChat' + slot + '">' + (live ? messagesHtml(c.messages) : '<div class="empty">' + esc(c.error || 'OTP bot se abhi kuch nahi mila') + '</div>') + '</div>'
     + '</div>';
 }
 function messagesHtml(msgs){
@@ -301,10 +298,12 @@ function messagesHtml(msgs){
 function claimCardHtml(slot, r){
   r = r || {};
   var running = !!r.running;
+  var bot = (CR && CR['bot'+slot]) || r.bot || 'rajafuckbot';
+  var target = (CR && CR['target'+slot]) || r.target || 1;
   return '<div class="cardbox' + (running ? ' live' : '') + '" id="clc' + slot + '">'
     + '<div class="top"><span>Claim bot #' + (slot+1) + '</span><span class="pill ' + (running ? 'ok' : '') + '">' + (r.phase || 'idle') + '</span></div>'
-    + '<input id="clBot' + slot + '" placeholder="@rajafuckbot" value="' + esc(r.bot || 'rajafuckbot') + '">'
-    + '<div class="two"><input id="clTarget' + slot + '" type="number" min="1" max="50" value="' + (r.target || 1) + '" placeholder="kitne claims">'
+    + '<input id="clBot' + slot + '" placeholder="@rajafuckbot" value="' + esc(bot) + '">'
+    + '<div class="two"><input id="clTarget' + slot + '" type="number" min="1" max="50" value="' + target + '" placeholder="kitne claims">'
     + '<input id="clNumber' + slot + '" placeholder="number bhejo" inputmode="numeric"></div>'
     + '<div class="two"><input id="clOtp' + slot + '" placeholder="OTP bhejo" inputmode="numeric">'
     + '<button class="secondary" id="clStart' + slot + '">▶ START</button></div>'
@@ -326,45 +325,45 @@ function renderClaim(){
 function bindTg(slot){
   var codeBtn = $('tgCode' + slot);
   if (codeBtn) codeBtn.onclick = function(){
-    $('tgOut' + slot).textContent = 'code bhej raha hoon…';
-    post('/tg/code', { slot: slot, phone: $('tgPhone'+slot).value.trim(), apiId: $('tgApi'+slot).value.trim(), apiHash: $('tgHash'+slot).value.trim() })
-      .then(function(r){
-        if (r.ok) { $('tgOut'+slot).textContent = '✅ ' + (r.message||'code bhej diya') + (r.loginId ? ' (loginId ' + r.loginId.slice(0,6) + '…)' : ''); TC['login'+slot] = r.loginId; }
-        else $('tgOut'+slot).textContent = '❌ ' + (r.error || 'fail');
-      });
-  };
-  var saveBtn = $('tgSave' + slot);
-  if (saveBtn) saveBtn.onclick = function(){
-    var apiId = $('tgApi'+slot).value.trim(), apiHash = $('tgHash'+slot).value.trim(), phone = $('tgPhone'+slot).value.trim();
-    if (!apiId && !apiHash && !phone) { $('tgOut'+slot).textContent = 'kuch bhara nahi — API ID / hash / number me se jo badalna hai wo daalo'; return }
-    $('tgOut'+slot).textContent = 'save ho raha hai…';
-    post('/tg/creds', { slot: slot, apiId: apiId, apiHash: apiHash, phone: phone }).then(function(r){
-      if (r.ok) { $('tgOut'+slot).textContent = '✅ card me save — ' + (r.phoneMasked || 'number') + (r.ready ? ' · ready' : ' · login baaki'); $('tgApi'+slot).value = ''; $('tgHash'+slot).value = ''; $('tgPhone'+slot).value = ''; refreshCards(); }
-      else $('tgOut'+slot).textContent = '❌ ' + (r.error || 'save fail');
-    });
+    var box = $('tgBox' + slot);
+    if (box) box.style.display = 'block';
+    $('tgOut' + slot).textContent = 'OTP bhej raha hoon…';
+    post('/tg/code', { slot: slot }).then(function(r){
+      if (r.ok) {
+        TC['login'+slot] = r.loginId;
+        $('tgOut'+slot).textContent = '✅ ' + (r.message || 'code bhej diya') + ' — neeche daalo';
+        var inp = $('tgLogin'+slot); if (inp) { try { inp.focus() } catch(e){} }
+      } else {
+        $('tgOut'+slot).textContent = '❌ ' + (r.error || 'code nahi gaya');
+      }
+    }).catch(function(){ $('tgOut'+slot).textContent = '❌ network fail' });
   };
   var applyBtn = $('tgApply' + slot);
   if (applyBtn) applyBtn.onclick = function(){
     var loginId = TC['login'+slot];
-    var code = $('tgLogin'+slot).value.replace(/\D/g,'');
+    var code = ($('tgLogin'+slot).value || '').replace(/\D/g,'');
     var pass = $('tgOtp'+slot).value;
-    var flow = code
-      ? post('/tg/signin', { loginId: loginId, code: code, password: pass || undefined })
-      : Promise.resolve({ ok: false, error: 'Login code daalo' });
-    flow.then(function(r){
-      if (r.ok && r.session) { $('tgOut'+slot).textContent = '✅ ' + (r.message || 'session set'); refreshCards(); }
-      else if (r.ok && r.step === 'password') { $('tgOut'+slot).textContent = '🔐 ' + (r.message || '2FA password chahiye'); }
+    if (!loginId) { $('tgOut'+slot).textContent = '❌ pehle "OTP bhejo" dabao'; return }
+    if (!code) { $('tgOut'+slot).textContent = '❌ code daalo'; return }
+    $('tgOut'+slot).textContent = 'check kar raha hoon…';
+    post('/tg/signin', { loginId: loginId, code: code, password: pass || undefined }).then(function(r){
+      if (r.ok && r.session) { $('tgOut'+slot).textContent = '✅ ' + (r.message || 'login ho gaya'); refreshCards(); }
+      else if (r.ok && r.step === 'password') { $('tgOut'+slot).textContent = '🔐 2FA password daalo'; }
       else $('tgOut'+slot).textContent = '❌ ' + (r.error || r.message || 'fail');
     });
   };
 }
-
 function bindClaim(slot){
   var btn = $('clStart' + slot);
   if (!btn) return;
+  var botIn = $('clBot' + slot);
+  if (botIn) botIn.oninput = function(){ CR['bot'+slot] = botIn.value.trim() };
+  var tgtIn = $('clTarget' + slot);
+  if (tgtIn) tgtIn.oninput = function(){ CR['target'+slot] = Number(tgtIn.value) || 1 };
   btn.onclick = function(){
-    var bot = $('clBot'+slot).value.trim().replace(/^@/,'');
+    var bot = $('clBot'+slot).value.trim().replace(/^@/,'') || 'rajafuckbot';
     var target = Number($('clTarget'+slot).value) || 1;
+    CR['bot'+slot] = bot; CR['target'+slot] = target;
     $('clMsg'+slot).textContent = 'START ho raha hai…';
     post('/claim/start', { slot: slot, bot: bot, target: target, useAccount: slot }).then(function(r){
       if (!r.ok) { $('clMsg'+slot).textContent = '❌ ' + (r.error || 'start fail'); return }

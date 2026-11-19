@@ -1055,3 +1055,25 @@ padh/sakta hai. Number pool + OTP inbox dono public hain. Rules lagwa lena
 npm test    # unit checks (koi network nahi — fetch mock hai) + linked-DB tests
 npm run doctor   # 💾 DB link report (linked hai ya nahi — data bachega ya nahi)
 ```
+
+## 🟡 Gold Drop security check — probe (sabse pehle ye chalao)
+
+Site par "Please complete the security check" ka kaaran har machine par alag
+ho sakta hai. Guess karne ke bajaye ek command se poora sach dekho:
+
+```
+node gold-drop-probe.mjs --phone=9696607387 --key=nocap_xxx
+```
+
+Ye key + wallet, sitekey, site reachability, aur **asli number par registration**
+ka exact jawab deta hai — konsa token field gaya, kitne chars ka token tha,
+aur site ne kya kaha.
+
+- **PASS** → tumhare network se check clear ho gaya; bas wahi key/number bot me use karo.
+- **"wallet"** → `nocaptchaai.com/manage/billing` → **Wallet** top-up (subscription nahi).
+- **"solved token ke bawajood reject"** → site ko asli browser chahiye:
+  `pip install seleniumbase playwright && python -m playwright install chromium`
+- **"site tak nahi pahucha"** → network/VPN block; doosra network try karo.
+
+> Bot ke startup log me `[FreshBot] BUILD …` line dekho. Purana build chal raha
+> ho to woh line purani date dikhayegi — tabhi "same issue" aata hai.

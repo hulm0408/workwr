@@ -317,14 +317,31 @@ export class GoldDropClient {
     }
   }
 
-  async _registerOnce({ name, mobile, email, pincode, code, image }, captchaToken) {
+  async _registerOnce({ name, mobile, email, pincode, code, image }, captchaToken, extraFields = {}) {
     const t = String(Date.now());
+    // Debug/probe ke liye: kaunse fields aur kaunsa token bheja gaya.
+    this.lastRegisterAttempt = {
+      fields: ['data', 'img', ...(captchaToken ? ['cf-turnstile-response'] : []), ...Object.keys(extraFields)],
+      token: captchaToken ? maskSitekey(String(captchaToken)) : '',
+      tokenLength: String(captchaToken || '').length,
+      extra: Object.fromEntries(Object.keys(extraFields).map(k => [k, maskSitekey(String(extraFields[k]))])),
+      at: new Date().toISOString(),
+    };
     const signed = signGoldDropPayload({ name, mobile, email, pincode, code, terms_accepted: '1' }, this.dataKey, this.userKey, t);
     const boundary = `----GoldDrop${randomBytes(16).toString('hex')}`;
+    // Site ka field naam shayad `cf-turnstile-response` na ho (BigCity SPA).
+    // Isliye token alag-alag naam se bhi bhejte hain — jo naam site maange wo
+    // mil jayega; extra fields benign hoti hain.
+    const captchaNames = (process.env.GOLD_DROP_CAPTCHA_FIELDS
+      || 'cf-turnstile-response,turnstileToken,captchaToken,captcha')
+      .split(',').map(x => x.trim()).filter(Boolean);
     const captchaPart = captchaToken
-      ? `\r\n--${boundary}\r\nContent-Disposition: form-data; name="cf-turnstile-response"\r\n\r\n${captchaToken}`
+      ? captchaNames.map(name => `\r\n--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${captchaToken}`).join('')
       : '';
-    const chunks = [Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="data"\r\n\r\n${signed}${captchaPart}\r\n--${boundary}\r\nContent-Disposition: form-data; name="img"; filename="sample.jpg"\r\nContent-Type: image/jpeg\r\n\r\n`), Buffer.from(image), Buffer.from(`\r\n--${boundary}--\r\n`)];
+    const extraPart = Object.entries(extraFields)
+      .map(([name, value]) => `\r\n--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${value}`)
+      .join('');
+    const chunks = [Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="data"\r\n\r\n${signed}${captchaPart}${extraPart}\r\n--${boundary}\r\nContent-Disposition: form-data; name="img"; filename="sample.jpg"\r\nContent-Type: image/jpeg\r\n\r\n`), Buffer.from(image), Buffer.from(`\r\n--${boundary}--\r\n`)];
     const result = await this.request(`/users/register/${encodeURIComponent(this.userKey)}?t=${t}`, Buffer.concat(chunks), `multipart/form-data; boundary=${boundary}`);
     if (result?.statusCode !== 200) throw new Error(String(result?.message || 'Registration failed'));
     return result;

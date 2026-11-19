@@ -190,8 +190,12 @@ export async function registerGoldDrop({ name, mobile, email, pincode, code, ima
     const t = String(Date.now());
     const signed = signPayload({ name, mobile, email, pincode, code, terms_accepted: '1' }, dataKey, userKey, t);
     const boundary = `----GoldDrop${randomBytes(16).toString('hex')}`;
+    // Site ka field naam alag ho sakta hai — token multiple names se bhejo.
+    const captchaNames = (process.env.GOLD_DROP_CAPTCHA_FIELDS
+      || 'cf-turnstile-response,turnstileToken,captchaToken,captcha')
+      .split(',').map(x => x.trim()).filter(Boolean);
     const captchaPart = captchaToken
-      ? `\r\n--${boundary}\r\nContent-Disposition: form-data; name="cf-turnstile-response"\r\n\r\n${captchaToken}`
+      ? captchaNames.map(name => `\r\n--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${captchaToken}`).join('')
       : '';
     const chunks = [Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="data"\r\n\r\n${signed}${captchaPart}\r\n--${boundary}\r\nContent-Disposition: form-data; name="img"; filename="sample.jpg"\r\nContent-Type: image/jpeg\r\n\r\n`), image, Buffer.from(`\r\n--${boundary}--\r\n`)];
     const { data: result } = await gdRequest(`/users/register/${encodeURIComponent(userKey)}?t=${t}`, Buffer.concat(chunks), `multipart/form-data; boundary=${boundary}`, cookies);

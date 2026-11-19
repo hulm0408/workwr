@@ -76,6 +76,8 @@ async function loadGoldDropChecker() {
   }
 }
 const { readFile } = await import('node:fs/promises');
+// Gold Drop ka build stamp — logs me dikhta hai taaki purana build na chale.
+const GOLD_DROP_BUILD = '2026-11-19.sitekeys+multi-captcha-field+browser';
 let goldDropRunning = false;
 let goldDropRun = null;
 const sources = await import('./firebase-sources.js');
@@ -206,6 +208,8 @@ function startHealthServer() {
     console.warn('[FreshBot] Health server error:', e?.message || e);
   });
   healthServer.listen(port, '0.0.0.0', () => {
+    // Build stamp — kaunsa version chal raha hai, ye turant pata chale.
+    console.log(`[FreshBot] BUILD ${GOLD_DROP_BUILD} · node ${process.version} · browser-reg ${process.env.GOLD_DROP_BROWSER_REG ?? '1'}`);
     console.log(`[FreshBot] Health server port ${port} par sun raha hai — GET /health (live) · GET /health/ready (Telegram ready).`);
     if (!keepAliveHandle) {
       keepAliveHandle = startKeepAlive();

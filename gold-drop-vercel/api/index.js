@@ -8,6 +8,7 @@ import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { registerGoldDrop, verifyGoldDropOtp, goldDropCaptchaDiagnose, goldDropDeadEnd, resetGoldDropDeadEnd } from './_gold-drop.js';
 import { goldDropBrowserAvailable, findStealthWorker } from './_gold-drop-browser.js';
+import { readOtpBotMirror, telegramConfigured } from './_otp-mirror.js';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const NOCAP_API = 'https://api.nocaptchaai.com';
@@ -151,10 +152,39 @@ button.secondary{background:#232845;color:#e8eaf2}
 .log{background:#0a0c18;border-radius:10px;padding:10px;font:12px/1.5 monospace;color:#7d84a8;max-height:220px;overflow:auto;margin-top:12px;white-space:pre-wrap}
 .row{display:flex;gap:10px}.row>div{flex:1}
 .badge{display:inline-block;padding:2px 10px;border-radius:99px;background:#232845;font-size:12px}
+.split{display:grid;grid-template-columns:minmax(270px,1fr) minmax(320px,1.1fr);gap:14px;align-items:start}
+@media(max-width:880px){.split{grid-template-columns:1fr}}
+.mirror{background:#0b0e18;border:1px solid #2a3050;border-radius:14px;overflow:hidden}
+.mirror .head{display:flex;align-items:center;justify-content:space-between;padding:10px 12px;background:#12162a;border-bottom:1px solid #2a3050;font-size:13px;font-weight:700}
+.mirror .dot{width:8px;height:8px;border-radius:99px;background:#4a5070;display:inline-block;margin-right:6px}
+.mirror .dot.live{background:#28c76f;box-shadow:0 0 6px #28c76f}
+.mirror .chat{padding:10px;max-height:360px;overflow:auto;display:flex;flex-direction:column;gap:8px}
+.mirror .bubble{background:#1a2036;border:1px solid #2a3050;border-radius:10px 10px 10px 3px;padding:8px 10px;font-size:12.5px;line-height:1.5;white-space:pre-wrap;word-break:break-word}
+.mirror .bubble small{display:block;color:#6f769a;font-size:10.5px;margin-top:4px}
+.mirror .code{display:inline-block;margin-top:4px;background:#0d3b22;color:#7ee2a8;border:1px solid #1f6b3a;border-radius:6px;padding:1px 7px;font:600 12px ui-monospace,monospace}
+.mirror .empty{color:#6f769a;font-size:12px;padding:12px;text-align:center}
+.mirror .foot{padding:10px 12px;border-top:1px solid #2a3050}
+.mirror .kv{display:flex;justify-content:space-between;font-size:12px;color:#8a90ad;margin-bottom:4px}
+.mirror .kv b{color:#e8eaf2;font:600 12.5px ui-monospace,monospace}
 </style></head><body><div class="card">
 <h1>🟡 Gold Drop</h1>
 <div class="sub">Direct API method — koi browser nahi, sab cloud par chalta hai. Number apne OTP bot se laao. <a href="/logout" style="color:#f7b500">Logout</a></div>
 <div class="sub" id="browsermode" style="border:1px solid #2a3050;border-radius:9px;padding:10px;background:#10142a">Browser mode check ho raha hai…</div>
+<div class="split">
+<div><!-- OTP bot mirror -->
+  <div class="mirror">
+    <div class="head"><span><span class="dot" id="mDot"></span>OTP bot mirror</span><span class="badge" id="mBot">—</span></div>
+    <div class="chat" id="mChat"><div class="empty">Mirror load ho raha hai…</div></div>
+    <div class="foot">
+      <div class="kv"><span>Number</span><b id="mNumber">—</b></div>
+      <div class="kv"><span>OTP</span><b id="mOtp">—</b></div>
+      <button class="secondary" id="mRefresh" style="margin-top:8px">🔄 Refresh mirror</button>
+      <button class="secondary" id="mNext" style="margin-top:6px">📱 Naya number lo</button>
+      <div class="sub" id="mHint" style="margin:6px 0 0"></div>
+    </div>
+  </div>
+</div>
+<div><!-- process -->
 <div id="setup">
 <label>Naam</label><input id="name" value="Rahul Kumar">
 <label>Email (Gmail — har number par +suffix apne aap)</label><input id="email" value="itsnoob012@gmail.com">
@@ -178,6 +208,8 @@ button.secondary{background:#232845;color:#e8eaf2}
 <div class="log" id="log"></div>
 </div>
 <div id="results" class="log" style="display:none"></div>
+</div><!-- /process -->
+</div><!-- /split -->
 </div>
 <script>
 var pollTimer = null;
@@ -215,6 +247,58 @@ $('sendNumber').onclick = function(){ var m=$('mobile').value.replace(/\\D/g,'')
 $('sendOtp').onclick = function(){ var o=$('otp').value.replace(/\\D/g,''); if(o.length!==6){alert('6-digit OTP daalo');return} $('otp').value=''; post('/otp',{otp:o}).then(poll) };
 $('reset').onclick = function(){ post('/reset').then(function(){ location.reload() }) };
 pollTimer = setInterval(poll, 1200); poll();
+loadMirror(); M.timer = setInterval(loadMirror, 5000);
+// ─── OTP bot mirror (left pane) ───
+var M = { timer: null, last: null, lastOtp: '' };
+function esc(t){ return String(t==null?'':t).replace(/[&<>"']/g, function(c){ return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c] }) }
+function fmtTime(iso){
+  if (!iso) return '';
+  var d = new Date(iso); if (isNaN(d)) return '';
+  return d.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+}
+function paintMirror(m){
+  $('mBot').textContent = m.bot ? ('@' + m.bot) : '—';
+  $('mDot').className = 'dot' + (m.ok ? ' live' : '');
+  var chat = $('mChat');
+  if (!m.ok){
+    chat.innerHTML = '<div class="empty">' + esc(m.error || 'Mirror band hai') + '</div>';
+  } else if (!(m.messages||[]).length){
+    chat.innerHTML = '<div class="empty">Bot me abhi koi message nahi — NEW NUMBER dabao</div>';
+  } else {
+    chat.innerHTML = (m.messages||[]).map(function(x, i){
+      var code = (String(x.text).match(/(?:^|\D)(\d{6})(?:\D|$)/)||[])[1];
+      var body = esc(x.text);
+      if (code) body = body.replace(code, '<span class="code">'+code+'</span>');
+      return '<div class="bubble">' + body + '<small>#' + (x.id||'') + ' · ' + fmtTime(x.at) + (i===0?' · latest':'') + '</small></div>';
+    }).join('');
+  }
+  $('mNumber').textContent = m.number || '—';
+  $('mOtp').textContent = m.otp || '—';
+  M.last = m;
+  if (m.otp && m.otp !== M.lastOtp){
+    M.lastOtp = m.otp;
+    var f = $('otp');
+    if (f && !f.value){ f.value = m.otp; $('mHint').textContent = 'OTP mirror se bhar diya — verify dabao'; }
+  }
+  $('mHint').textContent = m.ok ? ((m.messages||[]).length + ' messages') : '';
+}
+function loadMirror(){
+  fetch('/otp-mirror?slot=0').then(function(r){ return r.json() }).then(paintMirror).catch(function(){});
+}
+$('mRefresh').onclick = loadMirror;
+$('mNext').onclick = function(){
+  loadMirror();
+  setTimeout(function(){
+    var n = (M.last && M.last.number) || '';
+    if (n && /^[6-9]\d{9}$/.test(n)) {
+      var inp = $('mobile');
+      if (inp) { inp.value = n; inp.focus(); }
+      $('mHint').textContent = 'Number mirror se bhar diya — "Number bhejo" dabao';
+    } else {
+      $('mHint').textContent = 'Bot me naya number nahi mila — OTP bot me NEW NUMBER dabao, phir Refresh';
+    }
+  }, 400);
+};
 function captchaTest(){
   var btn = $('captchaTest');
   btn.disabled = true; var old = btn.textContent; btn.textContent = '🛡️ Test chal raha hai…';
@@ -355,6 +439,15 @@ export default async function handler(req, res) {
       state.status = 'idle'; state.message = ''; state.session = null; state.mobile = '';
       state.details = null; state.results = []; state.log = []; state.count = 0;
       sendJson(res, 200, { ok: true });
+      return;
+    }
+    if (req.method === 'GET' && url.pathname === '/otp-mirror') {
+      const slot = Number(url.searchParams.get('slot'));
+      const mirror = await readOtpBotMirror({
+        slot: Number.isInteger(slot) && slot >= 0 ? slot : 0,
+        botUsername: url.searchParams.get('bot') || '',
+      });
+      sendJson(res, 200, mirror);
       return;
     }
     if (req.method === 'GET' && url.pathname === '/browser-mode') {

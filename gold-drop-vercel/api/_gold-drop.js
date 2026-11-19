@@ -110,35 +110,43 @@ export async function goldDropCaptchaDiagnose(nocapApiKey) {
     out.keyOk = check.ok; out.keyMessage = check.message;
   }
   try {
-    out.sitekey = await fetchSitekey();
+    const keys = await fetchSitekeys();
+    out.sitekey = keys[0] || '';
+    out.sitekeys = keys;
     if (!out.sitekey) out.sitekeyError = 'Sitekey nahi mili — HTML badla hai';
   } catch (error) { out.sitekeyError = String(error?.message || error).slice(0, 160); }
   return out;
 }
 
-// Sitekey runtime par site ke HTML/JS bundle se nikalo — kabhi guess nahi.
-async function fetchSitekey() {
+// SPA par page me 1 se zyada Turnstile key hoti hai — pehla match galat ho sakta hai.
+async function fetchSitekeys(pageUrl = 'https://golddropgolddhamaka.com/register') {
   const read = async url => {
     const res = await fetch(url, { headers: { 'user-agent': GOLD_DROP_UA }, signal: AbortSignal.timeout(20000) });
     return res.text();
   };
-  const pageUrl = 'https://golddropgolddhamaka.com/register';
+  const keys = [];
+  const add = key => { if (key && !keys.includes(key)) keys.push(key); };
   let html;
   try { html = await read(pageUrl); }
   catch (error) { throw new Error(`Gold Drop site tak nahi pahucha (network): ${String(error?.message || error).slice(0, 90)}`); }
-  let match = /data-sitekey=["'](0x4[0-9A-Za-z_-]{21,})["']/i.exec(html);
-  if (match) return match[1];
-  match = /0x4[0-9A-Za-z_-]{21,}/.exec(html);
-  if (match) return match[0];
-  const scripts = [...html.matchAll(/<script[^>]+src=["']([^"']+)["']/gi)].map(x => x[1]);
-  for (const src of scripts.slice(0, 6)) {
-    try {
-      const js = await read(new URL(src, pageUrl).href);
-      match = /0x4[0-9A-Za-z_-]{21,}/.exec(js);
-      if (match) return match[0];
-    } catch { /* agla bundle */ }
+  for (const m of html.matchAll(/data-sitekey=["'](0x4[0-9A-Za-z_-]{21,})["']/gi)) add(m[1]);
+  for (const m of html.matchAll(/0x4[0-9A-Za-z_-]{21,}/g)) add(m[0]);
+  if (!keys.length) {
+    const scripts = [...html.matchAll(/<script[^>]+src=["']([^"']+)["']/gi)].map(x => x[1]);
+    for (const src of scripts.slice(0, 6)) {
+      try {
+        const js = await read(new URL(src, pageUrl).href);
+        for (const m of js.matchAll(/0x4[0-9A-Za-z_-]{21,}/g)) add(m[0]);
+      } catch { /* agla bundle */ }
+      if (keys.length) break;
+    }
   }
-  return '';
+  return keys.slice(0, 6);
+}
+
+function maskSitekey(key = '') {
+  const value = String(key || '');
+  return value.length > 14 ? `${value.slice(0, 10)}…${value.slice(-4)}` : value;
 }
 
 function isSecurityCheck(error) {
@@ -199,11 +207,30 @@ export async function registerGoldDrop({ name, mobile, email, pincode, code, ima
     if (!isSecurityCheck(error)) throw error;
     const key = String(nocapApiKey || '').trim();
     if (['off', '0', 'none'].includes(key.toLowerCase())) throw new Error('Security check maanga par NoCaptchaAI key OFF hai.');
-    const sitekey = await fetchSitekey().catch(() => '');
-    if (!sitekey) throw new Error('Site par Turnstile sitekey nahi mili — site ka structure badla hai.');
-    const token = await nocapSolveTurnstile(key || NOCAP_KEY_DEFAULT, sitekey, 'https://golddropgolddhamaka.com/register');
-    registerResult = await doRegister(token);
-    securitySolved = true;
+    const sitekeys = await fetchSitekeys().catch((error) => {
+      throw new Error(`Captcha solve nahi ho sakta — ${String(error?.message || error).slice(0, 150)}`);
+    });
+    if (!sitekeys.length) throw new Error('Captcha solve nahi ho sakta — site par Turnstile sitekey nahi mili (HTML badla hai).');
+    const tried = [];
+    let rejection = null;
+    for (const sitekey of sitekeys) {
+      const token = await nocapSolveTurnstile(key || NOCAP_KEY_DEFAULT, sitekey, 'https://golddropgolddhamaka.com/register');
+      try {
+        registerResult = await doRegister(token);
+        securitySolved = true;
+        rejection = null;
+        break;
+      } catch (retryError) {
+        if (!isSecurityCheck(retryError)) throw retryError;
+        rejection = retryError;
+        tried.push(maskSitekey(sitekey));
+      }
+    }
+    if (rejection) {
+      throw new Error(
+        `Security check site par hi clear nahi hua — ${tried.join(', ')} ka solved token bhi site ne reject kiya. Asli browser chahiye.`,
+      );
+    }
   }
 
   // session verify ke liye wapas chahiye (stateless serverless)

@@ -1692,14 +1692,68 @@ async function startGoldDropRun(ctx, source, target, cardMessageId) {
   const checkStop = () => { if (run.stop) throw new Error('STOP requested'); };
   // Keep the public operation name only; never log challenge tokens or cookies.
   let goldDropApiStep = '';
-  // DIRECT API (drop.py method): POST /api/users {} se userKey+dataKey → HMAC
-  // signed token hi site ka security proof hai → register multipart (data+img)
-  // → verify-otp JSON. Koi browser/stealth launch NAHI — "browser atak gaya"
-  // wali problem hi khatam. Koi security rejection aaye to turant loud error.
-  const getGoldDropDriver = async () => new GoldDropClient({
-    nocapApiKey: bs.getSetting('nocapApiKey'),
-    onStatus: text => render(text).catch(() => {}),
-  });
+  // PEHLA RASTA: ASLI BROWSER (stealth). Site (BigCity SPA) ka security check
+  // application-level hai — solved Turnstile token bhejne ke baad bhi raw HTTP
+  // API par wahi rejection aata hai (PR #91 me bhi yahi hua). Asli browser me
+  // site khud sab kuch satisfy karta hai, isliye wahi primary hai.
+  // Doosra raasta (fallback): direct API + NoCaptchaAI solve — sirf tab jab
+  // stealth stack na chale (GOLD_DROP_BROWSER_REG=0 / stealth worker error).
+  let stealthHandle = null;
+  let stealthFailedReason = '';
+  const stealthMode = String(process.env.GOLD_DROP_BROWSER_REG ?? '1').trim().toLowerCase();
+  const browserWanted = !['0', 'off', 'false', 'no'].includes(stealthMode);
+  const lastGoldDropDetails = {};
+
+  const closeStealth = async () => {
+    if (!stealthHandle) return;
+    const handle = stealthHandle;
+    stealthHandle = null;
+    await handle.close().catch(() => {});
+  };
+
+  const getGoldDropDriver = async () => {
+    if (browserWanted && !stealthFailedReason) {
+      try {
+        if (!stealthHandle) {
+          await render('Browser (stealth) launch ho raha hai…');
+          const checker = await loadGoldDropChecker();
+          if (typeof checker.launchGoldDropStealthChecker !== 'function') {
+            throw new Error('Stealth worker module me launcher nahi mila');
+          }
+          stealthHandle = await checker.launchGoldDropStealthChecker({
+            nocapApiKey: bs.getSetting('nocapApiKey') === 'off' ? '' : bs.getSetting('nocapApiKey'),
+            chromePath: process.env.CHROME_PATH || '',
+          });
+        }
+        const handle = stealthHandle;
+        return {
+          mode: 'browser',
+          browser: true,
+          bootstrap: async () => {},
+          register: async (details) => {
+            Object.assign(lastGoldDropDetails, details);
+            const checker = await loadGoldDropChecker();
+            return checker.registerGoldDropStealth(handle, details);
+          },
+          verifyOtp: async (otp) => {
+            // Mobile-first flow me details OTP ke BAAD aate hain — saath bhejo.
+            const { image, ...rest } = lastGoldDropDetails;
+            const checker = await loadGoldDropChecker();
+            return checker.verifyGoldDropOtpStealth(handle, otp, { ...rest, image });
+          },
+        };
+      } catch (error) {
+        stealthFailedReason = String(error?.message || error).slice(0, 200);
+        console.warn('[GoldDrop] Stealth browser nahi chala — API fallback:', stealthFailedReason);
+        await closeStealth();
+        await render('⚠️ Browser nahi chala — API fallback (security check ruk sakta hai)');
+      }
+    }
+    return new GoldDropClient({
+      nocapApiKey: bs.getSetting('nocapApiKey'),
+      onStatus: text => render(text).catch(() => {}),
+    });
+  };
   try {
     telegramOtp.setActiveOtpBotProfile(source);
     const image = await readFile(new URL('./assets/gold-drop-pack.jpg', import.meta.url));
@@ -1809,6 +1863,7 @@ async function startGoldDropRun(ctx, source, target, cardMessageId) {
       : `⚠️ Ruka: ${String(error?.message || 'Unknown error').slice(0, 160)}`;
     await render(status, true, securityCheck);
   } finally {
+    await closeStealth();
     telegramOtp.resetActiveOtpBotProfile();
     telegramOtp.setActiveOtpBotProfile(previousProfile);
     goldDropRun = null;

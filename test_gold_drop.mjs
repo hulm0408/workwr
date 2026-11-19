@@ -4,7 +4,7 @@ import { execFileSync, spawn } from 'node:child_process';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { GoldDropClient, goldDropEmailForMobile, goldDropCaptchaPreflight, isGoldDropDailyOtpLimit, isGoldDropInvalidOtp, isGoldDropSecurityCheck, nocapCheckKey, nocapExplain, nocapSolveTurnstile, retryGoldDropSecurity, signGoldDropPayload, unwrapGoldDropResponse } from './gold-drop-client.js';
+import { GoldDropClient, goldDropEmailForMobile, goldDropCaptchaPreflight, fetchTurnstileSitekeys, maskSitekey, isGoldDropDailyOtpLimit, isGoldDropInvalidOtp, isGoldDropSecurityCheck, nocapCheckKey, nocapExplain, nocapSolveTurnstile, retryGoldDropSecurity, signGoldDropPayload, unwrapGoldDropResponse } from './gold-drop-client.js';
 import { GoldDropCookieJar } from './gold-drop-cookies.js';
 import { extractGoldDropReward, isNewGoldDropReward, findFreshGoldDropReward } from './gold-drop-rewards.js';
 import { parseTelegramNumberCard } from './telegram-otp-source.js';
@@ -253,7 +253,89 @@ function nocapFake(handler) {
   await assert.rejects(fetchTurnstileSitekey(blockedPage, 'https://x/register'), /Cloudflare challenge/);
 }
 
-// 6) preflight: key off → turant reason, sitekey phir bhi try
+// 6) multi-sitekey: SPA par pehla 0x4… galat ho sakta hai → poori list
+{
+  const multi = async () => new Response(
+    '<div data-sitekey="0x4AAAAAAAfirstWidgetKey12"></div>'
+    + '<script>turnstile.render({sitekey:"0x4BBBBBBBrealSecondKey345"})</script>',
+    { status: 200 },
+  );
+  assert.deepEqual(await fetchTurnstileSitekeys(multi, 'https://x/register'),
+    ['0x4AAAAAAAfirstWidgetKey12', '0x4BBBBBBBrealSecondKey345']);
+  assert.equal(maskSitekey('0x4AAAAAAAfirstWidgetKey12'), '0x4AAAAAAA…ey12');
+}
+
+// 7) token ke bawajood site wahi rejection de → DOOSRI sitekey try hoti hai
+{
+  let registerCalls = 0;
+  let solveCalls = 0;
+  // Ek hi mock: NoCaptchaAI + Gold Drop dono ek fetchImpl par (client wahi
+  // fetchImpl nocap calls ke liye bhi use karta hai).
+  const client = new GoldDropClient({
+    fetchImpl: async (url, init) => {
+      const href = String(url);
+      if (href.includes('nocaptchaai.com')) {
+        const body = JSON.parse(init?.body || '{}');
+        if (href.endsWith('/createTask')) {
+          solveCalls++;
+          const correctKey = String(body.task.websiteKey).includes('BBBB');
+          return new Response(JSON.stringify({ errorId: 0, taskId: correctKey ? 'TOKEN-SECOND' : 'TOKEN-FIRST' }), { status: 200 });
+        }
+        return new Response(JSON.stringify({ errorId: 0, status: 'ready', solution: { token: body.taskId } }), { status: 200 });
+      }
+      if (href.includes('/users/register/')) {
+        registerCalls++;
+        const sent = Buffer.isBuffer(init?.body) ? init.body.toString('utf8') : '';
+        const passed = sent.includes('TOKEN-SECOND');
+        return passed
+          ? new Response(JSON.stringify({ statusCode: 200, message: 'OTP sent' }), { status: 200 })
+          : new Response(JSON.stringify({ statusCode: 400, message: 'Please complete the security check to continue.' }), { status: 400 });
+      }
+      if (href.includes('golddropgolddhamaka.com/register')) {
+        return new Response('<div data-sitekey="0x4AAAAAAAfirstWidgetKey12"></div>'
+          + '<div data-sitekey="0x4BBBBBBBrealSecondKey345"></div>', { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    },
+    nocapApiKey: 'nocap_test',
+  });
+  client.userKey = 'u';
+  client.dataKey = 'abcdefghijklmnopqrstuv';
+  const out = await client.register({ name: 'Rahul Kumar', mobile: '9876543210', email: 'x+y@example.com', pincode: '509412', code: 'KKD2LS01261026', image: Buffer.from('photo') });
+  assert.equal(out.statusCode, 200);
+  assert.equal(registerCalls, 3); // bina token → 1st sitekey token (reject) → 2nd sitekey token (pass)
+  assert.equal(solveCalls, 2);    // dono sitekey par solve chala
+}
+
+// 7b) saare token reject → loud error (chup-chaap "security check" nahi)
+{
+  const client = new GoldDropClient({
+    fetchImpl: async (url, init) => {
+      const href = String(url);
+      if (href.includes('nocaptchaai.com')) {
+        const body = JSON.parse(init?.body || '{}');
+        if (href.endsWith('/createTask')) return new Response(JSON.stringify({ errorId: 0, taskId: 'T' }), { status: 200 });
+        return new Response(JSON.stringify({ errorId: 0, status: 'ready', solution: { token: 'TOKEN' } }), { status: 200 });
+      }
+      if (href.includes('/users/register/')) {
+        return new Response(JSON.stringify({ statusCode: 400, message: 'Please complete the security check to continue.' }), { status: 400 });
+      }
+      if (href.includes('golddropgolddhamaka.com/register')) {
+        return new Response('<div data-sitekey="0x4AAAAAAAoneKeyHere12345"></div>', { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    },
+    nocapApiKey: 'nocap_test',
+  });
+  client.userKey = 'u';
+  client.dataKey = 'abcdefghijklmnopqrstuv';
+  await assert.rejects(
+    client.register({ name: 'Rahul Kumar', mobile: '9876543210', email: 'x+y@example.com', pincode: '509412', code: 'KKD2LS01261026', image: Buffer.from('photo') }),
+    /Security check site par hi clear nahi hua/,
+  );
+}
+
+// 8) preflight: key off → turant reason, sitekey phir bhi try
 {
   const diag = await goldDropCaptchaPreflight('off', { fetchImpl: async () => new Response('<i data-sitekey="0x4CCCCCCCCsitekeykeykeykey">', { status: 200 }) });
   assert.equal(diag.keyOk, false);

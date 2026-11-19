@@ -321,6 +321,7 @@ export default async function handler(req, res) {
         keyMasked: diag.keyMasked,
         keyOk: diag.keyOk,
         sitekey: diag.sitekey ? `${diag.sitekey.slice(0, 12)}…` : '',
+        sitekeys: (diag.sitekeys || []).map(k => `${k.slice(0, 12)}…`),
         sitekeyError: diag.sitekeyError,
         message: `${diag.keyMessage}${diag.sitekey ? ' · sitekey mil gayi ✅' : ` · ${diag.sitekeyError || 'sitekey nahi mili'}`}`,
       });

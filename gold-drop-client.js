@@ -93,38 +93,50 @@ export async function nocapCheckKey(apiKey, { fetchImpl = fetch } = {}) {
   return { ok: false, taskId: '', message: nocapExplain(created) || 'Key check fail' };
 }
 
-// Sitekey runtime par site ke HTML/JS bundle se nikalo (kabhi guess nahi).
-// data-sitekey attribute → Cloudflare widget URL → bundles → embedded JSON,
-// sab me 0x4… pattern dhoondha jata hai.
-export async function fetchTurnstileSitekey(fetchImpl = fetch, pageUrl = 'https://golddropgolddhamaka.com/register') {
+const GOLD_DROP_REGISTER_URL = 'https://golddropgolddhamaka.com/register';
+
+export function maskSitekey(key = '') {
+  const value = String(key || '');
+  return value.length > 14 ? `${value.slice(0, 10)}…${value.slice(-4)}` : value;
+}
+
+// Sitekeys runtime par site ke HTML/JS bundle se nikalo (kabhi guess nahi).
+// SPA par page me aksar 1 se zyada Turnstile key hoti hain (widget, ads,
+// dusra campaign) — pehla match galat ho sakta hai, isliye poori list.
+// Order: data-sitekey attribute → HTML ke saare 0x4… → JS bundles.
+export async function fetchTurnstileSitekeys(fetchImpl = fetch, pageUrl = GOLD_DROP_REGISTER_URL) {
   const read = async url => {
     const res = await fetchImpl(url, { headers: { 'user-agent': GOLD_DROP_UA, 'accept-language': 'en-US,en;q=0.9' }, signal: AbortSignal.timeout(20000) });
-    let html = await res.text();
-    // Cloudflare challenge page aaya to asli HTML nahi hai
-    if (/Just a moment|cf-challenge|Attention Required/i.test(html) && !/0x4[0-9A-Za-z_-]{21,}/.test(html)) {
-      throw new Error('Gold Drop ne HTML ki jagah Cloudflare challenge bheja — sitekey nahi mil sakti');
-    }
-    return html;
+    return res.text();
   };
+  const keys = [];
+  const add = key => { if (key && !keys.includes(key)) keys.push(key); };
   const html = await read(pageUrl).catch(error => {
     throw new Error(`Gold Drop page nahi khula: ${String(error?.message || error).slice(0, 120)}`);
   });
-  // 1) seedha attribute
-  let m = /data-sitekey=["'](0x4[0-9A-Za-z_-]{21,})["']/i.exec(html);
-  if (m) return m[1];
-  // 2) koi bhi 0x4… string (widget URL / inline config / astro island JSON)
-  m = /0x4[0-9A-Za-z_-]{21,}/.exec(html);
-  if (m) return m[0];
-  // 3) external bundles
-  const scripts = [...html.matchAll(/<script[^>]+src=["']([^"']+)["']/gi)].map(x => x[1]);
-  for (const src of scripts.slice(0, 8)) {
-    try {
-      const js = await read(new URL(src, pageUrl).href);
-      m = /0x4[0-9A-Za-z_-]{21,}/.exec(js);
-      if (m) return m[0];
-    } catch { /* agla bundle */ }
+  // Cloudflare challenge page aaya to asli HTML hi nahi hai
+  if (/Just a moment|cf-challenge|Attention Required/i.test(html) && !/0x4[0-9A-Za-z_-]{21,}/.test(html)) {
+    throw new Error('Gold Drop ne HTML ki jagah Cloudflare challenge bheja — sitekey nahi mil sakti');
   }
-  return '';
+  for (const m of html.matchAll(/data-sitekey=["'](0x4[0-9A-Za-z_-]{21,})["']/gi)) add(m[1]);
+  for (const m of html.matchAll(/0x4[0-9A-Za-z_-]{21,}/g)) add(m[0]);
+  if (!keys.length) {
+    const scripts = [...html.matchAll(/<script[^>]+src=["']([^"']+)["']/gi)].map(x => x[1]);
+    for (const src of scripts.slice(0, 8)) {
+      try {
+        const js = await read(new URL(src, pageUrl).href);
+        for (const m of js.matchAll(/0x4[0-9A-Za-z_-]{21,}/g)) add(m[0]);
+      } catch { /* agla bundle */ }
+      if (keys.length) break;
+    }
+  }
+  return keys.slice(0, 6);
+}
+
+// Back-compat: pehli sitekey.
+export async function fetchTurnstileSitekey(fetchImpl = fetch, pageUrl = GOLD_DROP_REGISTER_URL) {
+  const [first = ''] = await fetchTurnstileSitekeys(fetchImpl, pageUrl);
+  return first;
 }
 
 // Ek hi jagah se "captcha kyun nahi hal hua" ka poora diagnosis.
@@ -238,7 +250,7 @@ export class GoldDropClient {
     this.nocapApiKey = ['off', '0', 'none'].includes(key.toLowerCase()) ? '' : (key || NOCAP_KEY_DEFAULT);
     this.onStatus = typeof onStatus === 'function' ? onStatus : () => {};
     this.nocapTimeoutMs = Number(nocapTimeoutMs) > 0 ? Number(nocapTimeoutMs) : NOCAP_TIMEOUT_MS;
-    this._sitekey = '';
+    this._sitekeysCache = [];
   }
 
   async request(path, body, contentType, referer = 'https://golddropgolddhamaka.com/register') {
@@ -274,14 +286,34 @@ export class GoldDropClient {
   async register({ name, mobile, email, pincode, code, image }) {
     if (!this.userKey || !this.dataKey) throw new Error('Bootstrap required');
     if (!/^[6789]\d{9}$/.test(mobile) || !/^\d{6}$/.test(pincode) || !name || !email || !code || !image?.length) throw new Error('Invalid registration details');
+    const payload = { name, mobile, email, pincode, code, image };
     // Attempt 1: drop.py exact (bina captcha token). Sirf "security check"
-    // rejection par NoCaptchaAI se Turnstile solve karke 1 retry.
+    // rejection par NoCaptchaAI se Turnstile solve karke retry.
     try {
-      return await this._registerOnce({ name, mobile, email, pincode, code, image }, '');
+      return await this._registerOnce(payload, '');
     } catch (error) {
       if (!isGoldDropSecurityCheck(error)) throw error;
-      const token = await this._solveSecurityToken();
-      return await this._registerOnce({ name, mobile, email, pincode, code, image }, token);
+      // Key OFF ho to sitekey dhoondhne se pehle hi saaf jawab do.
+      if (!this.nocapApiKey) {
+        throw new Error('Security check maanga par NoCaptchaAI key OFF hai — Settings → 🛡️ NoCaptchaAI me key daalo.');
+      }
+      const sitekeys = await this._sitekeys();
+      const tried = [];
+      for (const sitekey of sitekeys) {
+        const token = await this._solveSecurityToken(sitekey);
+        try {
+          return await this._registerOnce(payload, token);
+        } catch (retryError) {
+          // Site ne token ke bawajood wahi rejection diya → agla sitekey.
+          if (!isGoldDropSecurityCheck(retryError)) throw retryError;
+          tried.push(maskSitekey(sitekey));
+          this.onStatus(`Sitekey ${maskSitekey(sitekey)} ka token site ne reject kiya`);
+        }
+      }
+      throw new Error(
+        `Security check site par hi clear nahi hua — ${tried.join(', ') || 'koi sitekey nahi'} ka solved token bhi site ne reject kiya. `
+        + 'Site ko asli browser ki zaroorat hai (raw API par ye check clear nahi hota) — GOLD_DROP_BROWSER_REG=1 chalao.',
+      );
     }
   }
 
@@ -298,22 +330,29 @@ export class GoldDropClient {
     return result;
   }
 
-  // Security check aaya → sitekey site se (cache) → NoCaptchaAI se token.
-  async _solveSecurityToken() {
-    if (!this.nocapApiKey) {
-      throw new Error('Security check maanga par NoCaptchaAI key OFF hai — Settings → 🛡️ NoCaptchaAI me key daalo.');
-    }
-    this.onStatus('Security check aaya — NoCaptchaAI se solve ho raha hai…');
-    if (!this._sitekey) {
+  // Site par mili saari Turnstile sitekeys (cached) — pehli galat ho sakti hai.
+  async _sitekeys() {
+    if (!this._sitekeysCache?.length) {
       try {
-        this._sitekey = await fetchTurnstileSitekey(this.fetch);
+        this._sitekeysCache = await fetchTurnstileSitekeys(this.fetch, GOLD_DROP_REGISTER_URL);
       } catch (error) {
         throw new Error(`Captcha solve nahi ho sakta — ${String(error?.message || error).slice(0, 160)}`);
       }
-      if (!this._sitekey) throw new Error('Captcha solve nahi ho sakta — site par Turnstile sitekey nahi mili (site ka HTML badla hai).');
+      if (!this._sitekeysCache.length) throw new Error('Captcha solve nahi ho sakta — site par Turnstile sitekey nahi mili (site ka HTML badla hai).');
+      this.onStatus(`Site par ${this._sitekeysCache.length} sitekey mili: ${this._sitekeysCache.map(maskSitekey).join(', ')}`);
     }
-    const token = await nocapSolveTurnstile(this.nocapApiKey, this._sitekey, 'https://golddropgolddhamaka.com/register', { fetchImpl: this.fetch, timeoutMs: this.nocapTimeoutMs });
-    this.onStatus('Security check solved (NoCaptchaAI) ✅ — register dobara bhej rahe hain');
+    return this._sitekeysCache;
+  }
+
+  // Security check aaya → sitekeys site se → NoCaptchaAI se token.
+  async _solveSecurityToken(sitekey) {
+    if (!this.nocapApiKey) {
+      throw new Error('Security check maanga par NoCaptchaAI key OFF hai — Settings → 🛡️ NoCaptchaAI me key daalo.');
+    }
+    const keyToUse = sitekey || (await this._sitekeys())[0];
+    this.onStatus(`Security check aaya — NoCaptchaAI se solve ho raha hai (${maskSitekey(keyToUse)})…`);
+    const token = await nocapSolveTurnstile(this.nocapApiKey, keyToUse, GOLD_DROP_REGISTER_URL, { fetchImpl: this.fetch, timeoutMs: this.nocapTimeoutMs });
+    this.onStatus(`Security check solved ✅ (${maskSitekey(keyToUse)}) — register dobara bhej rahe hain`);
     return token;
   }
 

@@ -35,6 +35,33 @@ Vercel → New Project → repo `hulm0408/workwr` → **Root Directory: `bot-hub
 | `ZZBOT_ACCESS_KEY` / `TOING_ACCESS_KEY` | access keys (defaults code me) |
 | `NOCAP_API_KEY` | Gold Drop security solve (default built-in) |
 
+## 🟡 Gold Drop — asli browser mode (RECOMMENDED)
+
+Site (BigCity SPA) ka **"Please complete the security check"** check
+application-level hai: **solved Turnstile token bhejne ke baad bhi** raw HTTP
+API par wahi 400 aata hai. Isliye Gold Drop ka registration **asli browser**
+me hota hai (wahi worker jo Telegram bot use karta hai):
+
+```
+pip install seleniumbase playwright
+python -m playwright install chromium
+```
+
+Phir hub khud `gold_drop_stealth.py` launch karta hai (repo root me hona
+chahiye). Browser available na ho to hub direct API + NoCaptchaAI par fallback
+karta hai — **par wahan security check clear nahi hoga**, sirf saaf error milega.
+
+| Env | Matlab |
+|---|---|
+| `GOLD_DROP_PYTHON` | python binary (default `python3`) |
+| `CHROME_PATH` | Chrome binary (khaali = worker khud dhoondhega) |
+| `GOLD_DROP_BROWSER_REG` | `0` = browser band (sirf API) |
+| `GOLD_DROP_LAUNCH_TIMEOUT_MS` | browser launch timeout (default 240000) |
+
+> ⚠️ Vercel serverless par Python + Chrome nahi hota — browser mode ke liye
+> Docker/VPS (repo ka `Dockerfile`) chahiye. Vercel par sirf Toing/ZZBOT
+> cards poore chalte hain.
+
 ## 🛡️ Gold Drop ka security check (captcha) — 1 click me test
 
 Page par **🛡️ Captcha test** button hai. Ye do cheezein batata hai:

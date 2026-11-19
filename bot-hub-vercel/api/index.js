@@ -30,6 +30,7 @@ import { readFileSync, existsSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { registerGoldDrop, verifyGoldDropOtp, goldDropCaptchaDiagnose } from './_gold-drop-core.js';
+import { getSharedBrowser, goldDropBrowserAvailable, browserRegister, browserVerifyOtp } from './_gold-drop-browser.js';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(path.dirname(ROOT), 'public');
@@ -290,6 +291,30 @@ async function goldStart({ mobile, form }) {
     })()
     : email;
   logLine(`🟡 ${mobile} — register ho raha hai (${plusEmail})…`);
+  // PEHLA RASTA: asli browser (site ka security check raw API par clear
+  // nahi hota — solved token ke baad bhi wahi rejection). Browser na chale
+  // tabhi direct API + NoCaptchaAI.
+  if (goldDropBrowserAvailable()) {
+    try {
+      logLine('🌐 Asli browser (stealth) se form bhar raha hoon…');
+      const browser = await getSharedBrowser({ nocapApiKey: form?.nocapKey || NOCAP_KEY });
+      const out = await browserRegister(browser, {
+        name: form?.name || 'Rahul Kumar',
+        mobile,
+        email: plusEmail,
+        pincode: form?.pincode || '509412',
+        code: form?.code || 'KKD2LS01261026',
+        imageBase64: DEFAULT_GOLD_PHOTO,
+      });
+      if (!out?.ok) throw new Error(String(out?.message || 'Browser registration fail').slice(0, 220));
+      state.goldBrowser = { name: form?.name || 'Rahul Kumar', email: plusEmail, pincode: form?.pincode || '509412', code: form?.code || 'KKD2LS01261026', mobile };
+      logLine(`✅ Browser se register ho gaya — ${out.message || out.stage}. OTP ka wait…`);
+      return { stage: 'need_otp', message: 'OTP bot me aaya 6-digit code yahan daalo' };
+    } catch (error) {
+      logLine(`⚠️ Browser fail: ${String(error?.message || error).slice(0, 140)}`);
+      state.goldBrowser = null;
+    }
+  }
   const res = await registerGoldDrop({
     name: form?.name || 'Rahul Kumar',
     mobile,
@@ -300,22 +325,39 @@ async function goldStart({ mobile, form }) {
     nocapApiKey: form?.nocapKey || NOCAP_KEY,
   });
   if (res.securitySolved) logLine('🛡️ Security check aaya tha — NoCaptchaAI ne solve kiya ✅');
+  else if (goldDropBrowserAvailable()) logLine('ℹ️ Direct API raasta — security check yahan clear nahi hota, browser mode chalao');
   logLine(`✅ Register ho gaya — ${res.message}. OTP ka wait…`);
-  state.secret = { type: 'gold', session: res.session };
-  state.phone = mobile;
-  state.step = 'need_otp';
-  state.message = 'OTP bot me aaya 6-digit code yahan daalo';
+  state.goldBrowser = null;
+  return { stage: 'need_otp', message: 'OTP bot me aaya 6-digit code yahan daalo', secret: { type: 'gold', session: res.session } };
 }
 
 async function goldOtp({ otp }) {
   logLine(`🔐 Gold Drop OTP verify…`);
+  // Browser se register hua tha to OTP bhi usi asli page par daalna hoga.
+  if (state.goldBrowser) {
+    const browser = await getSharedBrowser({ nocapApiKey: NOCAP_KEY });
+    const out = await browserVerifyOtp(browser, otp, {
+      ...state.goldBrowser,
+      image: DEFAULT_GOLD_PHOTO,
+    });
+    if (!out?.ok) throw new Error(String(out?.message || 'OTP verify fail').slice(0, 220));
+    logLine(`✅ ${state.phone} verified (browser) — ${out.message || 'done'}`);
+    state.results.push({ phone: state.phone, ok: true, message: String(out.message || 'Verified') });
+    state.result = { kind: 'gold', message: String(out.message || 'Verified'), reward: null };
+    state.goldBrowser = null;
+    state.secret = null;
+    finishOrNext();
+    return;
+  }
   const res = await verifyGoldDropOtp({ session: state.secret?.session, otp });
   const reward = res.reward?.name ? ` 🎁 ${res.reward.name} (${res.reward.faceValue})` : '';
   logLine(`✅ ${state.phone} verified — ${res.message}${reward}`);
   state.results.push({ phone: state.phone, ok: true, message: `${res.message}${reward}` });
-  state.result = { kind: 'gold', message: `${res.message}${reward}`, reward: res.reward || null };
+  const result = { kind: 'gold', message: `${res.message}${reward}`, reward: res.reward || null };
+  state.result = result;
   state.secret = null;
   finishOrNext();
+  return result;
 }
 
 // 2) Toing Pro — send_otp → verify → export
@@ -491,7 +533,11 @@ async function beginRun({ form = {} } = {}) {
 async function handlePhone(mobile) {
   const adapter = ADAPTERS[state.service];
   try {
-    await adapter.start({ mobile, form: state.form || {} });
+    const out = await adapter.start({ mobile, form: state.form || {} }) || {};
+    if (out.stage) state.step = out.stage;
+    if (out.message) state.message = out.message;
+    if (out.secret !== undefined) state.secret = out.secret;
+    if (!state.phone) state.phone = mobile;
   } catch (error) {
     const message = String(error?.message || error).slice(0, 200);
     logLine(`❌ ${mobile} — ${message}`);
@@ -833,7 +879,7 @@ $('testCaptcha').onclick = function(){
     btn.disabled = false; btn.textContent = '🛡️ Captcha test (key + sitekey)';
     var out = $('captchaOut');
     out.innerHTML = (res.ok ? '✅ ' : '❌ ') + (res.message || '')
-      + (res.sitekey ? '<br>sitekey: <code>' + res.sitekey + '</code>' : '')
+      + (res.sitekeys && res.sitekeys.length ? '<br>sitekeys: <code>' + res.sitekeys.join('</code>, <code>') + '</code>' : '')
       + (res.sitekeyError ? '<br>⚠️ ' + res.sitekeyError : '');
   }).catch(function(){
     btn.disabled = false; btn.textContent = '🛡️ Captcha test (key + sitekey)';
@@ -941,6 +987,7 @@ export default async function handler(req, res) {
         keyOk: diag.keyOk,
         keyMessage: diag.keyMessage,
         sitekey: diag.sitekey ? `${diag.sitekey.slice(0, 12)}…` : '',
+        sitekeys: (diag.sitekeys || []).map(k => `${k.slice(0, 12)}…`),
         sitekeyError: diag.sitekeyError,
         message: diag.sitekey
           ? `${diag.keyMessage} · sitekey mil gayi ✅`

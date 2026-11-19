@@ -341,12 +341,17 @@ function startCard() {
   const target = Number(bs.getSetting('target')) || 100;
   const maxMin = Number(bs.getSetting('maxMinutes')) || 120;
   const engineWorld = bs.getSetting('accountEngine') === 'worldbot';
+  const engineMode = bs.getSetting('accountEngine');
   return statusCard(instanceInfo.instanceTitle('🆕 Swiggy Fresh Bot'), [
     field('Status', 'READY — START ka wait'),
     telegram
       ? `📨 <b>Source:</b> ${mono(`${activeOtpBotLabel().toUpperCase()} ONLY`)} · 🔥 Firebase ${mono('OFF')}`
       : activeSourceLine(),
-    `🌍 <b>Engine:</b> ${engineWorld ? mono(`WORLD BOT @${worldBot.worldBotUsername()}`) : mono('CHROMIUM')}`,
+    `🌍 <b>Engine:</b> ${engineWorld
+      ? mono(`WORLD BOT @${worldBot.worldBotUsername()}`)
+      : (engineMode === 'toing_pro'
+        ? mono('TOING PRO WEB')
+        : (engineMode === 'zzbot' ? mono('ZZBOT ZEPTO') : mono('CHROMIUM')))}`,
     `🎯 <b>Batch:</b> ${mono(`${target} fresh`)} · ${mono(`${maxMin} min`)} · never-stop ${mono(bs.getSetting('autoContinue') ? 'ON' : 'OFF')}`,
     `🧭 <b>Flow:</b> ${mono(engineWorld
       ? 'LOGIN › OTP › JSON'
@@ -419,6 +424,7 @@ function settingsCard() {
 
 const settingsRows = () => {
   const engineWorld = bs.getSetting('accountEngine') === 'worldbot';
+  const engineModeNow = bs.getSetting('accountEngine');
   const proxySummary = proxyPool.proxySummary();
   return [
     [
@@ -442,7 +448,7 @@ const settingsRows = () => {
     [
       { text: '🔥 Firebase Sources', callback_data: 'ap_sources', style: 'primary' },
       // 🌍 World Bot aur Toing Pro mode me proxy ka koi button/wording nahi.
-      ...(['worldbot', 'toing_pro'].includes(bs.getSetting('accountEngine')) ? [] : [{
+      ...(['worldbot', 'toing_pro', 'zzbot'].includes(bs.getSetting('accountEngine')) ? [] : [{
         text: proxySummary.direct ? '🔀 Proxies: DIRECT' : `🔀 Proxies: ${proxySummary.enabledCount}`,
         callback_data: 'ap_proxies',
         style: 'primary',
@@ -459,6 +465,18 @@ const settingsRows = () => {
       {
         text: `${engineWorld ? '✓ ' : ''}🌍 World Bot`,
         callback_data: 'ap_engine_worldbot',
+        style: 'primary',
+      },
+    ],
+    [
+      {
+        text: `${engineModeNow === 'toing_pro' ? '✓ ' : ''}🌐 Toing Pro`,
+        callback_data: 'ap_engine_toing',
+        style: 'primary',
+      },
+      {
+        text: `${engineModeNow === 'zzbot' ? '✓ ' : ''}🌐 ZZBOT Zepto`,
+        callback_data: 'ap_engine_zzbot',
         style: 'primary',
       },
     ],
@@ -906,6 +924,10 @@ function activeStartPresetId() {
     const prof = bs.getSetting('otpBotProfile');
     return prof === 'hathi' ? 'toing_hathi' : 'toing_hermes';
   }
+  if (engine === 'zzbot') {
+    const prof = bs.getSetting('otpBotProfile');
+    return prof === 'hathi' ? 'zzbot_hathi' : 'zzbot_hermes';
+  }
   const normEngine = engine === 'worldbot' ? 'worldbot' : 'direct';
   const tgMode = telegramSettingEnabled();
   // 👤 Owner ke options: OTP bot + Chromium ya OTP bot + Swiggy World ya Toing Pro.
@@ -929,6 +951,7 @@ function otpBotChoiceRows() {
   };
   return [
     [{ text: `🌐 TOING PRO WEB SIGNUP`, callback_data: 'ap_start_toing_pro', style: 'primary' }],
+    [{ text: `🌐 ZZBOT (ZEPTO) SIGNUP`, callback_data: 'ap_start_zzbot', style: 'primary' }],
     // 👤 Owner: "otp bot + chromium" aur "otp bot + swiggy world" — do saaf option.
     presetRow('otp_chromium'),
     presetRow('otp_world'),
@@ -1144,7 +1167,9 @@ async function launchBatch(ctx, opts = {}) {
     source: lockedSourceMode,
     otpBot: lockedOtpBot,
     // Engine choice isi batch ke liye lock — preset/Settings jo kehta hai wahi.
-    accountEngine: bs.getSetting('accountEngine') === 'worldbot' ? 'worldbot' : (bs.getSetting('accountEngine') === 'toing_pro' ? 'toing_pro' : 'direct'),
+    accountEngine: ['worldbot', 'toing_pro', 'zzbot'].includes(bs.getSetting('accountEngine'))
+      ? bs.getSetting('accountEngine')
+      : 'direct',
     ui,
   }).catch((e) => console.error('[FreshBot] autopilot:', e?.stack || e?.message));
 }
@@ -1360,7 +1385,8 @@ async function diagCard() {
   } catch { lines.push(field('⛔ Number rule', 'ek number = ek hi baar')); }
   // 🌍 Account engine — kaun Swiggy account bana raha hai.
   try {
-    const engine = bs.getSetting('accountEngine') === 'worldbot' ? 'worldbot' : 'direct';
+    const engineRaw = bs.getSetting('accountEngine');
+    const engine = ['worldbot', 'toing_pro', 'zzbot'].includes(engineRaw) ? engineRaw : 'direct';
     const wbStatus = worldBot.getWorldBotStatus();
     let tg = {};
     try { tg = await telegramOtp.telegramUserClientStatus(); } catch {}
@@ -1369,7 +1395,11 @@ async function diagCard() {
       : '';
     lines.push(field('🌍 Account engine', engine === 'worldbot'
       ? `${mono('WORLD BOT')} @${esc(worldBot.worldBotUsername())} · spare TG ${tg.configured ? '✅' : '❌'}${esc(wbLine)}`
-      : `${mono('DIRECT API')} — bridge + proxy/WAF solver`));
+      : (engine === 'toing_pro'
+        ? `${mono('TOING PRO WEB')} — storelex.store/toing_web · number/OTP OTP bot se`
+        : (engine === 'zzbot'
+          ? `${mono('ZZBOT ZEPTO')} — storelex.store/zzbot · number/OTP OTP bot se`
+          : `${mono('DIRECT API')} — bridge + proxy/WAF solver`))));
   } catch { lines.push(field('🌍 Account engine', '—')); }
   // 🔁 Never-stop + auto-resume — batch rukne na rukne ka sach.
   try {
@@ -1825,6 +1855,33 @@ bot.action('ap_start_toing_pro', async (ctx) => {
   const rows = [
     [{ text: '🐘 Hathi OTP Bot (@Hathi_otp_bot)', callback_data: 'ap_start_go_toing_hathi', style: 'success' }],
     [{ text: '📨 Hermeshu OTP Bot (@HermeshuOTPROBOT)', callback_data: 'ap_start_go_toing_hermes', style: 'primary' }],
+    [{ text: '↩️ Back', callback_data: 'ap_start' }],
+  ];
+  await ctx.editMessageText(text, kb(rows))
+    .catch(async () => { await ctx.reply(text, kb(rows)).catch(() => {}); });
+});
+
+// 🌐 ZZBOT (Zepto Pro) flow: Ask user to choose OTP bot (🐘 Hathi or 📨 Hermes)
+// Toing Pro wala hi mirror — number/OTP Telegram OTP bot se, account Zepto
+// Pro (storelex.store/zzbot) API se.
+bot.action('ap_start_zzbot', async (ctx) => {
+  if (!(await gate(ctx))) return;
+  if (isAutopilotRunning()) {
+    await ctx.answerCbQuery('Pehle se chal raha hai!', { show_alert: true }).catch(() => {});
+    return;
+  }
+  await ctx.answerCbQuery().catch(() => {});
+  const text = section('🌐 ZZBOT (ZEPTO) SIGNUP', [
+    'ZZBOT / Zepto Pro flow (storelex.store/zzbot API):',
+    '• OTP Gateway trigger (login/otp)',
+    '• Auto OTP verify (login/verify)',
+    '• Zepto session export (.json) — chat me file',
+    '',
+    sub('Neeche apna Telegram OTP bot chunein jahan se number aur OTP claim karna hai:'),
+  ].join('\n'));
+  const rows = [
+    [{ text: '🐘 Hathi OTP Bot (@Hathi_otp_bot)', callback_data: 'ap_start_go_zzbot_hathi', style: 'success' }],
+    [{ text: '📨 Hermeshu OTP Bot (@HermeshuOTPROBOT)', callback_data: 'ap_start_go_zzbot_hermes', style: 'primary' }],
     [{ text: '↩️ Back', callback_data: 'ap_start' }],
   ];
   await ctx.editMessageText(text, kb(rows))
@@ -2506,8 +2563,9 @@ bot.action('ap_proxies', async (ctx) => {
   if (!(await gate(ctx))) return;
   await ctx.answerCbQuery().catch(() => {});
   // 🌍 World Bot mode: proxy pool ka concept nahi — sirf saaf jawab.
-  if (bs.getSetting('accountEngine') === 'worldbot') {
-    await editOrSend(ctx, section('🌍 World Bot ON', [
+  const bypassEngineNow = bs.getSetting('accountEngine');
+  if (bypassEngineNow === 'worldbot' || bypassEngineNow === 'zzbot' || bypassEngineNow === 'toing_pro') {
+    await editOrSend(ctx, section(bypassEngineNow === 'worldbot' ? '🌍 World Bot ON' : (bypassEngineNow === 'zzbot' ? '🌐 ZZBOT (Zepto) ON' : '🌐 Toing Pro ON'), [
       '› Login, OTP aur account banane ka kaam Swiggy World Bot ke andar hota hai.',
       '',
       sub('Engine badalna ho to Settings → 🌍 Account engine.'),
@@ -2955,7 +3013,7 @@ async function applyAccountEngineChoice(ctx, next) {
     await ctx.answerCbQuery('⏳ Batch chal raha hai — pehle STOP karo, phir engine badlo.', { show_alert: true }).catch(() => {});
     return;
   }
-  const want = next === 'worldbot' ? 'worldbot' : 'direct';
+  const want = ['worldbot', 'toing_pro', 'zzbot'].includes(next) ? next : 'direct';
   const already = bs.getSetting('accountEngine') === want;
   const r = bs.setSetting('accountEngine', want);
   if (!r.ok) {
@@ -2964,7 +3022,11 @@ async function applyAccountEngineChoice(ctx, next) {
   }
   let note = want === 'worldbot'
     ? '🌍 OTP BOT + SWIGGY WORLD ON — number/OTP OTP bot se, account @' + worldBot.worldBotUsername() + ' ke buttons se.'
-    : '🧩 OTP BOT + CHROMIUM ON — number/OTP OTP bot se, account is bot ke apne Swiggy bridge (Chromium) se.';
+    : want === 'toing_pro'
+      ? '🌐 TOING PRO WEB ON — number/OTP OTP bot se, Swiggy account storelex.store/toing_web API se banta hai.'
+      : want === 'zzbot'
+        ? '🌐 ZZBOT (ZEPTO) ON — number/OTP OTP bot se, Zepto account storelex.store/zzbot API se banta hai.'
+        : '🧩 OTP BOT + CHROMIUM ON — number/OTP OTP bot se, account is bot ke apne Swiggy bridge (Chromium) se.';
   if (already) note = `${note} (pehle se yahi chalu hai)`;
   if (want === 'worldbot') {
     let st = {};
@@ -2987,9 +3049,24 @@ bot.action('ap_engine_worldbot', async (ctx) => {
   await applyAccountEngineChoice(ctx, 'worldbot');
 });
 
+bot.action('ap_engine_toing', async (ctx) => {
+  await ctx.answerCbQuery('🌐 Toing Pro Web').catch(() => {});
+  await applyAccountEngineChoice(ctx, 'toing_pro');
+});
+
+bot.action('ap_engine_zzbot', async (ctx) => {
+  await ctx.answerCbQuery('🌐 ZZBOT (Zepto Pro)').catch(() => {});
+  await applyAccountEngineChoice(ctx, 'zzbot');
+});
+
 // Purana button (kisi purane message me pada ho to bhi kaam kare): flip.
 bot.action('ap_toggle_engine', async (ctx) => {
-  const cur = (() => { try { return bs.getSetting('accountEngine') === 'worldbot' ? 'worldbot' : 'direct'; } catch { return 'direct'; } })();
+  const cur = (() => {
+    try {
+      const e = bs.getSetting('accountEngine');
+      return ['worldbot', 'toing_pro', 'zzbot'].includes(e) ? e : 'direct';
+    } catch { return 'direct'; }
+  })();
   await applyAccountEngineChoice(ctx, cur === 'worldbot' ? 'direct' : 'worldbot');
 });
 

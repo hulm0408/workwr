@@ -39,8 +39,9 @@ const SPECS = {
   //   direct    = is bot ka apna Swiggy API/bridge flow (proxy + WAF solver)
   //   worldbot  = @SwiggyByWorldBot ke buttons click karke (koi proxy nahi)
   //   toing_pro = Toing Pro Web flow (storelex.store/toing_web API: check_mobile -> send_otp -> verify_otp -> export)
-  accountEngine:     { dflt: 'direct', label: '🌍 Account engine (Chromium / Swiggy World / Toing Pro Web)',
-                       enum: ['direct', 'worldbot', 'toing_pro'] },
+  //   zzbot     = Zepto Pro (storelex.store/zzbot API: login/otp -> login/verify -> export)
+  accountEngine:     { dflt: 'direct', label: '🌍 Account engine (Chromium / Swiggy World / Toing Pro / ZZBOT Zepto)',
+                       enum: ['direct', 'worldbot', 'toing_pro', 'zzbot'] },
   telegramOtpMode:   { bool: true, dflt: false, label: '📨 Telegram Hermes mode (number + OTP Telegram bot se)' },
   telegramOtpTimeoutMs: { min: 5000, max: 180000, dflt: 20000, label: 'Hermes OTP Refresh budget (ms)' },
   telegramOtpRefreshMs: { min: 1000, max: 15000, dflt: 2500, label: 'Hermes Refresh interval (ms)' },
@@ -177,6 +178,7 @@ export function fmtSetting(key) {
   }
   if (key === 'accountEngine') {
     if (v === 'toing_pro') return 'Toing Pro Web';
+    if (v === 'zzbot') return 'ZZBOT (Zepto Pro)';
     return v === 'worldbot' ? 'OTP bot + Swiggy World' : 'OTP bot + Chromium';
   }
   if (key === 'nocapApiKey') {

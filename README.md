@@ -482,6 +482,40 @@ flow — teeno path ledger mark karte hain. `/diag` me dekho:
 
 > Env se window badal sakta hai: `PREMIUM_USED_COOLDOWN_DAYS=30`
 
+## 🌐 Do web-signup engines — Toing Pro aur ZZBOT (Zepto)
+
+Bot ke andar **do external-API signup flows** hain. Dono ka tarika bilkul
+same hai: **number + OTP Telegram OTP bot (Hathi/Hermes) se, account external
+API se** — koi browser, proxy ya WAF solve nahi.
+
+| | 🌐 Toing Pro (Swiggy) | 🌐 ZZBOT (Zepto Pro) |
+|---|---|---|
+| START button | `🌐 TOING PRO WEB SIGNUP` | `🌐 ZZBOT (ZEPTO) SIGNUP` |
+| Base URL | `storelex.store/toing_web` | `storelex.store/zzbot` |
+| Engine setting | `toing_pro` | `zzbot` |
+| 1. OTP bhejo | `POST /api/auth/send_otp` | `POST /api/login/otp` |
+| 2. OTP bot se code | Hathi / Hermes poll | Hathi / Hermes poll |
+| 3. Verify | `POST /api/auth/verify_otp` | `POST /api/login/verify` |
+| 4. Session | `POST /api/accounts/{mobile}/export` | `POST /api/accounts/{mobile}/export` |
+| File | `toing-<phone>.json` | `zzbot-<phone>.json` |
+
+- **Access key:** env `TOING_ACCESS_KEY` / `ZZBOT_ACCESS_KEY` (ya Settings)
+  se override ho sakta hai. ZZBOT ki default key code me hai.
+- Session export **live credential** hai — file `0600` par likhti hai,
+  `data/session-files/` git me nahi jaata, aur chat me sirf owner ko jaati hai.
+- ZZBOT par `check_mobile` endpoint nahi hai — naya/purana account OTP verify
+  ke jawab se pata chalta hai.
+
+### 🖥 Browser se (Vercel) — `zzbot-vercel/`
+
+Bot ki zaroorat nahi: `zzbot-vercel/` ek chhota Vercel project hai (Gold Drop
+jaisa) — page kholo, number daalo, OTP (manual ya Telegram bot se auto),
+verify, aur **session JSON download**. Root Directory `zzbot-vercel` karke
+deploy karo. Env: `APP_PASSWORD`, `ZZBOT_ACCESS_KEY`, aur auto-OTP ke liye
+`TELEGRAM_API_ID/HASH/SESSION`.
+
+> Zepto Pro (zzbot) ka API documented hai: `storelex.store/zzbot/openapi.json`
+
 ## 💾 Linked database — "data bahut loss ho raha" ka asli fix
 
 Bot ka DB ek JSON file hai: `data/db.json`. Ye file Render ke **free** disk
@@ -793,6 +827,8 @@ chalta rehta hai; temporary error par number failed nahi gina jata.
 | `shop-bot-stock.js` | Fresh JSON → `@its_shop_bot` stock queue (10-10 files, zip nahi) |
 | `autopilot-engine.js` | **Parallel batch lanes** — distinct IPs/devices, target/time, lane-local rotate/defer, live-card |
 | `number-pipeline.js` | EK number ka poora lifecycle (saare scenarios) |
+| `toing-pro-engine.js` | 🌐 **Toing Pro Web signup** — `check_mobile → send_otp → verify_otp → export` (storelex.store/toing_web) |
+| `zzbot-engine.js` | 🌐 **ZZBOT (Zepto Pro) signup** — `login/otp → login/verify → export` (storelex.store/zzbot), Toing ka mirror |
 | `firebase-numbers.js` | Firebase reader — pool + OTP inbox + **dynamic source override** |
 | `firebase-sources.js` | **Multiple Firebase sources** — bulk add (1000)/verify/health; sab Delete tak ACTIVE (db-backed + vault) |
 | `firebase-seed-urls.js` | Owner ki ROLEX VIP Firebase list (400+ DBs) — boot par permanently seed hoti hai |
@@ -808,6 +844,7 @@ chalta rehta hai; temporary error par number failed nahi gina jata.
 | `scripts/db-doctor.mjs` | 💾 DB link report + live verify — `npm run doctor` |
 | `seed/used-numbers.json` | 📋 Blocklist — jinka OTP dobara nahi lena (30-din cooldown). Sirf mobile numbers |
 | `scripts/seed-used-numbers.mjs` | 📋 List import/apply — `npm run seed:used-numbers -- <file.json>` |
+| `zzbot-vercel/` | 🖥 **ZZBOT web signup (Vercel)** — browser se Zepto session JSON (root dir `zzbot-vercel`) |
 | `test_fresh_unit.mjs` | Unit tests (mocked fetch) — `npm test` |
 | `test_db_link.mjs` | Linked-DB tests (merge rules + KV round-trip) — `npm test` |
 | `test_used_numbers.mjs` | Blocklist tests (30-din unlock, idempotency) — `npm test` |

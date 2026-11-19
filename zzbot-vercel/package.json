@@ -1,0 +1,10 @@
+{
+  "name": "zzbot-zepto-web",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "dependencies": {
+    "teleproto": "^1.232.1"
+  }
+}

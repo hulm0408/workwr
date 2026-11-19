@@ -6,7 +6,7 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { registerGoldDrop, verifyGoldDropOtp, goldDropCaptchaDiagnose, goldDropDeadEnd, resetGoldDropDeadEnd } from './_gold-drop.js';
+import { registerGoldDrop, verifyGoldDropOtp, goldDropCaptchaDiagnose, goldDropDeadEnd, resetGoldDropDeadEnd, goldDropProxyCheck, proxyInfo } from './_gold-drop.js';
 import { goldDropBrowserAvailable, findStealthWorker } from './_gold-drop-browser.js';
 import { readOtpBotMirror, telegramConfigured, setMirrorSession } from './_otp-mirror.js';
 import { startTelegramLogin, submitTelegramCode, submitTelegramPassword, loginConfigured } from './_telegram-login.js';
@@ -184,7 +184,8 @@ button.secondary{background:#232845;color:#e8eaf2}
       <div class="sub" id="mHint" style="margin:6px 0 0"></div>
       <!-- Spare account login (sirf tab dikhta hai jab session nahi hai) -->
       <div id="tgLogin" style="display:none;margin-top:12px;border-top:1px solid #2a3050;padding-top:10px">
-        <div style="font-size:12.5px;font-weight:700;margin-bottom:6px">🔐 Spare account se mirror jodo</div>
+        <div style="font-size:12.5px;font-weight:700;margin-bottom:6px">🔐 Spare account (ek baar OTP se login)</div>
+        <div class="sub" style="margin:0 0 6px">Number + Telegram code daalo — session khud lag jayega, mirror turant chalu.</div>
         <div class="sub" id="tgNote" style="margin:0 0 6px"></div>
         <div id="tgPhoneRow">
           <input id="tgPhone" placeholder="+9198xxxxxxxx" inputmode="tel">
@@ -212,17 +213,24 @@ button.secondary{background:#232845;color:#e8eaf2}
 </div>
 <div><!-- process -->
 <div id="setup">
-<label>Naam</label><input id="name" value="Rahul Kumar">
-<label>Email (Gmail — har number par +suffix apne aap)</label><input id="email" value="itsnoob012@gmail.com">
-<div class="row"><div><label>PIN code</label><input id="pincode" value="509412"></div>
-<div><label>Batch code</label><input id="code" value="KKD2LS01261026"></div></div>
-<label>NoCaptchaAI API key (security check auto-solve)</label><input id="nocapKey" value="${NOCAP_KEY_DEFAULT}">
-<div class="sub" id="nocapbal">NoCaptchaAI balance check ho raha hai…</div>
-<label>Pack photo (optional — na do to default use hogi)</label><input id="photo" type="file" accept="image/*">
-<label>Kitne numbers process karne hain?</label><input id="target" type="number" value="5" min="1" max="100">
-<button class="secondary" id="captchaTest">🛡️ Captcha test (key + sitekeys)</button>
-<div class="sub" id="captchaOut"></div>
-<button id="start">▶ START</button>
+  <div id="summary" style="font-size:12.5px;color:#8a90ad;line-height:1.6;margin-bottom:10px">
+    <b style="color:#e8eaf2">Sab kuch pehle se set hai</b> — naam, email, PIN, batch code,
+    key aur photo auto-selected. Bas ▶ START dabao (aur number OTP bot mirror se aayega).
+  </div>
+  <button id="start">▶ START</button>
+  <button class="secondary" id="advToggle" style="margin-top:8px">⚙️ Details badalni hain (optional)</button>
+  <div id="adv" style="display:none;margin-top:10px">
+    <label>Naam</label><input id="name" value="Rahul Kumar">
+    <label>Email (Gmail — har number par +suffix apne aap)</label><input id="email" value="itsnoob012@gmail.com">
+    <div class="row"><div><label>PIN code</label><input id="pincode" value="509412"></div>
+    <div><label>Batch code</label><input id="code" value="KKD2LS01261026"></div></div>
+    <label>NoCaptchaAI API key (security check auto-solve)</label><input id="nocapKey" value="${NOCAP_KEY_DEFAULT}">
+    <div class="sub" id="nocapbal">NoCaptchaAI balance check ho raha hai…</div>
+    <label>Pack photo (optional — na do to default use hogi)</label><input id="photo" type="file" accept="image/*">
+    <label>Kitne numbers process karne hain?</label><input id="target" type="number" value="5" min="1" max="100">
+    <button class="secondary" id="captchaTest">🛡️ Captcha test (key + proxy + sitekey)</button>
+    <div class="sub" id="captchaOut"></div>
+  </div>
 </div>
 <div id="run" style="display:none">
 <div class="status"><span class="badge" id="st">…</span> <b id="prog"></b><div id="msg" style="margin-top:6px"></div></div>
@@ -254,6 +262,12 @@ function paint(s){
   if (s.results.length){ r.style.display='block'; r.textContent = s.results.map(function(x){return (x.ok?'✅':'❌')+' '+x.mobile+' — '+x.message}).join('\\n'); }
 }
 function poll(){ fetch('/state').then(function(r){return r.json()}).then(paint).catch(function(){}) }
+$('advToggle').onclick = function(){
+  var adv = $('adv');
+  var open = adv.style.display !== 'none';
+  adv.style.display = open ? 'none' : 'block';
+  $('advToggle').textContent = open ? '⚙️ Details badalni hain (optional)' : '⚙️ Details chhupao';
+};
 $('start').onclick = function(){
   var file = $('photo').files[0];
   var body = { name:$('name').value.trim(), email:$('email').value, pincode:$('pincode').value, code:$('code').value, target:Number($('target').value)||1, nocapKey:$('nocapKey').value.trim() };
@@ -325,7 +339,12 @@ function tgPaint(res){
   if (res.loginId) TG.loginId = res.loginId;
   if (res.session) { TG.session = res.session; $('tgSession').value = res.session; }
   tgShow(res.step || TG.step, (res.ok ? '✅ ' : '❌ ') + (res.message || res.error || ''));
-  if (res.step === 'done') loadMirror();
+  if (res.step === 'done') {
+    // Login hote hi session khud lag jaye — koi button dabane ki zaroorat nahi.
+    tgPost('/tg-login/apply', { loginId: TG.loginId, session: TG.session }).then(function(a){
+      if (a && a.ok) { $('tgLogin').style.display = 'none'; loadMirror(); }
+    });
+  }
 }
 function tgPost(url, body){
   return fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) })
@@ -399,6 +418,14 @@ fetch('/browser-mode').then(function(r){return r.json()}).then(function(b){
     el.innerHTML = '⚠️ <b>Browser mode OFF</b> — ' + (b.reason || 'Chrome/Python nahi mila')
       + '. Iske bina Gold Drop ka security check clear nahi hoga; phone numbers bachao aur 🛡️ Captcha test chalao.';
   }
+  // Proxy status bhi wahi banner — captcha ka asli kaaran yahi hota hai.
+  return post('/proxy-status',{}).then(function(p){
+    if (!p) return;
+    var extra = p.on
+      ? '<div style="margin-top:6px">🌐 Proxy: <b>' + (p.ip || p.label || 'on') + '</b>' + (p.ok ? ' ✅' : ' ⚠️ ' + esc(p.message||'')) + '</div>'
+      : '<div style="margin-top:6px;color:#ffd479">⚠️ Proxy OFF — datacenter IP par Turnstile token site reject karti hai. Vercel env <b>GOLD_DROP_PROXY</b> me residential proxy daalo.</div>';
+    el.innerHTML += extra;
+  });
 }).catch(function(){ $('browsermode').style.display='none'; });
 post('/nocap-balance',{key:$('nocapKey').value.trim()}).then(function(r){
   $('nocapbal').textContent = r.message || '';
@@ -535,6 +562,10 @@ export default async function handler(req, res) {
         apiReady: loginConfigured(),
         configured: telegramConfigured(),
         mirrorReady: telegramConfigured(),
+        // Proxy mirror ko bhi chahiye (same proxy se solve + register).
+        proxyOn: proxyInfo().on,
+        proxyLabel: proxyInfo().label,
+        proxy: proxyInfo().on ? proxyInfo().label : '',
       });
       return;
     }
@@ -558,13 +589,22 @@ export default async function handler(req, res) {
       if (!body.session) { sendJson(res, 400, { ok: false, error: 'Session nahi mila — pehle login poora karo' }); return; }
       try {
         await setMirrorSession(String(body.session), { slot: 0 });
+        const { storeConfigured, storeMasked } = await import('./_kv.js');
         sendJson(res, 200, {
           ok: true,
-          message: 'Mirror chalu — permanent rakhne ke liye ye session Vercel env TELEGRAM_SESSION me daal do.',
+          stored: storeConfigured(),
+          store: storeMasked(),
+          message: storeConfigured()
+            ? `Mirror chalu ✅ (session ${storeMasked()} me save — restart ke baad bhi chalega)`
+            : 'Mirror chalu ✅ isi instance par. Permanent ke liye session copy karke TELEGRAM_SESSION env me daalo (ya UPSTASH_REDIS_REST_URL/TOKEN set karo — tab apne aap save hoga).',
         });
       } catch (error) {
         sendJson(res, 400, { ok: false, error: String(error?.message || error) });
       }
+      return;
+    }
+    if (req.method === 'POST' && url.pathname === '/proxy-status') {
+      sendJson(res, 200, await goldDropProxyCheck());
       return;
     }
     if (req.method === 'GET' && url.pathname === '/browser-mode') {

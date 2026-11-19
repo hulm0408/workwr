@@ -167,6 +167,50 @@ for (const status of [200, 400]) {
   invalid.userKey = 'u'; invalid.dataKey = key;
   await assert.rejects(invalid.verifyOtp('123456'), isGoldDropInvalidOtp);
 }
+// ─── proxy: Turnstile token IP-bound — datacenter IP par site reject karti hai ───
+{
+  const mod = await import('./gold-drop-vercel/api/_gold-drop.js');
+  const prev = { ...process.env };
+  try {
+    delete process.env.GOLD_DROP_PROXY;
+    delete process.env.GOLD_DROP_PROXIES;
+    assert.equal(mod.proxyInfo().on, false, 'proxy env na ho to off');
+    const off = await mod.goldDropProxyCheck();
+    assert.equal(off.on, false);
+    assert.match(off.message, /GOLD_DROP_PROXY/, 'off par seedha fix batana chahiye');
+
+    // host:port:user:pass form bhi chale
+    process.env.GOLD_DROP_PROXY = 'proxyhost.net:8080:myuser:mypass';
+    const info = mod.proxyInfo();
+    assert.equal(info.on, true);
+    assert.equal(info.url, 'http://myuser:mypass@proxyhost.net:8080');
+    assert.ok(!info.label.includes('mypass'), 'password label me leak nahi hona chahiye');
+    assert.match(info.label, /\*\*\*/);
+  } finally {
+    for (const k of ['GOLD_DROP_PROXY', 'GOLD_DROP_PROXIES']) {
+      if (prev[k] === undefined) delete process.env[k]; else process.env[k] = prev[k];
+    }
+  }
+}
+
+// ─── session store (mirror session restart ke baad bache) ───
+{
+  const kv = await import('./gold-drop-vercel/api/_kv.js');
+  const prev = { ...process.env };
+  try {
+    delete process.env.UPSTASH_REDIS_REST_URL;
+    delete process.env.KV_REST_API_URL;
+    assert.equal(kv.storeConfigured(), false);
+    const res = await kv.kvGet('tg:session:0');   // env ke bina crash nahi, khali
+    assert.equal(res, '');
+    assert.equal(await kv.kvSet('k', 'v'), false);
+  } finally {
+    for (const k of ['UPSTASH_REDIS_REST_URL', 'KV_REST_API_URL']) {
+      if (prev[k] === undefined) delete process.env[k]; else process.env[k] = prev[k];
+    }
+  }
+}
+
 // ─── gold-drop-vercel (Vercel build): sitekey pehle, phir hi numbers ───
 {
   const mod = await import('./gold-drop-vercel/api/_gold-drop.js');

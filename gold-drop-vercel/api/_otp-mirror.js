@@ -24,16 +24,38 @@ export function sessionFor(slot = 0) {
     : firstEnv([`TELEGRAM_SESSION_${slot + 1}`]);
 }
 
+// Store (Upstash/KV) se session uthao — env na ho to web-login ka session
+// instance restart ke baad bhi kaam kare. Ek instance me ek hi baar padhta hai.
+const storeLoaded = new Map(); // slot → true
+export async function hydrateSession(slot = 0) {
+  if (sessionFor(slot) || storeLoaded.get(slot)) return sessionFor(slot);
+  storeLoaded.set(slot, true);
+  try {
+    const { kvGet, storeConfigured } = await import('./_kv.js');
+    if (!storeConfigured()) return '';
+    const saved = await kvGet(`tg:session:${slot}`);
+    if (saved) runtimeSessions.set(slot, saved);
+  } catch { /* ignore */ }
+  return sessionFor(slot);
+}
+
 export function telegramConfigured() {
   return Boolean(firstEnv(['TELEGRAM_API_ID']) && firstEnv(['TELEGRAM_API_HASH']) && sessionFor(0));
 }
 
 // Web login ke baad session ko turant live karo (naya deploy nahi chahiye).
 // Purana client band, cache clear — agli mirror call naye session se.
-export async function setMirrorSession(session, { slot = 0 } = {}) {
+export async function setMirrorSession(session, { slot = 0, persist = true } = {}) {
   const clean = String(session || '').trim();
   if (!clean) throw new Error('Session khali hai');
   runtimeSessions.set(slot, clean);
+  // Har instance ke liye — memory instance-local hoti hai, isliye store me bhi.
+  if (persist) {
+    try {
+      const { kvSet, storeConfigured } = await import('./_kv.js');
+      if (storeConfigured()) await kvSet(`tg:session:${slot}`, clean);
+    } catch { /* store na ho to memory par chalta rahega */ }
+  }
   await dropClient(slot); // naya client naye session se banega
   return { slot, configured: telegramConfigured() };
 }
@@ -98,6 +120,7 @@ export async function readOtpBotMirror({ slot = 0, botUsername = '', limit = 6 }
   const key = `${slot}:${bot}:${limit}`;
   if (cache.data && cache.key === key && Date.now() - cache.at < CACHE_MS) return cache.data;
   try {
+    await hydrateSession(slot);
     const client = await getClient(slot);
     const msgs = await client.getMessages(bot, { limit });
     const list = [];

@@ -62,6 +62,33 @@ NOCAP_API = "https://api.nocaptchaai.com"
 NOCAP_API_KEY_DEFAULT = "nocap_eVBzrYeejjgKLoikEErH6lbP"
 
 
+def _proxy_url():
+    """Residential proxy (GOLD_DROP_PROXY) — Turnstile token IP se bandha hota
+    hai, isliye solve + register dono ek hi proxy IP se jaate hain."""
+    raw = (os.environ.get("GOLD_DROP_PROXY") or os.environ.get("GOLD_DROP_PROXIES") or "").split(",")[0].strip()
+    if not raw:
+        return ""
+    if "://" in raw:
+        return raw
+    parts = raw.split(":")
+    if len(parts) == 4:
+        return f"http://{parts[2]}:{parts[3]}@{parts[0]}:{parts[1]}"
+    return f"http://{raw}"
+
+
+def _proxy_log_label():
+    url = _proxy_url()
+    if not url:
+        return "proxy OFF (datacenter IP — Turnstile token site reject karegi)"
+    return re.sub(r"//[^@/]*@", "//***@", url)
+
+
+def proxy_chrome_arg():
+    """Chrome flag for the same proxy — browser flow bhi usi IP se chale."""
+    url = _proxy_url()
+    return f"--proxy-server={url}" if url else ""
+
+
 def _nocap_post(pathname, api_key, body, timeout=30):
     """NoCaptchaAI POST — clientKey body me jata hai (docs ka official tareeqa)."""
     req = urllib.request.Request(
@@ -70,6 +97,13 @@ def _nocap_post(pathname, api_key, body, timeout=30):
         headers={"Content-Type": "application/json"},
         method="POST",
     )
+    proxy = _proxy_url()
+    if proxy:
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+        )
+        with opener.open(req, timeout=timeout) as res:
+            return json.loads(res.read().decode("utf-8"))
     with urllib.request.urlopen(req, timeout=timeout) as res:
         return json.loads(res.read().decode("utf-8"))
 
@@ -521,6 +555,7 @@ class GoldDropStealthBrowser:
         contexts = self.browser.contexts
         self.context = contexts[0] if contexts else self.browser.new_context()
         log(f"launch ok via {self.mode}: {endpoint_url}")
+        log(f"proxy: {_proxy_log_label()}")
         log(_nocap_balance_text(self.nocap_api_key) if self.nocap_api_key
             else "nocaptchaai auto-solve OFF (NOCAP_API_KEY=off)")
         return endpoint_url
@@ -538,7 +573,11 @@ class GoldDropStealthBrowser:
         else:
             sb_kwargs["headless2"] = True
         # Docker/Render root container me Chrome ke liye zaroori flags.
-        sb_kwargs["chromium_arg"] = "--no-sandbox --disable-dev-shm-usage --disable-gpu"
+        chromium_arg = "--no-sandbox --disable-dev-shm-usage --disable-gpu"
+        proxy_arg = proxy_chrome_arg()
+        if proxy_arg:
+            chromium_arg += " " + proxy_arg
+        sb_kwargs["chromium_arg"] = chromium_arg
 
         # SB(...) ek _GeneratorContextManager return karta hai — ASLI sb object
         # sirf __enter__() ka return value hota hai (yehi AttributeError tha).
@@ -572,6 +611,7 @@ class GoldDropStealthBrowser:
             "--disable-blink-features=AutomationControlled",
             "--lang=en-US", "--window-size=1280,900",
             "--headless=new",
+            *( [proxy_chrome_arg()] if proxy_chrome_arg() else [] ),
             "about:blank",
         ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         port_file = os.path.join(profile, "DevToolsActivePort")

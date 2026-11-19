@@ -11,6 +11,49 @@ const NOCAP_API = (process.env.NOCAP_API_BASE || 'https://api.nocaptchaai.com').
 // Turnstile solve aksar 60-90s leta hai — default 120s (env se badal sakte ho).
 const NOCAP_TIMEOUT_MS = Number(process.env.NOCAP_TIMEOUT_MS) || 120000;
 const NOCAP_KEY_DEFAULT = process.env.NOCAP_API_KEY || 'nocap_eVBzrYeejjgKLoikEErH6lbP';
+
+// ─── Proxy (ASLI fix) ───────────────────────────────────────────────────────
+// Turnstile token site ke IP se bandha hota hai. Vercel/datacenter IP par
+// solved token bhi site 400 "security check" deti hai (PR #91 + 6 sitekey test
+// me exactly yahi hua). Isliye solve + register dono ek residential proxy se
+// jaate hain — tab hi token site par valid hota hai.
+// Env: GOLD_DROP_PROXY=http://user:pass@host:port (ya host:port:user:pass),
+//      optional GOLD_DROP_PROXY_INSECURE=1 (self-signed proxy ke liye).
+function proxyRaw() {
+  return String(process.env.GOLD_DROP_PROXY || process.env.GOLD_DROP_PROXIES || '').split(',')[0].trim();
+}
+export function proxyInfo() {
+  const raw = proxyRaw();
+  if (!raw) return { on: false, label: '', url: '', insecure: false };
+  const url = normalizeProxy(raw);
+  const safe = url.replace(/\/\/[^@/]*@/, '//***@');
+  return { on: true, label: safe, url, insecure: ['1', 'on', 'true', 'yes'].includes(String(process.env.GOLD_DROP_PROXY_INSECURE || '').toLowerCase()) };
+}
+function normalizeProxy(raw) {
+  let value = String(raw || '').trim();
+  if (!value) return '';
+  if (!/^[a-z]+:\/\//i.test(value)) {
+    const parts = value.split(':');
+    value = parts.length === 4 ? `http://${parts[2]}:${parts[3]}@${parts[0]}:${parts[1]}` : `http://${value}`;
+  }
+  return value;
+}
+let proxyDispatcher = null;
+async function proxyFetch(url, options = {}) {
+  const info = proxyInfo();
+  if (!info.on) return fetch(url, options);
+  try {
+    const { ProxyAgent } = await import('undici');
+    if (!proxyDispatcher) {
+      proxyDispatcher = new ProxyAgent({ uri: info.url, requestTls: info.insecure ? { rejectUnauthorized: false } : undefined, proxyTls: info.insecure ? { rejectUnauthorized: false } : undefined });
+    }
+    return fetch(url, { ...options, dispatcher: proxyDispatcher });
+  } catch (error) {
+    // undici hi na mile to saaf message — chupchaap direct jaana galat hoga
+    // (site token reject karegi aur wajah pata nahi chalegi).
+    throw new Error(`Proxy chalu nahi ho paya (${info.label}): ${String(error?.message || error).slice(0, 120)}`);
+  }
+}
 const ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
 const b64 = value => Buffer.from(value, 'utf8').toString('base64');
 // ─── Sitekey registry + number-burn guard ───
@@ -58,7 +101,7 @@ function unwrapResponse(data) {
 
 // ─── NoCaptchaAI (security check / Turnstile solver) ───
 async function nocapPost(pathname, apiKey, body) {
-  const res = await fetch(`${NOCAP_API}${pathname}`, {
+  const res = await proxyFetch(`${NOCAP_API}${pathname}`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ clientKey: apiKey, ...body }),
@@ -123,8 +166,28 @@ export async function nocapKeyCheck(apiKey) {
   }
 }
 
+// Proxy ka live test: NoCaptchaAI + site dono proxy se reachable hain?
+export async function goldDropProxyCheck() {
+  const info = proxyInfo();
+  const out = { on: info.on, label: info.label, ip: '', ok: false, message: '' };
+  if (!info.on) {
+    out.message = 'Proxy OFF hai — Vercel (datacenter) IP par Turnstile token site reject karti hai. GOLD_DROP_PROXY env me residential proxy daalo.';
+    return out;
+  }
+  try {
+    const res = await proxyFetch('https://api.ipify.org?format=json', { signal: AbortSignal.timeout(20000) });
+    const data = await res.json().catch(() => ({}));
+    out.ip = String(data?.ip || '');
+    out.ok = Boolean(out.ip);
+    out.message = out.ok ? `Proxy chal raha hai — IP ${out.ip}` : 'Proxy ne IP nahi bataya';
+  } catch (error) {
+    out.message = `Proxy fail: ${String(error?.message || error).slice(0, 160)}`;
+  }
+  return out;
+}
+
 export async function goldDropCaptchaDiagnose(nocapApiKey) {
-  const out = { keyMasked: '', keyOk: null, keyMessage: '', sitekey: '', sitekeyError: '' };
+  const out = { keyMasked: '', keyOk: null, keyMessage: '', sitekey: '', sitekeyError: '', proxy: proxyInfo().on ? proxyInfo().label : '', proxyIp: '', proxyMessage: '' };
   const key = String(nocapApiKey || '').trim();
   out.keyMasked = key.length > 16 ? `${key.slice(0, 10)}…${key.slice(-4)}` : (key || '(none)');
   if (!key || ['off', '0', 'none'].includes(key.toLowerCase())) {
@@ -137,8 +200,14 @@ export async function goldDropCaptchaDiagnose(nocapApiKey) {
     const keys = await fetchSitekeys();
     out.sitekey = keys[0] || '';
     out.sitekeys = keys;
-    if (!out.sitekey) out.sitekeyError = 'Sitekey nahi mili — HTML badla hai';
+    if (out.sitekey) out.sitekeyCount = keys.length;
+    else out.sitekeyError = 'Sitekey nahi mili — HTML badla hai';
   } catch (error) { out.sitekeyError = String(error?.message || error).slice(0, 160); }
+  // Proxy test — asli wajah yahi hoti hai jab solved token bhi reject ho.
+  const proxy = await goldDropProxyCheck();
+  out.proxyOn = proxy.on;
+  out.proxyIp = proxy.ip || '';
+  out.proxyMessage = proxy.message;
   return out;
 }
 
@@ -147,7 +216,7 @@ const SITE_REGISTER_URL = process.env.GOLD_DROP_SITE_URL || 'https://golddropgol
 
 async function fetchSitekeys(pageUrl = SITE_REGISTER_URL) {
   const read = async url => {
-    const res = await fetch(url, { headers: { 'user-agent': GOLD_DROP_UA }, signal: AbortSignal.timeout(20000) });
+    const res = await proxyFetch(url, { headers: { 'user-agent': GOLD_DROP_UA }, signal: AbortSignal.timeout(20000) });
     return res.text();
   };
   const keys = [];
@@ -190,7 +259,9 @@ async function gdRequest(pathname, body, contentType, cookies = '', referer = 'h
   };
   if (contentType) headers['content-type'] = contentType;
   if (cookies) headers.Cookie = cookies;
-  const response = await fetch(`${BASE}${pathname}`, { method: 'POST', headers, body, signal: AbortSignal.timeout(45000) });
+  // Register/verify bhi usi proxy IP se — warna Turnstile token (jis IP par
+  // solve hua) site par invalid ho jaata hai.
+  const response = await proxyFetch(`${BASE}${pathname}`, { method: 'POST', headers, body, signal: AbortSignal.timeout(45000) });
   const raw = await response.text();
   let data;
   try { data = unwrapResponse(JSON.parse(raw)); } catch { data = { raw }; }

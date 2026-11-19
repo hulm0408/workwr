@@ -5,6 +5,7 @@
   "type": "module",
   "engines": { "node": ">=20" },
   "dependencies": {
-    "teleproto": "^1.232.1"
+    "teleproto": "^1.232.1",
+    "undici": "^8.12.3"
   }
 }

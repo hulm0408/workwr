@@ -5004,8 +5004,29 @@ Thanks`)),
   'START: Chromium option ka engine direct hai');
   ok(autoResumeSrc.includes('startSourcePresetSettings(preset)'),
     'START: preset dabate hi settings lock (engine + OTP bot)');
-  ok(autoResumeSrc.includes("accountEngine: bs.getSetting('accountEngine') === 'worldbot' ? 'worldbot' : (bs.getSetting('accountEngine') === 'toing_pro' ? 'toing_pro' : 'direct')"),
+  ok(autoResumeSrc.includes("accountEngine: ['worldbot', 'toing_pro', 'zzbot'].includes(bs.getSetting('accountEngine'))"),
     'START: engine choice batch ke saath lock hota hai');
+  // 🌐 ZZBOT (Zepto Pro) — Toing ka mirror. Preset, dispatch aur UI — teeno wired.
+  ok(presets.getStartSourcePreset('zzbot')?.accountEngine === 'zzbot'
+    && presets.getStartSourcePreset('zzbot_hermes')?.otpBotProfile === 'hermes'
+    && presets.getStartSourcePreset('zzbot_hathi')?.otpBotProfile === 'hathi'
+    && presets.startSourcePresetSettings(presets.getStartSourcePreset('zzbot_hathi'))?.accountEngine === 'zzbot',
+  'START: ZZBOT (Zepto) preset + haathi/hermes profile set hote hain');
+  ok(autoResumeSrc.includes("callback_data: 'ap_start_zzbot'")
+    && autoResumeSrc.includes("callback_data: 'ap_start_go_zzbot_hathi'")
+    && autoResumeSrc.includes("callback_data: 'ap_start_go_zzbot_hermes'"),
+  'START: ZZBOT signup button + dono OTP bot buttons maujood');
+  {
+    const np = await fsp.readFile(new URL('./number-pipeline.js', import.meta.url), 'utf8');
+    ok(np.includes("=== 'zzbot'") && np.includes('processSingleNumberViaZzbot'),
+      'pipeline: zzbot engine dispatch wired');
+    const zz = await fsp.readFile(new URL('./zzbot-engine.js', import.meta.url), 'utf8');
+    ok(zz.includes('/api/login/otp') && zz.includes('/api/login/verify') && zz.includes('/export')
+      && zz.includes('DEFAULT_ZZBOT_ACCESS_KEY'),
+      'zzbot engine: login/otp -> login/verify -> export + default access key');
+    ok(src.includes("'worldbot', 'toing_pro', 'zzbot'"),
+      'autopilot: zzbot mode bridge/WAF bypass me gina gaya');
+  }
 
   // World bot mode me Hermes source allowed hai (combined preset).
   ok(src.includes("resolvedSourceMode === 'firebase' ? 'firebase' : 'telegram'"),
@@ -5327,7 +5348,7 @@ Thanks`)),
   ok(wbBotSrc.includes("const diagWorld = bs.getSetting('accountEngine') === 'worldbot'")
     && wbBotSrc.includes('if (!diagWorld) {'),
   'diag: World Bot mode me Chrome/WAF token/proxy fields chhupe rehte hain');
-  ok(wbBotSrc.includes("...(['worldbot', 'toing_pro'].includes(bs.getSetting('accountEngine')) ? [] : [{")
+  ok(wbBotSrc.includes("...(['worldbot', 'toing_pro', 'zzbot'].includes(bs.getSetting('accountEngine')) ? [] : [{")
     && wbBotSrc.includes('🌍 World Bot ON'),
   'settings: World Bot mode me Proxies button nahi, purana button neutral card deta hai');
   ok(!/koi proxy\/WAF nahi/.test(wbBotSrc) && !/koi proxy\/WAF nahi/.test(wbPipelineSrc),

@@ -12,6 +12,7 @@
 let clients = new Map(); // slot → Promise<client>
 let runtimeSessions = new Map(); // slot → session string
 let runtimeApi = new Map(); // slot → { apiId, apiHash }
+let runtimePhone = new Map(); // slot → card ka number (pre-select)
 
 function firstEnv(names = []) {
   for (const name of names) {
@@ -44,6 +45,26 @@ export function sessionFor(slot = 0) {
   return slot === 0 ? firstEnv(['TELEGRAM_SESSION']) : firstEnv([`TELEGRAM_SESSION_${slot + 1}`]);
 }
 
+// Card par pehle se bhara number (jo user ne ek baar save kiya), env se fallback.
+export function phoneFor(slot = 0) {
+  const saved = runtimePhone.get(slot);
+  if (saved) return String(saved);
+  return envPhone(slot);
+}
+
+function envPhone(slot = 0) {
+  const suffix = slot === 0 ? '' : `_${slot + 1}`;
+  const value = firstEnv([`TELEGRAM_PHONE${suffix}`, 'TELEGRAM_PHONE']);
+  return value ? value.replace(/[^\d+]/g, '') : '';
+}
+
+// Display ke liye mask — poora number page par wapas nahi bhejte.
+export function maskPhone(phone = '') {
+  const digits = String(phone).replace(/\D/g, '');
+  if (digits.length < 6) return digits ? '•••' : '';
+  return `+${digits.slice(0, 2)}${'•'.repeat(Math.max(0, digits.length - 4))}${digits.slice(-2)}`;
+}
+
 export function slotReady(slot = 0) {
   const api = apiFor(slot);
   return Boolean(api.apiId && api.apiHash && sessionFor(slot));
@@ -62,16 +83,18 @@ export async function hydrateSlot(slot = 0) {
   try {
     const { kvGet, storeConfigured } = await import('./_kv.js');
     if (!storeConfigured()) return;
-    const [session, apiId, apiHash] = await Promise.all([
+    const [session, apiId, apiHash, phone] = await Promise.all([
       kvGet(`tg:session:${slot}`),
       kvGet(`tg:apiId:${slot}`),
       kvGet(`tg:apiHash:${slot}`),
+      kvGet(`tg:phone:${slot}`),
     ]);
     if (session && !runtimeSessions.get(slot)) runtimeSessions.set(slot, session);
     const next = { ...(runtimeApi.get(slot) || {}) };
     if (apiId) next.apiId = apiId;
     if (apiHash) next.apiHash = apiHash;
     if (next.apiId || next.apiHash) runtimeApi.set(slot, next);
+    if (phone && !runtimePhone.get(slot)) runtimePhone.set(slot, String(phone));
   } catch { /* ignore */ }
 }
 
@@ -86,13 +109,20 @@ async function persist(key, value) {
 }
 
 // Web login / form se aayi values ko turant live karo (naya deploy nahi chahiye).
-export async function setSlotCredentials({ slot = 0, session = '', apiId = '', apiHash = '', persistValues = true } = {}) {
+export async function setSlotCredentials({ slot = 0, session, apiId = '', apiHash = '', phone, persistValues = true } = {}) {
   // session: '' = clear (tests/logout), undefined = chhedo mat
   if (session !== undefined) {
     const clean = String(session).trim();
     if (clean) runtimeSessions.set(slot, clean);
     else runtimeSessions.delete(slot);
     if (persistValues) await persist(`tg:session:${slot}`, clean || '');
+  }
+  // phone: '' bhi chalti hai (clear), undefined = chhedo mat
+  if (phone !== undefined) {
+    const cleanPhone = String(phone).replace(/[^\d+]/g, '');
+    if (cleanPhone) runtimePhone.set(slot, cleanPhone);
+    else runtimePhone.delete(slot);
+    if (persistValues) await persist(`tg:phone:${slot}`, cleanPhone || '');
   }
   if (apiId || apiHash) {
     const next = { ...(runtimeApi.get(slot) || {}) };
@@ -231,6 +261,8 @@ export async function readSlotCard({ slot = 0, botUsername = '', limit = 4 } = {
     apiHashSet: Boolean(api.apiHash),
     apiIdMasked: api.apiId ? `${String(api.apiId).slice(0, 3)}…` : '',
     sessionSet: Boolean(sessionFor(slot)),
+    phone: phoneFor(slot),
+    phoneMasked: maskPhone(phoneFor(slot)),
     ready: Boolean(api.apiId && api.apiHash && sessionFor(slot)),
     bot: mirror.bot,
     ok: mirror.ok,

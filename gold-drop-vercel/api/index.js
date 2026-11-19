@@ -274,12 +274,13 @@ function tgCardHtml(slot, c){
     + '<div class="top"><span><span class="dot' + (live ? ' live' : '') + '" style="display:inline-block;width:8px;height:8px;border-radius:99px;background:' + (live ? '#28c76f' : '#4a5070') + ';margin-right:6px"></span>Account #' + (slot+1) + '</span>'
     + '<span class="pill ' + (ready ? 'ok' : 'bad') + '">' + (ready ? 'ready' : 'adhoora') + '</span></div>'
     + '<div class="mini">API ID: <b>' + (c.apiIdSet ? (c.apiIdMasked || 'set') : '—') + '</b> · hash: <b>' + (c.apiHashSet ? 'set' : '—') + '</b> · session: <b>' + (c.sessionSet ? 'set' : '—') + '</b></div>'
-    + '<div class="mini">Bot: <b>@' + esc(c.bot || 'Hathi_otp_bot') + '</b></div>'
-    + '<div class="two"><input id="tgApi' + slot + '" placeholder="API ID (optional)" value="">'
-    + '<input id="tgHash' + slot + '" placeholder="API hash (optional)"></div>'
-    + '<input id="tgPhone' + slot + '" placeholder="+9198xxxxxxxx (spare account)">'
+    + '<div class="mini">Number: <b>' + esc(c.phoneMasked || '—') + '</b> · Bot: <b>@' + esc(c.bot || 'Hathi_otp_bot') + '</b></div>'
+    + '<div class="two"><input id="tgApi' + slot + '" placeholder="API ID' + (c.apiIdSet ? ' (set — badalna ho tab bharo)' : '') + '">'
+    + '<input id="tgHash' + slot + '" placeholder="API hash' + (c.apiHashSet ? ' (set)' : '') + '"></div>'
+    + '<input id="tgPhone' + slot + '" placeholder="' + esc(c.phoneMasked || '+91xxxxxxxxxx (spare account)') + '" inputmode="tel">'
     + '<div class="two"><button class="secondary" id="tgCode' + slot + '">Code bhejo</button>'
     + '<button class="secondary" id="tgApply' + slot + '">Save session</button></div>'
+    + '<button class="secondary" id="tgSave' + slot + '" style="width:100%;margin-top:4px">💾 API ID / hash / number card me save</button>'
     + '<input id="tgLogin' + slot + '" placeholder="Telegram login code">'
     + '<input id="tgOtp' + slot + '" placeholder="2FA password (agar ho)">'
     + '<div class="mini" id="tgOut' + slot + '"></div>'
@@ -331,6 +332,16 @@ function bindTg(slot){
         if (r.ok) { $('tgOut'+slot).textContent = '✅ ' + (r.message||'code bhej diya') + (r.loginId ? ' (loginId ' + r.loginId.slice(0,6) + '…)' : ''); TC['login'+slot] = r.loginId; }
         else $('tgOut'+slot).textContent = '❌ ' + (r.error || 'fail');
       });
+  };
+  var saveBtn = $('tgSave' + slot);
+  if (saveBtn) saveBtn.onclick = function(){
+    var apiId = $('tgApi'+slot).value.trim(), apiHash = $('tgHash'+slot).value.trim(), phone = $('tgPhone'+slot).value.trim();
+    if (!apiId && !apiHash && !phone) { $('tgOut'+slot).textContent = 'kuch bhara nahi — API ID / hash / number me se jo badalna hai wo daalo'; return }
+    $('tgOut'+slot).textContent = 'save ho raha hai…';
+    post('/tg/creds', { slot: slot, apiId: apiId, apiHash: apiHash, phone: phone }).then(function(r){
+      if (r.ok) { $('tgOut'+slot).textContent = '✅ card me save — ' + (r.phoneMasked || 'number') + (r.ready ? ' · ready' : ' · login baaki'); $('tgApi'+slot).value = ''; $('tgHash'+slot).value = ''; $('tgPhone'+slot).value = ''; refreshCards(); }
+      else $('tgOut'+slot).textContent = '❌ ' + (r.error || 'save fail');
+    });
   };
   var applyBtn = $('tgApply' + slot);
   if (applyBtn) applyBtn.onclick = function(){
@@ -623,6 +634,27 @@ export default async function handler(req, res) {
       return;
     }
     // Fields se seedha save (session paste karne ka raasta)
+    if (req.method === 'POST' && url.pathname === '/tg/creds') {
+      const body = await readBody(req);
+      try {
+        const { setSlotCredentials, phoneFor, maskPhone } = await import('./_otp-mirror.js');
+        const slot = Math.min(2, Math.max(0, Number(body.slot) || 0));
+        const apiId = String(body.apiId || '').trim();
+        const apiHash = String(body.apiHash || '').trim();
+        if (apiId && !/^\d+$/.test(apiId)) return sendJson(res, 400, { ok: false, error: 'API ID sirf digits hota hai (my.telegram.org se)' });
+        if (apiHash && !/^[0-9a-f]{32}$/i.test(apiHash)) return sendJson(res, 400, { ok: false, error: 'API hash 32 characters ka hex hota hai' });
+        const phone = String(body.phone || '').replace(/[^\d+]/g, '');
+        if (phone && phone.replace(/\D/g, '').length < 8) return sendJson(res, 400, { ok: false, error: 'Number poora daalo (country code ke saath)' });
+        const patch = { slot, persistValues: true };
+        if (apiId) patch.apiId = apiId;
+        if (apiHash) patch.apiHash = apiHash;
+        if (body.phone !== undefined && String(body.phone).trim()) patch.phone = phone;
+        await setSlotCredentials(patch);
+        return sendJson(res, 200, { ok: true, slot, ready: slotReady(slot), phone: phoneFor(slot), phoneMasked: maskPhone(phoneFor(slot)) });
+      } catch (error) {
+        return sendJson(res, 500, { ok: false, error: String(error?.message || error).slice(0, 160) });
+      }
+    }
     if (req.method === 'POST' && url.pathname === '/tg/save') {
       const body = await readBody(req);
       const slot = Number(body.slot) || 0;

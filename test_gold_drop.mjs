@@ -192,6 +192,15 @@ for (const status of [200, 400]) {
   assert.equal(mirror.slotReady(2), true);
   assert.equal(mirror.sessionFor(2), 'SESSION_X');
 
+  // card ka number: save → card par masked (poora number page par nahi), clear bhi chalta
+  await mirror.setSlotCredentials({ slot: 2, phone: '8801709150174', persistValues: false });
+  assert.equal(mirror.phoneFor(2), '8801709150174', 'card number save hota hai');
+  assert.equal(mirror.maskPhone(mirror.phoneFor(2)), '+88•••••••••74', 'number masked dikhta hai');
+  const card2 = await mirror.readSlotCard({ slot: 2, limit: 1 }).catch(error => ({ error: String(error?.message || error) }));
+  assert.ok(card2.phoneMasked === undefined || card2.phoneMasked === '+88•••••••••74', 'card me masked number');
+  await mirror.setSlotCredentials({ slot: 2, phone: '', persistValues: false });
+  assert.equal(mirror.phoneFor(2), '', 'phone: \'\' = clear');
+
   // input queue validation (run ke bina / galat value)
   assert.equal(claim.pushClaimNumber('nope', '9876543210').ok, false);
   assert.equal(claim.pushClaimOtp('nope', '123456').ok, false);

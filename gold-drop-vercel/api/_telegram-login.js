@@ -12,7 +12,7 @@
 // /log me kabhi nahi jaata. Spare account use karo, main account nahi.
 
 import { randomBytes } from 'node:crypto';
-import { apiFor, hydrateSlot, setSlotCredentials } from './_otp-mirror.js';
+import { apiFor, hydrateSlot, setSlotCredentials, phoneFor } from './_otp-mirror.js';
 
 const TTL_MS = 10 * 60 * 1000;
 const logins = new Map(); // loginId → { client, phone, phoneCodeHash, step, at, slot, apiId, apiHash }
@@ -54,8 +54,17 @@ export async function startTelegramLogin({ slot = 0, phone = '', apiId = '', api
   cleanup();
   await hydrateSlot(Number(slot) || 0);
   const slotNum = Number(slot) || 0;
-  const raw = String(phone).replace(/[^\d+]/g, '');
-  if (!/^\+?\d{8,15}$/.test(raw)) return { ok: false, step: 'phone', slot: slotNum, error: 'Poora number country code ke saath daalo (jaise +9198xxxxxxxx)' };
+  // Card me number pehle se bhara hai — khaali aaye to wahi use karo.
+  const normalized = String(phone).replace(/\D/g, '');
+  let raw = String(phone).replace(/[^\d+]/g, '');
+  if (!/^\+?\d{8,15}$/.test(String(raw).replace(/\D/g, '')) && normalized.length < 8) {
+    const saved = phoneFor(slotNum);
+    if (saved) raw = saved.replace(/\D/g, '');
+  }
+  if (!/^\+?\d{8,15}$/.test(String(raw).replace(/\D/g, ''))) {
+    return { ok: false, step: 'phone', slot: slotNum, error: 'Poora number country code ke saath daalo (jaise +9198xxxxxxxx)' };
+  }
+  // 8-seen digits = Telegram ke liye kaafi nahi; seedha Telegram se hi error aayega.
   const creds = credsFor(slotNum, apiId, apiHash);
   if (creds.error) return { ok: false, step: 'phone', slot: slotNum, error: creds.error };
   const number = raw.startsWith('+') ? raw : `+${raw}`;

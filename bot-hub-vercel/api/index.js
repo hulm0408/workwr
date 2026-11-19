@@ -969,9 +969,11 @@ function tgCard(slot, c){
     + '<div style="display:flex;justify-content:space-between;font:700 12.5px system-ui">Account #' + (slot+1)
     + '<span class="badge">' + (c.ready?'ready':'adhoora') + '</span></div>'
     + '<div class="hint" style="margin:2px 0">API ID <b>' + (c.apiIdSet?(c.apiIdMasked||'set'):'—') + '</b> · hash <b>' + (c.apiHashSet?'set':'—') + '</b> · session <b>' + (c.sessionSet?'set':'—') + '</b></div>'
-    + '<input id="tgApi'+slot+'" placeholder="API ID (optional)">'
-    + '<input id="tgHash'+slot+'" placeholder="API hash (optional)">'
-    + '<input id="tgPhone'+slot+'" placeholder="+9198xxxxxxxx">'
+    + '<div class="hint" style="margin:2px 0">Number <b>' + esc2(c.phoneMasked||'—') + '</b></div>'
+    + '<input id="tgApi'+slot+'" placeholder="API ID' + (c.apiIdSet?' (set — badalna ho tab)':'') + '">'
+    + '<input id="tgHash'+slot+'" placeholder="API hash' + (c.apiHashSet?' (set)':'') + '">'
+    + '<input id="tgPhone'+slot+'" placeholder="' + esc2(c.phoneMasked||'+91xxxxxxxxxx') + '" inputmode="tel">'
+    + '<button class="ghost" id="tgSave'+slot+'">💾 API ID / hash / number save</button>'
     + '<button class="ghost" id="tgCode'+slot+'">Code bhejo</button>'
     + '<input id="tgLogin'+slot+'" placeholder="login code">'
     + '<input id="tgOtp'+slot+'" placeholder="2FA password (agar ho)">'
@@ -1002,6 +1004,15 @@ function renderCards(){
   $('tgCards').innerHTML = [0,1,2].map(function(s){ return tgCard(s, TC[s]) }).join('');
   $('claimCards').innerHTML = [0,1,2].map(function(s){ return claimCard(s, CR[s]) }).join('');
   [0,1,2].forEach(function(s){
+    var sv = $('tgSave'+s); if (sv) sv.onclick = function(){
+      var apiId = $('tgApi'+s).value.trim(), apiHash = $('tgHash'+s).value.trim(), phone = $('tgPhone'+s).value.trim();
+      if (!apiId && !apiHash && !phone){ $('tgOut'+s).textContent = 'kuch bhara nahi'; return }
+      $('tgOut'+s).textContent = 'save ho raha hai…';
+      post('/tg/creds',{slot:s,apiId:apiId,apiHash:apiHash,phone:phone}).then(function(r){
+        if (r.ok){ $('tgOut'+s).textContent = '✅ save — ' + (r.phoneMasked||'number') + (r.ready?' · ready':' · login baaki'); $('tgApi'+s).value=''; $('tgHash'+s).value=''; $('tgPhone'+s).value=''; refreshCards(); }
+        else $('tgOut'+s).textContent = '❌ ' + (r.error||'save fail');
+      });
+    };
     var cb = $('tgCode'+s); if (cb) cb.onclick = function(){
       $('tgOut'+s).textContent = 'code bhej raha hoon…';
       post('/tg/code',{slot:s, phone:$('tgPhone'+s).value.trim(), apiId:$('tgApi'+s).value.trim(), apiHash:$('tgHash'+s).value.trim()}).then(function(r){
@@ -1304,6 +1315,27 @@ export default async function handler(req, res) {
       }
       sendJson(res, 200, out);
       return;
+    }
+    if (req.method === 'POST' && url.pathname === '/tg/creds') {
+      const body = await readBody(req);
+      try {
+        const { setSlotCredentials, phoneFor, maskPhone } = await import('./_otp-mirror.js');
+        const slot = Math.min(2, Math.max(0, Number(body.slot) || 0));
+        const apiId = String(body.apiId || '').trim();
+        const apiHash = String(body.apiHash || '').trim();
+        if (apiId && !/^\d+$/.test(apiId)) return sendJson(res, 400, { ok: false, error: 'API ID sirf digits hota hai' });
+        if (apiHash && !/^[0-9a-f]{32}$/i.test(apiHash)) return sendJson(res, 400, { ok: false, error: 'API hash 32 chars hex hota hai' });
+        const phone = String(body.phone || '').replace(/[^\d+]/g, '');
+        if (phone && phone.replace(/\D/g, '').length < 8) return sendJson(res, 400, { ok: false, error: 'Number poora daalo (country code ke saath)' });
+        const patch = { slot, persistValues: true };
+        if (apiId) patch.apiId = apiId;
+        if (apiHash) patch.apiHash = apiHash;
+        if (body.phone !== undefined && String(body.phone).trim()) patch.phone = phone;
+        await setSlotCredentials(patch);
+        return sendJson(res, 200, { ok: true, slot, ready: slotReady(slot), phone: phoneFor(slot), phoneMasked: maskPhone(phoneFor(slot)) });
+      } catch (error) {
+        return sendJson(res, 500, { ok: false, error: String(error?.message || error).slice(0, 160) });
+      }
     }
     if (req.method === 'POST' && url.pathname === '/tg/save') {
       const body = await readBody(req);

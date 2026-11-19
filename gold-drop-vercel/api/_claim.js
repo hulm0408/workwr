@@ -16,8 +16,9 @@ import { getClient, hydrateSlot, sessionFor, apiFor, parseMirrorMessage } from '
 const CLAIM_TTL_MS = 10 * 60 * 1000;
 const runs = new Map(); // runId → run
 
-// Bot ke button labels — Hindi/English/Hinglish sab shapes.
-const MANUAL_CLAIM_RE = /manual\s*claim|manual|claim/i;
+// Bot ke button labels — screenshots ke hisaab se: "🎯 MANUAL CLAIM (3x)".
+// Dhyaan: sirf "claim" par match nahi karte, warna galat button dab sakta hai.
+const MANUAL_CLAIM_RE = /manual\s*claim|manual\s*claim\s*\(\d+x\)|manual\b/i;
 const OTP_RE = /(?:otp|code|verification|verify)/i;
 
 function newRun(slot, bot, target, details) {
@@ -107,6 +108,18 @@ async function clickButton(client, btn, label) {
   throw new Error(`Button "${label}" click nahi hua (teleproto ka click support nahi)`);
 }
 
+// "🎯 MANUAL CLAIM (3x)" jaisa button dhoondo — latest messages me, purane par atko nahi.
+// Zyada se zyada 8 messages peeche tak dekhte hain (bot ka menu + cancel card).
+function matchManualClaim(msgs = []) {
+  for (const msg of msgs) {
+    if (msg?.out) continue;
+    const buttons = buttonsOf(msg);
+    const btn = buttons.find(b => MANUAL_CLAIM_RE.test(buttonText(b)));
+    if (btn) return { msg, btn, label: buttonText(btn) };
+  }
+  return null;
+}
+
 // Naya message aane ka intezaar — naya id ya naya text.
 async function waitForBot(client, bot, { afterId = 0, afterText = '', timeoutMs = 25000 } = {}) {
   const deadline = Date.now() + timeoutMs;
@@ -159,39 +172,55 @@ export async function startClaimRun({ slot = 0, bot = 'rajafuckbot', target = 1,
       note(run, `Account #${useSlot + 1} jud gaya — @${botName} ko /start bhej raha hoon`, 'ok');
       run.phase = 'start';
 
+      // Purane messages ki id yaad rakho — /start ka NAYA jawab hi dekhna hai.
+      const beforeStart = await botMessages(client, botName, 8);
+      const newestBefore = Math.max(0, ...beforeStart.map(m => Number(m?.id || 0)));
       await sendText(client, botName, '/start');
-      let latest = await waitForBot(client, botName, { timeoutMs: 20000 });
+      let latest = await waitForBot(client, botName, { afterId: newestBefore, timeoutMs: 30000 });
+      if (!latest) {
+        const any = await botMessages(client, botName, 5);
+        latest = any.find(m => !m.out) || null;
+      }
       if (!latest) throw new Error(`@${botName} ne /start par jawab nahi diya (bot block/username galat ho sakta hai)`);
       note(run, `Bot: ${String(latest.message || '(buttons)').slice(0, 200)}`, 'bot');
 
+      let started = false;
       while (run.done < run.target) {
         run.phase = 'manual_claim';
-        // "Manual Claim" — button ho to dabao, na ho to text bhej do.
-        let clicked = false;
-        for (let attempt = 0; attempt < 3 && !clicked; attempt += 1) {
-          const buttons = buttonsOf(latest);
-          const btn = buttons.find(b => MANUAL_CLAIM_RE.test(buttonText(b)));
-          if (btn) {
-            const beforeId = Number(latest.id || 0);
-            await clickButton(client, btn, buttonText(btn));
-            clicked = true;
-            note(run, `Button dabaya: ${buttonText(btn)}`, 'click');
-            latest = await waitForBot(client, botName, { afterId: beforeId, timeoutMs: 25000 }) || latest;
-            note(run, `Bot: ${String(latest.message || '(buttons)').slice(0, 200)}`, 'bot');
-          } else if (/manual\s*claim/i.test(String(latest.message || ''))) {
-            await sendText(client, botName, 'Manual Claim');
-            clicked = true;
-            note(run, 'Text bheja: Manual Claim', 'click');
-            latest = await waitForBot(client, botName, { afterText: String(latest.message || ''), timeoutMs: 25000 }) || latest;
-            note(run, `Bot: ${String(latest.message || '(buttons)').slice(0, 200)}`, 'bot');
-          } else {
-            break;
+        // "🎯 MANUAL CLAIM (3x)" button — sabhi recent bot messages me dhoondo.
+        let hit = null;
+        let last = latest;
+        for (let attempt = 0; attempt < 3 && !hit; attempt += 1) {
+          const all = await botMessages(client, botName, 8);
+          hit = matchManualClaim(all);
+          if (hit) { last = hit.msg; break; }
+          // /start ka menu hi nahi mila to ek hi baar /start dobara — bar-bar nahi
+          // (har /start claim cancel karta hai, screenshots me wahi dikha).
+          if (attempt === 0 && !started) {
+            const snap = Math.max(0, ...all.map(m => Number(m?.id || 0)));
+            await sendText(client, botName, '/start');
+            note(run, '/start dobara bheja — menu ka intezaar', 'click');
+            const fresh = await waitForBot(client, botName, { afterId: snap, timeoutMs: 25000 });
+            if (fresh) { latest = fresh; last = fresh; }
+            continue;
           }
+          await sleep(2500);
         }
-        if (!clicked) {
-          // Naya "Manual Claim" nahi mila — shayad target poora ho gaya.
-          if (run.done >= 1) break;
-          throw new Error('Bot me "Manual Claim" nahi mila — screenshot/transcript dekh kar bot ka reply check karo');
+        if (!hit) {
+          if (run.done >= 1) break;   // target poora — agla claim nahi chahiye
+          const seen = (await botMessages(client, botName, 5))
+            .filter(m => !m.out)
+            .map(m => `• ${String(m.message || '(buttons)').slice(0, 60)} [${buttonsOf(m).map(buttonText).filter(Boolean).slice(0, 4).join(' | ') || 'koi button nahi'}]`)
+            .join('\n');
+          throw new Error(`Bot me "Manual Claim" button nahi mila. Bot ke aakhri messages:\n${seen || '(kuch nahi)'}`);
+        }
+        started = true;
+        {
+          const beforeId = Number(hit.msg.id || 0);
+          await clickButton(client, hit.btn, hit.label);
+          note(run, `Button dabaya: ${hit.label}`, 'click');
+          latest = await waitForBot(client, botName, { afterId: beforeId, timeoutMs: 30000 }) || latest;
+          note(run, `Bot: ${String(latest.message || '(buttons)').slice(0, 200)}`, 'bot');
         }
 
         // Number maango
@@ -200,9 +229,9 @@ export async function startClaimRun({ slot = 0, bot = 'rajafuckbot', target = 1,
         if (!number) throw new Error('Number nahi mila — OTP bot me naya number dabao, phir "Number bhejo" dabao');
         run.numbers.push(number);
         note(run, `Number bheja: ${number}`, 'ok');
-        const before = String(latest.message || '');
+        const beforeId = Number(latest.id || 0);
         await sendText(client, botName, number);
-        latest = await waitForBot(client, botName, { afterText: before, timeoutMs: 25000 }) || latest;
+        latest = await waitForBot(client, botName, { afterId: beforeId, timeoutMs: 25000 }) || latest;
         note(run, `Bot: ${String(latest.message || '(buttons)').slice(0, 200)}`, 'bot');
 
         // 3 baar OTP
@@ -211,16 +240,24 @@ export async function startClaimRun({ slot = 0, bot = 'rajafuckbot', target = 1,
         for (let i = 0; i < 3; i += 1) {
           run.step = i + 1;
           run.message = `OTP ${i + 1}/3 ka wait (OTP bot se)…`;
-          const code = await waitForOtp(run, i);
+          const code = await waitForOtp(run, i, {
+            baseId: Number(latest.id || 0),
+            // Bot ne hamare bhejne ke baad phir kuch bheja = wahi OTP dobara maang raha hai.
+            botAskedAgain: async () => {
+              const msgs = await botMessages(client, botName, 4);
+              const lastBot = msgs.find(m => !m.out);
+              return Number(lastBot?.id || 0) > Number(latest.id || 0);
+            },
+          });
           if (!code) {
             note(run, `OTP ${i + 1}/3 nahi mila — agla number`, 'warn');
             break;
           }
-          const prev = String(latest.message || '');
+          const prevId = Number(latest.id || 0);
           await sendText(client, botName, code);
           otps.push(code);
           note(run, `OTP ${i + 1}/3 bheja: ${code}`, 'ok');
-          latest = await waitForBot(client, botName, { afterText: prev, timeoutMs: 25000 }) || latest;
+          latest = await waitForBot(client, botName, { afterId: prevId, timeoutMs: 25000 }) || latest;
           note(run, `Bot: ${String(latest.message || '(buttons)').slice(0, 200)}`, 'bot');
         }
 
@@ -312,17 +349,24 @@ async function waitForNumber(run) {
   return '';
 }
 
-async function waitForOtp(run, index) {
+async function waitForOtp(run, index, { botAskedAgain } = {}) {
   const q = queueFor(run.id);
   const deadline = Date.now() + 120000;
   let lastAuto = '';
+  let reused = 0;
   while (Date.now() < deadline) {
     if (q.otps.length) return q.otps.shift();
-    // OTP bot ka naya code mirror se — jo bhej diya wo dobara nahi.
+    // OTP bot ka code mirror me hai. Wahi code 3 baar maanga jaata hai — isliye
+    // agar bot ne hamare bhejne ke baad phir maanga hai to same OTP phir bhejo.
     const auto = await mirrorValue(run, 'otp');
-    if (auto && auto !== lastAuto && !(run.sentOtps || []).includes(auto)) {
+    const sent = run.sentOtps || [];
+    const fresh = auto && !sent.includes(auto);
+    const sameButAskedAgain = auto && !fresh && reused < 2 && typeof botAskedAgain === 'function'
+      && (await botAskedAgain().catch(() => false));
+    if (auto && (fresh || (auto !== lastAuto && sameButAskedAgain))) {
       lastAuto = auto;
-      run.sentOtps = [...(run.sentOtps || []), auto];
+      if (fresh) run.sentOtps = [...sent, auto];
+      else { reused += 1; note(run, `Wahi OTP dobara maanga gaya — ${auto} phir bheja`, 'warn'); }
       note(run, `OTP mirror se mila: ${auto}`, 'ok');
       return auto;
     }

@@ -474,6 +474,13 @@ async function beginRun({ form = {} } = {}) {
   if (!adapter) throw new Error('Pehle service chuno');
   if (!state.botId) throw new Error('OTP bot chuno');
   if (state.service !== 'custom' && state.spareSlot < 0) throw new Error('Spare account chuno');
+  // Custom service: endpoints pehle hi check kar lo (warna number ke baad pata chalta tha)
+  if (state.service === 'custom') {
+    const base = String(form?.baseUrl || '').trim();
+    if (!/^https?:\/\//i.test(base)) throw new Error('Custom: base URL https:// se shuru hona chahiye');
+    if (!String(form?.sendPath || '').trim()) throw new Error('Custom: send-OTP path daalo');
+    if (!String(form?.verifyPath || '').trim()) throw new Error('Custom: verify path daalo');
+  }
   state.form = form;
   state.step = 'need_phone';
   state.message = 'Pehla mobile number daalo';

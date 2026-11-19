@@ -31,6 +31,9 @@ import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { registerGoldDrop, verifyGoldDropOtp, goldDropCaptchaDiagnose } from './_gold-drop-core.js';
 import { getSharedBrowser, goldDropBrowserAvailable, browserRegister, browserVerifyOtp } from './_gold-drop-browser.js';
+import { readSlotCard, setSlotCredentials } from './_otp-mirror.js';
+import { startClaimRun, getClaimRun, latestClaimRun, pushClaimNumber, pushClaimOtp } from './_claim.js';
+import { startTelegramLogin, submitTelegramCode, submitTelegramPassword } from './_telegram-login.js';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(path.dirname(ROOT), 'public');
@@ -200,12 +203,26 @@ function publicState() {
 // ─── Telegram (MTProto) — spare account se OTP bot padho ───
 let tgClients = new Map(); // slot → Promise<client>
 
+// Slot ka apna API ID/hash ho sakta hai (TELEGRAM_API_ID_2/_HASH_2 ...),
+// warna slot 0 wala fallback — 3 cards ek hi page par.
+function slotApi(slot = 0) {
+  const suffix = slot === 0 ? '' : `_${slot + 1}`;
+  return {
+    apiId: firstEnv([`TELEGRAM_API_ID${suffix}`, 'TELEGRAM_API_ID']),
+    apiHash: firstEnv([`TELEGRAM_API_HASH${suffix}`, 'TELEGRAM_API_HASH']),
+  };
+}
+function slotSession(slot = 0) {
+  return slot === 0 ? firstEnv(['TELEGRAM_SESSION']) : firstEnv([`TELEGRAM_SESSION_${slot + 1}`]);
+}
+export function slotReady(slot = 0) {
+  const api = slotApi(slot);
+  return Boolean(api.apiId && api.apiHash && slotSession(slot));
+}
+
 async function getTelegramClient(slot = 0) {
-  const apiId = firstEnv(['TELEGRAM_API_ID']);
-  const apiHash = firstEnv(['TELEGRAM_API_HASH']);
-  const session = slot === 0
-    ? firstEnv(['TELEGRAM_SESSION'])
-    : firstEnv([`TELEGRAM_SESSION_${slot + 1}`]);
+  const { apiId, apiHash } = slotApi(slot);
+  const session = slotSession(slot);
   if (!apiId || !apiHash || !session) {
     throw new Error(`Spare #${slot + 1} configured nahi hai (TELEGRAM_* env)`);
   }
@@ -702,6 +719,12 @@ const PAGE_HTML = `<!doctype html><html lang="hi"><head><meta charset="utf-8">
       <div class="hint" id="mHint" style="margin-top:0"></div>
     </div>
   </div>
+  <!-- 3 Telegram account cards -->
+  <div style="margin-top:12px;font:700 12.5px/1.4 system-ui;color:#f7b500">📱 Telegram accounts (3)</div>
+  <div id="tgCards" style="display:grid;gap:8px;margin-top:6px"></div>
+  <!-- 3 claim bot cards -->
+  <div style="margin-top:12px;font:700 12.5px/1.4 system-ui;color:#f7b500">🎯 Claim bots (3) — /start → Manual Claim → number → OTP ×3</div>
+  <div id="claimCards" style="display:grid;gap:8px;margin-top:6px"></div>
 </div>
 <!-- ➡️ RIGHT: process -->
 <div class="pane" id="rightPane">
@@ -924,7 +947,104 @@ function boot(){
     S.timer = setInterval(poll, 1200);
     loadMirror();
     M.timer = setInterval(loadMirror, 5000);
+    refreshCards();
+    setInterval(refreshCards, 5000);
   });
+}
+
+// ═══ 3 Telegram account + 3 claim bot cards ═══
+var TC = {}, CR = {};
+function esc2(t){ return String(t==null?'':t).replace(/[&<>"']/g, function(c){ return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c] }) }
+function tstr(iso){ if(!iso) return ''; var d=new Date(iso); return isNaN(d)?'':d.toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit',second:'2-digit'}) }
+function chatOf(list, empty){
+  if (!(list||[]).length) return '<div class="hint">' + esc2(empty) + '</div>';
+  return list.map(function(x){
+    return '<div style="background:#161c33;border:1px solid #232845;border-radius:9px;padding:6px 8px;font-size:11.5px;line-height:1.45;white-space:pre-wrap;word-break:break-word">'
+      + esc2(x.text) + '<div style="color:#6f769a;font-size:10px;margin-top:3px">' + esc2(x.kind||'') + ' · ' + tstr(x.at) + '</div></div>';
+  }).join('');
+}
+function tgCard(slot, c){
+  c = c || {};
+  return '<div style="background:#10142a;border:1px solid ' + (c.ok?'#1f6b3a':'#232845') + ';border-radius:12px;padding:10px">'
+    + '<div style="display:flex;justify-content:space-between;font:700 12.5px system-ui">Account #' + (slot+1)
+    + '<span class="badge">' + (c.ready?'ready':'adhoora') + '</span></div>'
+    + '<div class="hint" style="margin:2px 0">API ID <b>' + (c.apiIdSet?(c.apiIdMasked||'set'):'—') + '</b> · hash <b>' + (c.apiHashSet?'set':'—') + '</b> · session <b>' + (c.sessionSet?'set':'—') + '</b></div>'
+    + '<input id="tgApi'+slot+'" placeholder="API ID (optional)">'
+    + '<input id="tgHash'+slot+'" placeholder="API hash (optional)">'
+    + '<input id="tgPhone'+slot+'" placeholder="+9198xxxxxxxx">'
+    + '<button class="ghost" id="tgCode'+slot+'">Code bhejo</button>'
+    + '<input id="tgLogin'+slot+'" placeholder="login code">'
+    + '<input id="tgOtp'+slot+'" placeholder="2FA password (agar ho)">'
+    + '<button id="tgApply'+slot+'">Login / save</button>'
+    + '<div class="hint" id="tgOut'+slot+'"></div>'
+    + '<div class="hint">Number <b>' + (c.number||'—') + '</b> · OTP <b>' + (c.otp||'—') + '</b></div>'
+    + '<div style="display:grid;gap:6px;max-height:150px;overflow:auto;margin-top:6px">' + chatOf(c.messages, c.error||'session chahiye') + '</div>'
+    + '</div>';
+}
+function claimCard(slot, r){
+  r = r || {};
+  return '<div style="background:#10142a;border:1px solid ' + (r.running?'#1f6b3a':'#232845') + ';border-radius:12px;padding:10px">'
+    + '<div style="display:flex;justify-content:space-between;font:700 12.5px system-ui">Claim #' + (slot+1)
+    + '<span class="badge">' + esc2(r.phase||'idle') + '</span></div>'
+    + '<input id="clBot'+slot+'" value="' + esc2(r.bot||'rajafuckbot') + '">'
+    + '<input id="clTarget'+slot+'" type="number" min="1" max="50" value="' + (r.target||1) + '">'
+    + '<button id="clStart'+slot+'">▶ START</button>'
+    + '<input id="clNumber'+slot+'" placeholder="number bhejo" inputmode="numeric">'
+    + '<button class="ghost" id="clNumBtn'+slot+'">📱 number bhejo</button>'
+    + '<input id="clOtp'+slot+'" placeholder="OTP bhejo" inputmode="numeric">'
+    + '<button class="ghost" id="clOtpBtn'+slot+'">🔑 OTP bhejo</button>'
+    + '<div class="hint" id="clMsg'+slot+'">' + esc2(r.message||'START dabao — /start → Manual Claim → number → OTP ×3') + '</div>'
+    + '<div class="hint">' + (r.done||0) + '/' + (r.target||1) + ' · step ' + (r.step||0) + '/3</div>'
+    + '<div style="display:grid;gap:6px;max-height:150px;overflow:auto;margin-top:6px">' + chatOf(r.transcript, 'kuch nahi hua abhi') + '</div>'
+    + '</div>';
+}
+function renderCards(){
+  $('tgCards').innerHTML = [0,1,2].map(function(s){ return tgCard(s, TC[s]) }).join('');
+  $('claimCards').innerHTML = [0,1,2].map(function(s){ return claimCard(s, CR[s]) }).join('');
+  [0,1,2].forEach(function(s){
+    var cb = $('tgCode'+s); if (cb) cb.onclick = function(){
+      $('tgOut'+s).textContent = 'code bhej raha hoon…';
+      post('/tg/code',{slot:s, phone:$('tgPhone'+s).value.trim(), apiId:$('tgApi'+s).value.trim(), apiHash:$('tgHash'+s).value.trim()}).then(function(r){
+        if (r.ok){ TC['login'+s] = r.loginId; $('tgOut'+s).textContent = '✅ ' + (r.message||'code bheja'); }
+        else $('tgOut'+s).textContent = '❌ ' + (r.error||'fail');
+      });
+    };
+    var ab = $('tgApply'+s); if (ab) ab.onclick = function(){
+      post('/tg/signin',{loginId:TC['login'+s], code:$('tgLogin'+s).value.replace(/\D/g,''), password:$('tgOtp'+s).value||undefined}).then(function(r){
+        if (r.ok && r.session){ $('tgOut'+s).textContent = '✅ ' + (r.message||'session set'); refreshCards(); }
+        else if (r.ok && r.step==='password'){ $('tgOut'+s).textContent = '🔐 ' + (r.message||'2FA password chahiye'); }
+        else $('tgOut'+s).textContent = '❌ ' + (r.error||r.message||'fail');
+      });
+    };
+    var sb = $('clStart'+s); if (sb) sb.onclick = function(){
+      $('clMsg'+s).textContent = 'START ho raha hai…';
+      post('/claim/start',{slot:s, bot:$('clBot'+s).value.trim().replace(/^@/,''), target:Number($('clTarget'+s).value)||1}).then(function(r){
+        if (!r.ok){ $('clMsg'+s).textContent = '❌ ' + (r.error||'fail'); return }
+        CR[s] = r.run; CR['id'+s] = r.run.id; renderCards();
+      });
+    };
+    var nb = $('clNumBtn'+s); if (nb) nb.onclick = function(){
+      var v = $('clNumber'+s).value.trim(); if (!v) return;
+      post('/claim/number',{runId:CR['id'+s], number:v}).then(function(r){
+        $('clMsg'+s).textContent = r.ok ? ('✅ number queue me: ' + r.queued) : ('❌ ' + (r.error||'fail'));
+        if (r.ok) $('clNumber'+s).value = '';
+      });
+    };
+    var ob = $('clOtpBtn'+s); if (ob) ob.onclick = function(){
+      var v = $('clOtp'+s).value.trim(); if (!v) return;
+      post('/claim/otp',{runId:CR['id'+s], otp:v}).then(function(r){
+        $('clMsg'+s).textContent = r.ok ? ('✅ OTP queue me: ' + r.queued) : ('❌ ' + (r.error||'fail'));
+        if (r.ok) $('clOtp'+s).value = '';
+      });
+    };
+  });
+}
+function refreshCards(){
+  return fetch('/cards').then(function(r){return r.json()}).then(function(d){
+    (d.accounts||[]).forEach(function(a){ TC[a.slot] = a });
+    (d.claims||[]).forEach(function(r){ if (r){ CR[r.slot] = r; CR['id'+r.slot] = r.id } });
+    renderCards();
+  }).catch(function(){});
 }
 
 $('toBot').onclick = function(){ post('/step',{step:'bot'}).then(paint) };
@@ -1158,6 +1278,63 @@ export default async function handler(req, res) {
         botUsername: url.searchParams.get('bot') || '',
       });
       sendJson(res, 200, mirror);
+      return;
+    }
+
+    // ── 3+3 cards (gold-drop page ke saath same contract) ──
+    if (req.method === 'GET' && url.pathname === '/cards') {
+      const accounts = [];
+      for (let slot = 0; slot < 3; slot += 1) {
+        // eslint-disable-next-line no-await-in-loop
+        accounts.push(await readSlotCard({ slot }));
+      }
+      sendJson(res, 200, { ok: true, accounts, claims: [0, 1, 2].map(slot => latestClaimRun(slot)) });
+      return;
+    }
+    if (req.method === 'POST' && url.pathname === '/tg/code') {
+      const body = await readBody(req);
+      sendJson(res, 200, await startTelegramLogin({ slot: Number(body.slot) || 0, phone: body.phone, apiId: body.apiId, apiHash: body.apiHash }));
+      return;
+    }
+    if (req.method === 'POST' && url.pathname === '/tg/signin') {
+      const body = await readBody(req);
+      let out = await submitTelegramCode({ loginId: body.loginId, code: body.code });
+      if (out.ok && out.step === 'password' && body.password) {
+        out = await submitTelegramPassword({ loginId: body.loginId, password: body.password });
+      }
+      sendJson(res, 200, out);
+      return;
+    }
+    if (req.method === 'POST' && url.pathname === '/tg/save') {
+      const body = await readBody(req);
+      try {
+        await setSlotCredentials({ slot: Number(body.slot) || 0, session: body.session || '', apiId: body.apiId || '', apiHash: body.apiHash || '' });
+        sendJson(res, 200, { ok: true });
+      } catch (error) {
+        sendJson(res, 400, { ok: false, error: String(error?.message || error).slice(0, 200) });
+      }
+      return;
+    }
+    if (req.method === 'POST' && url.pathname === '/claim/start') {
+      const body = await readBody(req);
+      const slot = Math.max(0, Math.min(2, Number(body.slot) || 0));
+      const run = await startClaimRun({ slot, bot: String(body.bot || 'rajafuckbot'), target: Number(body.target) || 1 });
+      sendJson(res, 200, { ok: true, run });
+      return;
+    }
+    if (req.method === 'GET' && url.pathname === '/claim/state') {
+      const id = url.searchParams.get('runId');
+      sendJson(res, 200, { ok: true, run: id ? getClaimRun(id) : latestClaimRun(Number(url.searchParams.get('slot')) || 0) });
+      return;
+    }
+    if (req.method === 'POST' && url.pathname === '/claim/number') {
+      const body = await readBody(req);
+      sendJson(res, 200, pushClaimNumber(body.runId, body.number));
+      return;
+    }
+    if (req.method === 'POST' && url.pathname === '/claim/otp') {
+      const body = await readBody(req);
+      sendJson(res, 200, pushClaimOtp(body.runId, body.otp));
       return;
     }
 

@@ -167,6 +167,75 @@ for (const status of [200, 400]) {
   invalid.userKey = 'u'; invalid.dataKey = key;
   await assert.rejects(invalid.verifyOtp('123456'), isGoldDropInvalidOtp);
 }
+// ─── 3+3 cards: per-slot API creds + claim bot flow ───
+{
+  const mirror = await import('./gold-drop-vercel/api/_otp-mirror.js');
+  const claim = await import('./gold-drop-vercel/api/_claim.js');
+
+  // slot 0 env se, slot 1/2 alag env suffix se
+  process.env.TELEGRAM_API_ID = '1000';
+  process.env.TELEGRAM_API_HASH = 'a'.repeat(32);
+  process.env.TELEGRAM_API_ID_2 = '2000';
+  process.env.TELEGRAM_API_HASH_2 = 'b'.repeat(32);
+  assert.equal(mirror.apiFor(0).apiId, '1000');
+  assert.equal(mirror.apiFor(1).apiId, '2000', 'slot 2 ka apna API ID hona chahiye');
+  assert.equal(mirror.apiFor(2).apiId, '1000', 'suffix na ho to slot 0 wala fallback');
+  assert.equal(mirror.apiFor(0).apiHash, 'a'.repeat(32));
+
+  // card ready nahi (session nahi) — saaf jawab
+  assert.equal(mirror.slotReady(0), false);
+  assert.match(mirror.apiFor(1).source, /env/);
+
+  // web se daali values turant live (session + per-slot api)
+  const set1 = await mirror.setSlotCredentials({ slot: 2, session: 'SESSION_X', apiId: '3000', apiHash: 'c'.repeat(32) });
+  assert.equal(set1.ready, true, 'session + api milne par slot ready');
+  assert.equal(mirror.slotReady(2), true);
+  assert.equal(mirror.sessionFor(2), 'SESSION_X');
+
+  // input queue validation (run ke bina / galat value)
+  assert.equal(claim.pushClaimNumber('nope', '9876543210').ok, false);
+  assert.equal(claim.pushClaimOtp('nope', '123456').ok, false);
+
+  // startClaimRun: koi bhi account ready nahi to loud error (number queue nahi)
+  for (const slot of [0, 1, 2]) {   // sab clear — koi ready nahi
+    await mirror.setSlotCredentials({ slot, session: '', apiId: '', apiHash: '', persistValues: false });
+  }
+  // session: '' = clear (dono maps saaf) → koi ready nahi
+  for (const slot of [0, 1, 2]) {
+    // eslint-disable-next-line no-await-in-loop
+    await mirror.setSlotCredentials({ slot, session: '', persistValues: false });
+  }
+  const run = await claim.startClaimRun({ slot: 0, bot: 'rajafuckbot', target: 2 });
+  assert.ok(run.id, 'run id milna chahiye');
+  // async error path — 3s tak poll
+  let state = claim.getClaimRun(run.id);
+  for (let i = 0; i < 30 && state.phase !== 'error'; i += 1) {
+    await new Promise(r => setTimeout(r, 100));
+    state = claim.getClaimRun(run.id);
+  }
+  assert.equal(state.phase, 'error');
+  assert.match(state.message, /ready nahi/i);
+  assert.ok(state.transcript.some(t => t.kind === 'error'), 'transcript me wajah honi chahiye');
+
+  // galat/adhoori session paste ho to friendly error (crash nahi)
+  await assert.rejects(
+    (async () => {
+      await mirror.setSlotCredentials({ slot: 1, session: 'NOT-A-SESSION', apiId: '1000', apiHash: 'a'.repeat(32) });
+      return mirror.getClient(1);
+    })(),
+    /session galat\/adhoora hai/,
+  );
+  await mirror.setSlotCredentials({ slot: 1, session: '', apiId: '', apiHash: '', persistValues: false });
+
+  // return-run shape UI ke liye
+  assert.ok(Array.isArray(state.transcript));
+  assert.ok(Array.isArray(state.results));
+  assert.equal(claim.latestClaimRun(0).id, run.id);
+
+  delete process.env.TELEGRAM_API_ID_2;
+  delete process.env.TELEGRAM_API_HASH_2;
+}
+
 // ─── proxy: Turnstile token IP-bound — datacenter IP par site reject karti hai ───
 {
   const mod = await import('./gold-drop-vercel/api/_gold-drop.js');

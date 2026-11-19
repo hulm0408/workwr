@@ -8,8 +8,10 @@ import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { registerGoldDrop, verifyGoldDropOtp, goldDropCaptchaDiagnose, goldDropDeadEnd, resetGoldDropDeadEnd, goldDropProxyCheck, proxyInfo } from './_gold-drop.js';
 import { goldDropBrowserAvailable, findStealthWorker } from './_gold-drop-browser.js';
-import { readOtpBotMirror, telegramConfigured, setMirrorSession } from './_otp-mirror.js';
+import { readOtpBotMirror, telegramConfigured, setMirrorSession, readSlotCard, slotReady, apiFor } from './_otp-mirror.js';
 import { startTelegramLogin, submitTelegramCode, submitTelegramPassword, loginConfigured } from './_telegram-login.js';
+import { startClaimRun, getClaimRun, latestClaimRun, pushClaimNumber, pushClaimOtp } from './_claim.js';
+import { storeConfigured, storeMasked } from './_kv.js';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const NOCAP_API = 'https://api.nocaptchaai.com';
@@ -143,7 +145,7 @@ const PAGE_HTML = `<!doctype html>
 <title>Gold Drop</title>
 <style>
 body{background:#0f1220;color:#e8eaf2;font-family:system-ui,Segoe UI,Roboto,sans-serif;margin:0;padding:24px}
-.card{max-width:560px;margin:0 auto;background:#181c2e;border:1px solid #2a3050;border-radius:14px;padding:20px}
+.card{max-width:1080px;margin:0 auto;background:#181c2e;border:1px solid #2a3050;border-radius:14px;padding:20px}
 h1{font-size:20px;margin:0 0 4px} .sub{color:#8a90ad;font-size:13px;margin-bottom:16px}
 label{display:block;font-size:12px;color:#9aa1bd;margin:10px 0 4px}
 input,button{width:100%;box-sizing:border-box;padding:10px 12px;border-radius:9px;border:1px solid #2a3050;background:#0f1220;color:#e8eaf2;font-size:15px}
@@ -153,7 +155,7 @@ button.secondary{background:#232845;color:#e8eaf2}
 .log{background:#0a0c18;border-radius:10px;padding:10px;font:12px/1.5 monospace;color:#7d84a8;max-height:220px;overflow:auto;margin-top:12px;white-space:pre-wrap}
 .row{display:flex;gap:10px}.row>div{flex:1}
 .badge{display:inline-block;padding:2px 10px;border-radius:99px;background:#232845;font-size:12px}
-.split{display:grid;grid-template-columns:minmax(270px,1fr) minmax(320px,1.1fr);gap:14px;align-items:start}
+.split{display:grid;grid-template-columns:minmax(300px,1fr) minmax(320px,1fr);gap:14px;align-items:start}
 @media(max-width:880px){.split{grid-template-columns:1fr}}
 .mirror{background:#0b0e18;border:1px solid #2a3050;border-radius:14px;overflow:hidden}
 .mirror .head{display:flex;align-items:center;justify-content:space-between;padding:10px 12px;background:#12162a;border-bottom:1px solid #2a3050;font-size:13px;font-weight:700}
@@ -167,55 +169,43 @@ button.secondary{background:#232845;color:#e8eaf2}
 .mirror .foot{padding:10px 12px;border-top:1px solid #2a3050}
 .mirror .kv{display:flex;justify-content:space-between;font-size:12px;color:#8a90ad;margin-bottom:4px}
 .mirror .kv b{color:#e8eaf2;font:600 12.5px ui-monospace,monospace}
+
+/* ─── 3+3 cards ─── */
+.cards{display:grid;gap:10px}
+.cardbox{background:#10142a;border:1px solid #232845;border-radius:12px;padding:10px}
+.cardbox.live{border-color:#1f6b3a}
+.cardbox .top{display:flex;align-items:center;justify-content:space-between;font-size:12.5px;font-weight:700;margin-bottom:6px}
+.cardbox .mini{font-size:11.5px;color:#8a90ad;margin:2px 0}
+.cardbox input{padding:7px 9px;font-size:13px;border-radius:7px;margin:3px 0}
+.cardbox button{padding:7px 10px;font-size:12.5px;margin-top:6px;border-radius:8px}
+.two{display:grid;grid-template-columns:1fr 1fr;gap:6px}
+.chat{max-height:190px;overflow:auto;display:flex;flex-direction:column;gap:6px;margin-top:8px}
+.chat .b{background:#161c33;border:1px solid #232845;border-radius:9px 9px 9px 3px;padding:6px 8px;font-size:11.5px;line-height:1.45;white-space:pre-wrap;word-break:break-word}
+.chat .b.me{background:#1d2a1f;border-color:#2c5236;border-radius:9px 9px 3px 9px}
+.chat .b small{display:block;color:#6f769a;font-size:10px;margin-top:3px}
+.chat .empty{color:#6f769a;font-size:11.5px;text-align:center;padding:10px}
+.pill{padding:1px 8px;border-radius:99px;background:#232845;font-size:10.5px;font-weight:600;color:#9aa1bd}
+.pill.ok{background:#0d3b22;color:#7ee2a8}
+.pill.bad{background:#3b1414;color:#ff9c9c}
+.sec h2{font-size:13px;margin:0 0 8px;color:#f7b500;letter-spacing:.3px}
 </style></head><body><div class="card">
-<h1>🟡 Gold Drop</h1>
-<div class="sub">Direct API method — koi browser nahi, sab cloud par chalta hai. Number apne OTP bot se laao. <a href="/logout" style="color:#f7b500">Logout</a></div>
+<h1>🟡 Gold Drop + Claim</h1>
+<div class="sub">3 Telegram account · 3 claim bot — sab ka mirror ek hi page par. <a href="/logout" style="color:#f7b500">Logout</a></div>
 <div class="sub" id="browsermode" style="border:1px solid #2a3050;border-radius:9px;padding:10px;background:#10142a">Browser mode check ho raha hai…</div>
 <div class="split">
-<div><!-- OTP bot mirror -->
-  <div class="mirror">
-    <div class="head"><span><span class="dot" id="mDot"></span>OTP bot mirror</span><span class="badge" id="mBot">—</span></div>
-    <div class="chat" id="mChat"><div class="empty">Mirror load ho raha hai…</div></div>
-    <div class="foot">
-      <div class="kv"><span>Number</span><b id="mNumber">—</b></div>
-      <div class="kv"><span>OTP</span><b id="mOtp">—</b></div>
-      <button class="secondary" id="mRefresh" style="margin-top:8px">🔄 Refresh mirror</button>
-      <button class="secondary" id="mNext" style="margin-top:6px">📱 Naya number lo</button>
-      <div class="sub" id="mHint" style="margin:6px 0 0"></div>
-      <!-- Spare account login (sirf tab dikhta hai jab session nahi hai) -->
-      <div id="tgLogin" style="display:none;margin-top:12px;border-top:1px solid #2a3050;padding-top:10px">
-        <div style="font-size:12.5px;font-weight:700;margin-bottom:6px">🔐 Spare account (ek baar OTP se login)</div>
-        <div class="sub" style="margin:0 0 6px">Number + Telegram code daalo — session khud lag jayega, mirror turant chalu.</div>
-        <div class="sub" id="tgNote" style="margin:0 0 6px"></div>
-        <div id="tgPhoneRow">
-          <input id="tgPhone" placeholder="+9198xxxxxxxx" inputmode="tel">
-          <button class="secondary" id="tgSendCode" style="margin-top:6px">Code bhejo</button>
-        </div>
-        <div id="tgCodeRow" style="display:none">
-          <input id="tgCode" placeholder="Telegram login code" inputmode="numeric">
-          <button class="secondary" id="tgSignIn" style="margin-top:6px">Sign in</button>
-          <button class="secondary" id="tgResend" style="margin-top:6px">Code dobara bhejo</button>
-        </div>
-        <div id="tgPassRow" style="display:none">
-          <input id="tgPass" type="password" placeholder="2FA password">
-          <button class="secondary" id="tgPassOk" style="margin-top:6px">Unlock</button>
-        </div>
-        <div id="tgApplyRow" style="display:none">
-          <div class="sub" style="margin:0 0 4px">Session mil gaya. Ise <b>Vercel → Settings → Environment Variables → TELEGRAM_SESSION</b> me daalo, phir <b>Redeploy</b> — tab har naye instance par bhi mirror chalega. (Neeche wala button sirf isi instance par chalta hai.)</div>
-          <textarea id="tgSession" rows="3" readonly style="width:100%;font:11px ui-monospace,monospace;background:#0b0e18;color:#7ee2a8;border:1px solid #2a3050;border-radius:8px;padding:8px"></textarea>
-          <button class="secondary" id="tgCopy" style="margin-top:6px">📋 Session copy karo</button>
-          <button class="secondary" id="tgApply" style="margin-top:6px">✅ Isi instance par abhi chalao</button>
-        </div>
-        <div class="sub" id="tgOut" style="margin:6px 0 0"></div>
-      </div>
-    </div>
-  </div>
+<div class="sec">
+  <h2>📱 Telegram accounts (session + bot mirror)</h2>
+  <div class="cards" id="tgCards"></div>
 </div>
-<div><!-- process -->
+<div class="sec">
+  <h2>🎯 Claim bots — /start → Manual Claim → number → OTP ×3</h2>
+  <div class="cards" id="claimCards"></div>
+</div>
+</div>
+<div id="gdBox" style="display:none"></div>
 <div id="setup">
-  <div id="summary" style="font-size:12.5px;color:#8a90ad;line-height:1.6;margin-bottom:10px">
-    <b style="color:#e8eaf2">Sab kuch pehle se set hai</b> — naam, email, PIN, batch code,
-    key aur photo auto-selected. Bas ▶ START dabao (aur number OTP bot mirror se aayega).
+  <div id="summary" style="font-size:12.5px;color:#8a90ad;line-height:1.6;margin:14px 0 10px">
+    <b style="color:#e8eaf2">Gold Drop (alag flow)</b> — naam/email/PIN/batch/key sab pehle se set hain; bas ▶ START.
   </div>
   <button id="start">▶ START</button>
   <button class="secondary" id="advToggle" style="margin-top:8px">⚙️ Details badalni hain (optional)</button>
@@ -234,22 +224,23 @@ button.secondary{background:#232845;color:#e8eaf2}
 </div>
 <div id="run" style="display:none">
 <div class="status"><span class="badge" id="st">…</span> <b id="prog"></b><div id="msg" style="margin-top:6px"></div></div>
-<div id="askNumber" style="display:none"><label>Mobile number (apne OTP bot se naya number lo aur yahan daalo)</label>
+<div id="askNumber" style="display:none"><label>Mobile number</label>
 <input id="mobile" inputmode="numeric" maxlength="10" placeholder="9876543210"><button id="sendNumber">Number bhejo → Register karo</button></div>
-<div id="askOtp" style="display:none"><label>OTP (jo OTP bot me aaya)</label>
+<div id="askOtp" style="display:none"><label>OTP</label>
 <input id="otp" inputmode="numeric" maxlength="6" placeholder="123456"><button id="sendOtp">OTP verify karo</button></div>
 <button class="secondary" id="reset" style="margin-top:18px">■ Stop / Reset</button>
 <div class="log" id="log"></div>
 </div>
 <div id="results" class="log" style="display:none"></div>
-</div><!-- /process -->
-</div><!-- /split -->
 </div>
 <script>
 var pollTimer = null;
 function $(id){return document.getElementById(id)}
+function esc(t){ return String(t==null?'':t).replace(/[&<>"']/g, function(c){ return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c] }) }
 function post(url, body){return fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})}).then(function(r){return r.json()})}
-function show(id,on){$(id).style.display=on?'block':'none'}
+function get(url){return fetch(url).then(function(r){return r.json()})}
+function show(id,on){var e=$(id); if(e) e.style.display=on?'block':'none'}
+function fmtTime(iso){ if(!iso) return ''; var d=new Date(iso); if(isNaN(d)) return ''; return d.toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit',second:'2-digit'}) }
 function paint(s){
   $('st').textContent = s.status;
   $('prog').textContent = s.count + ' / ' + s.target + ' done';
@@ -261,7 +252,167 @@ function paint(s){
   var r = $('results');
   if (s.results.length){ r.style.display='block'; r.textContent = s.results.map(function(x){return (x.ok?'✅':'❌')+' '+x.mobile+' — '+x.message}).join('\\n'); }
 }
-function poll(){ fetch('/state').then(function(r){return r.json()}).then(paint).catch(function(){}) }
+function poll(){ get('/state').then(paint).catch(function(){}) }
+
+// ═══ 3+3 cards ═══
+var TC = {};   // slot → card state
+var CR = {};   // slot → claim run state
+
+function chatHtml(messages, me){
+  if (!(messages||[]).length) return '<div class="empty">' + esc(me || 'abhi koi message nahi') + '</div>';
+  return messages.map(function(x){
+    var cls = 'b' + (x.kind === 'me' || x.kind === 'click' ? ' me' : '');
+    return '<div class="' + cls + '">' + esc(x.text) + '<small>' + esc(x.kind || '') + ' · ' + fmtTime(x.at) + '</small></div>';
+  }).join('');
+}
+
+function tgCardHtml(slot, c){
+  c = c || {};
+  var ready = !!c.ready, live = !!c.ok;
+  var num = c.number || '', otp = c.otp || '';
+  return '<div class="cardbox' + (live ? ' live' : '') + '" id="tgc' + slot + '">'
+    + '<div class="top"><span><span class="dot' + (live ? ' live' : '') + '" style="display:inline-block;width:8px;height:8px;border-radius:99px;background:' + (live ? '#28c76f' : '#4a5070') + ';margin-right:6px"></span>Account #' + (slot+1) + '</span>'
+    + '<span class="pill ' + (ready ? 'ok' : 'bad') + '">' + (ready ? 'ready' : 'adhoora') + '</span></div>'
+    + '<div class="mini">API ID: <b>' + (c.apiIdSet ? (c.apiIdMasked || 'set') : '—') + '</b> · hash: <b>' + (c.apiHashSet ? 'set' : '—') + '</b> · session: <b>' + (c.sessionSet ? 'set' : '—') + '</b></div>'
+    + '<div class="mini">Bot: <b>@' + esc(c.bot || 'Hathi_otp_bot') + '</b></div>'
+    + '<div class="two"><input id="tgApi' + slot + '" placeholder="API ID (optional)" value="">'
+    + '<input id="tgHash' + slot + '" placeholder="API hash (optional)"></div>'
+    + '<input id="tgPhone' + slot + '" placeholder="+9198xxxxxxxx (spare account)">'
+    + '<div class="two"><button class="secondary" id="tgCode' + slot + '">Code bhejo</button>'
+    + '<button class="secondary" id="tgApply' + slot + '">Save session</button></div>'
+    + '<input id="tgLogin' + slot + '" placeholder="Telegram login code">'
+    + '<input id="tgOtp' + slot + '" placeholder="2FA password (agar ho)">'
+    + '<div class="mini" id="tgOut' + slot + '"></div>'
+    + '<div class="mini" id="tgNum' + slot + '">Number: <b>' + (num || '—') + '</b> · OTP: <b>' + (otp || '—') + '</b></div>'
+    + '<div class="chat" id="tgChat' + slot + '">' + (live ? messagesHtml(c.messages) : '<div class="empty">' + esc(c.error || 'session chahiye — code bhejo') + '</div>') + '</div>'
+    + '</div>';
+}
+function messagesHtml(msgs){
+  if (!(msgs||[]).length) return '<div class="empty">bot me koi message nahi — NEW NUMBER dabao</div>';
+  return msgs.map(function(x,i){
+    var code = (String(x.text).match(/(?:^|\D)(\d{6})(?:\D|$)/)||[])[1];
+    var body = esc(x.text);
+    if (code) body = body.replace(code, '<span class="code" style="background:#0d3b22;color:#7ee2a8;border:1px solid #1f6b3a;border-radius:5px;padding:0 4px">'+code+'</span>');
+    return '<div class="b">' + body + '<small>#' + (x.id||'') + ' · ' + fmtTime(x.at) + (i===0?' · latest':'') + '</small></div>';
+  }).join('');
+}
+
+function claimCardHtml(slot, r){
+  r = r || {};
+  var running = !!r.running;
+  return '<div class="cardbox' + (running ? ' live' : '') + '" id="clc' + slot + '">'
+    + '<div class="top"><span>Claim bot #' + (slot+1) + '</span><span class="pill ' + (running ? 'ok' : '') + '">' + (r.phase || 'idle') + '</span></div>'
+    + '<input id="clBot' + slot + '" placeholder="@rajafuckbot" value="' + esc(r.bot || 'rajafuckbot') + '">'
+    + '<div class="two"><input id="clTarget' + slot + '" type="number" min="1" max="50" value="' + (r.target || 1) + '" placeholder="kitne claims">'
+    + '<input id="clNumber' + slot + '" placeholder="number bhejo" inputmode="numeric"></div>'
+    + '<div class="two"><input id="clOtp' + slot + '" placeholder="OTP bhejo" inputmode="numeric">'
+    + '<button class="secondary" id="clStart' + slot + '">▶ START</button></div>'
+    + '<div class="mini" id="clMsg' + slot + '">' + esc(r.message || 'START dabao — bot ko /start jayega, phir Manual Claim') + '</div>'
+    + '<div class="mini" id="clCount' + slot + '">' + (r.done || 0) + '/' + (r.target || 1) + ' · step ' + (r.step || 0) + '/3</div>'
+    + '<div class="chat" id="clChat' + slot + '">' + chatHtml(r.transcript, 'kuch nahi hua abhi') + '</div>'
+    + '</div>';
+}
+
+function renderTg(){
+  $('tgCards').innerHTML = [0,1,2].map(function(slot){ return tgCardHtml(slot, TC[slot]) }).join('');
+  [0,1,2].forEach(bindTg);
+}
+function renderClaim(){
+  $('claimCards').innerHTML = [0,1,2].map(function(slot){ return claimCardHtml(slot, CR[slot]) }).join('');
+  [0,1,2].forEach(bindClaim);
+}
+
+function bindTg(slot){
+  var codeBtn = $('tgCode' + slot);
+  if (codeBtn) codeBtn.onclick = function(){
+    $('tgOut' + slot).textContent = 'code bhej raha hoon…';
+    post('/tg/code', { slot: slot, phone: $('tgPhone'+slot).value.trim(), apiId: $('tgApi'+slot).value.trim(), apiHash: $('tgHash'+slot).value.trim() })
+      .then(function(r){
+        if (r.ok) { $('tgOut'+slot).textContent = '✅ ' + (r.message||'code bhej diya') + (r.loginId ? ' (loginId ' + r.loginId.slice(0,6) + '…)' : ''); TC['login'+slot] = r.loginId; }
+        else $('tgOut'+slot).textContent = '❌ ' + (r.error || 'fail');
+      });
+  };
+  var applyBtn = $('tgApply' + slot);
+  if (applyBtn) applyBtn.onclick = function(){
+    var loginId = TC['login'+slot];
+    var code = $('tgLogin'+slot).value.replace(/\D/g,'');
+    var pass = $('tgOtp'+slot).value;
+    var flow = code
+      ? post('/tg/signin', { loginId: loginId, code: code, password: pass || undefined })
+      : Promise.resolve({ ok: false, error: 'Login code daalo' });
+    flow.then(function(r){
+      if (r.ok && r.session) { $('tgOut'+slot).textContent = '✅ ' + (r.message || 'session set'); refreshCards(); }
+      else if (r.ok && r.step === 'password') { $('tgOut'+slot).textContent = '🔐 ' + (r.message || '2FA password chahiye'); }
+      else $('tgOut'+slot).textContent = '❌ ' + (r.error || r.message || 'fail');
+    });
+  };
+}
+
+function bindClaim(slot){
+  var btn = $('clStart' + slot);
+  if (!btn) return;
+  btn.onclick = function(){
+    var bot = $('clBot'+slot).value.trim().replace(/^@/,'');
+    var target = Number($('clTarget'+slot).value) || 1;
+    $('clMsg'+slot).textContent = 'START ho raha hai…';
+    post('/claim/start', { slot: slot, bot: bot, target: target, useAccount: slot }).then(function(r){
+      if (!r.ok) { $('clMsg'+slot).textContent = '❌ ' + (r.error || 'start fail'); return }
+      CR[slot] = r.run; CR['id'+slot] = r.run.id; renderClaim();
+    });
+  };
+  var numIn = $('clNumber' + slot);
+  if (numIn) numIn.onkeydown = function(ev){ if (ev.key === 'Enter') sendNum(slot) };
+  var numBtn = $('clNumber' + slot + 'Btn');
+  var otpIn = $('clOtp' + slot);
+  if (otpIn) otpIn.onkeydown = function(ev){ if (ev.key === 'Enter') sendOtp(slot) };
+  function sendNum(s){
+    var v = $('clNumber'+s).value.trim(); if (!v) return;
+    post('/claim/number', { runId: CR['id'+s], number: v }).then(function(r){
+      if (r.ok) { $('clNumber'+s).value = ''; $('clMsg'+s).textContent = '✅ number queue me: ' + r.queued }
+      else $('clMsg'+s).textContent = '❌ ' + (r.error||'fail');
+    });
+  }
+  function sendOtp(s){
+    var v = $('clOtp'+s).value.trim(); if (!v) return;
+    post('/claim/otp', { runId: CR['id'+s], otp: v }).then(function(r){
+      if (r.ok) { $('clOtp'+s).value = ''; $('clMsg'+s).textContent = '✅ OTP queue me: ' + r.queued }
+      else $('clMsg'+s).textContent = '❌ ' + (r.error||'fail');
+    });
+  }
+  // number/otp input ke Enter handlers + chhote "bhejo" buttons
+  var wrap = document.getElementById('clc'+slot);
+  if (wrap && !wrap.dataset.bound){
+    wrap.dataset.bound = '1';
+    wrap.addEventListener('keydown', function(ev){
+      if (ev.key !== 'Enter') return;
+      if (ev.target.id === 'clNumber'+slot) { ev.preventDefault(); sendNum(slot); }
+      if (ev.target.id === 'clOtp'+slot) { ev.preventDefault(); sendOtp(slot); }
+    });
+    var sendN = document.createElement('button');
+    sendN.className = 'secondary'; sendN.textContent = '📱 number bhejo';
+    sendN.onclick = function(){ sendNum(slot) };
+    var sendO = document.createElement('button');
+    sendO.className = 'secondary'; sendO.textContent = '🔑 OTP bhejo';
+    sendO.onclick = function(){ sendOtp(slot) };
+    var chatEl = document.getElementById('clChat'+slot);
+    if (chatEl && chatEl.parentNode){
+      var bar = document.createElement('div');
+      bar.className = 'two'; bar.style.marginTop = '6px';
+      bar.appendChild(sendN); bar.appendChild(sendO);
+      chatEl.parentNode.insertBefore(bar, chatEl);
+    }
+  }
+}
+
+function refreshCards(){
+  return get('/cards').then(function(d){
+    (d.accounts||[]).forEach(function(a){ TC[a.slot] = a });
+    (d.claims||[]).forEach(function(r){ if (r) { CR[r.slot] = r; CR['id'+r.slot] = r.id } });
+    renderTg(); renderClaim();
+  }).catch(function(){});
+}
+
+// Gold Drop START
 $('advToggle').onclick = function(){
   var adv = $('adv');
   var open = adv.style.display !== 'none';
@@ -273,7 +424,7 @@ $('start').onclick = function(){
   var body = { name:$('name').value.trim(), email:$('email').value, pincode:$('pincode').value, code:$('code').value, target:Number($('target').value)||1, nocapKey:$('nocapKey').value.trim() };
   var go = function(){
     post('/start', body).then(function(r){
-      if(!r.ok){ alert(r.message||'Error'); return }
+      if(!r.ok){ alert(r.message||r.error||'Error'); return }
       show('setup',false); show('run',true); poll();
     });
   };
@@ -283,153 +434,41 @@ $('start').onclick = function(){
     rd.readAsDataURL(file);
   } else go();
 };
-$('sendNumber').onclick = function(){ var m=$('mobile').value.replace(/\\D/g,'').slice(-10); if(m.length!==10){alert('10-digit mobile daalo');return} $('mobile').value=''; post('/number',{mobile:m}).then(poll) };
-$('sendOtp').onclick = function(){ var o=$('otp').value.replace(/\\D/g,''); if(o.length!==6){alert('6-digit OTP daalo');return} $('otp').value=''; post('/otp',{otp:o}).then(poll) };
+$('sendNumber').onclick = function(){ var m=$('mobile').value.replace(/\D/g,'').slice(-10); if(m.length!==10){alert('10-digit mobile daalo');return} $('mobile').value=''; post('/number',{mobile:m}).then(poll) };
+$('sendOtp').onclick = function(){ var o=$('otp').value.replace(/\D/g,''); if(o.length!==6){alert('6-digit OTP daalo');return} $('otp').value=''; post('/otp',{otp:o}).then(poll) };
 $('reset').onclick = function(){ post('/reset').then(function(){ location.reload() }) };
-pollTimer = setInterval(poll, 1200); poll();
-// ─── OTP bot mirror (left pane) ───
-var M = { timer: null, last: null, lastOtp: '' };
-function esc(t){ return String(t==null?'':t).replace(/[&<>"']/g, function(c){ return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c] }) }
-function fmtTime(iso){
-  if (!iso) return '';
-  var d = new Date(iso); if (isNaN(d)) return '';
-  return d.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-}
-function paintMirror(m){
-  $('mBot').textContent = m.bot ? ('@' + m.bot) : '—';
-  $('mDot').className = 'dot' + (m.ok ? ' live' : '');
-  var chat = $('mChat');
-  if (!m.ok && !(m.messages||[]).length){
-    // Load error — mirror se link nahi bana. Error ke saath seedha fix batao.
-    chat.innerHTML = '<div class="empty">' + esc(m.error || 'Mirror band hai')
-      + '<br><br>Fix: Vercel → Settings → Environment Variables me TELEGRAM_SESSION daalo'
-      + ' (TELEGRAM_API_ID/HASH pehle se hain), phir Redeploy.</div>';
-  } else if (!(m.messages||[]).length){
-    chat.innerHTML = '<div class="empty">Bot me abhi koi message nahi — NEW NUMBER dabao</div>';
-  } else {
-    chat.innerHTML = (m.messages||[]).map(function(x, i){
-      var code = (String(x.text).match(/(?:^|\D)(\d{6})(?:\D|$)/)||[])[1];
-      var body = esc(x.text);
-      if (code) body = body.replace(code, '<span class="code">'+code+'</span>');
-      return '<div class="bubble">' + body + '<small>#' + (x.id||'') + ' · ' + fmtTime(x.at) + (i===0?' · latest':'') + '</small></div>';
-    }).join('');
-  }
-  $('mNumber').textContent = m.number || '—';
-  $('mOtp').textContent = m.otp || '—';
-  M.last = m;
-  if (m.otp && m.otp !== M.lastOtp){
-    M.lastOtp = m.otp;
-    var f = $('otp');
-    if (f && !f.value){ f.value = m.otp; $('mHint').textContent = 'OTP mirror se bhar diya — verify dabao'; }
-  }
-  $('mHint').textContent = (m.messages||[]).length + ' messages'
-    + (!m.ok ? ' · purana data (' + (m.error || '') + ')' : '');
-}
-var TG = { loginId: '', step: 'phone', session: '' };
-function tgShow(step, out){
-  $('tgPhoneRow').style.display = step === 'phone' ? 'block' : 'none';
-  $('tgCodeRow').style.display = step === 'code' ? 'block' : 'none';
-  $('tgPassRow').style.display = step === 'password' ? 'block' : 'none';
-  $('tgApplyRow').style.display = step === 'done' ? 'block' : 'none';
-  if (out) $('tgOut').textContent = out;
-  TG.step = step;
-}
-function tgPaint(res){
-  if (!res) return;
-  if (res.loginId) TG.loginId = res.loginId;
-  if (res.session) { TG.session = res.session; $('tgSession').value = res.session; }
-  tgShow(res.step || TG.step, (res.ok ? '✅ ' : '❌ ') + (res.message || res.error || ''));
-  if (res.step === 'done') {
-    // Login hote hi session khud lag jaye — koi button dabane ki zaroorat nahi.
-    tgPost('/tg-login/apply', { loginId: TG.loginId, session: TG.session }).then(function(a){
-      if (a && a.ok) { $('tgLogin').style.display = 'none'; loadMirror(); }
-    });
-  }
-}
-function tgPost(url, body){
-  return fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) })
-    .then(function(r){ return r.json() }).then(function(res){ tgPaint(res); return res; })
-    .catch(function(e){ $('tgOut').textContent = '❌ ' + e; });
-}
-$('tgSendCode').onclick = function(){ tgPost('/tg-login/start', { phone: $('tgPhone').value.trim() }); };
-$('tgSignIn').onclick = function(){ tgPost('/tg-login/code', { loginId: TG.loginId, code: $('tgCode').value.trim() }); };
-$('tgResend').onclick = function(){ TG.loginId = ''; tgPost('/tg-login/start', { phone: $('tgPhone').value.trim() }); };
-$('tgPassOk').onclick = function(){ tgPost('/tg-login/password', { loginId: TG.loginId, password: $('tgPass').value }); };
-$('tgCopy').onclick = function(){
-  var t = $('tgSession');
-  if (!t.value) { $('tgOut').textContent = '❌ Session abhi nahi mila'; return; }
-  t.select();
-  try { document.execCommand('copy'); $('tgOut').textContent = '📋 Copy ho gaya — Vercel env me paste karo'; }
-  catch (e) { $('tgOut').textContent = 'Copy nahi hua — text select karke copy karo'; }
-};
-$('tgApply').onclick = function(){
-  tgPost('/tg-login/apply', { loginId: TG.loginId, session: TG.session }).then(function(res){
-    if (res && res.ok){ $('tgLogin').style.display = 'none'; loadMirror(); }
-  });
-};
-function loadMirror(){
-  fetch('/otp-mirror?slot=0').then(function(r){ return r.json() }).then(function(m){
-    paintMirror(m);
-    // Mirror ne session nahi maanga? Login panel dikhao, warna chhupao.
-    var need = !m.ok && /configured nahi|SESSION/i.test(m.error || '');
-    $('tgLogin').style.display = need ? 'block' : 'none';
-  }).catch(function(){});
-}
-fetch('/tg-login/status').then(function(r){ return r.json() }).then(function(st){
-  $('tgNote').textContent = st.configured
-    ? ''
-    : (st.apiReady ? 'API ID/HASH mil gaya — spare account ka number daalo.' : 'TELEGRAM_API_ID/HASH env missing hai — login nahi ho payega.');
+pollTimer = setInterval(poll, 1500);
+poll(); refreshCards(); setInterval(refreshCards, 5000);
+
+fetch('/browser-mode').then(function(r){return r.json()}).then(function(b){
+  var el = $('browsermode');
+  el.innerHTML = (b.available
+    ? '✅ <b>Browser mode ON</b> — Gold Drop ka security check browser khud clear karega.'
+    : '⚠️ <b>Browser mode OFF</b> — ' + esc(b.reason || 'Chrome/Python nahi mila'))
+    + ' <span id="proxyLine"></span>';
 }).catch(function(){});
-$('mRefresh').onclick = loadMirror;
-$('mNext').onclick = function(){
-  loadMirror();
-  setTimeout(function(){
-    var n = (M.last && M.last.number) || '';
-    if (n && /^[6-9]\d{9}$/.test(n)) {
-      var inp = $('mobile');
-      if (inp) { inp.value = n; inp.focus(); }
-      $('mHint').textContent = 'Number mirror se bhar diya — "Number bhejo" dabao';
-    } else {
-      $('mHint').textContent = 'Bot me naya number nahi mila — OTP bot me NEW NUMBER dabao, phir Refresh';
-    }
-  }, 400);
-};
+post('/proxy-status', {}).then(function(p){
+  var el = $('proxyLine'); if (!el || !p) return;
+  el.innerHTML = p.on
+    ? ' · 🌐 Proxy: <b>' + esc(p.ip || p.label || 'on') + '</b>' + (p.ok ? ' ✅' : ' ⚠️ ' + esc(p.message||''))
+    : ' · <span style="color:#ffd479">⚠️ Proxy OFF — Vercel IP par Turnstile token reject hota hai; env GOLD_DROP_PROXY daalo</span>';
+}).catch(function(){});
+
 function captchaTest(){
   var btn = $('captchaTest');
   btn.disabled = true; var old = btn.textContent; btn.textContent = '🛡️ Test chal raha hai…';
   post('/captcha-test',{key:$('nocapKey').value.trim()}).then(function(r){
     btn.disabled = false; btn.textContent = old;
     var out = $('captchaOut');
-    out.innerHTML = (r.ok?'✅ ':'❌ ') + (r.message||'');
+    out.innerHTML = (r.ok?'✅ ':'❌ ') + esc(r.message||'');
+    if (r.proxyMessage) out.innerHTML += '<br>🌐 ' + esc(r.proxyMessage);
     if (r.sitekeys && r.sitekeys.length) out.innerHTML += '<br>sitekeys: <code>' + r.sitekeys.join('</code>, <code>') + '</code>';
     $('nocapbal').textContent = r.keyMasked ? ('key: ' + r.keyMasked) : '';
   }).catch(function(){ btn.disabled = false; btn.textContent = old; });
 }
 $('captchaTest').onclick = captchaTest;
-// Mirror boot — sab function/var define hone ke BAAD hi chalta hai.
-loadMirror(); M.timer = setInterval(loadMirror, 5000);
-fetch('/browser-mode').then(function(r){return r.json()}).then(function(b){
-  var el = $('browsermode');
-  if (b.available) {
-    el.style.borderColor = '#1f6b3a'; el.style.background = '#0f2418'; el.style.color = '#7ee2a8';
-    el.innerHTML = '✅ <b>Asli browser mode ON</b> — Gold Drop ka security check browser khud clear karega (register + OTP dono usi page par).';
-  } else {
-    el.style.borderColor = '#6b4b00'; el.style.background = '#241c00'; el.style.color = '#ffd479';
-    el.innerHTML = '⚠️ <b>Browser mode OFF</b> — ' + (b.reason || 'Chrome/Python nahi mila')
-      + '. Iske bina Gold Drop ka security check clear nahi hoga; phone numbers bachao aur 🛡️ Captcha test chalao.';
-  }
-  // Proxy status bhi wahi banner — captcha ka asli kaaran yahi hota hai.
-  return post('/proxy-status',{}).then(function(p){
-    if (!p) return;
-    var extra = p.on
-      ? '<div style="margin-top:6px">🌐 Proxy: <b>' + (p.ip || p.label || 'on') + '</b>' + (p.ok ? ' ✅' : ' ⚠️ ' + esc(p.message||'')) + '</div>'
-      : '<div style="margin-top:6px;color:#ffd479">⚠️ Proxy OFF — datacenter IP par Turnstile token site reject karti hai. Vercel env <b>GOLD_DROP_PROXY</b> me residential proxy daalo.</div>';
-    el.innerHTML += extra;
-  });
-}).catch(function(){ $('browsermode').style.display='none'; });
 post('/nocap-balance',{key:$('nocapKey').value.trim()}).then(function(r){
   $('nocapbal').textContent = r.message || '';
-  $('captchaOut').textContent = (r.ok?'✅ ':'❌ ') + (r.message||'') + (r.sitekeys&&r.sitekeys.length ? ' · sitekeys: ' + r.sitekeys.join(', ') : '');
 }).catch(function(){ $('nocapbal').textContent=''; });
 </script></body></html>`;
 
@@ -546,6 +585,18 @@ export default async function handler(req, res) {
       sendJson(res, 200, { ok: true });
       return;
     }
+    // ── 3+3 cards: accounts + claim bots ──
+    if (req.method === 'GET' && url.pathname === '/cards') {
+      const accounts = [];
+      for (let slot = 0; slot < 3; slot += 1) {
+        // eslint-disable-next-line no-await-in-loop
+        accounts.push(await readSlotCard({ slot }));
+      }
+      const claims = [0, 1, 2].map(slot => latestClaimRun(slot));
+      sendJson(res, 200, { ok: true, accounts, claims, storeReady: storeConfigured() });
+      return;
+    }
+    // purana endpoint — ab slot support ke saath (compat)
     if (req.method === 'GET' && url.pathname === '/otp-mirror') {
       const slot = Number(url.searchParams.get('slot'));
       const mirror = await readOtpBotMirror({
@@ -555,23 +606,61 @@ export default async function handler(req, res) {
       sendJson(res, 200, mirror);
       return;
     }
-    // ── Spare Telegram account login (mirror ke liye session) ──
+    // Step 1 — login code us card ke apne API ID/hash se
+    if (req.method === 'POST' && url.pathname === '/tg/code') {
+      const body = await readBody(req);
+      sendJson(res, 200, await startTelegramLogin({ slot: Number(body.slot) || 0, phone: body.phone, apiId: body.apiId, apiHash: body.apiHash }));
+      return;
+    }
+    // Step 2 — code (+ 2FA) → session usi slot me live
+    if (req.method === 'POST' && url.pathname === '/tg/signin') {
+      const body = await readBody(req);
+      let res1 = await submitTelegramCode({ loginId: body.loginId, code: body.code });
+      if (res1.ok && res1.step === 'password' && body.password) {
+        res1 = await submitTelegramPassword({ loginId: body.loginId, password: body.password });
+      }
+      sendJson(res, 200, res1);
+      return;
+    }
+    // Fields se seedha save (session paste karne ka raasta)
+    if (req.method === 'POST' && url.pathname === '/tg/save') {
+      const body = await readBody(req);
+      const slot = Number(body.slot) || 0;
+      if (!body.session && !body.apiId && !body.apiHash) { sendJson(res, 400, { ok: false, error: 'Kuch bhi nahi mila — session ya API ID/hash daalo' }); return; }
+      try {
+        const { setSlotCredentials } = await import('./_otp-mirror.js');
+        await setSlotCredentials({ slot, session: body.session || '', apiId: body.apiId || '', apiHash: body.apiHash || '' });
+        sendJson(res, 200, { ok: true, slot, ready: slotReady(slot), stored: storeConfigured() });
+      } catch (error) {
+        sendJson(res, 400, { ok: false, error: String(error?.message || error).slice(0, 200) });
+      }
+      return;
+    }
+    if (req.method === 'GET' && url.pathname === '/tg/status') {
+      sendJson(res, 200, {
+        ok: true,
+        slots: [0, 1, 2].map(slot => ({ slot, ready: slotReady(slot), api: apiFor(slot).source })),
+        configured: telegramConfigured(),
+        storeReady: storeConfigured(),
+      });
+      return;
+    }
+    // purane routes (compat)
     if (req.method === 'GET' && url.pathname === '/tg-login/status') {
       sendJson(res, 200, {
         ok: true,
         apiReady: loginConfigured(),
         configured: telegramConfigured(),
-        mirrorReady: telegramConfigured(),
-        // Proxy mirror ko bhi chahiye (same proxy se solve + register).
+        slots: [0, 1, 2].map(slot => ({ slot, ready: slotReady(slot) })),
         proxyOn: proxyInfo().on,
         proxyLabel: proxyInfo().label,
-        proxy: proxyInfo().on ? proxyInfo().label : '',
+        storeReady: storeConfigured(),
       });
       return;
     }
     if (req.method === 'POST' && url.pathname === '/tg-login/start') {
       const body = await readBody(req);
-      sendJson(res, 200, await startTelegramLogin({ phone: body.phone }));
+      sendJson(res, 200, await startTelegramLogin({ slot: Number(body.slot) || 0, phone: body.phone }));
       return;
     }
     if (req.method === 'POST' && url.pathname === '/tg-login/code') {
@@ -588,23 +677,38 @@ export default async function handler(req, res) {
       const body = await readBody(req);
       if (!body.session) { sendJson(res, 400, { ok: false, error: 'Session nahi mila — pehle login poora karo' }); return; }
       try {
-        await setMirrorSession(String(body.session), { slot: 0 });
-        const { storeConfigured, storeMasked } = await import('./_kv.js');
-        sendJson(res, 200, {
-          ok: true,
-          stored: storeConfigured(),
-          store: storeMasked(),
-          message: storeConfigured()
-            ? `Mirror chalu ✅ (session ${storeMasked()} me save — restart ke baad bhi chalega)`
-            : 'Mirror chalu ✅ isi instance par. Permanent ke liye session copy karke TELEGRAM_SESSION env me daalo (ya UPSTASH_REDIS_REST_URL/TOKEN set karo — tab apne aap save hoga).',
-        });
+        await setMirrorSession(String(body.session), { slot: Number(body.slot) || 0 });
+        sendJson(res, 200, { ok: true, stored: storeConfigured(), store: storeMasked(), message: 'Session lag gaya ✅' });
       } catch (error) {
         sendJson(res, 400, { ok: false, error: String(error?.message || error) });
       }
       return;
     }
-    if (req.method === 'POST' && url.pathname === '/proxy-status') {
-      sendJson(res, 200, await goldDropProxyCheck());
+    // ── Claim bot (rajafuckbot): /start → Manual Claim → number → OTP ×3 ──
+    if (req.method === 'POST' && url.pathname === '/claim/start') {
+      const body = await readBody(req);
+      const slot = Math.max(0, Math.min(2, Number(body.slot) || 0));
+      const run = await startClaimRun({
+        slot,
+        bot: String(body.bot || 'rajafuckbot'),
+        target: Number(body.target) || 1,
+      });
+      sendJson(res, 200, { ok: true, run });
+      return;
+    }
+    if (req.method === 'GET' && url.pathname === '/claim/state') {
+      const id = url.searchParams.get('runId');
+      sendJson(res, 200, { ok: true, run: id ? getClaimRun(id) : latestClaimRun(Number(url.searchParams.get('slot')) || 0) });
+      return;
+    }
+    if (req.method === 'POST' && url.pathname === '/claim/number') {
+      const body = await readBody(req);
+      sendJson(res, 200, pushClaimNumber(body.runId, body.number));
+      return;
+    }
+    if (req.method === 'POST' && url.pathname === '/claim/otp') {
+      const body = await readBody(req);
+      sendJson(res, 200, pushClaimOtp(body.runId, body.otp));
       return;
     }
     if (req.method === 'GET' && url.pathname === '/browser-mode') {

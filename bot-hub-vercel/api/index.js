@@ -234,6 +234,54 @@ async function disconnectAllTelegram() {
   tgClients = new Map();
 }
 
+// ─── OTP bot ka LIVE mirror (page ke left pane ke liye) ───
+// Last message + usme se nikla number/code, dono alag-alag. Sirf read karta
+// hai — koi message bhejta nahi, koi token/credential log nahi karta.
+function parseMirrorMessage(text = '') {
+  const flat = String(text).replace(/\s+/g, ' ');
+  // Phone: +91 85820 21057 / 8582021057 / 85820-21057 — pehle space/hyphen
+  // hatao, phir 10-digit (6-9 se shuru) dhoondho.
+  let phone = '';
+  const compact = flat.replace(/[\s-]/g, '');
+  const p = compact.match(/(?:\+?91)?([6-9]\d{9})(?!\d)/);
+  if (p) phone = p[1];
+  // OTP: "OTP: 5469" / "code 123456" / akele 6-digit number.
+  const otp = (flat.match(/(?:otp|code)[^0-9]{0,12}(\d{4,8})/i)
+    || flat.match(/(?:^|\D)(\d{6})(?:\D|$)/)
+    || [])[1] || '';
+  return { phone, otp };
+}
+
+let mirrorCache = { at: 0, slot: -1, data: null };
+async function readOtpBotMirror({ slot = 0, botUsername = '', limit = 6 } = {}) {
+  const bot = String(botUsername || firstEnv(['OTP_BOT_USERNAME']) || '').replace(/^@/, '');
+  const out = { ok: false, bot, slot, messages: [], number: '', otp: '', at: new Date().toISOString(), error: '' };
+  if (!bot) { out.error = 'OTP bot username set nahi hai (OTP_BOT_USERNAME)'; return out; }
+  // 10s cache — page har 2s poll karta hai, Telegram ko satana nahi hai.
+  if (mirrorCache.data && mirrorCache.slot === slot && Date.now() - mirrorCache.at < 10000
+      && mirrorCache.data.bot === bot) return mirrorCache.data;
+  try {
+    const client = await getTelegramClient(slot);
+    const msgs = await client.getMessages(bot, { limit });
+    const list = [];
+    for (const msg of msgs || []) {
+      const text = String(msg?.message || '').trim();
+      if (text) list.push({ id: msg?.id ?? null, text: text.slice(0, 600), at: msg?.date ? new Date(Number(msg.date) * 1000).toISOString() : '' });
+    }
+    out.ok = true;
+    out.messages = list;
+    const latest = list[0] || {};
+    const parsed = parseMirrorMessage(latest.text || '');
+    out.number = parsed.phone;
+    out.otp = parsed.otp;
+    out.latestAt = latest.at || '';
+    mirrorCache = { at: Date.now(), slot, data: out };
+  } catch (error) {
+    out.error = String(error?.message || error).slice(0, 160);
+  }
+  return out;
+}
+
 // OTP bot se is number ka latest 6-digit code.
 async function pollTelegramOtp({ mobile, botUsername, slot, timeoutMs = 45000, refreshMs = 2500 }) {
   const client = await getTelegramClient(slot);
@@ -598,6 +646,24 @@ a.dl{display:block;text-align:center;margin-top:10px;padding:10px;border-radius:
 .steps{display:flex;gap:6px;font-size:11px;color:#8b92b0;flex-wrap:wrap;margin-top:8px}
 .steps span{background:#12162a;border:1px solid #272c44;padding:3px 8px;border-radius:99px}
 .hint{color:#8b92b0;font-size:12px;margin-top:8px}
+/* ── do-pane layout: left = OTP bot mirror, right = process ── */
+.split{display:grid;grid-template-columns:minmax(280px,1fr) minmax(320px,1.15fr);gap:14px;align-items:start}
+@media(max-width:860px){.split{grid-template-columns:1fr}}
+.pane{position:sticky;top:12px}
+@media(max-width:860px){.pane{position:static}}
+.mirror{background:#0b0e18;border:1px solid #272c44;border-radius:14px;overflow:hidden}
+.mirror .head{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:10px 12px;background:#12162a;border-bottom:1px solid #272c44;font-size:13px;font-weight:700}
+.mirror .head .dot{width:8px;height:8px;border-radius:99px;background:#4a5070;display:inline-block;margin-right:6px}
+.mirror .head .dot.live{background:#28c76f;box-shadow:0 0 6px #28c76f}
+.mirror .chat{padding:10px;max-height:340px;overflow:auto;display:flex;flex-direction:column;gap:8px}
+.mirror .bubble{background:#1a2036;border:1px solid #2a3050;border-radius:10px 10px 10px 3px;padding:8px 10px;font-size:12.5px;line-height:1.5;white-space:pre-wrap;word-break:break-word}
+.mirror .bubble small{display:block;color:#6f769a;font-size:10.5px;margin-top:4px}
+.mirror .bubble .code{display:inline-block;margin-top:4px;background:#0d3b22;color:#7ee2a8;border:1px solid #1f6b3a;border-radius:6px;padding:1px 7px;font:600 12px ui-monospace,monospace}
+.mirror .empty{color:#6f769a;font-size:12px;padding:12px;text-align:center}
+.mirror .foot{padding:10px 12px;border-top:1px solid #272c44;display:flex;flex-direction:column;gap:8px}
+.mirror .kv{display:flex;justify-content:space-between;gap:8px;font-size:12px;color:#8b92b0}
+.mirror .kv b{color:#e9ecf5;font:600 12.5px ui-monospace,monospace}
+.mirror button{margin-top:0}
 `;
 
 const LOGIN_HTML = `<!doctype html><html lang="hi"><head><meta charset="utf-8">
@@ -622,6 +688,23 @@ const PAGE_HTML = `<!doctype html><html lang="hi"><head><meta charset="utf-8">
 <h1>🌐 Service Hub</h1>
 <div class="sub">Pehle service chuno → spare account → bot → START. <a href="/logout" style="color:#7c5cff">Logout</a></div>
 <div class="crumbs" id="crumbs"></div>
+<div class="split">
+<!-- ⬅️ LEFT: OTP bot ka live mirror -->
+<div class="pane">
+  <div class="mirror">
+    <div class="head"><span><span class="dot" id="mDot"></span>OTP bot mirror</span><span class="badge" id="mBot">—</span></div>
+    <div class="chat" id="mChat"><div class="empty">Spare + bot chuno…</div></div>
+    <div class="foot">
+      <div class="kv"><span>Number</span><b id="mNumber">—</b></div>
+      <div class="kv"><span>OTP</span><b id="mOtp">—</b></div>
+      <button class="ghost" id="mRefresh">🔄 Refresh mirror</button>
+      <button id="mNext">📱 Naya number lo</button>
+      <div class="hint" id="mHint" style="margin-top:0"></div>
+    </div>
+  </div>
+</div>
+<!-- ➡️ RIGHT: process -->
+<div class="pane" id="rightPane">
 
 <div class="card" id="c-service">
   <div style="font-weight:700;margin-bottom:10px">1️⃣ Kis service ke liye?</div>
@@ -676,6 +759,8 @@ const PAGE_HTML = `<!doctype html><html lang="hi"><head><meta charset="utf-8">
   <div class="log" id="log" style="margin-top:12px"></div>
   <div class="log" id="results" style="display:none"></div>
 </div>
+</div><!-- /right pane -->
+</div><!-- /split -->
 </div>
 <script>
 var S = { config: null, state: null, timer: null };
@@ -837,6 +922,8 @@ function boot(){
     });
     poll();
     S.timer = setInterval(poll, 1200);
+    loadMirror();
+    M.timer = setInterval(loadMirror, 5000);
   });
 }
 
@@ -884,6 +971,74 @@ $('testCaptcha').onclick = function(){
   }).catch(function(){
     btn.disabled = false; btn.textContent = '🛡️ Captcha test (key + sitekey)';
   });
+};
+// ─── OTP bot mirror (left pane) ───
+var M = { timer: null, last: null, lastOtp: '' };
+function esc(t){ return String(t==null?'':t).replace(/[&<>"']/g, function(c){ return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c] }) }
+function fmtTime(iso){
+  if (!iso) return '';
+  var d = new Date(iso); if (isNaN(d)) return '';
+  return d.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+}
+function paintMirror(m){
+  var s = S.state || {};
+  var bots = (S.config && S.config.bots) || [];
+  var bot = bots.filter(function(x){ return x.id===s.botId })[0];
+  $('mBot').textContent = m.bot ? ('@' + m.bot) : (bot ? bot.label : '—');
+  var dot = $('mDot');
+  dot.className = 'dot' + (m.ok ? ' live' : '');
+  var chat = $('mChat');
+  if (!m.ok){
+    chat.innerHTML = '<div class="empty">' + esc(m.error || 'Mirror band hai') + '</div>';
+  } else if (!(m.messages||[]).length){
+    chat.innerHTML = '<div class="empty">Bot me abhi koi message nahi — NEW NUMBER dabao</div>';
+  } else {
+    chat.innerHTML = (m.messages||[]).map(function(x, i){
+      var code = (String(x.text).match(/(?:^|\D)(\d{6})(?:\D|$)/)||[])[1];
+      var body = esc(x.text);
+      if (code) body = body.replace(code, '<span class="code">'+code+'</span>');
+      return '<div class="bubble">' + body + '<small>#' + (x.id||'') + ' · ' + fmtTime(x.at) + (i===0?' · latest':'') + '</small></div>';
+    }).join('');
+  }
+  $('mNumber').textContent = m.number || '—';
+  $('mOtp').textContent = m.otp || '—';
+  M.last = m;
+  // OTP aaya aur field khali hai to auto-fill (user ko type nahi karna padta).
+  if (m.otp && m.otp !== M.lastOtp){
+    M.lastOtp = m.otp;
+    var f = $('otp');
+    if (f && !f.value) { f.value = m.otp; $('mHint').textContent = 'OTP mirror se bhar diya — verify dabao'; }
+  }
+  var s2 = S.state || {};
+  $('mHint').textContent = m.ok
+    ? (m.messages||[]).length + ' messages · ' + (s2.spareSlot>=0 ? 'spare #'+(s2.spareSlot+1) : 'spare chuno')
+    : '';
+}
+function loadMirror(){
+  var s = S.state || {};
+  var bot = '';
+  try {
+    var cfg = S.config || {};
+    var b = (cfg.bots||[]).filter(function(x){ return x.id === s.botId })[0];
+    bot = (b && b.username) || '';
+  } catch(e){}
+  var q = '/otp-mirror?slot=' + (s.spareSlot>=0 ? s.spareSlot : 0) + (bot ? ('&bot=' + encodeURIComponent(bot)) : '');
+  fetch(q).then(function(r){ return r.json() }).then(paintMirror).catch(function(){});
+}
+$('mRefresh').onclick = loadMirror;
+$('mNext').onclick = function(){
+  loadMirror();
+  // Mirror se fresh number uthao; na mile to "NEW NUMBER" ka message bhejne ko bolo
+  setTimeout(function(){
+    var n = (M.last && M.last.number) || '';
+    if (n && /^[6-9]\d{9}$/.test(n)) {
+      $('phone').value = n;
+      $('phone').focus();
+      $('mHint').textContent = 'Number mirror se bhar diya — "Number bhejo" dabao';
+    } else {
+      $('mHint').textContent = 'Bot me naya number nahi mila — OTP bot me NEW NUMBER dabao, phir Refresh';
+    }
+  }, 400);
 };
 $('reset').onclick = function(){ post('/reset').then(function(){ location.reload() }) };
 boot();
@@ -993,6 +1148,16 @@ export default async function handler(req, res) {
           ? `${diag.keyMessage} · sitekey mil gayi ✅`
           : `${diag.keyMessage} · ${diag.sitekeyError || 'sitekey nahi mili'}`,
       });
+      return;
+    }
+
+    if (req.method === 'GET' && url.pathname === '/otp-mirror') {
+      const slot = Number(url.searchParams.get('slot'));
+      const mirror = await readOtpBotMirror({
+        slot: Number.isInteger(slot) && slot >= 0 ? slot : Math.max(0, state.spareSlot),
+        botUsername: url.searchParams.get('bot') || '',
+      });
+      sendJson(res, 200, mirror);
       return;
     }
 

@@ -11,7 +11,13 @@ import { registerGoldDrop, verifyGoldDropOtp, goldDropCaptchaDiagnose, goldDropD
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const NOCAP_API = 'https://api.nocaptchaai.com';
 const NOCAP_KEY_DEFAULT = process.env.NOCAP_API_KEY || 'nocap_eVBzrYeejjgKLoikEErH6lbP';
-const DEFAULT_PHOTO = readFileSync(path.join(ROOT, 'gold-drop-pack.jpg')).toString('base64');
+// Pack photo: file ho to wahi, warna ek chhota embedded JPEG — taaki app
+// kisi bhi build environment me (Docker image me file na ho tab bhi) chale.
+const EMBEDDED_PHOTO = '/9j/4AAQSkZJRgABAQEAYABgAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwcJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPDs0NDT/wAALCAABAAEBAREA/8QAFAABAQAAAAAAAAAAAAAAAAAAAAv/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAwDAQACEQMRAD8AmAA/9k=';
+const DEFAULT_PHOTO = (() => {
+  try { return readFileSync(path.join(ROOT, 'gold-drop-pack.jpg')).toString('base64'); }
+  catch { return EMBEDDED_PHOTO; }
+})();
 
 // ─── LOGIN (public Vercel URL hai — password ke bina koi use na kar paye) ───
 const APP_PASSWORD = process.env.APP_PASSWORD || 'rahul@123';
@@ -367,8 +373,9 @@ export default async function handler(req, res) {
   }
 }
 
-// Local test ke liye: `node api/index.js` bhi chal sakta hai
+// Local test / container (Docker CMD) ke liye: `node api/index.js`
 if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) {
   const port = Number(process.env.PORT || 3737);
-  http.createServer(handler).listen(port, () => console.log(`🟡 Gold Drop (Vercel build) local par: http://localhost:${port}`));
+  // 0.0.0.0 — container/preview proxy ke liye zaroori
+  http.createServer(handler).listen(port, '0.0.0.0', () => console.log(`🟡 Gold Drop (Vercel build) local par: http://localhost:${port}`));
 }

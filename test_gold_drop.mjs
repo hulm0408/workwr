@@ -167,6 +167,53 @@ for (const status of [200, 400]) {
   invalid.userKey = 'u'; invalid.dataKey = key;
   await assert.rejects(invalid.verifyOtp('123456'), isGoldDropInvalidOtp);
 }
+// ─── gold-drop-vercel (Vercel build): sitekey pehle, phir hi numbers ───
+{
+  const mod = await import('./gold-drop-vercel/api/_gold-drop.js');
+  let registerCalls = 0;
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    const href = String(url);
+    if (href.includes('golddropgolddhamaka.com/register')) {
+      // site HTML: do sitekey
+      return new Response('<div data-sitekey="0x4AAAAAAAkeyOne1111111111"></div>'
+        + '<div data-sitekey="0x4BBBBBBBkeyTwo2222222222"></div>', { status: 200 });
+    }
+    if (href.includes('/users/register/')) {
+      registerCalls++;
+      return new Response(JSON.stringify({ statusCode: 400, message: 'Please complete the security check to continue.' }), { status: 400 });
+    }
+    if (href.includes('nocaptchaai.com')) {
+      const body = JSON.parse(init?.body || '{}');
+      if (href.endsWith('/createTask')) return new Response(JSON.stringify({ errorId: 0, taskId: 'T' }), { status: 200 });
+      return new Response(JSON.stringify({ errorId: 0, status: 'ready', solution: { token: 'TOK' } }), { status: 200 });
+    }
+    if (href.includes('/users')) return new Response(JSON.stringify({ userKey: 'uk1', dataKey: 'abcdefghijklmnop' }), { status: 200 });
+    return new Response('{}', { status: 200 });
+  };
+  try {
+    // 1) saare sitekey reject → loud error + dead-end set
+    await assert.rejects(
+      mod.registerGoldDrop({ name: 'Rahul Kumar', mobile: '9876543210', email: 'x+1@example.com', pincode: '509412', code: 'KKD2LS01261026', imageBase64: Buffer.from('p').toString('base64'), nocapApiKey: 'nocap_test' }),
+      /Security check site par hi clear nahi hua/,
+    );
+    assert.ok(mod.goldDropDeadEnd()?.message, 'dead-end yaad rehna chahiye');
+    // 2) guard: naya number bhi turant wahi error (site ko dobara nahi satate)
+    const before = registerCalls;
+    await assert.rejects(
+      mod.registerGoldDrop({ name: 'Rahul Kumar', mobile: '9876543211', email: 'x+2@example.com', pincode: '509412', code: 'KKD2LS01261026', imageBase64: Buffer.from('p').toString('base64'), nocapApiKey: 'nocap_test' }),
+      /Security check site par hi clear nahi hua/,
+    );
+    assert.equal(registerCalls, before, 'guard ke baad site par register call nahi jaani chahiye');
+    // 3) captcha test (diag) guard reset karta hai
+    mod.resetGoldDropDeadEnd();
+    assert.equal(mod.goldDropDeadEnd(), null);
+  } finally {
+    globalThis.fetch = origFetch;
+    mod.resetGoldDropDeadEnd();
+  }
+}
+
 const securityMessage = 'Please complete the security check to continue.';
 assert.equal(isGoldDropSecurityCheck(new Error(`Gold Drop HTTP 400: ${securityMessage}`)), true);
 assert.equal(isGoldDropSecurityCheck(new Error('fetch failed')), false);

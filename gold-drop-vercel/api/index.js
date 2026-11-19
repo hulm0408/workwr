@@ -6,7 +6,7 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { registerGoldDrop, verifyGoldDropOtp, goldDropCaptchaDiagnose } from './_gold-drop.js';
+import { registerGoldDrop, verifyGoldDropOtp, goldDropCaptchaDiagnose, goldDropDeadEnd, resetGoldDropDeadEnd } from './_gold-drop.js';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const NOCAP_API = 'https://api.nocaptchaai.com';
@@ -147,6 +147,9 @@ button.secondary{background:#232845;color:#e8eaf2}
 </style></head><body><div class="card">
 <h1>🟡 Gold Drop</h1>
 <div class="sub">Direct API method — koi browser nahi, sab cloud par chalta hai. Number apne OTP bot se laao. <a href="/logout" style="color:#f7b500">Logout</a></div>
+<div class="sub" style="border:1px solid #6b4b00;border-radius:9px;padding:10px;background:#241c00;color:#ffd479">
+⚠️ Ye Vercel build browser ke bina chalta hai. Gold Drop ka security check aksar <b>browser ke bina clear nahi hota</b> — pehle niche <b>🛡️ Captcha test</b> dabao, wo bata dega kaaran aur kitni sitekey mili. Browser mode ke liye Docker/VPS chahiye.
+</div>
 <div id="setup">
 <label>Naam</label><input id="name" value="Rahul Kumar">
 <label>Email (Gmail — har number par +suffix apne aap)</label><input id="email" value="itsnoob012@gmail.com">
@@ -156,6 +159,8 @@ button.secondary{background:#232845;color:#e8eaf2}
 <div class="sub" id="nocapbal">NoCaptchaAI balance check ho raha hai…</div>
 <label>Pack photo (optional — na do to default use hogi)</label><input id="photo" type="file" accept="image/*">
 <label>Kitne numbers process karne hain?</label><input id="target" type="number" value="5" min="1" max="100">
+<button class="secondary" id="captchaTest">🛡️ Captcha test (key + sitekeys)</button>
+<div class="sub" id="captchaOut"></div>
 <button id="start">▶ START</button>
 </div>
 <div id="run" style="display:none">
@@ -205,7 +210,22 @@ $('sendNumber').onclick = function(){ var m=$('mobile').value.replace(/\\D/g,'')
 $('sendOtp').onclick = function(){ var o=$('otp').value.replace(/\\D/g,''); if(o.length!==6){alert('6-digit OTP daalo');return} $('otp').value=''; post('/otp',{otp:o}).then(poll) };
 $('reset').onclick = function(){ post('/reset').then(function(){ location.reload() }) };
 pollTimer = setInterval(poll, 1200); poll();
-post('/nocap-balance',{key:$('nocapKey').value.trim()}).then(function(r){ $('nocapbal').textContent = r.message || ''; }).catch(function(){ $('nocapbal').textContent=''; });
+function captchaTest(){
+  var btn = $('captchaTest');
+  btn.disabled = true; var old = btn.textContent; btn.textContent = '🛡️ Test chal raha hai…';
+  post('/captcha-test',{key:$('nocapKey').value.trim()}).then(function(r){
+    btn.disabled = false; btn.textContent = old;
+    var out = $('captchaOut');
+    out.innerHTML = (r.ok?'✅ ':'❌ ') + (r.message||'');
+    if (r.sitekeys && r.sitekeys.length) out.innerHTML += '<br>sitekeys: <code>' + r.sitekeys.join('</code>, <code>') + '</code>';
+    $('nocapbal').textContent = r.keyMasked ? ('key: ' + r.keyMasked) : '';
+  }).catch(function(){ btn.disabled = false; btn.textContent = old; });
+}
+$('captchaTest').onclick = captchaTest;
+post('/nocap-balance',{key:$('nocapKey').value.trim()}).then(function(r){
+  $('nocapbal').textContent = r.message || '';
+  $('captchaOut').textContent = (r.ok?'✅ ':'❌ ') + (r.message||'') + (r.sitekeys&&r.sitekeys.length ? ' · sitekeys: ' + r.sitekeys.join(', ') : '');
+}).catch(function(){ $('nocapbal').textContent=''; });
 </script></body></html>`;
 
 // ─── HTTP helpers ───
@@ -284,6 +304,16 @@ export default async function handler(req, res) {
       state.status = 'need_number';
       state.message = 'Pehla mobile number daalo';
       logLine(`▶ START — target ${state.target} numbers (direct API, koi browser nahi)`);
+      // Guard: is instance par pehle hi sab kuch fail ho chuka hai to naye
+      // numbers jalaane ka koi matlab nahi — pehle Captcha test chalao.
+      const dead = goldDropDeadEnd();
+      if (dead) {
+        state.status = 'blocked';
+        state.message = 'Ruk gaya — pehle 🛡️ Captcha test chalao (security check ka kaaran pata chalega)';
+        logLine('⛔ Security check pichhle run me site par hi reject hua tha — numbers bachaye gaye');
+        sendJson(res, 200, { ok: true, blocked: true, deadEnd: dead.message });
+        return;
+      }
       sendJson(res, 200, { ok: true });
       return;
     }
@@ -316,6 +346,8 @@ export default async function handler(req, res) {
       // task se test karte hain (asli address: $0.0005/solve wallet se).
       const body = await readBody(req);
       const diag = await goldDropCaptchaDiagnose(String(body.key || body.nocapKey || NOCAP_KEY_DEFAULT).trim());
+      resetGoldDropDeadEnd();
+      const count = (diag.sitekeys || []).length;
       sendJson(res, 200, {
         ok: Boolean(diag.keyOk && diag.sitekey),
         keyMasked: diag.keyMasked,
@@ -323,7 +355,9 @@ export default async function handler(req, res) {
         sitekey: diag.sitekey ? `${diag.sitekey.slice(0, 12)}…` : '',
         sitekeys: (diag.sitekeys || []).map(k => `${k.slice(0, 12)}…`),
         sitekeyError: diag.sitekeyError,
-        message: `${diag.keyMessage}${diag.sitekey ? ' · sitekey mil gayi ✅' : ` · ${diag.sitekeyError || 'sitekey nahi mili'}`}`,
+        message: `${diag.keyMessage}`
+          + (count ? ` · ${count} sitekey mili (sab try hongi)` : ` · ${diag.sitekeyError || 'sitekey nahi mili'}`)
+          + ' · guard reset — ab START kar sakte ho',
       });
       return;
     }

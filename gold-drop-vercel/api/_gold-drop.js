@@ -12,6 +12,29 @@ const NOCAP_TIMEOUT_MS = Number(process.env.NOCAP_TIMEOUT_MS) || 120000;
 const NOCAP_KEY_DEFAULT = process.env.NOCAP_API_KEY || 'nocap_eVBzrYeejjgKLoikEErH6lbP';
 const ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
 const b64 = value => Buffer.from(value, 'utf8').toString('base64');
+// ─── Sitekey registry + number-burn guard ───
+// Ek warm instance me yaad rehta hai: kaunsi sitekey chali, kaunsi fail hui,
+// aur kya sab possible paths already fail ho chuke hain.
+const workingSitekeys = new Set();
+const triedKeys = new Set();
+const guardOn = !['0', 'off', 'false', 'no'].includes(String(process.env.GOLD_DROP_GUARD || '1').toLowerCase());
+let deadEndReport = null; // { message, at }
+function rememberWorkingSitekey(sitekey) {
+  const masked = maskSitekey(sitekey);
+  workingSitekeys.add(masked);
+  triedKeys.add(masked);
+}
+export function goldDropDeadEnd() {
+  return deadEndReport;
+}
+export function resetGoldDropDeadEnd() {
+  deadEndReport = null;
+}
+function markDeadEnd(message) {
+  if (!deadEndReport) deadEndReport = { message, at: new Date().toISOString() };
+  return new Error(message);
+}
+
 
 // ─── Signing (drop.py ke signer ke exactly same) ───
 function signPayload(payload, dataKey, userKey, t) {
@@ -119,7 +142,9 @@ export async function goldDropCaptchaDiagnose(nocapApiKey) {
 }
 
 // SPA par page me 1 se zyada Turnstile key hoti hai — pehla match galat ho sakta hai.
-async function fetchSitekeys(pageUrl = 'https://golddropgolddhamaka.com/register') {
+const SITE_REGISTER_URL = process.env.GOLD_DROP_SITE_URL || 'https://golddropgolddhamaka.com/register';
+
+async function fetchSitekeys(pageUrl = SITE_REGISTER_URL) {
   const read = async url => {
     const res = await fetch(url, { headers: { 'user-agent': GOLD_DROP_UA }, signal: AbortSignal.timeout(20000) });
     return res.text();
@@ -179,6 +204,10 @@ export async function registerGoldDrop({ name, mobile, email, pincode, code, ima
   const image = Buffer.from(imageBase64, 'base64');
   if (!image.length) throw new Error('Photo decode nahi hui');
 
+  // Guard sabse pehle: pichhla run dead-end par rukа tha to naya number
+  // site tak jaata hi nahi (na number jalta hai, na OTP jaata hai).
+  if (guardOn && deadEndReport) throw markDeadEnd(deadEndReport.message);
+
   // Session keys (drop.py init_session — sirf {} body)
   const boot = await gdRequest('/users', JSON.stringify({}), 'application/json');
   if (!boot.data?.userKey || !boot.data?.dataKey) throw new Error(String(boot.data?.message || 'Session keys nahi mile'));
@@ -203,26 +232,53 @@ export async function registerGoldDrop({ name, mobile, email, pincode, code, ima
     return result;
   };
 
+  const key = String(nocapApiKey || '').trim();
+  const keyOff = ['off', '0', 'none'].includes(key.toLowerCase());
+
+  // ── PEHLE sitekey verify karo, phir number jalao ──────────────────────
+  // Turnstile token ka "action" site ke widget config se aata hai; galat
+  // widget ki sitekey se solved token site reject kar deti hai. Registry me
+  // sirf wahi sitekeys rakhi jaati hain jinka token site ne kabhi accept kiya
+  // ho — isliye sitekey probe fail ho to register call hi nahi jaati.
+  let sitekeys = [];
+  let sitekeyError = '';
+  try {
+    sitekeys = await fetchSitekeys();
+  } catch (error) {
+    sitekeyError = String(error?.message || error).slice(0, 150);
+  }
+  if (!sitekeys.length) {
+    // Sitekey na mile to bhi site ko dobara nahi satayenge — saaf jawab.
+    throw new Error(
+      `Security check ka kaaran pehle hi pata chal gaya (number use nahi hua): `
+      + `${sitekeyError || 'site par Turnstile sitekey nahi mili (HTML badla hai)'}`
+      + ` — ye Vercel build browser ke bina chalta hai, isliye Gold Drop ka check clear nahi hoga. `
+      + `Docker/VPS par browser mode chalao ya Toing/ZZBOT card use karo.`,
+    );
+  }
+
+  // Registry: jo sitekey pehle kaam kar chuki ho wahi pehle.
+  sitekeys = [...sitekeys.filter(k => workingSitekeys.has(maskSitekey(k))),
+    ...sitekeys.filter(k => !workingSitekeys.has(maskSitekey(k)))];
+
   let registerResult;
   let securitySolved = false;
   try {
     registerResult = await doRegister('');
   } catch (error) {
     if (!isSecurityCheck(error)) throw error;
-    const key = String(nocapApiKey || '').trim();
-    if (['off', '0', 'none'].includes(key.toLowerCase())) throw new Error('Security check maanga par NoCaptchaAI key OFF hai.');
-    const sitekeys = await fetchSitekeys().catch((error) => {
-      throw new Error(`Captcha solve nahi ho sakta — ${String(error?.message || error).slice(0, 150)}`);
-    });
-    if (!sitekeys.length) throw new Error('Captcha solve nahi ho sakta — site par Turnstile sitekey nahi mili (HTML badla hai).');
+    if (keyOff) throw new Error('Security check maanga par NoCaptchaAI key OFF hai.');
+    // Guard: same dead end par dobara numbers jalao mat.
+    if (guardOn && deadEndReport && triedKeys.size) throw markDeadEnd(deadEndReport.message);
     const tried = [];
     let rejection = null;
     for (const sitekey of sitekeys) {
-      const token = await nocapSolveTurnstile(key || NOCAP_KEY_DEFAULT, sitekey, 'https://golddropgolddhamaka.com/register');
+      const token = await nocapSolveTurnstile(key || NOCAP_KEY_DEFAULT, sitekey, SITE_REGISTER_URL);
       try {
         registerResult = await doRegister(token);
         securitySolved = true;
         rejection = null;
+        rememberWorkingSitekey(sitekey);
         break;
       } catch (retryError) {
         if (!isSecurityCheck(retryError)) throw retryError;
@@ -231,8 +287,12 @@ export async function registerGoldDrop({ name, mobile, email, pincode, code, ima
       }
     }
     if (rejection) {
-      throw new Error(
-        `Security check site par hi clear nahi hua — ${tried.join(', ')} ka solved token bhi site ne reject kiya. Asli browser chahiye.`,
+      for (const k of tried) triedKeys.add(k);
+      const registryNote = 'Sab sitekeys ek baar try ho gayi — dobara mat try karo.';
+      throw markDeadEnd(
+        `Security check site par hi clear nahi hua — ${tried.join(', ')} ka solved token bhi site ne reject kiya. `
+        + `${registryNote} Site ko asli browser chahiye (ye Vercel par possible nahi — Docker/VPS chahiye). `
+        + `Number bacha hai: yahan ruk kar aur numbers mat jalao.`,
       );
     }
   }

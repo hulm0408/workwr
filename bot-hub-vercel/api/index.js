@@ -29,7 +29,7 @@ import path from 'node:path';
 import { readFileSync, existsSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { registerGoldDrop, verifyGoldDropOtp } from './_gold-drop-core.js';
+import { registerGoldDrop, verifyGoldDropOtp, goldDropCaptchaDiagnose } from './_gold-drop-core.js';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(path.dirname(ROOT), 'public');
@@ -602,6 +602,8 @@ const PAGE_HTML = `<!doctype html><html lang="hi"><head><meta charset="utf-8">
   <div id="svcForm"></div>
   <label>Kitne numbers?</label><input id="target" type="number" value="1" min="1" max="50">
   <button id="start">▶ START the process</button>
+  <button class="ghost" id="testCaptcha">🛡️ Captcha test (key + sitekey)</button>
+  <div class="hint" id="captchaOut"></div>
   <button class="ghost" id="backBot">↩️ Bot badlo</button>
 </div>
 
@@ -823,6 +825,20 @@ $('autoOtp').onclick = function(){
     poll();
   }).catch(function(){ btn.disabled = false; btn.textContent = '🤖 Auto — bot se khud uthao' });
 };
+$('testCaptcha').onclick = function(){
+  var btn = $('testCaptcha');
+  btn.disabled = true; btn.textContent = '🛡️ Test chal raha hai…';
+  var form = collectForm();
+  post('/captcha-test', { nocapKey: form.nocapKey || '' }).then(function(res){
+    btn.disabled = false; btn.textContent = '🛡️ Captcha test (key + sitekey)';
+    var out = $('captchaOut');
+    out.innerHTML = (res.ok ? '✅ ' : '❌ ') + (res.message || '')
+      + (res.sitekey ? '<br>sitekey: <code>' + res.sitekey + '</code>' : '')
+      + (res.sitekeyError ? '<br>⚠️ ' + res.sitekeyError : '');
+  }).catch(function(){
+    btn.disabled = false; btn.textContent = '🛡️ Captcha test (key + sitekey)';
+  });
+};
 $('reset').onclick = function(){ post('/reset').then(function(){ location.reload() }) };
 boot();
 </script></body></html>`;
@@ -912,6 +928,24 @@ export default async function handler(req, res) {
 
     if (req.method === 'GET' && url.pathname === '/state') {
       sendJson(res, 200, publicState());
+      return;
+    }
+
+    if (req.method === 'POST' && url.pathname === '/captcha-test') {
+      // Gold Drop ka captcha diagnose: key live test + site key fetch.
+      const body = await readBody(req);
+      const diag = await goldDropCaptchaDiagnose(String(body.nocapKey || '').trim() || NOCAP_KEY);
+      sendJson(res, 200, {
+        ok: Boolean(diag.keyOk && diag.sitekey),
+        keyMasked: diag.keyMasked,
+        keyOk: diag.keyOk,
+        keyMessage: diag.keyMessage,
+        sitekey: diag.sitekey ? `${diag.sitekey.slice(0, 12)}…` : '',
+        sitekeyError: diag.sitekeyError,
+        message: diag.sitekey
+          ? `${diag.keyMessage} · sitekey mil gayi ✅`
+          : `${diag.keyMessage} · ${diag.sitekeyError || 'sitekey nahi mili'}`,
+      });
       return;
     }
 

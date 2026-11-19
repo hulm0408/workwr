@@ -4,7 +4,7 @@ import { execFileSync, spawn } from 'node:child_process';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { GoldDropClient, goldDropEmailForMobile, isGoldDropDailyOtpLimit, isGoldDropInvalidOtp, isGoldDropSecurityCheck, retryGoldDropSecurity, signGoldDropPayload, unwrapGoldDropResponse } from './gold-drop-client.js';
+import { GoldDropClient, goldDropEmailForMobile, goldDropCaptchaPreflight, isGoldDropDailyOtpLimit, isGoldDropInvalidOtp, isGoldDropSecurityCheck, nocapCheckKey, nocapExplain, nocapSolveTurnstile, retryGoldDropSecurity, signGoldDropPayload, unwrapGoldDropResponse } from './gold-drop-client.js';
 import { GoldDropCookieJar } from './gold-drop-cookies.js';
 import { extractGoldDropReward, isNewGoldDropReward, findFreshGoldDropReward } from './gold-drop-rewards.js';
 import { parseTelegramNumberCard } from './telegram-otp-source.js';
@@ -177,6 +177,89 @@ for (const status of [200, 400]) {
   // Security rejection par NoCaptchaAI retry hota hai; key OFF hone par loud error.
   await assert.rejects(blocked.register({ name: 'Rahul Kumar', mobile: '9876543210', email: 'x@example.com', pincode: '509412', code: 'KKD2LS01261026', image: Buffer.from('photo') }), /NoCaptchaAI key OFF/);
 }
+// ─── NoCaptchaAI: docs v2 ke error codes + turnstile poll flow ───
+// Turnstile subscription plan me nahi aata — wallet khaali ho to yeh reason
+// aana chahiye (yahi "recharge ke baad bhi solve nahi hua" ka asli kaaran tha).
+assert.match(nocapExplain({ errorId: 1, errorCode: 'ERROR_ZERO_BALANCE' }), /wallet.*top-up/i);
+assert.match(nocapExplain({ errorCode: 'ERROR_KEY_DOES_NOT_EXIST' }), /key galat/i);
+assert.match(nocapExplain({ errorCode: 'ERROR_NO_SLOT_AVAILABLE' }), /busy/i);
+assert.equal(nocapExplain({ errorId: 0 }), '');
+
+function nocapFake(handler) {
+  const calls = [];
+  const fetchImpl = async (url, init) => {
+    const body = JSON.parse(init?.body || '{}');
+    calls.push({ url, body });
+    const out = handler(url, body);
+    return new Response(JSON.stringify(out), { status: 200 });
+  };
+  return { calls, fetchImpl };
+}
+
+// 1) pehla type reject, doosra chale → token (aur dono type try hue)
+{
+  const fake = nocapFake((url, body) => {
+    if (url.endsWith('/createTask')) {
+      return body.task.type === 'TurnstileTaskProxyLess'
+        ? { errorId: 1, errorCode: 'ERROR_BAD_PARAMETERS', errorDescription: 'bad type' }
+        : { errorId: 0, status: 'idle', taskId: 'T1' };
+    }
+    return { errorId: 0, status: 'ready', solution: { token: 'TOKEN-OK' } };
+  });
+  assert.equal(await nocapSolveTurnstile('k', '0x4AAAA', 'https://x/register', { fetchImpl: fake.fetchImpl, sleepFn: async () => {} }), 'TOKEN-OK');
+  assert.equal(fake.calls.filter(c => c.url.endsWith('/createTask')).length, 2);
+}
+
+// 2) wallet khaali → saaf reason (silent "fail" nahi)
+{
+  const fake = nocapFake(() => ({ errorId: 1, errorCode: 'ERROR_ZERO_BALANCE' }));
+  await assert.rejects(
+    nocapSolveTurnstile('k', '0x4AAAA', 'https://x/register', { fetchImpl: fake.fetchImpl, sleepFn: async () => {} }),
+    /wallet.*top-up/i,
+  );
+}
+
+// 3) ready par khali token → loud error
+{
+  const fake = nocapFake(url => url.endsWith('/createTask')
+    ? { errorId: 0, taskId: 'T2' }
+    : { errorId: 0, status: 'ready', solution: {} });
+  await assert.rejects(
+    nocapSolveTurnstile('k', '0x4AAAA', 'https://x/register', { fetchImpl: fake.fetchImpl, sleepFn: async () => {} }),
+    /khali token/,
+  );
+}
+
+// 4) key check: ok aur zero-balance dono
+{
+  const okFake = nocapFake(() => ({ errorId: 0, taskId: 'PROBE1' }));
+  const ok = await nocapCheckKey('nocap_test', { fetchImpl: okFake.fetchImpl });
+  assert.equal(ok.ok, true);
+  assert.equal(ok.taskId, 'PROBE1');
+  const badFake = nocapFake(() => ({ errorId: 1, errorCode: 'ERROR_ZERO_BALANCE' }));
+  const bad = await nocapCheckKey('nocap_test', { fetchImpl: badFake.fetchImpl });
+  assert.equal(bad.ok, false);
+  assert.match(bad.message, /wallet/i);
+}
+
+// 5) sitekey: data-sitekey attribute pehle, phir plain 0x4… string
+{
+  const attr = async () => new Response('<div class="cf-turnstile" data-sitekey="0x4AAAAAAAabcdefghijklmnop"></div>', { status: 200 });
+  const { fetchTurnstileSitekey } = await import('./gold-drop-client.js');
+  assert.equal(await fetchTurnstileSitekey(attr, 'https://x/register'), '0x4AAAAAAAabcdefghijklmnop');
+  const plain = async () => new Response('<script>turnstile.render({sitekey:"0x4BBBBBBBaveryverylongsitekey"})</script>', { status: 200 });
+  assert.equal(await fetchTurnstileSitekey(plain, 'https://x/register'), '0x4BBBBBBBaveryverylongsitekey');
+  const blockedPage = async () => new Response('<title>Just a moment...</title>', { status: 200 });
+  await assert.rejects(fetchTurnstileSitekey(blockedPage, 'https://x/register'), /Cloudflare challenge/);
+}
+
+// 6) preflight: key off → turant reason, sitekey phir bhi try
+{
+  const diag = await goldDropCaptchaPreflight('off', { fetchImpl: async () => new Response('<i data-sitekey="0x4CCCCCCCCsitekeykeykeykey">', { status: 200 }) });
+  assert.equal(diag.keyOk, false);
+  assert.equal(diag.sitekey, '0x4CCCCCCCCsitekeykeykeykey');
+}
+
 assert.deepEqual(parseWinningCodes('ABC123\nxyz987 ABC123'), ['ABC123', 'XYZ987']);
 assert.throws(() => parseWinningCodes('bad/code'), /letters\/digits/);
 assert.throws(() => parseWinningCodes('A'.repeat(13)), /12 characters/);

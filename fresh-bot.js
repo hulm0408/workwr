@@ -2694,19 +2694,33 @@ bot.action('ap_px_add', async (ctx) => {
 });
 
 // ===== 🛡️ NOCAPTCHAAI KEY — Gold Drop security check auto-solve =====
-// NoCaptchaAI key ka live balance/status — key set karte hi confirm.
+// NoCaptchaAI (v2) me "balance" endpoint nahi hai — key ko asli Turnstile
+// task se test karte hain. Turnstile subscription plan me nahi aata; alag
+// wallet balance ($0.0005/solve) se katta hai — isi liye recharge ke baad bhi
+// solve fail hota tha jab wallet khaali ho.
 async function nocapBalanceLine(key) {
   try {
-    const res = await fetch(`https://api.nocaptchaai.com/balance?apiKey=${encodeURIComponent(key)}`, {
-      signal: AbortSignal.timeout(15000),
+    const res = await fetch('https://api.nocaptchaai.com/createTask', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        clientKey: key,
+        task: {
+          type: 'TurnstileTaskProxyLess',
+          websiteURL: 'https://golddropgolddhamaka.com/register',
+          websiteKey: '0x4AAAAAAAdiagnosticProbe000000000000',
+        },
+      }),
+      signal: AbortSignal.timeout(20000),
     });
     const data = await res.json().catch(() => ({}));
-    if (String(data?.status || '').toLowerCase() !== 'ok') {
-      return { ok: false, text: String(data?.error || data?.msg || `HTTP ${res.status}`).slice(0, 120) };
+    if ((data?.errorId ?? 0) === 0 && data?.taskId) return { ok: true, text: `key chalu ✅ (wallet se $0.0005/solve katega)` };
+    const code = String(data?.errorCode ?? data?.errorDescription ?? data?.msg ?? `HTTP ${res.status}`);
+    if (/ZERO_BALANCE|INSUFFICIENT|NO_FUNDS/i.test(code)) {
+      return { ok: false, text: 'wallet khaali — Turnstile plan me NAHI aata, nocaptchaai.com/manage/billing se wallet top-up karo' };
     }
-    const plan = data.plan || {};
-    const extra = plan.dailyLimit ? ` · aaj ${plan.dailyLimitUsed}/${plan.dailyLimit} used` : '';
-    return { ok: true, text: `balance $${data.balance}${extra}` };
+    if (/BAD_KEY|WRONG_USER_KEY|KEY_DOES_NOT_EXIST|AUTH/i.test(code)) return { ok: false, text: 'key invalid — dashboard se dobara copy karo' };
+    return { ok: false, text: code.slice(0, 120) };
   } catch (error) {
     return { ok: null, text: String(error?.message || error).slice(0, 120) };
   }
@@ -2726,7 +2740,7 @@ bot.action('ap_nocap_key', async (ctx) => {
     '• <code>off</code> = auto-solve band',
     '• <code>default</code> = built-in key par wapas',
     ``,
-    sub('Key wala message bot turant delete kar dega (secret). Balance check karke confirm hoga ki key kaam kar rahi hai.'),
+    sub('Key wala message bot turant delete kar dega (secret). Live Turnstile task se confirm hoga ki key aur wallet dono chal rahe hain. Turnstile subscription plan me nahi aata — wallet balance alag rakho.'),
   ].join('\n')), [[{ text: '↩️ Cancel', callback_data: 'ap_settings', style: 'primary' }]]);
 });
 

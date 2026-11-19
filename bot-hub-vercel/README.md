@@ -35,6 +35,30 @@ Vercel → New Project → repo `hulm0408/workwr` → **Root Directory: `bot-hub
 | `ZZBOT_ACCESS_KEY` / `TOING_ACCESS_KEY` | access keys (defaults code me) |
 | `NOCAP_API_KEY` | Gold Drop security solve (default built-in) |
 
+## 🛡️ Gold Drop ka security check (captcha) — 1 click me test
+
+Page par **🛡️ Captcha test** button hai. Ye do cheezein batata hai:
+
+1. **Key chalu hai ya nahi** — asli `TurnstileTaskProxyLess` task bhejkar.
+2. **Siteki key mil rahi hai ya nahi** — site ke HTML/JS bundle se.
+
+> ⚠️ **Sabse badi galti:** NoCaptchaAI ka **Turnstile subscription plan me NAHI
+> aata**. Ye alag pay-as-you-go wallet se **$0.0005 per solve** katta hai.
+> "Recharge" karke bhi fail ho raha ho to `nocaptchaai.com/manage/billing` →
+> **wallet** top-up karo (subscription nahi). Fail par charge nahi lagta.
+
+Error ka matlab (ab UI me seedha Hinglish me dikhta hai, pehle chhup jata tha):
+
+| Code | Matlab |
+|---|---|
+| `ERROR_ZERO_BALANCE` / `INSUFFICIENT` | wallet khaali — top-up karo |
+| `ERROR_KEY_DOES_NOT_EXIST` / `ERROR_BAD_KEY` | key invalid — dobara copy |
+| `ERROR_NO_SLOT_AVAILABLE` | NoCaptchaAI busy — 5-10s baad retry |
+
+Solve ka timeout **120s** hai (pehle 45–50s tha, jisme asli solve aksar cut ho
+jata tha). Env override: `NOCAP_API_BASE` (sirf test/mock ke liye),
+`NOCAP_API_KEY` (key), `NOCAP_TIMEOUT_MS` (default 120000).
+
 ## OTP ke do raste
 
 - **Manual** (default): OTP bot me code dekho → page par daalo. Har jagah chalta hai.

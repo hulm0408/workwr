@@ -6,7 +6,7 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { registerGoldDrop, verifyGoldDropOtp } from './_gold-drop.js';
+import { registerGoldDrop, verifyGoldDropOtp, goldDropCaptchaDiagnose } from './_gold-drop.js';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const NOCAP_API = 'https://api.nocaptchaai.com';
@@ -311,16 +311,19 @@ export default async function handler(req, res) {
       sendJson(res, 200, { ok: true });
       return;
     }
-    if (req.method === 'POST' && url.pathname === '/nocap-balance') {
+    if (req.method === 'POST' && (url.pathname === '/nocap-balance' || url.pathname === '/captcha-test')) {
+      // NoCaptchaAI v2 me balance endpoint nahi hai — key ko asli turnstile
+      // task se test karte hain (asli address: $0.0005/solve wallet se).
       const body = await readBody(req);
-      const key = String(body.key || NOCAP_KEY_DEFAULT);
-      try {
-        const r = await fetch(`${NOCAP_API}/balance?apiKey=${encodeURIComponent(key)}`, { signal: AbortSignal.timeout(15000) }).then(x => x.json());
-        if (String(r.status || '').toLowerCase() !== 'ok') { sendJson(res, 200, { message: `⚠️ Balance check fail: ${r.error || r.msg || 'unknown'} — key sahi hai?` }); return; }
-        sendJson(res, 200, { message: `💰 NoCaptchaAI balance: $${r.Balance ?? r.balance} (${r.Subscription === 'active' ? 'active' : r.Subscription || '—'})` });
-      } catch (error) {
-        sendJson(res, 200, { message: `⚠️ Balance check fail: ${String(error?.message || error).slice(0, 100)}` });
-      }
+      const diag = await goldDropCaptchaDiagnose(String(body.key || body.nocapKey || NOCAP_KEY_DEFAULT).trim());
+      sendJson(res, 200, {
+        ok: Boolean(diag.keyOk && diag.sitekey),
+        keyMasked: diag.keyMasked,
+        keyOk: diag.keyOk,
+        sitekey: diag.sitekey ? `${diag.sitekey.slice(0, 12)}…` : '',
+        sitekeyError: diag.sitekeyError,
+        message: `${diag.keyMessage}${diag.sitekey ? ' · sitekey mil gayi ✅' : ` · ${diag.sitekeyError || 'sitekey nahi mili'}`}`,
+      });
       return;
     }
     sendJson(res, 404, { ok: false, message: 'Not found' });

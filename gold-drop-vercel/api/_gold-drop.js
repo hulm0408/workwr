@@ -6,7 +6,9 @@ import { randomBytes, createHmac } from 'node:crypto';
 
 const BASE = 'https://golddropgolddhamaka.com/api';
 const GOLD_DROP_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
-const NOCAP_API = 'https://api.nocaptchaai.com';
+const NOCAP_API = (process.env.NOCAP_API_BASE || 'https://api.nocaptchaai.com').replace(/\/+$/, '');
+// Turnstile solve aksar 60-90s leta hai — default 120s (env se badal sakte ho).
+const NOCAP_TIMEOUT_MS = Number(process.env.NOCAP_TIMEOUT_MS) || 120000;
 const NOCAP_KEY_DEFAULT = process.env.NOCAP_API_KEY || 'nocap_eVBzrYeejjgKLoikEErH6lbP';
 const ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
 const b64 = value => Buffer.from(value, 'utf8').toString('base64');
@@ -41,18 +43,32 @@ async function nocapPost(pathname, apiKey, body) {
   return res.json().catch(() => ({}));
 }
 
-async function nocapSolveTurnstile(apiKey, sitekey, pageUrl) {
-  let lastError = '';
-  for (const type of ['CloudflareTurnstileTaskProxyLess', 'TurnstileTaskProxyLess']) {
+// NoCaptchaAI error codes → seedha wajah wala message.
+function nocapExplain(result) {
+  const code = String(result?.errorCode ?? result?.errorId ?? '');
+  const desc = String(result?.errorDescription || result?.msg || '').trim();
+  const text = `${code} ${desc}`.toUpperCase();
+  if (/ZERO_BALANCE|INSUFFICIENT|NO_FUNDS/.test(text)) {
+    return 'NoCaptchaAI wallet khaali hai — Turnstile plan me NAHI aata, alag $0.0005/solve wallet se katta hai. nocaptchaai.com/manage/billing se top-up karo.';
+  }
+  if (/BAD_KEY|WRONG_USER_KEY|KEY_DOES_NOT_EXIST|AUTH/.test(text)) return 'NoCaptchaAI key invalid hai — dashboard se dobara copy karo.';
+  if (/NO_SLOT|TOO_MUCH_REQUESTS|RATE|BUSY/.test(text)) return 'NoCaptchaAI busy hai — thodi der baad retry.';
+  if (code === '0') return desc;
+  return desc || (code ? `NoCaptchaAI error ${code}` : '');
+}
+
+async function nocapSolveTurnstile(apiKey, sitekey, pageUrl, timeoutMs = NOCAP_TIMEOUT_MS) {
+  const errors = [];
+  for (const type of ['TurnstileTaskProxyLess', 'CloudflareTurnstileTaskProxyLess']) {
     let created;
     try {
       created = await nocapPost('/createTask', apiKey, { task: { type, websiteURL: pageUrl, websiteKey: sitekey } });
-    } catch (error) { lastError = String(error?.message || error).slice(0, 120); continue; }
+    } catch (error) { errors.push(String(error?.message || error).slice(0, 120)); continue; }
     if ((created.errorId ?? 0) !== 0 || !created.taskId) {
-      lastError = String(created.errorDescription || created.msg || 'createTask fail').slice(0, 120);
+      errors.push(nocapExplain(created) || 'createTask fail');
       continue;
     }
-    const deadline = Date.now() + 45000;
+    const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
       await new Promise(r => setTimeout(r, 2000));
       let result;
@@ -63,11 +79,41 @@ async function nocapSolveTurnstile(apiKey, sitekey, pageUrl) {
         if (token) return token;
         throw new Error('NoCaptchaAI ne ready par khali token diya');
       }
-      if (status === 'failed') throw new Error(`NoCaptchaAI: ${String(result.errorDescription || result.errorCode || 'failed').slice(0, 120)}`);
+      if (status === 'failed') throw new Error(`NoCaptchaAI solve fail: ${nocapExplain(result) || 'failed'}`);
     }
-    throw new Error(`NoCaptchaAI task 45s me ready nahi hua`);
+    throw new Error(`NoCaptchaAI ne ${Math.round(timeoutMs / 1000)}s me solve nahi kiya — dobara try karo`);
   }
-  throw new Error(`NoCaptchaAI createTask fail: ${lastError || 'unknown'}`);
+  throw new Error(`NoCaptchaAI createTask fail: ${errors.filter(Boolean).join(' | ') || 'unknown'}`);
+}
+
+// Key + sitekey ka live test (UI button ke liye).
+export async function nocapKeyCheck(apiKey) {
+  const key = String(apiKey || '').trim();
+  if (!key) return { ok: false, message: 'Key khaali hai' };
+  try {
+    const created = await nocapPost('/createTask', key, { task: { type: 'TurnstileTaskProxyLess', websiteURL: 'https://golddropgolddhamaka.com/register', websiteKey: '0x4AAAAAAAdiagnosticProbe000000000000' } });
+    if ((created.errorId ?? 0) === 0 && created.taskId) return { ok: true, message: 'Key chal rahi hai ✅ (wallet se kat raha hai)' };
+    return { ok: false, message: nocapExplain(created) || 'Key test fail' };
+  } catch (error) {
+    return { ok: false, message: `NoCaptchaAI tak nahi pahucha: ${String(error?.message || error).slice(0, 140)}` };
+  }
+}
+
+export async function goldDropCaptchaDiagnose(nocapApiKey) {
+  const out = { keyMasked: '', keyOk: null, keyMessage: '', sitekey: '', sitekeyError: '' };
+  const key = String(nocapApiKey || '').trim();
+  out.keyMasked = key.length > 16 ? `${key.slice(0, 10)}…${key.slice(-4)}` : (key || '(none)');
+  if (!key || ['off', '0', 'none'].includes(key.toLowerCase())) {
+    out.keyOk = false; out.keyMessage = 'Key OFF hai — nocap_… key daalo.';
+  } else {
+    const check = await nocapKeyCheck(key);
+    out.keyOk = check.ok; out.keyMessage = check.message;
+  }
+  try {
+    out.sitekey = await fetchSitekey();
+    if (!out.sitekey) out.sitekeyError = 'Sitekey nahi mili — HTML badla hai';
+  } catch (error) { out.sitekeyError = String(error?.message || error).slice(0, 160); }
+  return out;
 }
 
 // Sitekey runtime par site ke HTML/JS bundle se nikalo — kabhi guess nahi.
@@ -77,8 +123,12 @@ async function fetchSitekey() {
     return res.text();
   };
   const pageUrl = 'https://golddropgolddhamaka.com/register';
-  const html = await read(pageUrl);
-  let match = /0x4[0-9A-Za-z_-]{21,}/.exec(html);
+  let html;
+  try { html = await read(pageUrl); }
+  catch (error) { throw new Error(`Gold Drop site tak nahi pahucha (network): ${String(error?.message || error).slice(0, 90)}`); }
+  let match = /data-sitekey=["'](0x4[0-9A-Za-z_-]{21,})["']/i.exec(html);
+  if (match) return match[1];
+  match = /0x4[0-9A-Za-z_-]{21,}/.exec(html);
   if (match) return match[0];
   const scripts = [...html.matchAll(/<script[^>]+src=["']([^"']+)["']/gi)].map(x => x[1]);
   for (const src of scripts.slice(0, 6)) {

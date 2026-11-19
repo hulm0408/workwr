@@ -13,7 +13,7 @@ const GOLD_DROP_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.
 // ─── NoCaptchaAI — security check (Cloudflare Turnstile) solver ───
 // Register par "Please complete the security check" aaye tabhi use hota hai.
 // NOCAP_API_KEY env / bot Settings se override; 'off' = disabled.
-const NOCAP_API = 'https://api.nocaptchaai.com';
+const NOCAP_API = (process.env.NOCAP_API_BASE || 'https://api.nocaptchaai.com').replace(/\/+$/, '');
 const NOCAP_KEY_DEFAULT = 'nocap_eVBzrYeejjgKLoikEErH6lbP';
 
 async function nocapPost(pathname, apiKey, body, fetchImpl) {
@@ -26,17 +26,38 @@ async function nocapPost(pathname, apiKey, body, fetchImpl) {
   return res.json().catch(() => ({}));
 }
 
+// NoCaptchaAI ke error codes ko seedha-wajah wale message me badlo.
+// (docs: errorId/errorCode 0 = ok; balance/wallet alag hai subscription se)
+export function nocapExplain(result) {
+  const code = String(result?.errorCode ?? result?.errorId ?? '');
+  const desc = String(result?.errorDescription || result?.msg || '').trim();
+  const text = `${code} ${desc}`.toUpperCase();
+  if (/ZERO_BALANCE|INSUFFICIENT|NO_FUNDS/.test(text)) {
+    return 'NoCaptchaAI wallet khaali hai — Turnstile alag pay-as-you-go hai ($0.0005/solve), subscription plan ise cover NAHI karta. nocaptchaai.com/manage/billing se wallet me $ top-up karo.';
+  }
+  if (/BAD_KEY|WRONG_USER_KEY|KEY_DOES_NOT_EXIST|AUTH/.test(text)) {
+    return 'NoCaptchaAI key galat/invalid hai — nocaptchaai.com dashboard se key dobara copy karo.';
+  }
+  if (/INSUFFICIENT|BALANCE/.test(text)) return 'NoCaptchaAI balance khatam ho gaya.';
+  if (/NO_SLOT|TOO_MUCH_REQUESTS|RATE|BUSY/.test(text)) return 'NoCaptchaAI busy hai (slot nahi mila) — thodi der baad retry.';
+  if (code === '0') return desc;
+  return desc || (code ? `NoCaptchaAI error ${code}` : '');
+}
+
 // createTask → getTaskResult poll → token. Loud error on failure.
-export async function nocapSolveTurnstile(apiKey, sitekey, pageUrl, { fetchImpl = fetch, timeoutMs = 50000, sleepFn = ms => new Promise(r => setTimeout(r, ms)) } = {}) {
-  let lastError = '';
-  for (const type of ['CloudflareTurnstileTaskProxyLess', 'TurnstileTaskProxyLess']) {
+export const NOCAP_TIMEOUT_MS = Number(process.env.NOCAP_TIMEOUT_MS) || 120000;
+
+export async function nocapSolveTurnstile(apiKey, sitekey, pageUrl, { fetchImpl = fetch, timeoutMs = NOCAP_TIMEOUT_MS, sleepFn = ms => new Promise(r => setTimeout(r, ms)) } = {}) {
+  const errors = [];
+  // Turnstile ke do type naam docs me chalte hain — jo pehle chale wahi use karo.
+  for (const type of ['TurnstileTaskProxyLess', 'CloudflareTurnstileTaskProxyLess']) {
     let created;
     try {
       created = await nocapPost('/createTask', apiKey, { task: { type, websiteURL: pageUrl, websiteKey: sitekey } }, fetchImpl);
-    } catch (error) { lastError = String(error?.message || error).slice(0, 120); continue; }
+    } catch (error) { errors.push(`${type}: ${String(error?.message || error).slice(0, 120)}`); continue; }
     if ((created.errorId ?? 0) !== 0 || !created.taskId) {
-      lastError = String(created.errorDescription || created.msg || 'createTask fail').slice(0, 120);
-      continue;
+      errors.push(`${type}: ${nocapExplain(created) || 'createTask fail'}`);
+      continue; // key/balance ka error agle type par bhi aayega, reason list me rahega
     }
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
@@ -47,33 +68,86 @@ export async function nocapSolveTurnstile(apiKey, sitekey, pageUrl, { fetchImpl 
       if (status === 'ready') {
         const token = result.solution?.token || '';
         if (token) return token;
-        throw new Error('NoCaptchaAI ne ready par khali token diya');
+        throw new Error('NoCaptchaAI ne ready par khali token diya — dobara try karo.');
       }
-      if (status === 'failed') throw new Error(`NoCaptchaAI task failed: ${String(result.errorDescription || result.errorCode || 'unknown').slice(0, 120)}`);
+      if (status === 'failed') {
+        throw new Error(`NoCaptchaAI solve fail: ${nocapExplain(result) || 'unknown'}`);
+      }
     }
-    throw new Error(`NoCaptchaAI task ${created.taskId} ${Math.round(timeoutMs / 1000)}s me ready nahi hua`);
+    throw new Error(`NoCaptchaAI ne ${Math.round(timeoutMs / 1000)}s me solve nahi kiya — thodi der baad dobara try karo (turnstile kabhi kabhi slow hota hai).`);
   }
-  throw new Error(`NoCaptchaAI createTask fail: ${lastError || 'unknown'}`);
+  throw new Error(`NoCaptchaAI createTask fail: ${errors.filter(Boolean).join(' | ') || 'unknown'}`);
+}
+
+// Key + wallet live check — solve fail hone par exact reason batata hai.
+export async function nocapCheckKey(apiKey, { fetchImpl = fetch } = {}) {
+  let created;
+  try {
+    created = await nocapPost('/createTask', apiKey, { task: { type: 'TurnstileTaskProxyLess', websiteURL: 'https://golddropgolddhamaka.com/register', websiteKey: '0x4AAAAAAAdiagnosticProbe000000000000' } }, fetchImpl);
+  } catch (error) {
+    return { ok: false, taskId: '', message: `NoCaptchaAI tak nahi pahucha: ${String(error?.message || error).slice(0, 120)}` };
+  }
+  if ((created.errorId ?? 0) === 0 && created.taskId) {
+    return { ok: true, taskId: created.taskId, message: `Key chal rahi hai ✅ (test task bana: ${created.taskId})` };
+  }
+  return { ok: false, taskId: '', message: nocapExplain(created) || 'Key check fail' };
 }
 
 // Sitekey runtime par site ke HTML/JS bundle se nikalo (kabhi guess nahi).
+// data-sitekey attribute → Cloudflare widget URL → bundles → embedded JSON,
+// sab me 0x4… pattern dhoondha jata hai.
 export async function fetchTurnstileSitekey(fetchImpl = fetch, pageUrl = 'https://golddropgolddhamaka.com/register') {
   const read = async url => {
-    const res = await fetchImpl(url, { headers: { 'user-agent': GOLD_DROP_UA }, signal: AbortSignal.timeout(20000) });
-    return res.text();
+    const res = await fetchImpl(url, { headers: { 'user-agent': GOLD_DROP_UA, 'accept-language': 'en-US,en;q=0.9' }, signal: AbortSignal.timeout(20000) });
+    let html = await res.text();
+    // Cloudflare challenge page aaya to asli HTML nahi hai
+    if (/Just a moment|cf-challenge|Attention Required/i.test(html) && !/0x4[0-9A-Za-z_-]{21,}/.test(html)) {
+      throw new Error('Gold Drop ne HTML ki jagah Cloudflare challenge bheja — sitekey nahi mil sakti');
+    }
+    return html;
   };
-  const html = await read(pageUrl);
-  let match = /0x4[0-9A-Za-z_-]{21,}/.exec(html);
-  if (match) return match[0];
+  const html = await read(pageUrl).catch(error => {
+    throw new Error(`Gold Drop page nahi khula: ${String(error?.message || error).slice(0, 120)}`);
+  });
+  // 1) seedha attribute
+  let m = /data-sitekey=["'](0x4[0-9A-Za-z_-]{21,})["']/i.exec(html);
+  if (m) return m[1];
+  // 2) koi bhi 0x4… string (widget URL / inline config / astro island JSON)
+  m = /0x4[0-9A-Za-z_-]{21,}/.exec(html);
+  if (m) return m[0];
+  // 3) external bundles
   const scripts = [...html.matchAll(/<script[^>]+src=["']([^"']+)["']/gi)].map(x => x[1]);
-  for (const src of scripts.slice(0, 6)) {
+  for (const src of scripts.slice(0, 8)) {
     try {
       const js = await read(new URL(src, pageUrl).href);
-      match = /0x4[0-9A-Za-z_-]{21,}/.exec(js);
-      if (match) return match[0];
+      m = /0x4[0-9A-Za-z_-]{21,}/.exec(js);
+      if (m) return m[0];
     } catch { /* agla bundle */ }
   }
   return '';
+}
+
+// Ek hi jagah se "captcha kyun nahi hal hua" ka poora diagnosis.
+export async function goldDropCaptchaPreflight(nocapApiKey, { fetchImpl = fetch, pageUrl = 'https://golddropgolddhamaka.com/register', skipKeyTest = false } = {}) {
+  const key = String(nocapApiKey || '').trim();
+  const out = { key: key ? `${key.slice(0, 10)}…${key.slice(-4)}` : '(none)', sitekey: '', sitekeyError: '', keyOk: null, keyMessage: '', pageOk: false, pageError: '' };
+  if (!key || ['off', '0', 'none'].includes(key.toLowerCase())) {
+    out.keyMessage = 'NoCaptchaAI key OFF hai — apni nocap_… key set karo.';
+    out.keyOk = false;
+  } else if (!skipKeyTest) {
+    const check = await nocapCheckKey(key, { fetchImpl });
+    out.keyOk = check.ok;
+    out.keyMessage = check.message;
+    out.probeTaskId = check.taskId || '';
+  }
+  try {
+    out.sitekey = await fetchTurnstileSitekey(fetchImpl, pageUrl);
+    out.pageOk = Boolean(out.sitekey);
+    if (!out.sitekey) out.sitekeyError = 'Sitekey nahi mili (site ka HTML badal gaya)';
+  } catch (error) {
+    out.sitekeyError = String(error?.message || error).slice(0, 160);
+  }
+  return out;
 }
 
 // Gmail plus addressing keeps delivery in the original inbox while using six
@@ -154,7 +228,7 @@ export function unwrapGoldDropResponse(value) {
 }
 
 export class GoldDropClient {
-  constructor({ fetchImpl = fetch, base = BASE, nocapApiKey = '', onStatus = null } = {}) {
+  constructor({ fetchImpl = fetch, base = BASE, nocapApiKey = '', onStatus = null, nocapTimeoutMs = NOCAP_TIMEOUT_MS } = {}) {
     this.fetch = fetchImpl;
     this.base = base.replace(/\/$/, '');
     this.cookieJar = new GoldDropCookieJar(this.base);
@@ -163,6 +237,7 @@ export class GoldDropClient {
     const key = String(nocapApiKey || '').trim();
     this.nocapApiKey = ['off', '0', 'none'].includes(key.toLowerCase()) ? '' : (key || NOCAP_KEY_DEFAULT);
     this.onStatus = typeof onStatus === 'function' ? onStatus : () => {};
+    this.nocapTimeoutMs = Number(nocapTimeoutMs) > 0 ? Number(nocapTimeoutMs) : NOCAP_TIMEOUT_MS;
     this._sitekey = '';
   }
 
@@ -230,10 +305,14 @@ export class GoldDropClient {
     }
     this.onStatus('Security check aaya — NoCaptchaAI se solve ho raha hai…');
     if (!this._sitekey) {
-      this._sitekey = await fetchTurnstileSitekey(this.fetch).catch(() => '');
-      if (!this._sitekey) throw new Error('Site par Turnstile sitekey nahi mili — site ka structure badla hai, report karo.');
+      try {
+        this._sitekey = await fetchTurnstileSitekey(this.fetch);
+      } catch (error) {
+        throw new Error(`Captcha solve nahi ho sakta — ${String(error?.message || error).slice(0, 160)}`);
+      }
+      if (!this._sitekey) throw new Error('Captcha solve nahi ho sakta — site par Turnstile sitekey nahi mili (site ka HTML badla hai).');
     }
-    const token = await nocapSolveTurnstile(this.nocapApiKey, this._sitekey, 'https://golddropgolddhamaka.com/register', { fetchImpl: this.fetch });
+    const token = await nocapSolveTurnstile(this.nocapApiKey, this._sitekey, 'https://golddropgolddhamaka.com/register', { fetchImpl: this.fetch, timeoutMs: this.nocapTimeoutMs });
     this.onStatus('Security check solved (NoCaptchaAI) ✅ — register dobara bhej rahe hain');
     return token;
   }

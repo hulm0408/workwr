@@ -3,6 +3,7 @@
 // register (data+img) → verify-otp. Security check aaye to NoCaptchaAI se
 // Turnstile solve → cf-turnstile-response ke saath 1 retry.
 import { randomBytes, createHmac } from 'node:crypto';
+import { getSharedBrowser, goldDropBrowserAvailable, browserRegister, browserVerifyOtp } from './_gold-drop-browser.js';
 
 const BASE = 'https://golddropgolddhamaka.com/api';
 const GOLD_DROP_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
@@ -208,6 +209,36 @@ export async function registerGoldDrop({ name, mobile, email, pincode, code, ima
   // site tak jaata hi nahi (na number jalta hai, na OTP jaata hai).
   if (guardOn && deadEndReport) throw markDeadEnd(deadEndReport.message);
 
+  // PEHLA RASTA: asli browser (image me Chrome hai). Raw API par solved
+  // token ke bawajood site security check deti rehti hai — browser hi clear
+  // karta hai. Browser na chale to niche direct API fallback hai.
+  if (goldDropBrowserAvailable()) {
+    try {
+      const browser = await getSharedBrowser({ nocapApiKey: nocapApiKey || '' });
+      const out = await browserRegister(browser, {
+        name, mobile, email, pincode, code, imageBase64, url: SITE_REGISTER_URL,
+      });
+      if (out?.ok) {
+        return {
+          ok: true,
+          securitySolved: true,
+          viaBrowser: true,
+          message: String(out.message || 'OTP sent'),
+          stage: String(out.stage || 'otp'),
+          // verify step ko wahi details chahiye (form OTP ke baad bhi bharna padta hai)
+          session: { userKey: '', dataKey: '', viaBrowser: true, details: { name, mobile, email, pincode, code, image: imageBase64 } },
+        };
+      }
+      // Browser ne saaf error diya (site ka verbatim message) — wahi throw karo
+      if (out?.message) throw new Error(String(out.message).slice(0, 200));
+    } catch (error) {
+      const text = String(error?.message || '');
+      // Login/OTP-stage ka saaf jawab ho to wahi dikhao (guard nahi lagana)
+      if (/otp|already|limit|invalid|expired/i.test(text) && !/security/i.test(text)) throw error;
+      console.warn('[GoldDrop] browser fail:', text.slice(0, 160));
+    }
+  }
+
   // Session keys (drop.py init_session — sirf {} body)
   const boot = await gdRequest('/users', JSON.stringify({}), 'application/json');
   if (!boot.data?.userKey || !boot.data?.dataKey) throw new Error(String(boot.data?.message || 'Session keys nahi mile'));
@@ -307,6 +338,15 @@ export async function registerGoldDrop({ name, mobile, email, pincode, code, ima
 }
 
 export async function verifyGoldDropOtp({ session, otp }) {
+  // Browser se register hua tha? To OTP bhi usi asli page par daalna hoga —
+  // raw verify-otp call browser ke session se mel hi nahi khayega.
+  if (session?.viaBrowser && goldDropBrowserAvailable()) {
+    if (!/^\d{6}$/.test(String(otp))) throw new Error('OTP 6 digits ka hota hai');
+    const browser = await getSharedBrowser();
+    const out = await browserVerifyOtp(browser, String(otp), session.details || {});
+    if (!out?.ok) throw new Error(String(out?.message || 'OTP verify fail').slice(0, 200));
+    return { ok: true, viaBrowser: true, message: String(out.message || 'Verified'), reward: null };
+  }
   const userKey = String(session?.userKey || '');
   const dataKey = String(session?.dataKey || '');
   if (!userKey || !dataKey) throw new Error('Session expire ho gaya — number dobara bhejo');

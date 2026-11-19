@@ -7,6 +7,7 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { registerGoldDrop, verifyGoldDropOtp, goldDropCaptchaDiagnose, goldDropDeadEnd, resetGoldDropDeadEnd } from './_gold-drop.js';
+import { goldDropBrowserAvailable, findStealthWorker } from './_gold-drop-browser.js';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const NOCAP_API = 'https://api.nocaptchaai.com';
@@ -153,9 +154,7 @@ button.secondary{background:#232845;color:#e8eaf2}
 </style></head><body><div class="card">
 <h1>🟡 Gold Drop</h1>
 <div class="sub">Direct API method — koi browser nahi, sab cloud par chalta hai. Number apne OTP bot se laao. <a href="/logout" style="color:#f7b500">Logout</a></div>
-<div class="sub" style="border:1px solid #6b4b00;border-radius:9px;padding:10px;background:#241c00;color:#ffd479">
-⚠️ Ye Vercel build browser ke bina chalta hai. Gold Drop ka security check aksar <b>browser ke bina clear nahi hota</b> — pehle niche <b>🛡️ Captcha test</b> dabao, wo bata dega kaaran aur kitni sitekey mili. Browser mode ke liye Docker/VPS chahiye.
-</div>
+<div class="sub" id="browsermode" style="border:1px solid #2a3050;border-radius:9px;padding:10px;background:#10142a">Browser mode check ho raha hai…</div>
 <div id="setup">
 <label>Naam</label><input id="name" value="Rahul Kumar">
 <label>Email (Gmail — har number par +suffix apne aap)</label><input id="email" value="itsnoob012@gmail.com">
@@ -228,6 +227,17 @@ function captchaTest(){
   }).catch(function(){ btn.disabled = false; btn.textContent = old; });
 }
 $('captchaTest').onclick = captchaTest;
+fetch('/browser-mode').then(function(r){return r.json()}).then(function(b){
+  var el = $('browsermode');
+  if (b.available) {
+    el.style.borderColor = '#1f6b3a'; el.style.background = '#0f2418'; el.style.color = '#7ee2a8';
+    el.innerHTML = '✅ <b>Asli browser mode ON</b> — Gold Drop ka security check browser khud clear karega (register + OTP dono usi page par).';
+  } else {
+    el.style.borderColor = '#6b4b00'; el.style.background = '#241c00'; el.style.color = '#ffd479';
+    el.innerHTML = '⚠️ <b>Browser mode OFF</b> — ' + (b.reason || 'Chrome/Python nahi mila')
+      + '. Iske bina Gold Drop ka security check clear nahi hoga; phone numbers bachao aur 🛡️ Captcha test chalao.';
+  }
+}).catch(function(){ $('browsermode').style.display='none'; });
 post('/nocap-balance',{key:$('nocapKey').value.trim()}).then(function(r){
   $('nocapbal').textContent = r.message || '';
   $('captchaOut').textContent = (r.ok?'✅ ':'❌ ') + (r.message||'') + (r.sitekeys&&r.sitekeys.length ? ' · sitekeys: ' + r.sitekeys.join(', ') : '');
@@ -345,6 +355,19 @@ export default async function handler(req, res) {
       state.status = 'idle'; state.message = ''; state.session = null; state.mobile = '';
       state.details = null; state.results = []; state.log = []; state.count = 0;
       sendJson(res, 200, { ok: true });
+      return;
+    }
+    if (req.method === 'GET' && url.pathname === '/browser-mode') {
+      const available = goldDropBrowserAvailable();
+      sendJson(res, 200, {
+        available,
+        worker: findStealthWorker() ? 'mil gaya' : 'nahi mila',
+        reason: available
+          ? ''
+          : (findStealthWorker()
+            ? 'worker mila par Python deps/Chrome missing (seleniumbase, playwright)'
+            : 'gold_drop_stealth.py nahi mila — Docker image me hona chahiye'),
+      });
       return;
     }
     if (req.method === 'POST' && (url.pathname === '/nocap-balance' || url.pathname === '/captcha-test')) {
